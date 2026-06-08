@@ -1,0 +1,71 @@
+# Testing
+
+Current tests cover:
+
+- strict `settings.json` parsing
+- secret redaction
+- startup path validation
+- virtual FUSE root layout
+- operation matrix
+- live `/nzbs` visible-name mapping
+- `/nzbs` unlink-to-cancel behavior
+- `/content` release directory mapping
+- inline virtual-file reads through FUSE content nodes
+- host-side publication symlink creation
+- metadata-aware movie publication path
+- metadata-aware tv publication path
+- completed-symlink metadata exposure
+- startup publication reconstruction
+- manual republish endpoint
+- manual maintenance endpoints
+- orphaned-content cleanup
+- broken media symlink cleanup
+- orphaned completed-symlink row cleanup
+- Seerr request parsing
+- NZBHydra2 search response parsing
+- request sync workflow
+- release search/ranking workflow
+- selected-release NZB fetch/import workflow
+- candidate fallback after selected-release fetch failure
+- yEnc article decoding
+- NNTP multiline body parsing
+- NNTP range extraction from decoded article body
+- bounded byte LRU eviction
+- decoded-article cache hit path
+- NNTP concurrency limiter
+- pooled NNTP session reuse
+- pooled NNTP max-open bound
+- scheduler priority ordering
+- disk cache put/get/trim
+- disk decoded-article cache hit path
+- read-ahead priority scheduling
+- read-ahead cancellation on seek/stop
+- provider fallback
+- provider retry on transient source failure
+- deterministic host-side symlink publishing
+- NZB XML parsing
+- staged NZB import
+- NZB invalid XML rejection
+- NZB upload-size limit
+- queue cancel semantics
+- imported NZB file metadata extraction
+- playable-media detection for direct virtual file creation
+- FUSE upload-handle import on flush/release
+- FUSE upload-handle size limit
+- library listing endpoint
+- release listing endpoint
+- requests listing endpoint
+- requests sync endpoint
+- library search endpoint
+- range-to-segment mapping
+- direct virtual reads
+- keyed singleflight cache deduplication
+- candidate ranking
+- queue retry against existing viable candidate rows before fresh search
+
+Still missing:
+
+- live FUSE mount tests
+- staged NZB uploads
+- range-to-segment mapping
+- archive offset mapping

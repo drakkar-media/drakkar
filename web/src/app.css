@@ -1,0 +1,122 @@
+/* ─── Google Fonts: Space Grotesk + JetBrains Mono ─────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+/* ─── CSS custom properties (match reference project exactly) ───────────────── */
+:root {
+  --background:        215 36%  4%;
+  --foreground:        188 34% 91%;
+  --card:              211 31%  7%;
+  --card-foreground:   188 34% 91%;
+  --muted:             209 26% 12%;
+  --muted-foreground:  190 13% 58%;
+  --border:            197 29% 18%;
+  --primary:           171 82% 55%;
+  --primary-foreground: 191 65%  6%;
+  --accent:             83 72% 58%;
+  --accent-foreground:  190 64%  7%;
+  --danger:              0 72% 51%;
+
+  /* Status colors — exact match to reference project Library.tsx */
+  --status-available:    142 69% 44%;   /* #22c55e  Completed (Monitored)     */
+  --status-partial:      217 100% 68%;  /* #5f98ff  Completed (Unmonitored)   */
+  --status-downloading:  262 83% 71%;   /* #8b5cf6  Downloading / Grabbed     */
+  --status-missing:        0 100% 67%;  /* #ff5b5b  Missing                   */
+  --status-failed:         0 100% 67%;  /* same red as missing                */
+  --status-unreleased:   217 100% 68%;  /* same blue as partial / unmonitored */
+  --status-unmonitored:  217 100% 68%;  /* #5f98ff  Completed (Unmonitored)   */
+  --status-warning:       43  96% 55%;  /* amber — misc warning               */
+
+  /* Radii (match reference) */
+  --radius-sm:   0.25rem;
+  --radius:      0.375rem;
+  --radius-md:   0.5rem;
+  --radius-lg:   0.75rem;
+  --radius-xl:   1rem;
+  --radius-2xl:  1.5rem;
+}
+
+/* ─── Reset ─────────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  background:
+    linear-gradient(90deg,  hsl(171 80% 56% / 0.03) 1px, transparent 1px),
+    linear-gradient(180deg, hsl(171 80% 56% / 0.025) 1px, transparent 1px),
+    radial-gradient(circle at 80% 18%, hsl(171 82% 18% / 0.32), transparent 28rem),
+    radial-gradient(circle at 15% 80%, hsl(83  72% 15% / 0.16), transparent 34rem),
+    linear-gradient(180deg, hsl(215 36% 5%), hsl(215 36% 3%) 50rem);
+  background-size: 40px 40px, 40px 40px, auto, auto, auto;
+  color: hsl(var(--foreground));
+  font-family: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+/* Monospace elements use JetBrains Mono */
+code, kbd, pre, samp, .mono {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.875em;
+}
+
+a { color: inherit; text-decoration: none; }
+
+button, input, textarea, select { font: inherit; color: inherit; }
+
+img, svg, canvas, video { max-width: 100%; }
+
+/* ─── Scrollbar ──────────────────────────────────────────────────────────────── */
+::-webkit-scrollbar        { width: 6px; height: 6px; }
+::-webkit-scrollbar-track  { background: transparent; }
+::-webkit-scrollbar-thumb  { background: hsl(0 0% 100% / 0.15); border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover { background: hsl(0 0% 100% / 0.25); }
+
+/* ─── Utility ────────────────────────────────────────────────────────────────── */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0;
+  margin: -1px; overflow: hidden; clip: rect(0,0,0,0);
+  white-space: nowrap; border: 0;
+}
+
+/* Draggable scroll container */
+.drag-scroll {
+  display: flex;
+  overflow-x: auto;
+  gap: 12px;
+  padding-bottom: 6px;
+  cursor: grab;
+  user-select: none;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+.drag-scroll::-webkit-scrollbar { display: none; }
+.drag-scroll:active { cursor: grabbing; }
+
+/* Status color bars used on PosterCard top edge */
+.status-bar-available    { background: hsl(var(--status-available)); }
+.status-bar-unmonitored  { background: hsl(var(--status-unmonitored)); }
+.status-bar-downloading  { background: hsl(var(--status-downloading)); }
+.status-bar-missing      { background: hsl(var(--status-missing)); }
+.status-bar-warning      { background: hsl(var(--status-warning)); }
+.status-bar-neutral      { background: hsl(0 0% 100% / 0.15); }
+
+/* Heading clamp scale matching reference */
+h1 { font-size: clamp(1.9rem, 4vw, 3rem);   font-weight: 700; line-height: 1.1; margin: 0; }
+h2 { font-size: clamp(1.35rem, 2.5vw, 2.2rem); font-weight: 700; line-height: 1.15; margin: 0; }
+h3 { font-size: clamp(1.1rem, 1.8vw, 1.5rem);  font-weight: 600; line-height: 1.2;  margin: 0; }
+
+/* Metric card value */
+.metric-value {
+  font-size: clamp(1.6rem, 3vw, 2.4rem);
+  font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+  letter-spacing: -0.02em;
+  line-height: 1;
+}

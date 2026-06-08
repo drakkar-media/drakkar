@@ -1,0 +1,286 @@
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import Play from '@lucide/svelte/icons/play';
+  import RefreshCw from '@lucide/svelte/icons/refresh-cw';
+  import Clock3 from '@lucide/svelte/icons/clock-3';
+  import CheckCircle2 from '@lucide/svelte/icons/check-circle-2';
+  import AlertTriangle from '@lucide/svelte/icons/alert-triangle';
+  import PageHeader from '$lib/components/PageHeader.svelte';
+  import Panel from '$lib/components/Panel.svelte';
+  import Button from '$lib/components/Button.svelte';
+  import StatusPill from '$lib/components/StatusPill.svelte';
+  import { toastError, toastSuccess } from '$lib/toast';
+  import { api } from '$lib/api';
+  import type { TaskSchedule } from '$lib/types';
+
+  type TaskResult = { ok: boolean; detail: string; ranAt: string };
+  type TaskDef = {
+    id: string;
+    label: string;
+    description: string;
+    group: string;
+    interval: string;
+    manual: boolean;
+    run: () => Promise<unknown>;
+  };
+
+  let running: Record<string, boolean> = {};
+  let results: Record<string, TaskResult> = {};
+  let schedules: TaskSchedule[] = [];
+
+  const tasks: TaskDef[] = [
+    { id: 'seerr_sync', label: 'Sync Seerr Requests', description: 'Import new and updated requests from Seerr.', group: 'Indexing', interval: '10m', manual: true, run: async () => { const r = await api.syncRequests(); return `seen ${r.seen}, created ${r.created}`; } },
+    { id: 'pending_queue_push', label: 'Dispatch Pending Queue', description: 'Push pending library rows into the bounded background work queue.', group: 'Indexing', interval: '20m', manual: false, run: async () => '' },
+    { id: 'search-pending', label: 'Search Pending Items', description: 'Search missing library items in bounded batches.', group: 'Indexing', interval: 'Manual', manual: true, run: async () => { const r = await api.searchPendingLibrary(); return `processed ${r.processed}, searched ${r.searched}, selected ${r.selected}`; } },
+    { id: 'retry_failed_queue', label: 'Retry Failed Queue', description: 'Retry failed queue rows using current fallback policy.', group: 'Indexing', interval: '30m', manual: true, run: async () => { const r = await api.retryFailedQueue(); return `processed ${r.processed}, retried ${r.retried}`; } },
+    { id: 'republish_pending', label: 'Republish Pending', description: 'Republish library items with a selected release but no current publication.', group: 'Publishing', interval: '30m', manual: true, run: async () => { const r = await api.republishPendingLibrary(); return `processed ${r.processed}, republished ${r.republished}`; } },
+    { id: 'fill_missing_episodes', label: 'Fill Missing Episodes', description: 'Use TMDB episode lists to create library items for episodes not yet tracked, then queue them for search.', group: 'Indexing', interval: 'Manual', manual: true, run: async () => { const r = await api.fillMissingEpisodes(); return `processed ${r.showsProcessed} shows, found ${r.episodesFound} episodes, created ${r.itemsCreated} new items`; } },
+    { id: 'backfill_metadata', label: 'Backfill Metadata', description: 'Re-enrich movies and TV shows with new TMDB fields (tagline, status, content rating, release date, trailer).', group: 'Indexing', interval: 'Manual', manual: true, run: async () => { const r = await api.backfillMetadata(); return `enriched ${r.enriched} items (movies: ${r.processedMovies}, shows: ${r.processedShows}, failed: ${r.failed})`; } },
+    { id: 'health_check', label: 'Run Health Check', description: 'Verify published symlinks still point to valid VFS targets.', group: 'Maintenance', interval: '60m', manual: true, run: async () => { const r = await api.runHealthCheck(); return `checked ${r.checked}, healthy ${r.healthy}`; } },
+    { id: 'cache_prune', label: 'Prune Block Cache', description: 'Delete oldest decoded articles from disk cache.', group: 'Maintenance', interval: '6h', manual: true, run: async () => { const r = await api.pruneCache(); return `deleted ${r.deletedFiles} files`; } },
+    { id: 'orphaned-content', label: 'Remove Orphaned Content', description: 'Delete content rows with no matching publication.', group: 'Maintenance', interval: '6h', manual: true, run: async () => { const r = await api.maintenance('orphaned-content'); return `deleted ${r.deletedFiles} files`; } },
+    { id: 'broken-media-symlinks', label: 'Remove Broken Media Symlinks', description: 'Delete broken host-side media symlinks.', group: 'Maintenance', interval: '6h', manual: true, run: async () => { const r = await api.maintenance('broken-media-symlinks'); return `deleted ${r.deletedFiles} symlinks`; } },
+    { id: 'orphaned-completed-symlinks', label: 'Remove Orphaned History', description: 'Clean stale completed-symlink rows and files.', group: 'Maintenance', interval: '6h', manual: true, run: async () => { const r = await api.maintenance('orphaned-completed-symlinks'); return `deleted ${r.deletedFiles} symlinks`; } }
+  ];
+
+  async function loadSchedules() {
+    schedules = (await api.taskSchedules()).items ?? [];
+  }
+
+  async function runTask(task: TaskDef) {
+    running = { ...running, [task.id]: true };
+    const ranAt = new Date().toISOString();
+    try {
+      const detail = String(await task.run());
+      results = { ...results, [task.id]: { ok: true, detail, ranAt } };
+      toastSuccess(`${task.label}: ${detail}`);
+      await loadSchedules();
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      results = { ...results, [task.id]: { ok: false, detail, ranAt } };
+      toastError(`${task.label} failed: ${detail}`);
+    } finally {
+      running = { ...running, [task.id]: false };
+    }
+  }
+
+  function fmtTime(iso: string) {
+    return new Date(iso).toLocaleString('en-GB', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+  }
+
+  function scheduleFor(task: TaskDef) {
+    return schedules.find((item) => item.id === task.id);
+  }
+
+  $: groups = [...new Set(tasks.map((task) => task.group))];
+  $: runningCount = Object.values(running).filter(Boolean).length;
+  $: lastRunCount = Object.keys(results).length;
+
+  onMount(() => {
+    void loadSchedules();
+  });
+</script>
+
+<svelte:head><title>Tasks — Drakkar</title></svelte:head>
+
+<PageHeader title="Tasks" subtitle="Scheduled-job style control plane for indexing, publishing, and maintenance work.">
+  <StatusPill tone="neutral">{tasks.length} tasks</StatusPill>
+  <StatusPill tone={runningCount > 0 ? 'warn' : 'ok'}>{runningCount} running</StatusPill>
+</PageHeader>
+
+<section class="summary-grid">
+  <div class="summary-card">
+    <div class="summary-value">{tasks.filter((task) => task.group === 'Indexing').length}</div>
+    <div class="summary-label">Indexing tasks</div>
+  </div>
+  <div class="summary-card">
+    <div class="summary-value">{tasks.filter((task) => task.group === 'Publishing').length}</div>
+    <div class="summary-label">Publishing tasks</div>
+  </div>
+  <div class="summary-card">
+    <div class="summary-value">{tasks.filter((task) => task.group === 'Maintenance').length}</div>
+    <div class="summary-label">Maintenance tasks</div>
+  </div>
+  <div class="summary-card">
+    <div class="summary-value">{lastRunCount}</div>
+    <div class="summary-label">Executed this session</div>
+  </div>
+</section>
+
+<Panel title="Scheduled" subtitle="Reference-style scheduled tasks table, backed by current callable operations.">
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Interval</th>
+          <th>Status</th>
+          <th>Last Execution</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {#each groups as group}
+          <tr class="group-row">
+            <td colspan="5">{group}</td>
+          </tr>
+          {#each tasks.filter((task) => task.group === group) as task}
+            {@const busy = running[task.id]}
+            {@const result = results[task.id]}
+            {@const schedule = scheduleFor(task)}
+            <tr>
+              <td>
+                <div class="row-title">{task.label}</div>
+                <div class="row-sub">{task.description}</div>
+                {#if result}
+                  <div class={`result ${result.ok ? 'ok' : 'fail'}`}>
+                    <svelte:component this={result.ok ? CheckCircle2 : AlertTriangle} size={12} />
+                    <span>{result.detail}</span>
+                  </div>
+                {/if}
+              </td>
+              <td class="muted">{schedule?.interval ?? task.interval}</td>
+              <td>
+                {#if busy}
+                  <StatusPill tone="warn">Running</StatusPill>
+                {:else if schedule?.automated}
+                  <StatusPill tone="ok">Automated</StatusPill>
+                {:else if result?.ok}
+                  <StatusPill tone="ok">Success</StatusPill>
+                {:else if result && !result.ok}
+                  <StatusPill tone="danger">Failed</StatusPill>
+                {:else}
+                  <StatusPill tone="neutral">Idle</StatusPill>
+                {/if}
+              </td>
+              <td class="muted">
+                {#if result}
+                  <span class="time-cell"><Clock3 size={12} /> {fmtTime(result.ranAt)}</span>
+                {:else if schedule?.lastRunAt}
+                  <span class="time-cell"><Clock3 size={12} /> {fmtTime(schedule.lastRunAt)}</span>
+                {:else}
+                  Never
+                {/if}
+              </td>
+              <td>
+                <Button kind="secondary" on:click={() => runTask(task)} disabled={busy || !task.manual}>
+                  {#if busy}
+                    <RefreshCw size={14} class="spin" />
+                    Running…
+                  {:else}
+                    <Play size={14} />
+                    Run
+                  {/if}
+                </Button>
+              </td>
+            </tr>
+          {/each}
+        {/each}
+      </tbody>
+    </table>
+  </div>
+</Panel>
+
+<style>
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 14px;
+    margin-bottom: 20px;
+  }
+
+  .summary-card {
+    padding: 18px 20px;
+    border: 1px solid hsl(0 0% 100% / 0.08);
+    border-radius: 20px;
+    background: hsl(var(--card) / 0.82);
+  }
+
+  .summary-value {
+    font-size: 2rem;
+    font-weight: 700;
+    line-height: 1;
+  }
+
+  .summary-label,
+  .row-sub,
+  .muted {
+    margin-top: 8px;
+    color: hsl(var(--muted-foreground));
+    font-size: 13px;
+  }
+
+  .table-wrap {
+    overflow-x: auto;
+  }
+
+  table {
+    width: 100%;
+    min-width: 880px;
+    border-collapse: collapse;
+  }
+
+  th,
+  td {
+    padding: 14px 10px;
+    border-bottom: 1px solid hsl(0 0% 100% / 0.05);
+    text-align: left;
+    vertical-align: top;
+  }
+
+  th {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: hsl(var(--muted-foreground));
+  }
+
+  .group-row td {
+    padding-top: 20px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: hsl(var(--primary));
+    background: transparent;
+  }
+
+  .row-title {
+    font-weight: 600;
+  }
+
+  .result,
+  .time-cell {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .result {
+    margin-top: 10px;
+    font-size: 12px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .result.ok { color: hsl(141 80% 68%); }
+  .result.fail { color: hsl(0 96% 82%); }
+
+  .time-cell {
+    color: hsl(var(--muted-foreground));
+    font-size: 12px;
+  }
+
+  :global(.spin) {
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  @media (max-width: 900px) {
+    .summary-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+</style>

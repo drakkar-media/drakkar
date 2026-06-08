@@ -1,0 +1,66 @@
+{
+  "database": {
+    "host": "postgres",
+    "port": 5432,
+    "name": "drakkar",
+    "username": "drakkar",
+    "password": "change-me"
+  },
+  "valkey": {
+    "host": "valkey",
+    "port": 6379,
+    "password": ""
+  },
+  "nzbhydra2": {
+    "url": "http://nzbhydra2:5076",
+    "apiKey": ""
+  },
+  "seerr": {
+    "url": "http://seerr:5055",
+    "apiKey": ""
+  },
+  "usenet": {
+    "maxDownloadConnections": 15,
+    "streamingPriorityPercent": 80,
+    "articleBufferSize": 40,
+    "providers": [
+      {
+        "name": "primary",
+        "host": "",
+        "port": 563,
+        "tls": true,
+        "username": "",
+        "password": "",
+        "maxConnections": 20,
+        "enabled": true
+      }
+    ]
+  },
+  "metadata": {
+    "tmdb": {
+      "apiKey": ""
+    },
+    "tvdb": {
+      "apiKey": ""
+    }
+  },
+  "subtitles": {
+    "enabled": true,
+    "languages": [
+      "nl",
+      "en"
+    ],
+    "providers": {
+      "subdl": {
+        "enabled": true,
+        "apiKey": ""
+      },
+      "opensubtitles": {
+        "enabled": false,
+        "apiKey": "",
+        "username": "",
+        "password": ""
+      }
+    }
+  }
+}
