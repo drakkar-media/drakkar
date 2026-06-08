@@ -842,6 +842,12 @@ func (s *Service) fetchAndImportSelectedReleaseDepth(ctx context.Context, select
 	if current.FailureCount >= 5 {
 		return s.promoteNextAfterFailureDepth(ctx, current, "too_many_failures", depth)
 	}
+	// If the NZB was already downloaded in a previous attempt (e.g. stuck in
+	// preflight then reset), re-use the stored document instead of fetching again.
+	// This prevents duplicate entries in NZBHydra's download history.
+	if current.NZBDocumentID != nil {
+		return s.retrySelectedReleaseFromStoredNZB(ctx, current)
+	}
 	for {
 		if err := s.repo.MarkSelectedReleaseFetching(ctx, current.SelectedReleaseID); err != nil {
 			return nil, err
