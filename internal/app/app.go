@@ -284,58 +284,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		return publicationSvc.PublishSelectedRelease(ctx, *item.SelectedRelease)
 	}
 
-	// Preflight checker — quick article existence check before publishing.
-	// Samples up to 3 files (first, middle, last) from the NZB. If any are
-	// confirmed missing (430) the release is skipped. Checks run sequentially
-	// using a single NNTP connection to avoid hammering the provider.
-	if len(pooledSources) > 0 {
-		pool := pooledSources[0]
-		workflowSvc.SetPreflightChecker(func(ctx context.Context, item database.QueueSnapshot) error {
-			if item.NZBDocumentID == nil {
-				return nil
-			}
-			rows, err := db.SQL.QueryContext(ctx, `
-				SELECT (SELECT ns.message_id FROM nzb_segments ns
-				        WHERE ns.nzb_file_id = nf.id
-				        ORDER BY ns.segment_number LIMIT 1)
-				FROM nzb_files nf
-				WHERE nf.nzb_document_id = $1
-				  AND nf.file_size_bytes > 0
-				ORDER BY nf.id`, *item.NZBDocumentID)
-			if err != nil {
-				return nil
-			}
-			defer rows.Close()
-			var msgIDs []string
-			for rows.Next() {
-				var id string
-				if err := rows.Scan(&id); err == nil && id != "" {
-					msgIDs = append(msgIDs, id)
-				}
-			}
-			if len(msgIDs) == 0 {
-				return nil
-			}
-			// Sample first, middle, last — 3 checks max regardless of NZB size.
-			sample := []string{msgIDs[0]}
-			if mid := len(msgIDs) / 2; mid > 0 {
-				sample = append(sample, msgIDs[mid])
-			}
-			if last := len(msgIDs) - 1; last > 0 && last != len(msgIDs)/2 {
-				sample = append(sample, msgIDs[last])
-			}
-			// Check sequentially on a single connection — fast (3 round-trips)
-			// and doesn't interfere with the NNTP pool.
-			statCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			for _, msgID := range sample {
-				if err := pool.Stat(statCtx, msgID); errors.Is(err, nntp.ErrArticleMissing) {
-					return fmt.Errorf("preflight_failed: article missing %s", msgID)
-				}
-			}
-			return nil
-		})
-	}
+
 
 	queueSvc.SetPostImportHook(postImport)
 	workflowSvc.SetPostImportHook(postImport)

@@ -52,6 +52,13 @@ func (c *ArticleClient) NewSession(ctx context.Context) (BodySession, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Set a deadline covering the entire greeting + auth handshake.
+	// tls.DialWithDialer does not accept a context, so without this the
+	// greeting/auth reads can block indefinitely if the server is slow.
+	if err := conn.SetDeadline(time.Now().Add(c.timeout)); err != nil {
+		conn.Close()
+		return nil, err
+	}
 	session := &clientSession{
 		conn:    conn,
 		reader:  bufio.NewReader(conn),
@@ -82,6 +89,11 @@ func (c *ArticleClient) NewSession(ctx context.Context) (BodySession, error) {
 				return nil, err
 			}
 		}
+	}
+	// Clear the handshake deadline — per-command deadlines are set in Body/Stat.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, err
 	}
 	return session, nil
 }
