@@ -13,6 +13,41 @@ import (
 	"github.com/hjongedijk/drakkar/internal/stream"
 )
 
+// bulkInsertSegments inserts all segments for one NZB file in a single query
+// (one round-trip instead of N). Returns the inserted IDs in segment order.
+func bulkInsertSegments(ctx context.Context, tx *sql.Tx, nzbFileID int64, segments []ImportedNZBSegment) ([]int64, error) {
+	if len(segments) == 0 {
+		return nil, nil
+	}
+	// Build: INSERT INTO nzb_segments (...) VALUES ($1,$2,$3,$4,$5,$6,'unknown'), ... RETURNING id
+	sb := strings.Builder{}
+	sb.WriteString(`insert into nzb_segments (nzb_file_id, segment_number, message_id, encoded_size_bytes, decoded_start_offset, decoded_end_offset, availability_status) values `)
+	args := make([]interface{}, 0, len(segments)*6)
+	for i, seg := range segments {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		base := i * 6
+		fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,'unknown')", base+1, base+2, base+3, base+4, base+5, base+6)
+		args = append(args, nzbFileID, seg.Number, seg.MessageID, seg.EncodedSizeBytes, seg.DecodedStartOffset, seg.DecodedEndOffset)
+	}
+	sb.WriteString(` returning id`)
+	rows, err := tx.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make([]int64, 0, len(segments))
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 type importedFileSegments struct {
 	fileName string
 	spans    []stream.SegmentSpan
@@ -179,29 +214,13 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 			return QueueSnapshot{}, err
 		}
 
-		segmentIDs := make([]int64, 0, len(file.Segments))
-		for _, segment := range file.Segments {
-			var segmentID int64
-			if err = tx.QueryRowContext(ctx, `
-				insert into nzb_segments (
-					nzb_file_id, segment_number, message_id, encoded_size_bytes,
-					decoded_start_offset, decoded_end_offset, availability_status
-				) values ($1, $2, $3, $4, $5, $6, 'unknown')
-				returning id`,
-				nzbFileID,
-				segment.Number,
-				segment.MessageID,
-				segment.EncodedSizeBytes,
-				segment.DecodedStartOffset,
-				segment.DecodedEndOffset,
-			).Scan(&segmentID); err != nil {
-				return QueueSnapshot{}, err
-			}
-			segmentIDs = append(segmentIDs, segmentID)
+		segmentIDs, err := bulkInsertSegments(ctx, tx, nzbFileID, file.Segments)
+		if err != nil {
+			return QueueSnapshot{}, err
 		}
 		fileSegments[file.FileName] = importedFileSegments{
 			fileName: file.FileName,
-			ids:      append([]int64(nil), segmentIDs...),
+			ids:      segmentIDs,
 			spans:    importedSegmentSpans(file.Segments, segmentIDs),
 		}
 
@@ -323,29 +342,13 @@ func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID in
 		).Scan(&nzbFileID); err != nil {
 			return QueueSnapshot{}, err
 		}
-		segmentIDs := make([]int64, 0, len(file.Segments))
-		for _, segment := range file.Segments {
-			var segmentID int64
-			if err = tx.QueryRowContext(ctx, `
-				insert into nzb_segments (
-					nzb_file_id, segment_number, message_id, encoded_size_bytes,
-					decoded_start_offset, decoded_end_offset, availability_status
-				) values ($1, $2, $3, $4, $5, $6, 'unknown')
-				returning id`,
-				nzbFileID,
-				segment.Number,
-				segment.MessageID,
-				segment.EncodedSizeBytes,
-				segment.DecodedStartOffset,
-				segment.DecodedEndOffset,
-			).Scan(&segmentID); err != nil {
-				return QueueSnapshot{}, err
-			}
-			segmentIDs = append(segmentIDs, segmentID)
+		segmentIDs, err := bulkInsertSegments(ctx, tx, nzbFileID, file.Segments)
+		if err != nil {
+			return QueueSnapshot{}, err
 		}
 		fileSegments[file.FileName] = importedFileSegments{
 			fileName: file.FileName,
-			ids:      append([]int64(nil), segmentIDs...),
+			ids:      segmentIDs,
 			spans:    importedSegmentSpans(file.Segments, segmentIDs),
 		}
 		if isPlayableMedia(file.FileName) {
