@@ -13,6 +13,7 @@ import (
 const (
 	DefaultSettingsPath         = "/app/data/settings.json"
 	DefaultVFSBaseURL           = "http://localhost:8080"
+	DefaultRcloneMountPath      = "/mnt/drakkar/vfs"
 	DefaultMovieLibraryPath     = "/mnt/drakkar/media/movies"
 	DefaultTVLibraryPath        = "/mnt/drakkar/media/tv"
 	DefaultLogsPath             = "/app/data/logs"
@@ -109,6 +110,7 @@ type Runtime struct {
 	SettingsPath           string
 	HTTPAddress            string
 	VFSBaseURL             string // Base URL for the HTTP VFS server, e.g. http://drakkar:8080
+	RcloneMountPath        string // Where rclone mounts the WebDAV, e.g. /mnt/drakkar/vfs
 	MovieLibraryPath       string
 	TVLibraryPath          string
 	LogsPath               string
@@ -122,6 +124,7 @@ func DefaultRuntime() Runtime {
 		SettingsPath:           DefaultSettingsPath,
 		HTTPAddress:            DefaultHTTPAddress,
 		VFSBaseURL:             DefaultVFSBaseURL,
+		RcloneMountPath:        DefaultRcloneMountPath,
 		MovieLibraryPath:       DefaultMovieLibraryPath,
 		TVLibraryPath:          DefaultTVLibraryPath,
 		LogsPath:               DefaultLogsPath,

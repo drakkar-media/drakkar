@@ -114,6 +114,9 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	if env := os.Getenv("DRAKKAR_VFS_BASE_URL"); env != "" {
 		rt.VFSBaseURL = env
 	}
+	if env := os.Getenv("DRAKKAR_RCLONE_MOUNT"); env != "" {
+		rt.RcloneMountPath = env
+	}
 
 	cfg, err := config.Load(rt.SettingsPath)
 	if err != nil {

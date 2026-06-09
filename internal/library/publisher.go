@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/hjongedijk/drakkar/internal/config"
 	"github.com/hjongedijk/drakkar/internal/database"
 	"github.com/hjongedijk/drakkar/internal/metrics"
+	"github.com/hjongedijk/drakkar/internal/symlink"
 )
 
 var ErrNoVirtualFiles = errors.New("selected release has no publishable virtual files")
@@ -30,6 +30,7 @@ type Repository interface {
 
 type Publisher struct {
 	repo            Repository
+	syml            *symlink.Publisher
 	runtime         config.Runtime
 	postPublishHook func(context.Context, int64) error
 }
@@ -45,6 +46,7 @@ type BulkRepublishResult struct {
 func NewPublisher(repo Repository, runtime config.Runtime) *Publisher {
 	return &Publisher{
 		repo:    repo,
+		syml:    symlink.NewPublisher(),
 		runtime: runtime,
 	}
 }
@@ -68,16 +70,15 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 	for _, file := range files {
 		libraryPath := p.libraryPathFor(file)
 		if libraryPath == "" {
-			slog.Warn("skipping strm: insufficient metadata", "virtual_file_id", file.VirtualFileID, "file", file.FileName)
+			slog.Warn("skipping symlink: insufficient metadata", "virtual_file_id", file.VirtualFileID, "file", file.FileName)
 		} else {
-			// Create a STRM file pointing to the HTTP VFS server (same as nzbdav).
-			// Plex, Jellyfin, and Kodi all support STRM natively.
-			strmPath := libraryPath + ".strm"
-			streamURL := fmt.Sprintf("%s/content/%d/%s", strings.TrimRight(p.runtime.VFSBaseURL, "/"), file.VirtualFileID, file.FileName)
-			if err := writeSTRM(strmPath, streamURL); err != nil {
-				return fmt.Errorf("write strm %s: %w", strmPath, err)
-			}
-			if err := p.repo.UpsertSymlinkPublication(ctx, file.LibraryItemID, file.VirtualFileID, strmPath, streamURL); err != nil {
+			// Symlink to the rclone VFS mount — same as nzbdav symlink mode for Plex.
+			// rclone mounts Drakkar's WebDAV at RcloneMountPath; the file is at
+			// content/{virtualFileID}/{filename} within that mount.
+			target := filepath.Join(p.runtime.RcloneMountPath, "content", fmt.Sprintf("%d", file.VirtualFileID), file.FileName)
+			if err := p.syml.Publish(libraryPath, target); err != nil {
+				slog.Warn("symlink publish failed", "path", libraryPath, "err", err)
+			} else if err := p.repo.UpsertSymlinkPublication(ctx, file.LibraryItemID, file.VirtualFileID, libraryPath, target); err != nil {
 				return err
 			}
 		}
@@ -122,9 +123,8 @@ func (p *Publisher) RebuildPublications(ctx context.Context) error {
 		return err
 	}
 	for _, selectedReleaseID := range selectedReleaseIDs {
-		// isNew=false: skip per-episode item creation; those were already done on initial publish.
 		if err := p.publishSelectedRelease(ctx, selectedReleaseID, false); err != nil {
-			return err
+			slog.Warn("rebuild: publish failed", "selected_release_id", selectedReleaseID, "err", err)
 		}
 	}
 	return nil
@@ -210,10 +210,9 @@ func (p *Publisher) fulfillSeasonPackEpisodes(ctx context.Context, selectedRelea
 		}
 		libraryPath := p.libraryPathFor(enriched)
 		if libraryPath != "" {
-			strmPath := libraryPath + ".strm"
-			streamURL := fmt.Sprintf("%s/content/%d/%s", strings.TrimRight(p.runtime.VFSBaseURL, "/"), m.VirtualFileID, enriched.FileName)
-			if writeErr := writeSTRM(strmPath, streamURL); writeErr == nil {
-				_ = p.repo.UpsertSymlinkPublication(ctx, m.LibraryItemID, m.VirtualFileID, strmPath, streamURL)
+			target := filepath.Join(p.runtime.RcloneMountPath, "content", fmt.Sprintf("%d", m.VirtualFileID), enriched.FileName)
+			if symlinkErr := p.syml.Publish(libraryPath, target); symlinkErr == nil {
+				_ = p.repo.UpsertSymlinkPublication(ctx, m.LibraryItemID, m.VirtualFileID, libraryPath, target)
 			}
 		}
 		_ = p.repo.FulfillEpisodeLibraryItem(ctx, m.LibraryItemID, selectedReleaseID, m.VirtualFileID)
@@ -228,7 +227,7 @@ func (p *Publisher) libraryPathFor(file database.ReleaseVirtualFile) string {
 	switch strings.ToLower(file.MediaType) {
 	case "movie":
 		if file.MovieTitle != "" {
-			return moviePath(p.runtime.MovieLibraryPath, file.MovieTitle, file.MovieYear, int(file.MovieTMDBID), file.FileName)
+			return symlink.MoviePath(p.runtime.MovieLibraryPath, file.MovieTitle, file.MovieYear, int(file.MovieTMDBID), file.FileName)
 		}
 	case "episode", "tv":
 		season := file.SeasonNumber
@@ -237,71 +236,10 @@ func (p *Publisher) libraryPathFor(file database.ReleaseVirtualFile) string {
 			season, episode = database.ParseEpisodeFromFilename(file.FileName)
 		}
 		if file.ShowTitle != "" && season > 0 && episode > 0 {
-			return episodePath(p.runtime.TVLibraryPath, file.ShowTitle, file.ShowYear, int(file.ShowTVDBID), season, episode, file.FileName)
+			return symlink.EpisodePath(p.runtime.TVLibraryPath, file.ShowTitle, file.ShowYear, int(file.ShowTVDBID), season, episode, file.FileName)
 		}
 	}
 	return ""
-}
-
-// writeSTRM writes a STRM file with the given URL, creating parent directories.
-// STRM files are plain-text files containing a single streaming URL — supported
-// natively by Plex, Jellyfin, and Kodi (same format as nzbdav uses).
-func writeSTRM(strmPath, streamURL string) error {
-	if err := os.MkdirAll(filepath.Dir(strmPath), 0o755); err != nil {
-		return err
-	}
-	tmp := strmPath + ".tmp"
-	if err := os.WriteFile(tmp, []byte(streamURL+"\n"), 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, strmPath)
-}
-
-// Path helpers (inlined from symlink package to avoid dependency).
-func moviePath(root, title string, year int, tmdbID int, rawFileName string) string {
-	ext := mediaExt(rawFileName)
-	var dir, file string
-	if tmdbID > 0 {
-		dir = fmt.Sprintf("%s (%d) {tmdb-%d}", sanitize(title), year, tmdbID)
-	} else if year > 0 {
-		dir = fmt.Sprintf("%s (%d)", sanitize(title), year)
-	} else {
-		dir = sanitize(title)
-	}
-	if year > 0 {
-		file = fmt.Sprintf("%s (%d)%s", sanitize(title), year, ext)
-	} else {
-		file = fmt.Sprintf("%s%s", sanitize(title), ext)
-	}
-	return filepath.Join(root, dir, file)
-}
-
-func episodePath(root, show string, year int, tvdbID int, season, episode int, rawFileName string) string {
-	ext := mediaExt(rawFileName)
-	var dir string
-	if tvdbID > 0 {
-		dir = fmt.Sprintf("%s (%d) {tvdb-%d}", sanitize(show), year, tvdbID)
-	} else if year > 0 {
-		dir = fmt.Sprintf("%s (%d)", sanitize(show), year)
-	} else {
-		dir = sanitize(show)
-	}
-	file := fmt.Sprintf("%s - S%02dE%02d%s", sanitize(show), season, episode, ext)
-	return filepath.Join(root, dir, fmt.Sprintf("Season %02d", season), file)
-}
-
-func sanitize(input string) string {
-	r := strings.NewReplacer("/", "-", "\\", "-", ":", " -")
-	return r.Replace(strings.TrimSpace(input))
-}
-
-func mediaExt(filename string) string {
-	ext := strings.ToLower(filepath.Ext(filename))
-	switch ext {
-	case ".mkv", ".mp4", ".avi":
-		return ext
-	}
-	return ".mkv"
 }
 
 func CompletedTargetVirtualPath(selectedReleaseID int64, fileName string) string {
