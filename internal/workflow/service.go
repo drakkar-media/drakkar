@@ -819,16 +819,95 @@ func isRetryableSearchFailure(err error) bool {
 }
 
 func (s *Service) fetchAndImportSelectedRelease(ctx context.Context, selectedReleaseID int64) (*int64, error) {
-	// Acquire the import semaphore — only 1 NZB may go through
-	// preflight + publish at a time (nzbdav SemaphoreSlim(1,1) parity).
-	// This prevents multiple concurrent items from draining the NNTP pool.
+	// Acquire the import semaphore — only 1 NZB fetch+index at a time to
+	// avoid DB write contention on nzb_segments during bulk inserts.
+	// The semaphore is released immediately after indexing; publish runs
+	// concurrently so one slow season pack doesn't block the whole queue.
 	select {
 	case s.importSem <- struct{}{}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	defer func() { <-s.importSem }()
-	return s.fetchAndImportSelectedReleaseDepth(ctx, selectedReleaseID, 0)
+	result, importedRelease, err := s.fetchIndexAndRelease(ctx, selectedReleaseID)
+	<-s.importSem // release before publish — publish can run concurrently
+	if err != nil || importedRelease == nil {
+		return result, err
+	}
+	// Publish the indexed release (create symlinks, mark available, etc.)
+	return s.publishImportedRelease(ctx, *importedRelease)
+}
+
+// pendingPublish holds data needed to publish an already-indexed release.
+type pendingPublish struct {
+	current database.ReleaseSummary
+	item    database.QueueSnapshot
+}
+
+// fetchIndexAndRelease fetches the NZB, bulk-inserts segments, and returns the
+// release ready for publishing. Runs under the import semaphore.
+func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID int64) (*int64, *pendingPublish, error) {
+	current, err := s.repo.GetSelectedReleaseSummary(ctx, selectedReleaseID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if current.FailureCount >= 5 {
+		result, err := s.promoteNextAfterFailureDepth(ctx, current, "too_many_failures", 0)
+		return result, nil, err
+	}
+	if current.NZBDocumentID != nil {
+		// Already indexed — skip straight to publish.
+		return nil, &pendingPublish{current: current}, nil
+	}
+	if err := s.repo.MarkSelectedReleaseFetching(ctx, current.SelectedReleaseID); err != nil {
+		return nil, nil, err
+	}
+	fileName, raw, err := s.fetcher.Fetch(ctx, current.ExternalURL)
+	if err != nil {
+		result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), 0)
+		return result, nil, err
+	}
+	imported, err := nzb.BuildImportedNZB(fileName, raw, fmt.Sprintf("selected-release:%d", current.SelectedReleaseID), current.ExternalURL)
+	if err != nil {
+		result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), 0)
+		return result, nil, err
+	}
+	item, err := s.repo.ImportSelectedReleaseNZB(ctx, current.SelectedReleaseID, imported)
+	if err != nil {
+		result, err := s.promoteNextAfterFailure(ctx, current, err.Error())
+		return result, nil, err
+	}
+	if err := s.repo.SetImportedNZBIndexed(ctx, item.QueueItemID); err != nil {
+		result, err := s.promoteNextAfterFailure(ctx, current, err.Error())
+		return result, nil, err
+	}
+	item.State = database.QueuePreflight
+	return nil, &pendingPublish{current: current, item: item}, nil
+}
+
+// publishImportedRelease runs postImportHook (symlinks, episode items, Plex)
+// without holding the import semaphore so other fetches can proceed in parallel.
+func (s *Service) publishImportedRelease(ctx context.Context, p pendingPublish) (*int64, error) {
+	if p.current.NZBDocumentID != nil && p.item.QueueItemID == 0 {
+		// Already indexed in a previous run — re-import from stored NZB.
+		return s.retrySelectedReleaseFromStoredNZB(ctx, p.current)
+	}
+	updated, err := s.repo.GetSelectedReleaseSummary(ctx, p.current.SelectedReleaseID)
+	if err == nil && updated.VirtualFileCount == 0 && strings.TrimSpace(updated.ArchiveRejects) != "" {
+		return s.promoteNextAfterFailure(ctx, p.current, updated.ArchiveRejects)
+	}
+	if s.postImportHook != nil {
+		if err := s.postImportHook(ctx, p.item); err != nil {
+			failureReason := err.Error()
+			if errors.Is(err, library.ErrNoVirtualFiles) {
+				if updated, lookupErr := s.repo.GetSelectedReleaseSummary(ctx, p.current.SelectedReleaseID); lookupErr == nil && strings.TrimSpace(updated.ArchiveRejects) != "" {
+					failureReason = updated.ArchiveRejects
+				}
+			}
+			return s.promoteNextAfterFailure(ctx, p.current, failureReason)
+		}
+	}
+	value := p.current.SelectedReleaseID
+	return &value, nil
 }
 
 func (s *Service) fetchAndImportSelectedReleaseDepth(ctx context.Context, selectedReleaseID int64, depth int) (*int64, error) {
