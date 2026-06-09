@@ -12,6 +12,7 @@ import (
 	"github.com/hjongedijk/drakkar/internal/database"
 	"github.com/hjongedijk/drakkar/internal/metrics"
 	"github.com/hjongedijk/drakkar/internal/symlink"
+	"github.com/hjongedijk/drakkar/internal/vfs"
 )
 
 var ErrNoVirtualFiles = errors.New("selected release has no publishable virtual files")
@@ -75,7 +76,7 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 			// Symlink to the rclone VFS mount — same as nzbdav symlink mode for Plex.
 			// rclone mounts Drakkar's WebDAV at RcloneMountPath; the file is at
 			// content/{virtualFileID}/{filename} within that mount.
-			target := filepath.Join(p.runtime.RcloneMountPath, "content", fmt.Sprintf("%d", file.VirtualFileID), file.FileName)
+			target := p.runtime.RcloneMountPath + vfs.IdsPath(file.VirtualFileID, file.FileName)
 			if err := p.syml.Publish(libraryPath, target); err != nil {
 				slog.Warn("symlink publish failed", "path", libraryPath, "err", err)
 			} else if err := p.repo.UpsertSymlinkPublication(ctx, file.LibraryItemID, file.VirtualFileID, libraryPath, target); err != nil {
@@ -217,7 +218,7 @@ func (p *Publisher) fulfillSeasonPackEpisodes(ctx context.Context, selectedRelea
 		}
 		libraryPath := p.libraryPathFor(enriched)
 		if libraryPath != "" {
-			target := filepath.Join(p.runtime.RcloneMountPath, "content", fmt.Sprintf("%d", m.VirtualFileID), enriched.FileName)
+			target := p.runtime.RcloneMountPath + vfs.IdsPath(m.VirtualFileID, enriched.FileName)
 			if symlinkErr := p.syml.Publish(libraryPath, target); symlinkErr == nil {
 				_ = p.repo.UpsertSymlinkPublication(ctx, m.LibraryItemID, m.VirtualFileID, libraryPath, target)
 			}
