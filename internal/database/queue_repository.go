@@ -146,7 +146,7 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 
 func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (QueueSnapshot, error) {
 	imported = db.applyImportPolicies(ctx, imported)
-	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher)
+	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, nil)
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
 		return QueueSnapshot{}, err
@@ -294,7 +294,7 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 
 func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID int64, imported ImportedNZB) (QueueSnapshot, error) {
 	imported = db.applyImportPolicies(ctx, imported)
-	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher)
+	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, nil)
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
 		return QueueSnapshot{}, err
