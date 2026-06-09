@@ -198,8 +198,8 @@ func (d *davFS) openIdsPath(ctx context.Context, name string) (webdav.File, erro
 
 	depth := len(parts)
 
-	// Depth 1-5: prefix character directory levels
-	if depth <= 5 {
+	// Depth 1-4: prefix character directory levels (partial prefix — show next char)
+	if depth < 5 {
 		prefix := strings.Join(parts, "")
 		seen := map[string]struct{}{}
 		for _, f := range files {
@@ -219,13 +219,27 @@ func (d *davFS) openIdsPath(ctx context.Context, name string) (webdav.File, erro
 		return staticDir(name, entries), nil
 	}
 
+	// Depth 5: /.ids/c0/c1/c2/c3/c4 — full 5-char prefix consumed, list matching IDs
+	if depth == 5 {
+		prefix := strings.Join(parts, "")
+		var entries []os.FileInfo
+		for _, f := range files {
+			if idPrefix(f.ID) == prefix {
+				entries = append(entries, dirInfo(fmt.Sprintf("%012d", f.ID)))
+			}
+		}
+		if len(entries) == 0 {
+			return nil, os.ErrNotExist
+		}
+		return staticDir(name, entries), nil
+	}
+
 	// Depth 6: /.ids/c0/c1/c2/c3/c4/{12-digit-id} — list files for this ID
 	if depth == 6 {
-		prefix := strings.Join(parts[:5], "")
 		idStr := parts[5]
 		var matchID int64
 		fmt.Sscanf(idStr, "%d", &matchID)
-		if fmt.Sprintf("%012d", matchID) != idStr || idPrefix(matchID) != prefix {
+		if fmt.Sprintf("%012d", matchID) != idStr {
 			return nil, os.ErrNotExist
 		}
 		for _, f := range files {
