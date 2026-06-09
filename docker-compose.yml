@@ -68,12 +68,15 @@ services:
     command: >
       mount drakkar:
       /mnt/drakkar/vfs
-      --allow-non-empty
       --allow-other
+      --links
+      --use-cookies
       --vfs-cache-mode full
-      --vfs-cache-max-size 1G
-      --dir-cache-time 5m
-      --poll-interval 30s
+      --vfs-cache-max-size 20G
+      --vfs-cache-max-age 24h
+      --buffer-size 0M
+      --vfs-read-ahead 512M
+      --dir-cache-time 20s
       --rc
       --rc-addr :5572
       --rc-no-auth
