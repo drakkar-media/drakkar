@@ -37,7 +37,10 @@ type Server struct {
 }
 
 func NewServer(db DB) *Server {
+	// Prefix: "/dav" ensures PROPFIND responses include /dav/ in hrefs so
+	// rclone's WebDAV client resolves paths correctly relative to the remote root.
 	davHandler := &webdav.Handler{
+		Prefix:     "/dav",
 		FileSystem: newDAVFS(db, db),
 		LockSystem: webdav.NewMemLS(),
 	}
@@ -51,13 +54,12 @@ func (s *Server) Register(r chi.Router) {
 }
 
 // Handler wraps the given chi router so that /dav/* requests bypass chi entirely
-// (chi filters unknown methods like PROPFIND with 405). All other requests
-// are forwarded to the chi router as normal.
+// (chi filters unknown methods like PROPFIND with 405). The webdav.Handler's
+// Prefix field handles path stripping and correct href generation internally.
 func (s *Server) Handler(next http.Handler) http.Handler {
-	davStripped := http.StripPrefix("/dav", s.dav)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/dav") {
-			davStripped.ServeHTTP(w, r)
+			s.dav.ServeHTTP(w, r)
 			return
 		}
 		next.ServeHTTP(w, r)

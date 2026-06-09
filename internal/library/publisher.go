@@ -122,11 +122,18 @@ func (p *Publisher) RebuildPublications(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var published, skipped int
 	for _, selectedReleaseID := range selectedReleaseIDs {
 		if err := p.publishSelectedRelease(ctx, selectedReleaseID, false); err != nil {
-			slog.Warn("rebuild: publish failed", "selected_release_id", selectedReleaseID, "err", err)
+			if !errors.Is(err, ErrNoVirtualFiles) {
+				slog.Warn("rebuild: publish failed", "selected_release_id", selectedReleaseID, "err", err)
+			}
+			skipped++
+		} else {
+			published++
 		}
 	}
+	slog.Info("rebuild: publications complete", "published", published, "skipped", skipped)
 	return nil
 }
 
