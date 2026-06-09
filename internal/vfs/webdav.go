@@ -113,18 +113,13 @@ func (d *davFS) OpenFile(ctx context.Context, name string, _ int, _ os.FileMode)
 	}
 
 	// ── /content ──────────────────────────────────────────────────────────────
+	// /content/ dir listing is intentionally empty — files are accessed via
+	// /.ids/{prefix}/{id}/{filename} to avoid rclone doing STAT on hundreds
+	// of files when listing the directory (which would hang the host's ls).
 	if name == "/content" {
-		files, err := d.listFiles(ctx)
-		if err != nil {
-			return nil, err
-		}
-		entries := make([]os.FileInfo, 0, len(files))
-		for _, f := range files {
-			entries = append(entries, &fileInfo{name: f.FileName, size: f.Size})
-		}
-		return staticDir("/content", entries), nil
+		return staticDir("/content", nil), nil
 	}
-	// /content/{filename} — look up by filename
+	// /content/{filename} — direct access by filename still works
 	if strings.HasPrefix(name, "/content/") {
 		fname := path.Base(name)
 		files, err := d.listFiles(ctx)
@@ -146,15 +141,8 @@ func (d *davFS) OpenFile(ctx context.Context, name string, _ int, _ os.FileMode)
 	// ── /completed-symlinks ───────────────────────────────────────────────────
 	// Mirrors /content but serves .rclonelink files (plain-text path to /.ids/...)
 	if name == "/completed-symlinks" {
-		files, err := d.listFiles(ctx)
-		if err != nil {
-			return nil, err
-		}
-		entries := make([]os.FileInfo, 0, len(files))
-		for _, f := range files {
-			entries = append(entries, &fileInfo{name: f.FileName + ".rclonelink", size: int64(len(IdsPath(f.ID, f.FileName)) + 1)})
-		}
-		return staticDir("/completed-symlinks", entries), nil
+		// Empty listing — individual .rclonelink files still accessible by path.
+		return staticDir("/completed-symlinks", nil), nil
 	}
 	if strings.HasPrefix(name, "/completed-symlinks/") {
 		linkName := path.Base(name)
