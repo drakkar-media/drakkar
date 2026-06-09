@@ -10,11 +10,8 @@ services:
       DRAKKAR_HTTP_ADDR: :8080
       DRAKKAR_VFS_BASE_URL: http://drakkar:8080
     volumes:
-      - ./data/settings.json:/app/data/settings.json:ro
-      - ./data/logs:/app/data/logs
-      - /mnt/drakkar/media:/mnt/drakkar/media
-      - /mnt/drakkar/cache:/mnt/drakkar/cache
-      - /mnt/drakkar/staging:/mnt/drakkar/staging
+      - ./data:/app/data
+      - /mnt:/mnt
     ports:
       - "8080:8080"
     depends_on:
