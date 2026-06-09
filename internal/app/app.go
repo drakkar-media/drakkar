@@ -316,8 +316,10 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	apiRouter := api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, metricsColl)
 	vfsServer.Register(apiRouter)
 	server := &http.Server{
-		Addr:              rt.HTTPAddress,
-		Handler:           apiRouter,
+		Addr: rt.HTTPAddress,
+		// vfsServer.Handler wraps apiRouter so /dav/* bypasses chi's method filter
+		// (chi returns 405 for PROPFIND/WebDAV methods).
+		Handler: vfsServer.Handler(apiRouter),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

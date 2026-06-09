@@ -44,17 +44,24 @@ func NewServer(db DB) *Server {
 	return &Server{opener: db, dav: davHandler}
 }
 
-// Register mounts content + WebDAV routes on r.
+// Register mounts content routes on r (GET/HEAD only — chi handles these fine).
 func (s *Server) Register(r chi.Router) {
 	r.Get("/content/{id}/{filename}", s.serveFile)
 	r.Head("/content/{id}/{filename}", s.serveFile)
-	// WebDAV mount — PROPFIND, GET, HEAD, OPTIONS and other WebDAV methods.
-	// chi.Handle only covers known methods; use a catch-all middleware for /dav/*.
+}
+
+// Handler wraps the given chi router so that /dav/* requests bypass chi entirely
+// (chi filters unknown methods like PROPFIND with 405). All other requests
+// are forwarded to the chi router as normal.
+func (s *Server) Handler(next http.Handler) http.Handler {
 	davStripped := http.StripPrefix("/dav", s.dav)
-	davHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		davStripped.ServeHTTP(w, req)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/dav") {
+			davStripped.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
-	r.Mount("/dav", davHandler)
 }
 
 func (s *Server) serveFile(w http.ResponseWriter, r *http.Request) {
