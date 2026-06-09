@@ -15,17 +15,10 @@ const (
 	DefaultVFSBaseURL           = "http://localhost:8080"
 	DefaultMovieLibraryPath     = "/mnt/drakkar/media/movies"
 	DefaultTVLibraryPath        = "/mnt/drakkar/media/tv"
-	DefaultBlockCachePath       = "/mnt/drakkar/cache/blocks"
-	DefaultHeaderCachePath      = "/mnt/drakkar/cache/headers"
-	DefaultRepairWorkspacePath  = "/mnt/drakkar/cache/repair-workspace"
-	DefaultStagingNZBPath       = "/mnt/drakkar/staging/nzbs"
-	DefaultFailedDiagnostics    = "/mnt/drakkar/failed"
 	DefaultLogsPath             = "/app/data/logs"
 	DefaultHTTPAddress          = ":8080"
-	DefaultDiskCacheLimitBytes  = int64(20 << 30)
 	DefaultReadAheadLimitBytes  = int64(512 << 20)
 	DefaultMemoryHotCacheBytes  = int64(512 << 20)
-	DefaultRepairWorkspaceBytes = int64(20 << 30)
 	DefaultNZBUploadLimitBytes  = int64(64 << 20)
 	DefaultMaxDownloadConns     = 15
 	DefaultStreamingPriorityPct = 80
@@ -118,16 +111,9 @@ type Runtime struct {
 	VFSBaseURL             string // Base URL for the HTTP VFS server, e.g. http://drakkar:8080
 	MovieLibraryPath       string
 	TVLibraryPath          string
-	BlockCachePath         string
-	HeaderCachePath        string
-	RepairWorkspacePath    string
-	StagingNZBPath         string
-	FailedDiagnosticsPath  string
 	LogsPath               string
-	DiskCacheLimitBytes    int64
 	ReadAheadLimitBytes    int64
 	MemoryHotCacheMaxBytes int64
-	RepairWorkspaceMax     int64
 	NZBUploadLimitBytes    int64
 }
 
@@ -138,16 +124,9 @@ func DefaultRuntime() Runtime {
 		VFSBaseURL:             DefaultVFSBaseURL,
 		MovieLibraryPath:       DefaultMovieLibraryPath,
 		TVLibraryPath:          DefaultTVLibraryPath,
-		BlockCachePath:         DefaultBlockCachePath,
-		HeaderCachePath:        DefaultHeaderCachePath,
-		RepairWorkspacePath:    DefaultRepairWorkspacePath,
-		StagingNZBPath:         DefaultStagingNZBPath,
-		FailedDiagnosticsPath:  DefaultFailedDiagnostics,
 		LogsPath:               DefaultLogsPath,
-		DiskCacheLimitBytes:    DefaultDiskCacheLimitBytes,
 		ReadAheadLimitBytes:    DefaultReadAheadLimitBytes,
 		MemoryHotCacheMaxBytes: DefaultMemoryHotCacheBytes,
-		RepairWorkspaceMax:     DefaultRepairWorkspaceBytes,
 		NZBUploadLimitBytes:    DefaultNZBUploadLimitBytes,
 	}
 }

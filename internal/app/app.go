@@ -122,17 +122,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	if err := config.ValidatePaths(rt); err != nil {
 		return err
 	}
-	for _, dir := range []string{
-		rt.BlockCachePath,
-		rt.HeaderCachePath,
-		rt.RepairWorkspacePath,
-		rt.StagingNZBPath,
-		rt.FailedDiagnosticsPath,
-		rt.LogsPath,
-	} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
+	if err := os.MkdirAll(rt.LogsPath, 0o755); err != nil {
+		return err
 	}
 
 	db, err := database.Open(cfg.Database)
@@ -180,8 +171,9 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		// are never re-fetched from NNTP within the TTL window.
 		cachedFallback := nntp.NewCachedFallbackSource(fallback)
 		scheduled := nntp.NewScheduledSource(cachedFallback, maxDownloadConnections*3, maxDownloadConnections*8)
-		// No separate background budget (matches nzbdav behaviour) — all priorities share the pool
-		diskDecoded := nntp.NewDiskCachedDecodedSource(scheduled, rt.BlockCachePath, rt.DiskCacheLimitBytes)
+		// No disk block cache — rclone handles disk-level VFS caching.
+		// Keep the DiskCachedDecodedSource for yEnc decoding; pass empty root to disable disk writes.
+		diskDecoded := nntp.NewDiskCachedDecodedSource(scheduled, "", 0)
 		decoded := nntp.NewCachedDecodedSource(diskDecoded, rt.MemoryHotCacheMaxBytes)
 		db.SegmentFetcher = nntp.NewSegmentFetcher(decoded)
 		db.ReadAhead.SetConnectionBudget(maxDownloadConnections, cfg.Usenet.StreamingPriorityPct)
@@ -218,7 +210,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 
 	startedAt := time.Now().UTC()
 	statusSvc := &runtimeStatus{status: api.StatusFromConfig(rt, cfg, startedAt, true)}
-	queueSvc := queue.NewService(db, nzb.NewImporter(rt.StagingNZBPath, rt.NZBUploadLimitBytes))
+	queueSvc := queue.NewService(db, nzb.NewImporter(os.TempDir(), rt.NZBUploadLimitBytes))
 	seerrClient := seerr.NewClient(cfg.Seerr)
 	hydraClient := hydra.NewClient(cfg.NZBHydra2)
 	workflowSvc := workflow.NewService(db, seerrClient, hydraClient)
@@ -230,7 +222,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	}
 	publicationSvc := library.NewPublisher(db, rt)
 	maintenanceSvc := maintenance.NewService(db, rt)
-	cacheSvc := cache.NewService(cache.NewFileCache(rt.BlockCachePath, rt.DiskCacheLimitBytes))
+	cacheSvc := cache.NewService(cache.NewFileCache("", 0)) // disk cache removed; rclone handles caching
 	catalogSvc := catalog.NewService(db, tmdb.NewClient(cfg.Metadata))
 	var subtitleProviders []subtitles.Provider
 	var probeProviders []probe.NamedProber
@@ -304,12 +296,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	if len(pooledSources) > 0 {
 		pooledSrcs = pooledSources
 	}
-	blockCache := cache.NewFileCache(rt.BlockCachePath, rt.DiskCacheLimitBytes)
 	metricsColl := &liveMetricsCollector{
 		readAhead:  db.ReadAhead,
 		pools:      pooledSrcs,
 		scheduled:  scheduledSrc,
-		blockCache: blockCache,
+		blockCache: cache.NewFileCache("", 0),
 	}
 	taskScheduleSvc := &taskScheduleStatusService{db: db}
 

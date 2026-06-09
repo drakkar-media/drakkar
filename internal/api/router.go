@@ -163,7 +163,6 @@ type Status struct {
 	Settings             map[string]any `json:"settings"`
 	Integrations         Integrations   `json:"integrations"`
 	VFSBaseURL            string         `json:"vfsBaseUrl"`
-	DiskCacheLimitBytes  int64          `json:"diskCacheLimitBytes"`
 	ReadAheadLimitBytes  int64          `json:"readAheadLimitBytes"`
 	MemoryHotCacheBytes  int64          `json:"memoryHotCacheBytes"`
 	BackgroundQueueDepth int            `json:"backgroundQueueDepth"`
@@ -1302,7 +1301,6 @@ func StatusFromConfig(rt config.Runtime, cfg config.Settings, startedAt time.Tim
 		Settings:            config.RedactedSettings(cfg),
 		Integrations:        integrationStatusFromConfig(cfg),
 		VFSBaseURL:           rt.VFSBaseURL,
-		DiskCacheLimitBytes: rt.DiskCacheLimitBytes,
 		ReadAheadLimitBytes: rt.ReadAheadLimitBytes,
 		MemoryHotCacheBytes: rt.MemoryHotCacheMaxBytes,
 	}
