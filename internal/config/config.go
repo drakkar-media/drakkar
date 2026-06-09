@@ -7,19 +7,26 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
 const (
 	DefaultSettingsPath         = "/app/data/settings.json"
-	DefaultVFSBaseURL           = "http://localhost:8080"
-	DefaultRcloneMountPath      = "/mnt/drakkar/vfs"
+	DefaultFuseMountPath        = "/mnt/drakkar/vfs"
 	DefaultMovieLibraryPath     = "/mnt/drakkar/media/movies"
 	DefaultTVLibraryPath        = "/mnt/drakkar/media/tv"
+	DefaultBlockCachePath       = "/mnt/drakkar/cache/blocks"
+	DefaultHeaderCachePath      = "/mnt/drakkar/cache/headers"
+	DefaultRepairWorkspacePath  = "/mnt/drakkar/cache/repair-workspace"
+	DefaultStagingNZBPath       = "/mnt/drakkar/staging/nzbs"
+	DefaultFailedDiagnostics    = "/mnt/drakkar/failed"
 	DefaultLogsPath             = "/app/data/logs"
 	DefaultHTTPAddress          = ":8080"
+	DefaultDiskCacheLimitBytes  = int64(20 << 30)
 	DefaultReadAheadLimitBytes  = int64(512 << 20)
 	DefaultMemoryHotCacheBytes  = int64(512 << 20)
+	DefaultRepairWorkspaceBytes = int64(20 << 30)
 	DefaultNZBUploadLimitBytes  = int64(64 << 20)
 	DefaultMaxDownloadConns     = 15
 	DefaultStreamingPriorityPct = 80
@@ -109,13 +116,19 @@ type SubtitleAuth struct {
 type Runtime struct {
 	SettingsPath           string
 	HTTPAddress            string
-	VFSBaseURL             string // Base URL for the HTTP VFS server, e.g. http://drakkar:8080
-	RcloneMountPath        string // Where rclone mounts the WebDAV, e.g. /mnt/drakkar/vfs
+	FuseMountPath          string
 	MovieLibraryPath       string
 	TVLibraryPath          string
+	BlockCachePath         string
+	HeaderCachePath        string
+	RepairWorkspacePath    string
+	StagingNZBPath         string
+	FailedDiagnosticsPath  string
 	LogsPath               string
+	DiskCacheLimitBytes    int64
 	ReadAheadLimitBytes    int64
 	MemoryHotCacheMaxBytes int64
+	RepairWorkspaceMax     int64
 	NZBUploadLimitBytes    int64
 }
 
@@ -123,13 +136,19 @@ func DefaultRuntime() Runtime {
 	return Runtime{
 		SettingsPath:           DefaultSettingsPath,
 		HTTPAddress:            DefaultHTTPAddress,
-		VFSBaseURL:             DefaultVFSBaseURL,
-		RcloneMountPath:        DefaultRcloneMountPath,
+		FuseMountPath:          DefaultFuseMountPath,
 		MovieLibraryPath:       DefaultMovieLibraryPath,
 		TVLibraryPath:          DefaultTVLibraryPath,
+		BlockCachePath:         DefaultBlockCachePath,
+		HeaderCachePath:        DefaultHeaderCachePath,
+		RepairWorkspacePath:    DefaultRepairWorkspacePath,
+		StagingNZBPath:         DefaultStagingNZBPath,
+		FailedDiagnosticsPath:  DefaultFailedDiagnostics,
 		LogsPath:               DefaultLogsPath,
+		DiskCacheLimitBytes:    DefaultDiskCacheLimitBytes,
 		ReadAheadLimitBytes:    DefaultReadAheadLimitBytes,
 		MemoryHotCacheMaxBytes: DefaultMemoryHotCacheBytes,
+		RepairWorkspaceMax:     DefaultRepairWorkspaceBytes,
 		NZBUploadLimitBytes:    DefaultNZBUploadLimitBytes,
 	}
 }
@@ -238,6 +257,35 @@ func validateURL(name, raw string) error {
 }
 
 func ValidatePaths(rt Runtime) error {
+	abs := func(path string) string {
+		out, err := filepath.Abs(path)
+		if err != nil {
+			return path
+		}
+		return filepath.Clean(out)
+	}
+
+	fuseRoot := abs(rt.FuseMountPath)
+	checks := []string{
+		rt.MovieLibraryPath,
+		rt.TVLibraryPath,
+		rt.BlockCachePath,
+		rt.HeaderCachePath,
+		rt.RepairWorkspacePath,
+		rt.StagingNZBPath,
+		rt.FailedDiagnosticsPath,
+	}
+
+	for _, target := range checks {
+		clean := abs(target)
+		if clean == fuseRoot || strings.HasPrefix(clean, fuseRoot+string(os.PathSeparator)) {
+			return fmt.Errorf("path %s must remain outside fuse mount %s", clean, fuseRoot)
+		}
+	}
+
+	if !strings.HasPrefix(abs(rt.MovieLibraryPath), filepath.Dir(filepath.Dir(fuseRoot))+string(os.PathSeparator)) {
+		return fmt.Errorf("movie library path %s must live under /mnt/drakkar", rt.MovieLibraryPath)
+	}
 	return nil
 }
 

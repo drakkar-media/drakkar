@@ -16,6 +16,7 @@ import (
 	"github.com/hjongedijk/drakkar/internal/catalog"
 	"github.com/hjongedijk/drakkar/internal/config"
 	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/hjongedijk/drakkar/internal/fuse"
 	"github.com/hjongedijk/drakkar/internal/hydra"
 	"github.com/hjongedijk/drakkar/internal/library"
 	"github.com/hjongedijk/drakkar/internal/maintenance"
@@ -24,7 +25,6 @@ import (
 	"github.com/hjongedijk/drakkar/internal/nzb"
 	"github.com/hjongedijk/drakkar/internal/opensubtitles"
 	"github.com/hjongedijk/drakkar/internal/plex"
-	"github.com/hjongedijk/drakkar/internal/rclone"
 	"github.com/hjongedijk/drakkar/internal/policy"
 	"github.com/hjongedijk/drakkar/internal/probe"
 	"github.com/hjongedijk/drakkar/internal/queue"
@@ -34,7 +34,6 @@ import (
 	"github.com/hjongedijk/drakkar/internal/subtitles"
 	"github.com/hjongedijk/drakkar/internal/tmdb"
 	"github.com/hjongedijk/drakkar/internal/tvdb"
-	"github.com/hjongedijk/drakkar/internal/vfs"
 	"github.com/hjongedijk/drakkar/internal/workflow"
 	"github.com/redis/go-redis/v9"
 	"github.com/redis/go-redis/v9/maintnotifications"
@@ -112,13 +111,6 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	if env := os.Getenv("DRAKKAR_HTTP_ADDR"); env != "" {
 		rt.HTTPAddress = env
 	}
-	if env := os.Getenv("DRAKKAR_VFS_BASE_URL"); env != "" {
-		rt.VFSBaseURL = env
-	}
-	if env := os.Getenv("DRAKKAR_RCLONE_MOUNT"); env != "" {
-		rt.RcloneMountPath = env
-	}
-	rcloneRCURL := os.Getenv("DRAKKAR_RCLONE_RC") // e.g. http://drakkar_rclone:5572
 
 	cfg, err := config.Load(rt.SettingsPath)
 	if err != nil {
@@ -127,8 +119,17 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	if err := config.ValidatePaths(rt); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(rt.LogsPath, 0o755); err != nil {
-		return err
+	for _, dir := range []string{
+		rt.BlockCachePath,
+		rt.HeaderCachePath,
+		rt.RepairWorkspacePath,
+		rt.StagingNZBPath,
+		rt.FailedDiagnosticsPath,
+		rt.LogsPath,
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
 	}
 
 	db, err := database.Open(cfg.Database)
@@ -176,9 +177,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		// are never re-fetched from NNTP within the TTL window.
 		cachedFallback := nntp.NewCachedFallbackSource(fallback)
 		scheduled := nntp.NewScheduledSource(cachedFallback, maxDownloadConnections*3, maxDownloadConnections*8)
-		// No disk block cache — rclone handles disk-level VFS caching.
-		// Keep the DiskCachedDecodedSource for yEnc decoding; pass empty root to disable disk writes.
-		diskDecoded := nntp.NewDiskCachedDecodedSource(scheduled, "", 0)
+		// No separate background budget (matches nzbdav behaviour) — all priorities share the pool
+		diskDecoded := nntp.NewDiskCachedDecodedSource(scheduled, rt.BlockCachePath, rt.DiskCacheLimitBytes)
 		decoded := nntp.NewCachedDecodedSource(diskDecoded, rt.MemoryHotCacheMaxBytes)
 		db.SegmentFetcher = nntp.NewSegmentFetcher(decoded)
 		db.ReadAhead.SetConnectionBudget(maxDownloadConnections, cfg.Usenet.StreamingPriorityPct)
@@ -215,7 +215,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 
 	startedAt := time.Now().UTC()
 	statusSvc := &runtimeStatus{status: api.StatusFromConfig(rt, cfg, startedAt, true)}
-	queueSvc := queue.NewService(db, nzb.NewImporter(os.TempDir(), rt.NZBUploadLimitBytes))
+	queueSvc := queue.NewService(db, nzb.NewImporter(rt.StagingNZBPath, rt.NZBUploadLimitBytes))
 	seerrClient := seerr.NewClient(cfg.Seerr)
 	hydraClient := hydra.NewClient(cfg.NZBHydra2)
 	workflowSvc := workflow.NewService(db, seerrClient, hydraClient)
@@ -227,7 +227,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	}
 	publicationSvc := library.NewPublisher(db, rt)
 	maintenanceSvc := maintenance.NewService(db, rt)
-	cacheSvc := cache.NewService(cache.NewFileCache("", 0)) // disk cache removed; rclone handles caching
+	cacheSvc := cache.NewService(cache.NewFileCache(rt.BlockCachePath, rt.DiskCacheLimitBytes))
 	catalogSvc := catalog.NewService(db, tmdb.NewClient(cfg.Metadata))
 	var subtitleProviders []subtitles.Provider
 	var probeProviders []probe.NamedProber
@@ -260,19 +260,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	blocklistSvc := blocklist.NewService(db)
 	probeSvc := probe.NewService(probeProviders...)
 	plexClient := plex.NewClient(cfg.Plex.URL, cfg.Plex.Token)
-	rcloneClient := rclone.NewClient(rcloneRCURL)
 	publicationSvc.SetPostPublishHook(func(ctx context.Context, libraryItemID int64) error {
 		if err := subtitleSvc.RepublishStoredSubtitles(ctx, libraryItemID); err != nil {
 			return err
 		}
 		subtitleSvc.TriggerAutomaticSearch(libraryItemID)
-		// Tell rclone to forget its VFS cache for the /content/ directory so
-		// Plex sees the new file immediately — matches nzbdav's RcloneVfsForget.
-		go func() {
-			rcCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = rcloneClient.ForgetVfsPaths(rcCtx, []string{"/content"})
-		}()
 		// Notify Plex to scan the new file's library section.
 		if plexClient.Enabled() {
 			go func() {
@@ -300,8 +292,13 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	if err := publicationSvc.RebuildPublications(ctx); err != nil {
 		return err
 	}
-	// VFS HTTP server — replaces FUSE; serves NZB segments via Range requests.
-	vfsServer := vfs.NewServer(db)
+	// Attempt lazy unmount in case a previous process left a stale FUSE socket.
+	_ = fuse.LazyUnmount(rt.FuseMountPath)
+	fuseServer, err := fuse.Mount(rt.FuseMountPath, rt.StagingNZBPath, rt.NZBUploadLimitBytes, queueSvc)
+	if err != nil {
+		return err
+	}
+	defer fuseServer.Unmount()
 	broker := api.NewEventBroker()
 
 	// live metrics collector — reads NNTP pool + scheduler + disk cache at query time
@@ -309,21 +306,18 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	if len(pooledSources) > 0 {
 		pooledSrcs = pooledSources
 	}
+	blockCache := cache.NewFileCache(rt.BlockCachePath, rt.DiskCacheLimitBytes)
 	metricsColl := &liveMetricsCollector{
 		readAhead:  db.ReadAhead,
 		pools:      pooledSrcs,
 		scheduled:  scheduledSrc,
-		blockCache: cache.NewFileCache("", 0),
+		blockCache: blockCache,
 	}
 	taskScheduleSvc := &taskScheduleStatusService{db: db}
 
-	apiRouter := api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, metricsColl)
-	vfsServer.Register(apiRouter)
 	server := &http.Server{
-		Addr: rt.HTTPAddress,
-		// vfsServer.Handler wraps apiRouter so /dav/* bypasses chi's method filter
-		// (chi returns 405 for PROPFIND/WebDAV methods).
-		Handler: vfsServer.Handler(apiRouter),
+		Addr:              rt.HTTPAddress,
+		Handler:           api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, metricsColl),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -507,7 +501,10 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		return server.Shutdown(shutdownCtx)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			return err
+		}
+		return fuseServer.Unmount()
 	case err := <-errCh:
 		return err
 	}

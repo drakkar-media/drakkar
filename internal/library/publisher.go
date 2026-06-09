@@ -12,7 +12,6 @@ import (
 	"github.com/hjongedijk/drakkar/internal/database"
 	"github.com/hjongedijk/drakkar/internal/metrics"
 	"github.com/hjongedijk/drakkar/internal/symlink"
-	"github.com/hjongedijk/drakkar/internal/vfs"
 )
 
 var ErrNoVirtualFiles = errors.New("selected release has no publishable virtual files")
@@ -69,17 +68,15 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 	}
 	libraryItemIDs := make(map[int64]struct{})
 	for _, file := range files {
+		target := filepath.Join(p.runtime.FuseMountPath, "content", file.Path)
 		libraryPath := p.libraryPathFor(file)
 		if libraryPath == "" {
-			slog.Warn("skipping symlink: insufficient metadata", "virtual_file_id", file.VirtualFileID, "file", file.FileName)
+			slog.Warn("skipping host symlink: insufficient metadata", "virtual_file_id", file.VirtualFileID, "file", file.FileName)
 		} else {
-			// Symlink to the rclone VFS mount — same as nzbdav symlink mode for Plex.
-			// rclone mounts Drakkar's WebDAV at RcloneMountPath; the file is at
-			// content/{virtualFileID}/{filename} within that mount.
-			target := p.runtime.RcloneMountPath + vfs.IdsPath(file.VirtualFileID, file.FileName)
 			if err := p.syml.Publish(libraryPath, target); err != nil {
-				slog.Warn("symlink publish failed", "path", libraryPath, "err", err)
-			} else if err := p.repo.UpsertSymlinkPublication(ctx, file.LibraryItemID, file.VirtualFileID, libraryPath, target); err != nil {
+				return err
+			}
+			if err := p.repo.UpsertSymlinkPublication(ctx, file.LibraryItemID, file.VirtualFileID, libraryPath, target); err != nil {
 				return err
 			}
 		}
@@ -123,18 +120,12 @@ func (p *Publisher) RebuildPublications(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var published, skipped int
 	for _, selectedReleaseID := range selectedReleaseIDs {
+		// isNew=false: skip per-episode item creation; those were already done on initial publish.
 		if err := p.publishSelectedRelease(ctx, selectedReleaseID, false); err != nil {
-			if !errors.Is(err, ErrNoVirtualFiles) {
-				slog.Warn("rebuild: publish failed", "selected_release_id", selectedReleaseID, "err", err)
-			}
-			skipped++
-		} else {
-			published++
+			return err
 		}
 	}
-	slog.Info("rebuild: publications complete", "published", published, "skipped", skipped)
 	return nil
 }
 
@@ -216,9 +207,9 @@ func (p *Publisher) fulfillSeasonPackEpisodes(ctx context.Context, selectedRelea
 				}
 			}
 		}
+		target := filepath.Join(p.runtime.FuseMountPath, "content", enriched.Path)
 		libraryPath := p.libraryPathFor(enriched)
 		if libraryPath != "" {
-			target := p.runtime.RcloneMountPath + vfs.IdsPath(m.VirtualFileID, enriched.FileName)
 			if symlinkErr := p.syml.Publish(libraryPath, target); symlinkErr == nil {
 				_ = p.repo.UpsertSymlinkPublication(ctx, m.LibraryItemID, m.VirtualFileID, libraryPath, target)
 			}
@@ -240,11 +231,21 @@ func (p *Publisher) libraryPathFor(file database.ReleaseVirtualFile) string {
 	case "episode", "tv":
 		season := file.SeasonNumber
 		episode := file.EpisodeNumber
+		// Season packs: the library item may have season=0/episode=0 when imported
+		// as a whole-show request. Fall back to parsing the filename.
 		if (season <= 0 || episode <= 0) && file.FileName != "" {
 			season, episode = database.ParseEpisodeFromFilename(file.FileName)
 		}
 		if file.ShowTitle != "" && season > 0 && episode > 0 {
-			return symlink.EpisodePath(p.runtime.TVLibraryPath, file.ShowTitle, file.ShowYear, int(file.ShowTVDBID), season, episode, file.FileName)
+			return symlink.EpisodePath(
+				p.runtime.TVLibraryPath,
+				file.ShowTitle,
+				file.ShowYear,
+				int(file.ShowTVDBID),
+				season,
+				episode,
+				file.FileName,
+			)
 		}
 	}
 	return ""

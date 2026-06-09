@@ -162,7 +162,7 @@ type Status struct {
 	StartedAt            time.Time      `json:"startedAt"`
 	Settings             map[string]any `json:"settings"`
 	Integrations         Integrations   `json:"integrations"`
-	VFSBaseURL            string         `json:"vfsBaseUrl"`
+	FuseMountPath        string         `json:"fuseMountPath"`
 	ReadAheadLimitBytes  int64          `json:"readAheadLimitBytes"`
 	MemoryHotCacheBytes  int64          `json:"memoryHotCacheBytes"`
 	BackgroundQueueDepth int            `json:"backgroundQueueDepth"`
@@ -1300,7 +1300,7 @@ func StatusFromConfig(rt config.Runtime, cfg config.Settings, startedAt time.Tim
 		StartedAt:           startedAt,
 		Settings:            config.RedactedSettings(cfg),
 		Integrations:        integrationStatusFromConfig(cfg),
-		VFSBaseURL:           rt.VFSBaseURL,
+		FuseMountPath:       rt.FuseMountPath,
 		ReadAheadLimitBytes: rt.ReadAheadLimitBytes,
 		MemoryHotCacheBytes: rt.MemoryHotCacheMaxBytes,
 	}
