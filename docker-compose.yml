@@ -56,7 +56,7 @@ services:
     restart: unless-stopped
     volumes:
       - ./data/rclone:/config/rclone
-      - /mnt/drakkar/vfs:/mnt/drakkar/vfs:rshared
+      - /mnt:/mnt:rshared
     devices:
       - /dev/fuse:/dev/fuse
     cap_add:
