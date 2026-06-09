@@ -79,6 +79,9 @@ type Requirements struct {
 	Year          int
 	SeasonNumber  int
 	EpisodeNumber int
+	// TrustSource: skip title check for ID-based searches (TMDB/IMDB/TVDB).
+	// Obfuscated NZB subjects would otherwise wrongly reject valid results.
+	TrustSource bool
 }
 
 type Preferences struct {
@@ -111,7 +114,7 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 	titleLower := strings.ToLower(candidate.Title)
 	requiredLower := strings.ToLower(required.Title)
 
-	if !containsNormalized(titleLower, requiredLower) {
+	if !required.TrustSource && !containsNormalized(titleLower, requiredLower) {
 		return Result{Rejected: true, RejectReason: "wrong_title"}
 	}
 

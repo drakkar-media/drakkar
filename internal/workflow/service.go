@@ -605,7 +605,11 @@ func (s *Service) searchLibraryOnce(ctx context.Context, libraryItemID int64) (S
 
 	// searchTier runs all requests in a tier and returns true if the caller
 	// should stop (selected a release or found good candidates).
-	searchTier := func(tierRequests []hydra.SearchRequest) bool {
+	// trustSource=true for tier1 (ID-based): skips title check since indexer
+	// guarantees correctness and NZB subjects may be obfuscated.
+	searchTier := func(tierRequests []hydra.SearchRequest, trustSource bool) bool {
+		req := searchRequirements(input)
+		req.TrustSource = trustSource
 		for _, candidateRequest := range tierRequests {
 			query = searchRequestLabel(candidateRequest)
 			results, err = s.searchHydraWithRetry(ctx, candidateRequest)
@@ -614,7 +618,7 @@ func (s *Service) searchLibraryOnce(ctx context.Context, libraryItemID int64) (S
 				continue
 			}
 			lastSearchErr = nil
-			candidates = buildSearchCandidates(results, searchRequirements(input), history, profilePrefs)
+			candidates = buildSearchCandidates(results, req, history, profilePrefs)
 			combinedCandidates = mergeSearchCandidates(combinedCandidates, candidates)
 			selectedReleaseID, err = s.repo.ReplaceSearchCandidates(ctx, libraryItemID, combinedCandidates)
 			if err != nil {
@@ -630,14 +634,14 @@ func (s *Service) searchLibraryOnce(ctx context.Context, libraryItemID int64) (S
 	// Tier 1: ID-based queries (tmdbid / imdbid / tvdbid).
 	// If these return a usable candidate we skip title queries entirely —
 	// same logic as Radarr/Sonarr's IndexerPageableRequestChain.AddTier().
-	tier1Done := searchTier(plan.Tier1)
+	tier1Done := searchTier(plan.Tier1, true)  // ID-based: trust indexer
 	if err != nil {
 		return SearchResult{}, err
 	}
 
 	// Tier 2: title-based fallback — only run if tier 1 produced no candidates.
 	if !tier1Done && selectedReleaseID == nil && len(combinedCandidates) == 0 {
-		searchTier(plan.Tier2)
+		searchTier(plan.Tier2, false)  // title-based: verify title
 		if err != nil {
 			return SearchResult{}, err
 		}
