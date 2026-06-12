@@ -12,12 +12,10 @@
   import { api, subscribeEvents } from '$lib/api';
   import { detailsHref } from '$lib/detailsHref';
   import { toastError } from '$lib/toast';
-  import type { DashboardHome, DiscoverMediaItem, LibraryItem, Status } from '$lib/types';
+  import type { DashboardHome, LibraryItem, Status } from '$lib/types';
 
   let home: DashboardHome | null = null;
   let status: Status | null = null;
-  let discoverMovies: DiscoverMediaItem[] = [];
-  let discoverTv: DiscoverMediaItem[] = [];
   let loading = true;
   let heroIndex = 0;
   let heroTimer: number;
@@ -31,37 +29,12 @@
   async function loadAll() {
     loading = true;
     try {
-      const [dashboard, appStatus, movieDiscover, tvDiscover] = await Promise.all([
-        api.dashboardHome(),
-        api.status(),
-        api.discoverList('movie', 1),
-        api.discoverList('tv', 1)
-      ]);
+      const [dashboard, appStatus] = await Promise.all([api.dashboardHome(), api.status()]);
       home = dashboard;
       status = appStatus;
-      discoverMovies = movieDiscover.items;
-      discoverTv = tvDiscover.items;
     }
     catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
     finally { loading = false; }
-  }
-
-  function asLibraryLike(item: DiscoverMediaItem): LibraryItem {
-    return {
-      id: 0,
-      mediaType: item.mediaType,
-      title: item.title,
-      year: item.year,
-      overview: item.overview,
-      posterUrl: item.posterUrl,
-      backdropUrl: item.backdropUrl,
-      available: false,
-      requestedAt: '',
-      queueState: '',
-      failureReason: '',
-      tmdbId: item.tmdbId,
-      imdbId: item.imdbId
-    };
   }
 
   function startCarousel(items: LibraryItem[]) {
@@ -80,7 +53,9 @@
     return () => { window.clearInterval(t); window.clearInterval(heroTimer); unsub(); };
   });
 
-  $: heroItems = [...discoverMovies, ...discoverTv].slice(0, 8).map(asLibraryLike);
+  $: heroItems = ((home?.recentlyAdded ?? []).length > 0
+    ? (home?.recentlyAdded ?? [])
+    : [...(home?.trendingMovies ?? []), ...(home?.trendingTv ?? [])]).slice(0, 8);
   $: { if (heroItems.length) startCarousel(heroItems); }
   $: hero = heroItems[heroIndex] ?? heroItems[0];
   $: integrations = status?.integrations;
@@ -203,29 +178,29 @@
     />
   {/if}
 
-  {#if discoverMovies.length > 0}
+  {#if (home?.trendingMovies ?? []).length > 0}
     <MediaRow
       title="Trending Movies"
-      subtitle="Live TMDB movie discover feed."
-      items={discoverMovies.map(asLibraryLike)}
+      subtitle="Popular movies from TMDB."
+      items={home?.trendingMovies ?? []}
       href="/discover/movie"
       linkLabel="Browse →"
       itemWidth={140}
     />
   {/if}
 
-  {#if discoverTv.length > 0}
+  {#if (home?.trendingTv ?? []).length > 0}
     <MediaRow
       title="Trending TV Shows"
-      subtitle="Live TMDB TV discover feed."
-      items={discoverTv.map(asLibraryLike)}
+      subtitle="Popular TV shows from TMDB."
+      items={home?.trendingTv ?? []}
       href="/discover/tv"
       linkLabel="Browse →"
       itemWidth={140}
     />
   {/if}
 
-  {#if !loading && !home?.recentlyAdded?.length && !discoverMovies.length}
+  {#if !loading && !home?.recentlyAdded?.length && !(home?.trendingMovies ?? []).length}
     <div class="empty-state">No media yet. Sync Seerr requests to get started.</div>
   {/if}
 </div>

@@ -11,9 +11,8 @@
   import StatusPill from '$lib/components/StatusPill.svelte';
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
-  import type { QueueItem, Status } from '$lib/types';
+  import type { QueueItem } from '$lib/types';
 
-  let status: Status | null = null;
   let items: QueueItem[] = [];
   let loading = true;
   let working = false;
@@ -30,7 +29,6 @@
   $: historyItems = items.filter((item) => doneStates.includes(item.state));
   $: failedItems = items.filter((item) => item.state === 'failed');
   $: totalSegments = queueItems.reduce((sum, item) => sum + (item.nzbSegmentCount || 0), 0);
-  $: bandwidth = ((status?.settings.usenet as Record<string, unknown> | undefined) ?? {});
   $: queueTotalPages = Math.max(1, Math.ceil(queueItems.length / queuePageSize));
   $: historyTotalPages = Math.max(1, Math.ceil(historyItems.length / historyPageSize));
   $: if (queuePage > queueTotalPages) queuePage = queueTotalPages;
@@ -45,9 +43,8 @@
   async function load() {
     loading = true;
     try {
-      const [queue, nextStatus] = await Promise.all([api.queue(), api.status()]);
+      const queue = await api.queue();
       items = queue.items ?? [];
-      status = nextStatus;
     } catch (err) {
       toastError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -199,15 +196,6 @@
   </div>
 </section>
 
-<Panel title="Runtime" subtitle="Queue posture and current download pool policy.">
-  <div class="runtime-grid">
-    <div class="runtime-row"><span>Max download connections</span><strong>{bandwidth.maxDownloadConnections ?? 0}</strong></div>
-    <div class="runtime-row"><span>Streaming priority</span><strong>{bandwidth.streamingPriorityPercent ?? 0}%</strong></div>
-    <div class="runtime-row"><span>Article buffer size</span><strong>{bandwidth.articleBufferSize ?? 0}</strong></div>
-    <div class="runtime-row"><span>Background queue depth</span><strong>{status?.backgroundQueueDepth ?? 0}</strong></div>
-  </div>
-</Panel>
-
 <div class="tab-row">
   <button class:active={tab === 'queue'} on:click={() => (tab = 'queue')}>queue</button>
   <button class:active={tab === 'history'} on:click={() => (tab = 'history')}>history</button>
@@ -218,12 +206,6 @@
   subtitle={tab === 'queue' ? 'Active lifecycle rows from request to publication.' : 'Completed and failed rows.'}
 >
   <div slot="actions">
-    {#if tab === 'history' && failedItems.length > 0}
-      <Button kind="ghost" on:click={clearFailed} disabled={working}>
-        <Trash2 size={13} />
-        Clear {failedItems.length} failed
-      </Button>
-    {/if}
     <StatusPill tone="neutral">{tab === 'queue' ? `${queueItems.length} active` : `${historyItems.length} rows`}</StatusPill>
   </div>
 
@@ -346,27 +328,6 @@
     font-size: 13px;
   }
 
-  .runtime-grid {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 12px;
-  }
-
-  .runtime-row {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding: 14px 16px;
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    border-radius: 16px;
-    background: hsl(0 0% 100% / 0.03);
-    font-size: 13px;
-  }
-
-  .runtime-row span {
-    color: hsl(var(--muted-foreground));
-  }
-
   .tab-row {
     display: flex;
     gap: 6px;
@@ -480,8 +441,7 @@
   }
 
   @media (max-width: 900px) {
-    .summary-grid,
-    .runtime-grid {
+    .summary-grid {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
   }
