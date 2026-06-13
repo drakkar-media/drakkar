@@ -260,7 +260,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)
 	}
 	workflowSvc := workflow.NewService(db, seerrClient, hydraClient)
-	wq, err := workflow.NewWorkQueue(6, valkey, wqWorkerClient)
+	wq, err := workflow.NewWorkQueue(3, valkey, wqWorkerClient)
 	if err != nil {
 		return fmt.Errorf("workqueue init: %w", err)
 	}
