@@ -77,6 +77,10 @@ func (w workflowStub) SyncRequests(ctx context.Context) (workflow.SyncResult, er
 	return w.sync, nil
 }
 
+func (w workflowStub) CreateSeerrRequest(ctx context.Context, mediaType string, tmdbID int64) (workflow.SyncResult, error) {
+	return w.sync, nil
+}
+
 func (w workflowStub) SearchPendingLibrary(ctx context.Context) (workflow.BulkSearchResult, error) {
 	return w.pending, nil
 }
@@ -111,6 +115,19 @@ func (w workflowStub) RestoreRejectedReleases(ctx context.Context, libraryItemID
 
 func (w workflowStub) SkipRelease(ctx context.Context, releaseCandidateID int64) (workflow.ReleaseActionResult, error) {
 	return w.skip, nil
+}
+func (w workflowStub) BackfillMetadata(_ context.Context) (workflow.BackfillMetadataResult, error) {
+	return workflow.BackfillMetadataResult{}, nil
+}
+func (w workflowStub) ClearFailedQueue(_ context.Context) (int, error) { return 0, nil }
+func (w workflowStub) FillMissingEpisodes(_ context.Context) (workflow.FillMissingEpisodesResult, error) {
+	return workflow.FillMissingEpisodesResult{}, nil
+}
+func (w workflowStub) ManualSearch(_ context.Context, _ string) ([]workflow.ManualSearchItem, error) {
+	return nil, nil
+}
+func (w workflowStub) ImportNZBFromPush(_ context.Context, _ []byte, _, _ string) (string, error) {
+	return "", nil
 }
 
 func (p *publicationStub) RepublishLibraryItem(ctx context.Context, libraryItemID int64) error {
@@ -199,7 +216,7 @@ const sampleNZB = `<?xml version="1.0" encoding="UTF-8"?>
 
 func TestImportNZBEndpoint(t *testing.T) {
 	queueSvc := queue.NewService(queue.NewMemoryRepository(), nzb.NewImporter(t.TempDir(), 1024*1024))
-	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/nzbs/import", strings.NewReader(sampleNZB))
 	req.Header.Set("Content-Disposition", `attachment; filename="dune.nzb"`)
@@ -229,7 +246,7 @@ func TestCancelNZBEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/nzbs/"+itoa(*item.NZBDocumentID), nil)
 	rec := httptest.NewRecorder()
@@ -252,7 +269,7 @@ func TestLibraryEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil)
 
 	libraryReq := httptest.NewRequest(http.MethodGet, "/api/library", nil)
 	libraryRec := httptest.NewRecorder()
@@ -384,7 +401,7 @@ func TestWorkflowEndpoints(t *testing.T) {
 			{Name: "seerr", OK: true, Detail: "ok", CheckedAt: time.Now().UTC(), DurationMS: 12},
 		},
 	}}
-	router := Router(statusStub{}, queueSvc, workflowSvc, pub, maint, cacheSvc, subtitles, blocklist, probes, nil, NewEventBroker(), nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, workflowSvc, pub, maint, cacheSvc, subtitles, blocklist, probes, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil)
 
 	requestsReq := httptest.NewRequest(http.MethodGet, "/api/requests", nil)
 	requestsRec := httptest.NewRecorder()

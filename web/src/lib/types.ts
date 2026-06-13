@@ -8,13 +8,46 @@ export type QualityProfile = {
   languages: string[];
   audioFormats: string[];
   hdrFormats: string[];
+  excludePatterns: string[];
   preferProper: boolean;
   preferRepack: boolean;
   rejectCam: boolean;
+  allowUpgrade: boolean;
+  cutoffResolution: string;
+  minimumAgeHours: number;
   minSizeMb: number;
   maxSizeMb: number;
   createdAt?: string;
   updatedAt?: string;
+};
+
+export type GrabHistoryEntry = {
+  id: number;
+  libraryItemId: number;
+  releaseCandidateId?: number;
+  title: string;
+  indexerName: string;
+  score: number;
+  resolution: string;
+  grabbedAt: string;
+};
+
+export type CustomFormat = {
+  id?: number;
+  name: string;
+  pattern: string;
+  score: number;
+  enabled: boolean;
+};
+
+export type QualityDefinition = {
+  id: number;
+  mediaType: string;
+  qualityKey: string;
+  title: string;
+  minSizeMb: number;
+  maxSizeMb: number;
+  sortOrder: number;
 };
 
 export type IntegrationStatus = {
@@ -129,6 +162,11 @@ export type QueueDecisionAction =
 export type PolicySettings = {
   queueDecisionActions: Record<string, QueueDecisionAction>;
   ignoredPatterns: string[];
+  duplicateNzbBehavior: string;
+  failNzbWithoutVideo: boolean;
+  importStrategy: string;
+  manualUploadCategory: string;
+  blocklistTtlDays: number;
 };
 
 export type LibraryItem = {
@@ -234,6 +272,8 @@ export type LibraryDetail = {
   availableCount: number;
   missingCount: number;
   seasons: SeasonDetail[];
+  tvShowId?: number;
+  monitoringMode?: string;
 };
 
 export type SeasonDetail = {
@@ -338,4 +378,55 @@ export type BlocklistItem = {
   key: string;
   reason: string;
   expiresAt?: string;
+};
+
+export type UsenetProvider = {
+  name: string;
+  host: string;
+  port: number;
+  tls: boolean;
+  username: string;
+  password: string;
+  maxConnections: number;
+  priority: number;
+  retentionDays: number;
+  backup: boolean;
+  enabled: boolean;
+};
+
+export type FullSettings = {
+  database: { host: string; port: number; name: string; username: string; password: string };
+  valkey: { host: string; port: number; password: string };
+  nzbhydra2: { url: string; apiKey: string; searchCacheTtlSeconds: number; feedCacheTtlSeconds: number; feedMaxResults: number };
+  seerr: { url: string; apiKey: string; searchCacheTtlSeconds: number; feedCacheTtlSeconds: number; feedMaxResults: number };
+  usenet: {
+    maxDownloadConnections: number;
+    streamingPriorityPercent: number;
+    articleBufferSize: number;
+    providers: UsenetProvider[];
+  };
+  metadata: { tmdb: { apiKey: string }; tvdb: { apiKey: string }; language: string; cacheTtlHours: number };
+  subtitles: {
+    enabled: boolean;
+    languages: string[];
+    providers: Record<string, { enabled: boolean; apiKey: string; username: string; password: string }>;
+  };
+  plex: { url: string; token: string; sectionKey: string };
+  jellyfin: { url: string; apiKey: string };
+  library: { defaultMovieProfile: string; defaultTvProfile: string };
+  indexer: {
+    tvRssSyncIntervalMinutes: number;
+    movieRssSyncIntervalMinutes: number;
+    minimumAgeMinutes: number;
+    retentionDays: number;
+    maximumSizeMB: number;
+    searchDelayMs: number;
+  };
+  notifications: {
+    discordWebhookUrl: string;
+    genericWebhookUrl: string;
+    onGrab: boolean;
+    onAvailable: boolean;
+    onFailed: boolean;
+  };
 };

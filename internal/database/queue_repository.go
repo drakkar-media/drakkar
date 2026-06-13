@@ -19,6 +19,42 @@ import (
 // 65535-parameter limit (6 params per segment: 65535/6 = 10922, rounded down).
 const maxSegmentBatch = 10000
 
+// vfRange is a single virtual_file_ranges row ready for bulk insert.
+type vfRange struct {
+	segmentID  int64
+	rangeStart int64
+	rangeEnd   int64
+}
+
+// bulkInsertVFRanges inserts virtual_file_ranges rows in batches (4 params per
+// row → max 16381 rows per query). This replaces the previous one-INSERT-per-
+// segment loop that caused measurable latency for large NZBs.
+func bulkInsertVFRanges(ctx context.Context, tx *sql.Tx, virtualFileID int64, ranges []vfRange) error {
+	const batchSize = 16000 // 4 params × 16000 = 64000 < 65535 limit
+	for start := 0; start < len(ranges); start += batchSize {
+		end := start + batchSize
+		if end > len(ranges) {
+			end = len(ranges)
+		}
+		batch := ranges[start:end]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO virtual_file_ranges (virtual_file_id, nzb_segment_id, range_start, range_end) VALUES `)
+		args := make([]any, 0, len(batch)*4)
+		for i, r := range batch {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			base := i * 4
+			fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d)", base+1, base+2, base+3, base+4)
+			args = append(args, virtualFileID, r.segmentID, r.rangeStart, r.rangeEnd)
+		}
+		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func bulkInsertSegments(ctx context.Context, tx *sql.Tx, nzbFileID int64, segments []ImportedNZBSegment) ([]int64, error) {
 	if len(segments) == 0 {
 		return nil, nil
@@ -194,11 +230,15 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 		return QueueSnapshot{}, errors.New("existing queue item not found after idempotency hit")
 	}
 
+	mediaType := imported.MediaType
+	if mediaType == "" {
+		mediaType = "manual_nzb"
+	}
 	var libraryItemID int64
 	if err = tx.QueryRowContext(ctx, `
 		insert into library_items (media_type, title)
-		values ('manual_nzb', $1)
-		returning id`, imported.FileName).Scan(&libraryItemID); err != nil {
+		values ($1, $2)
+		returning id`, mediaType, imported.FileName).Scan(&libraryItemID); err != nil {
 		return QueueSnapshot{}, err
 	}
 
@@ -264,17 +304,12 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 			).Scan(&virtualFileID); err != nil {
 				return QueueSnapshot{}, err
 			}
-			for i, segment := range file.Segments {
-				if _, err = tx.ExecContext(ctx, `
-					insert into virtual_file_ranges (virtual_file_id, nzb_segment_id, range_start, range_end)
-					values ($1, $2, $3, $4)`,
-					virtualFileID,
-					segmentIDs[i],
-					segment.DecodedStartOffset,
-					segment.DecodedEndOffset,
-				); err != nil {
-					return QueueSnapshot{}, err
-				}
+			vfrs := make([]vfRange, len(file.Segments))
+			for i, seg := range file.Segments {
+				vfrs[i] = vfRange{segmentID: segmentIDs[i], rangeStart: seg.DecodedStartOffset, rangeEnd: seg.DecodedEndOffset}
+			}
+			if err = bulkInsertVFRanges(ctx, tx, virtualFileID, vfrs); err != nil {
+				return QueueSnapshot{}, err
 			}
 		}
 	}
@@ -398,17 +433,12 @@ func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID in
 			).Scan(&virtualFileID); err != nil {
 				return QueueSnapshot{}, err
 			}
-			for i, segment := range file.Segments {
-				if _, err = tx.ExecContext(ctx, `
-					insert into virtual_file_ranges (virtual_file_id, nzb_segment_id, range_start, range_end)
-					values ($1, $2, $3, $4)`,
-					virtualFileID,
-					segmentIDs[i],
-					segment.DecodedStartOffset,
-					segment.DecodedEndOffset,
-				); err != nil {
-					return QueueSnapshot{}, err
-				}
+			vfrs := make([]vfRange, len(file.Segments))
+			for i, seg := range file.Segments {
+				vfrs[i] = vfRange{segmentID: segmentIDs[i], rangeStart: seg.DecodedStartOffset, rangeEnd: seg.DecodedEndOffset}
+			}
+			if err = bulkInsertVFRanges(ctx, tx, virtualFileID, vfrs); err != nil {
+				return QueueSnapshot{}, err
 			}
 		}
 	}
@@ -545,17 +575,12 @@ func insertArchiveVirtualFile(ctx context.Context, tx *sql.Tx, selectedReleaseID
 		if err != nil {
 			return 0, err
 		}
-		for _, resolved := range ranges {
-			if _, err := tx.ExecContext(ctx, `
-				insert into virtual_file_ranges (virtual_file_id, nzb_segment_id, range_start, range_end)
-				values ($1, $2, $3, $4)`,
-				virtualFileID,
-				resolved.SegmentID,
-				resolved.RangeStart,
-				resolved.RangeEnd,
-			); err != nil {
-				return 0, err
-			}
+		vfrs := make([]vfRange, len(ranges))
+		for i, r := range ranges {
+			vfrs[i] = vfRange{segmentID: r.SegmentID, rangeStart: r.RangeStart, rangeEnd: r.RangeEnd}
+		}
+		if err = bulkInsertVFRanges(ctx, tx, virtualFileID, vfrs); err != nil {
+			return 0, err
 		}
 	}
 	return virtualFileID, nil
@@ -786,4 +811,126 @@ func (db *DB) ResetStaleQueueItems(ctx context.Context, staleAfter time.Duration
 	}
 	n, _ := result.RowsAffected()
 	return int(n), nil
+}
+
+func (db *DB) ListSabQueueItems(ctx context.Context, category string, start, limit int) ([]SabQueueItem, int, error) {
+	rows, err := db.SQL.QueryContext(ctx, `
+		SELECT li.id, li.title, li.media_type, q.state
+		FROM library_items li
+		JOIN queue_items q ON q.library_item_id = li.id
+		WHERE q.state NOT IN ('available', 'degraded', 'failed')
+		  AND q.sab_dismissed = false
+		  AND ($1 = ''
+		       OR ($1 = 'movies' AND li.media_type = 'movie')
+		       OR ($1 = 'tv' AND li.media_type IN ('tv', 'episode'))
+		       OR ($1 NOT IN ('movies', 'tv')))
+		ORDER BY q.created_at ASC
+		LIMIT $2 OFFSET $3`, category, limit, start)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var items []SabQueueItem
+	for rows.Next() {
+		var it SabQueueItem
+		if err := rows.Scan(&it.LibraryItemID, &it.Title, &it.MediaType, &it.State); err != nil {
+			return nil, 0, err
+		}
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	var total int
+	err = db.SQL.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM library_items li
+		JOIN queue_items q ON q.library_item_id = li.id
+		WHERE q.state NOT IN ('available', 'degraded', 'failed')
+		  AND q.sab_dismissed = false
+		  AND ($1 = ''
+		       OR ($1 = 'movies' AND li.media_type = 'movie')
+		       OR ($1 = 'tv' AND li.media_type IN ('tv', 'episode'))
+		       OR ($1 NOT IN ('movies', 'tv')))`, category).Scan(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
+}
+
+func (db *DB) ListSabHistoryItems(ctx context.Context, category string, start, limit int) ([]SabHistoryItem, int, error) {
+	rows, err := db.SQL.QueryContext(ctx, `
+		SELECT li.id, li.title, li.media_type, q.state, q.failure_reason,
+		       COALESCE(q.selected_release_id, 0),
+		       COALESCE((
+		           SELECT SUM(ns.encoded_size_bytes)
+		           FROM nzb_documents nd
+		           JOIN nzb_files nf ON nf.nzb_document_id = nd.id
+		           JOIN nzb_segments ns ON ns.nzb_file_id = nf.id
+		           WHERE nd.selected_release_id = q.selected_release_id
+		       ), 0)
+		FROM library_items li
+		JOIN queue_items q ON q.library_item_id = li.id
+		WHERE q.state IN ('available', 'degraded', 'failed')
+		  AND q.sab_dismissed = false
+		  AND ($1 = ''
+		       OR ($1 = 'movies' AND li.media_type = 'movie')
+		       OR ($1 = 'tv' AND li.media_type IN ('tv', 'episode'))
+		       OR ($1 NOT IN ('movies', 'tv')))
+		ORDER BY q.updated_at DESC
+		LIMIT $2 OFFSET $3`, category, limit, start)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var items []SabHistoryItem
+	for rows.Next() {
+		var it SabHistoryItem
+		if err := rows.Scan(&it.LibraryItemID, &it.Title, &it.MediaType, &it.State, &it.FailureReason, &it.SelectedReleaseID, &it.TotalBytes); err != nil {
+			return nil, 0, err
+		}
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	var total int
+	err = db.SQL.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM library_items li
+		JOIN queue_items q ON q.library_item_id = li.id
+		WHERE q.state IN ('available', 'degraded', 'failed')
+		  AND q.sab_dismissed = false
+		  AND ($1 = ''
+		       OR ($1 = 'movies' AND li.media_type = 'movie')
+		       OR ($1 = 'tv' AND li.media_type IN ('tv', 'episode'))
+		       OR ($1 NOT IN ('movies', 'tv')))`, category).Scan(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+	return items, total, nil
+}
+
+// DismissSabItems marks queue items as dismissed from the SABnzbd history/queue
+// view. Called when Radarr/Sonarr sends mode=history&name=delete or
+// mode=queue&name=delete. Dismissed items are excluded from future polls
+// without altering queue state or triggering any workflow transitions.
+func (db *DB) DismissSabItems(ctx context.Context, libraryItemIDs []int64) error {
+	if len(libraryItemIDs) == 0 {
+		return nil
+	}
+	// Build $1, $2, ... placeholders
+	placeholders := make([]string, len(libraryItemIDs))
+	args := make([]any, len(libraryItemIDs))
+	for i, id := range libraryItemIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+	query := fmt.Sprintf(`
+		UPDATE queue_items SET sab_dismissed = true
+		WHERE library_item_id IN (%s)`, strings.Join(placeholders, ","))
+	_, err := db.SQL.ExecContext(ctx, query, args...)
+	return err
 }

@@ -57,6 +57,7 @@ func (r *repoStub) FindSeasonPackMatches(_ context.Context, _, _ int64) ([]datab
 func (r *repoStub) FulfillEpisodeLibraryItem(_ context.Context, _, _, _ int64) error {
 	return nil
 }
+func (r *repoStub) CreateSeasonPackEpisodeItems(_ context.Context, _, _ int64) error { return nil }
 
 func TestPublishSelectedReleaseUnknownMediaType(t *testing.T) {
 	root := t.TempDir()

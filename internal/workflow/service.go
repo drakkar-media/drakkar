@@ -12,6 +12,11 @@ import (
 	"sync"
 	"time"
 
+	"database/sql"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/rs/zerolog"
+
 	"github.com/hjongedijk/drakkar/internal/database"
 	"github.com/hjongedijk/drakkar/internal/hydra"
 	"github.com/hjongedijk/drakkar/internal/library"
@@ -34,13 +39,17 @@ type Repository interface {
 	EnrichTVFull(ctx context.Context, libraryItemID int64, episodeTitle string, e database.TVShowEnrichment) error
 	DetectMovieSearchConflict(ctx context.Context, libraryItemID int64) (string, error)
 	GetDefaultQualityProfile(ctx context.Context) (database.QualityProfile, error)
+	GetQualityProfileByName(ctx context.Context, name string) (database.QualityProfile, error)
+	GetLibraryItemQualityProfile(ctx context.Context, libraryItemID int64) (*database.QualityProfile, error)
+	ListQualityDefinitions(ctx context.Context) ([]database.QualityDefinition, error)
 	GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (database.LibrarySearchInput, error)
 	LookupCandidateHistory(ctx context.Context, libraryItemID int64) (map[string]database.CandidateHistory, error)
 	ListPendingLibrarySearchTargets(ctx context.Context) ([]database.PendingLibrarySearchTarget, error)
 	ListFailedQueueRetryTargets(ctx context.Context) ([]database.FailedQueueRetryTarget, error)
+	ListUpgradableLibraryItems(ctx context.Context) ([]int64, error)
 	ClearFailedQueueItems(ctx context.Context) (int, error)
 	GetQueueRetryTarget(ctx context.Context, queueItemID int64) (database.QueueRetryTarget, error)
-	BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int64, reason string) error
+	BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int64, reason string, ttlDays int) error
 	ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) error
 	ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord) (*int64, error)
 	MarkLibrarySearchFailed(ctx context.Context, libraryItemID int64, reason string) error
@@ -62,15 +71,27 @@ type Repository interface {
 	ListMetadataBackfillTargets(ctx context.Context) ([]database.MetadataBackfillTarget, error)
 	ListShowsWithMissingEpisodes(ctx context.Context) ([]database.ShowWithMissingEpisodes, error)
 	EnsureEpisodeLibraryItem(ctx context.Context, tvShowID int64, showTitle string, seasonNum, episodeNum int, episodeTitle, airDate string) (created bool, err error)
+	ListCustomFormats(ctx context.Context) ([]database.CustomFormat, error)
+	CreateImportedNZB(ctx context.Context, imported database.ImportedNZB) (database.QueueSnapshot, error)
+	ListSabQueueItems(ctx context.Context, category string, start, limit int) ([]database.SabQueueItem, int, error)
+	ListSabHistoryItems(ctx context.Context, category string, start, limit int) ([]database.SabHistoryItem, int, error)
+	DismissSabItems(ctx context.Context, libraryItemIDs []int64) error
 }
 
 type SeerrClient interface {
 	PendingRequests(ctx context.Context) ([]seerr.Request, error)
+	CreateRequest(ctx context.Context, mediaType string, tmdbID int64) error
 }
 
 type HydraClient interface {
 	Search(ctx context.Context, request hydra.SearchRequest) ([]hydra.SearchResult, error)
 	SearchRecent(ctx context.Context, mediaType string) ([]hydra.SearchResult, error)
+}
+
+type IndexerLimits struct {
+	MinimumAgeMinutes int
+	RetentionDays     int
+	MaximumSizeMB     int
 }
 
 type Service struct {
@@ -83,14 +104,20 @@ type Service struct {
 	postImportHook   func(context.Context, database.QueueSnapshot) error
 	preflightChecker func(context.Context, database.QueueSnapshot) error
 	queuePolicy      QueuePolicyProvider
+	indexerLimits    IndexerLimits
+	logger           zerolog.Logger
 	// WorkQueue accepts individual library item IDs for immediate dispatch.
 	// Push items here from webhooks or sync to bypass the 30-min tick.
-	WorkQueue *WorkQueue
+	WorkQueue WorkQueuer
 
-	// profileCacheMu guards the cached quality profile.
-	profileCacheMu  sync.Mutex
-	profileCacheAt  time.Time
-	profileCachedPrefs ranking.Preferences
+	// default profile names per media type (set from config at startup).
+	movieProfileName string
+	tvProfileName    string
+
+	// profileCacheMu guards the cached quality profiles (keyed by media type).
+	profileCacheMu   sync.Mutex
+	profileCacheAt   map[string]time.Time
+	profileCachedPrefs map[string]ranking.Preferences
 
 	// importSem limits fetchAndImportSelectedRelease to 1 concurrent execution.
 	// Like nzbdav's SemaphoreSlim(1,1): parallel searching is fine, but only one
@@ -170,9 +197,12 @@ func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service 
 		seerr:     seerr,
 		hydra:     hydra,
 		fetcher:   HTTPNZBFetcher{},
-		WorkQueue: NewWorkQueue(3), // 3 concurrent search workers; importSem still limits imports to 1
 		importSem: make(chan struct{}, 1), // 1 concurrent import/preflight/publish (nzbdav parity)
 	}
+}
+
+func (s *Service) SetIndexerLimits(limits IndexerLimits) {
+	s.indexerLimits = limits
 }
 
 func (s *Service) SetTMDBClient(client TMDBClient) {
@@ -193,6 +223,10 @@ func (s *Service) SetPreflightChecker(fn func(context.Context, database.QueueSna
 
 func (s *Service) SetQueuePolicyProvider(provider QueuePolicyProvider) {
 	s.queuePolicy = provider
+}
+
+func (s *Service) SetLogger(l zerolog.Logger) {
+	s.logger = l
 }
 
 func (s *Service) ListRequests(ctx context.Context) ([]database.MediaRequestSummary, error) {
@@ -258,6 +292,16 @@ func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 		}
 	}
 	return result, nil
+}
+
+func (s *Service) CreateSeerrRequest(ctx context.Context, mediaType string, tmdbID int64) (SyncResult, error) {
+	if s == nil || s.seerr == nil {
+		return SyncResult{}, fmt.Errorf("seerr client unavailable")
+	}
+	if err := s.seerr.CreateRequest(ctx, mediaType, tmdbID); err != nil {
+		return SyncResult{}, err
+	}
+	return s.SyncRequests(ctx)
 }
 
 func (s *Service) enrichMovieRequest(ctx context.Context, libraryItemID, tmdbID int64) error {
@@ -353,7 +397,7 @@ func (s *Service) PushPendingToQueue(priority int) {
 		return
 	}
 	for _, target := range targets {
-		s.WorkQueue.Push(target.LibraryItemID, priority)
+		s.WorkQueue.Push(ctx, target.LibraryItemID, priority)
 	}
 }
 
@@ -398,7 +442,7 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 			// WorkQueue workers process at the natural Hydra throttle rate (500ms).
 			// Matches Radarr's "Search All Missing" which queries all missing items
 			// in parallel without a hard batch limit.
-			s.WorkQueue.Push(target.LibraryItemID, 0)
+			s.WorkQueue.Push(ctx, target.LibraryItemID, 0)
 			result.Searched++
 			continue
 		}
@@ -429,7 +473,6 @@ func (s *Service) SearchRecentPending(ctx context.Context, mediaType string) (Bu
 		return BulkSearchResult{}, err
 	}
 	result := BulkSearchResult{}
-	profilePrefs := s.defaultProfilePreferences(ctx)
 	for _, target := range targets {
 		input, err := s.repo.GetLibrarySearchInput(ctx, target.LibraryItemID)
 		if err != nil {
@@ -456,7 +499,8 @@ func (s *Service) SearchRecentPending(ctx context.Context, mediaType string) (Bu
 			result.FailedItems = append(result.FailedItems, target.LibraryItemID)
 			continue
 		}
-		candidates := buildSearchCandidates(recent, searchRequirements(input), history, profilePrefs)
+		profilePrefs := s.profilePreferencesForItem(ctx, target.LibraryItemID, input.MediaType)
+		candidates := buildSearchCandidates(recent, searchRequirements(input), history, profilePrefs, s.indexerLimits)
 		if len(candidates) == 0 {
 			continue
 		}
@@ -494,15 +538,65 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 	if err != nil {
 		return BulkQueueRetryResult{}, err
 	}
+
+	// Load user-configured policy (same source as AutoManageFailedQueue).
+	settings := policy.DefaultSettings()
+	if s.queuePolicy != nil {
+		if loaded, loadErr := s.queuePolicy.Settings(ctx); loadErr == nil {
+			settings = loaded
+		}
+	}
+	ttl := settings.BlocklistTTLDays
+
 	result := BulkQueueRetryResult{Processed: len(targets)}
 	for _, target := range targets {
 		result.ProcessedQueues = append(result.ProcessedQueues, target.QueueItemID)
 
-		// Use policy engine to decide the recovery action for this failure.
+		// User-configured policy takes precedence over the hardcoded matrix.
+		// AutoManageFailedQueue runs before this function and resets handled
+		// items to 'requested', so they won't appear here — but handle the
+		// fallback explicitly for failure reasons not yet covered by Auto.
+		userAction := policy.ActionForReason(settings, target.FailureReason)
+		if userAction != policy.QueueActionDoNothing {
+			switch userAction {
+			case policy.QueueActionRemoveBlocklistAndSearch, policy.QueueActionRemoveAndBlocklist:
+				if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, ttl); err != nil {
+					s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: blocklist failed")
+				}
+				if err := s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID); err != nil {
+					result.Failed++
+					result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+					continue
+				}
+				if userAction == policy.QueueActionRemoveBlocklistAndSearch {
+					if _, err := s.SearchLibrary(ctx, target.LibraryItemID); err == nil {
+						result.Retried++
+					} else {
+						result.Failed++
+						result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+					}
+				}
+			case policy.QueueActionSearchAgain:
+				if _, err := s.SearchLibrary(ctx, target.LibraryItemID); err == nil {
+					result.Retried++
+				} else {
+					result.Failed++
+					result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+				}
+			case policy.QueueActionRemove:
+				_ = s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID)
+			}
+			continue
+		}
+
+		// Fall back to the hardcoded recovery matrix for failure reasons
+		// that have no user-configured policy entry.
 		action := policy.DecideFromReason(target.FailureReason)
 		switch action {
 		case policy.ActionBlocklistAndSearch:
-			// Blocklist the current release and trigger a fresh search.
+			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, ttl); err != nil {
+				s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("bulk retry: blocklist failed")
+			}
 			if sr, err := s.SearchLibrary(ctx, target.LibraryItemID); err == nil && sr.SelectedReleaseID != nil {
 				result.Retried++
 			} else {
@@ -511,8 +605,6 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 			}
 			continue
 		case policy.ActionDoNothing:
-			// Hard failures (no releases, wrong title) — don't retry until
-			// the next sync brings fresh candidates.
 			result.Failed++
 			result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
 			continue
@@ -532,7 +624,8 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 
 // isDeadlock returns true when err is a PostgreSQL deadlock (SQLSTATE 40P01).
 func isDeadlock(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "40P01")
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.SQLState() == "40P01"
 }
 
 func (s *Service) SearchLibrary(ctx context.Context, libraryItemID int64) (SearchResult, error) {
@@ -553,7 +646,7 @@ func (s *Service) searchLibraryOnce(ctx context.Context, libraryItemID int64) (S
 		return SearchResult{}, fmt.Errorf("nzbhydra2 client unavailable")
 	}
 	if reason, err := s.repo.DetectMovieSearchConflict(ctx, libraryItemID); err != nil {
-		if strings.Contains(err.Error(), "no rows") {
+		if errors.Is(err, sql.ErrNoRows) {
 			return SearchResult{LibraryItemID: libraryItemID}, nil // item deleted or missing, skip
 		}
 		return SearchResult{}, err
@@ -565,7 +658,7 @@ func (s *Service) searchLibraryOnce(ctx context.Context, libraryItemID int64) (S
 	}
 	input, err := s.repo.GetLibrarySearchInput(ctx, libraryItemID)
 	if err != nil {
-		if strings.Contains(err.Error(), "no rows") {
+		if errors.Is(err, sql.ErrNoRows) {
 			return SearchResult{LibraryItemID: libraryItemID}, nil // item deleted between queue push and processing
 		}
 		return SearchResult{}, err
@@ -574,7 +667,8 @@ func (s *Service) searchLibraryOnce(ctx context.Context, libraryItemID int64) (S
 	if err != nil {
 		return SearchResult{}, err
 	}
-	profilePrefs := s.defaultProfilePreferences(ctx)
+	s.logger.Debug().Int64("libraryItemId", libraryItemID).Str("title", input.Title).Str("mediaType", input.MediaType).Msg("workqueue: searching item")
+	profilePrefs := s.profilePreferencesForItem(ctx, libraryItemID, input.MediaType)
 
 	// For TV episodes, try the full season pack first if the rate limit allows.
 	// A season pack covers all episodes in the season and avoids many separate downloads.
@@ -615,10 +709,11 @@ func (s *Service) searchLibraryOnce(ctx context.Context, libraryItemID int64) (S
 			results, err = s.searchHydraWithRetry(ctx, candidateRequest)
 			if err != nil {
 				lastSearchErr = err
+				err = nil // search errors don't exit early; only DB errors should
 				continue
 			}
 			lastSearchErr = nil
-			candidates = buildSearchCandidates(results, req, history, profilePrefs)
+			candidates = buildSearchCandidates(results, req, history, profilePrefs, s.indexerLimits)
 			combinedCandidates = mergeSearchCandidates(combinedCandidates, candidates)
 			selectedReleaseID, err = s.repo.ReplaceSearchCandidates(ctx, libraryItemID, combinedCandidates)
 			if err != nil {
@@ -639,18 +734,39 @@ func (s *Service) searchLibraryOnce(ctx context.Context, libraryItemID int64) (S
 		return SearchResult{}, err
 	}
 
-	// Tier 2: title-based fallback — only run if tier 1 produced no candidates.
-	if !tier1Done && selectedReleaseID == nil && len(combinedCandidates) == 0 {
-		searchTier(plan.Tier2, false)  // title-based: verify title
+	// Tier 2: title-based fallback — run unless tier 1 definitively stopped early
+	// (i.e. found a good, non-failed candidate). Also runs when tier 1 found only
+	// rejected candidates, or found a failure-history candidate that warrants
+	// checking for a fresher alternative.
+	if !tier1Done {
+		searchTier(plan.Tier2, false) // title-based: verify title
 		if err != nil {
 			return SearchResult{}, err
 		}
 	}
 	if selectedReleaseID == nil && len(combinedCandidates) == 0 && lastSearchErr != nil {
-		if markErr := s.repo.MarkLibrarySearchFailed(ctx, libraryItemID, classifySearchFailureReason(lastSearchErr)); markErr != nil {
+		reason := classifySearchFailureReason(lastSearchErr)
+		s.logger.Warn().
+			Int64("libraryItemId", libraryItemID).
+			Str("title", input.Title).
+			Str("reason", reason).
+			Err(lastSearchErr).
+			Msg("workqueue: search failed — indexer unreachable, nothing to blocklist")
+		if markErr := s.repo.MarkLibrarySearchFailed(ctx, libraryItemID, reason); markErr != nil {
 			return SearchResult{}, markErr
 		}
 		return SearchResult{}, lastSearchErr
+	}
+	if selectedReleaseID == nil && len(combinedCandidates) == 0 {
+		s.logger.Info().Int64("libraryItemId", libraryItemID).Str("title", input.Title).Msg("workqueue: no matching releases found")
+	} else if selectedReleaseID == nil {
+		rejected := 0
+		for _, c := range combinedCandidates {
+			if c.Rejected {
+				rejected++
+			}
+		}
+		s.logger.Info().Int64("libraryItemId", libraryItemID).Str("title", input.Title).Int("candidates", len(combinedCandidates)).Int("rejected", rejected).Msg("workqueue: candidates found but none selected")
 	}
 	if selectedReleaseID != nil {
 		finalSelected, err := s.fetchAndImportSelectedRelease(ctx, *selectedReleaseID)
@@ -695,13 +811,13 @@ func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearc
 		combinedCandidates []database.SearchCandidateRecord
 		selectedReleaseID  *int64
 	)
-	profilePrefs := s.defaultProfilePreferences(ctx)
+	profilePrefs := s.profilePreferencesForItem(ctx, libraryItemID, "episode")
 	for _, req := range packRequests {
 		results, err := s.searchHydraWithRetry(ctx, req)
 		if err != nil || len(results) == 0 {
 			continue
 		}
-		candidates := buildSearchCandidates(results, searchRequirements(packInput), history, profilePrefs)
+		candidates := buildSearchCandidates(results, searchRequirements(packInput), history, profilePrefs, s.indexerLimits)
 		combinedCandidates = mergeSearchCandidates(combinedCandidates, candidates)
 		selectedReleaseID, err = s.repo.ReplaceSearchCandidates(ctx, libraryItemID, combinedCandidates)
 		if err != nil {
@@ -849,7 +965,7 @@ type pendingPublish struct {
 func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID int64) (*int64, *pendingPublish, error) {
 	current, err := s.repo.GetSelectedReleaseSummary(ctx, selectedReleaseID)
 	if err != nil {
-		if strings.Contains(err.Error(), "no rows") {
+		if errors.Is(err, sql.ErrNoRows) {
 			// Concurrent worker already processed or deleted this release — skip quietly.
 			return nil, nil, nil
 		}
@@ -918,7 +1034,7 @@ func (s *Service) publishImportedRelease(ctx context.Context, p pendingPublish) 
 func (s *Service) fetchAndImportSelectedReleaseDepth(ctx context.Context, selectedReleaseID int64, depth int) (*int64, error) {
 	current, err := s.repo.GetSelectedReleaseSummary(ctx, selectedReleaseID)
 	if err != nil {
-		if strings.Contains(err.Error(), "no rows") {
+		if errors.Is(err, sql.ErrNoRows) {
 			// Concurrent worker already processed or deleted this release — skip quietly.
 			return nil, nil
 		}
@@ -952,11 +1068,118 @@ func (s *Service) fetchAndImportSelectedReleaseDepth(ctx context.Context, select
 	}
 }
 
-func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requirements, history map[string]database.CandidateHistory, prefs ranking.Preferences) []database.SearchCandidateRecord {
+// dedupeSearchResults collapses results that are the same release posted to
+// multiple indexers. Two results are considered the same when their normalized
+// titles match and their sizes are within 5% of each other. Within each group
+// the entry with the highest IndexerScore wins; Grabs breaks ties.
+func dedupeSearchResults(results []hydra.SearchResult) []hydra.SearchResult {
+	type bucket struct {
+		normTitle string
+		size      int64
+		best      hydra.SearchResult
+	}
+	buckets := make([]bucket, 0, len(results))
+	for _, r := range results {
+		nt := normReleaseTitle(r.Title)
+		found := false
+		for i := range buckets {
+			if buckets[i].normTitle != nt || !sizesClose(r.SizeBytes, buckets[i].size) {
+				continue
+			}
+			if r.IndexerScore > buckets[i].best.IndexerScore ||
+				(r.IndexerScore == buckets[i].best.IndexerScore && r.Grabs > buckets[i].best.Grabs) {
+				buckets[i].best = r
+			}
+			found = true
+			break
+		}
+		if !found {
+			buckets = append(buckets, bucket{normTitle: nt, size: r.SizeBytes, best: r})
+		}
+	}
+	out := make([]hydra.SearchResult, 0, len(buckets))
+	for _, b := range buckets {
+		out = append(out, b.best)
+	}
+	return out
+}
+
+// normReleaseTitle lowercases a release title and collapses all separators
+// (dots, dashes, underscores, brackets) to single spaces so that e.g.
+// "Show.S01E01.1080p" and "Show S01E01 1080p" compare equal.
+func normReleaseTitle(title string) string {
+	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ")
+	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(title))), " ")
+}
+
+// sizesClose returns true when two sizes are within 5% of each other.
+func sizesClose(a, b int64) bool {
+	if a == 0 || b == 0 {
+		return a == b
+	}
+	diff := a - b
+	if diff < 0 {
+		diff = -diff
+	}
+	max := a
+	if b > a {
+		max = b
+	}
+	return diff*20 <= max
+}
+
+func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requirements, history map[string]database.CandidateHistory, prefs ranking.Preferences, limits IndexerLimits) []database.SearchCandidateRecord {
+	results = dedupeSearchResults(results)
+	now := time.Now()
 	candidates := make([]database.SearchCandidateRecord, 0, len(results))
 	for _, result := range results {
+		if result.Passworded {
+			continue
+		}
+		// Minimum Age: skip releases posted too recently (Sonarr/Radarr behaviour).
+		if limits.MinimumAgeMinutes > 0 && !result.PublishedAt.IsZero() {
+			age := now.Sub(result.PublishedAt)
+			if age < time.Duration(limits.MinimumAgeMinutes)*time.Minute {
+				continue
+			}
+		}
+		// Retention: skip releases older than provider retention window.
+		if limits.RetentionDays > 0 && !result.PublishedAt.IsZero() {
+			cutoff := now.AddDate(0, 0, -limits.RetentionDays)
+			if result.PublishedAt.Before(cutoff) {
+				continue
+			}
+		}
+		// Maximum Size: reject oversized releases.
+		if limits.MaximumSizeMB > 0 && result.SizeBytes > int64(limits.MaximumSizeMB)*1024*1024 {
+			continue
+		}
 		known := history[strings.TrimSpace(result.Link)]
-		score := ranking.ScoreWithPreferences(parseCandidate(result, known), required, prefs)
+		// Sonarr/Radarr behaviour: blocklist on the first download failure.
+		// Any URL that has already failed is rejected immediately so it won't be
+		// re-selected. Exception: interrupted_by_restart / stale_worker means the
+		// server was restarted mid-download — not a real failure, give it another try.
+		if known.FailureCount >= 1 {
+			lr := strings.ToLower(known.LastFailureReason)
+			isRestartInterruption := strings.Contains(lr, "interrupted_by_restart") || strings.Contains(lr, "stale_worker")
+			if !isRestartInterruption {
+				candidates = append(candidates, database.SearchCandidateRecord{
+					Title:             result.Title,
+					ExternalURL:       result.Link,
+					IndexerName:       result.Indexer,
+					SizeBytes:         result.SizeBytes,
+					PostedAt:          result.PublishedAt,
+					Score:             0,
+					Rejected:          true,
+					RejectReason:      "previously_failed",
+					FailureCount:      known.FailureCount,
+					LastFailureReason: known.LastFailureReason,
+				})
+				continue
+			}
+		}
+		parsed := parseCandidate(result, known)
+		score := ranking.ScoreWithPreferences(parsed, required, prefs)
 		candidates = append(candidates, database.SearchCandidateRecord{
 			Title:             result.Title,
 			ExternalURL:       result.Link,
@@ -968,6 +1191,7 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 			RejectReason:      score.RejectReason,
 			FailureCount:      known.FailureCount,
 			LastFailureReason: known.LastFailureReason,
+			Resolution:        parsed.Resolution,
 		})
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
@@ -1172,19 +1396,40 @@ func (s *Service) promoteNextAfterFailure(ctx context.Context, current database.
 	return s.promoteNextAfterFailureDepth(ctx, current, reason, 0)
 }
 
+// cleanupCtx returns a non-canceled context for DB state cleanup. If the
+// caller's context is already canceled (e.g. BullMQ stalled-job detection),
+// DB calls to record the failure would fail immediately, leaving the item
+// stuck in a transitional state. Using context.Background() as the fallback
+// is safe: FailSelectedReleaseAndPromoteNext wraps with its own 90s timeout.
+func cleanupCtx(ctx context.Context) context.Context {
+	if ctx.Err() == nil {
+		return ctx
+	}
+	return context.Background()
+}
+
 // promoteNextAfterFailureDepth adds a depth counter to prevent infinite recursive
 // promotion chains (e.g. all candidates fail with 403 from the indexer).
 // Radarr/Sonarr never recurse here — they let the scheduler re-try later.
 // We cap at 5 hops so we can try a few alternatives without stack-overflowing.
 func (s *Service) promoteNextAfterFailureDepth(ctx context.Context, current database.ReleaseSummary, reason string, depth int) (*int64, error) {
+	s.logger.Warn().
+		Int64("libraryItemId", current.LibraryItemID).
+		Str("release", current.Title).
+		Str("url", current.ExternalURL).
+		Str("reason", reason).
+		Msg("workqueue: release failed — checking for next candidate")
+	// Use a fresh context for DB cleanup if the caller's context was already
+	// canceled — prevents the item from remaining stuck in a transitional state.
+	dbCtx := cleanupCtx(ctx)
 	if depth >= 2 {
 		// Depth limit: fail the current item so it doesn't stay stuck in preflight.
 		// The next scheduler cycle will pick it up with a fresh search.
-		_, _ = s.repo.FailSelectedReleaseAndPromoteNext(ctx, current.SelectedReleaseID, reason)
+		_, _ = s.repo.FailSelectedReleaseAndPromoteNext(dbCtx, current.SelectedReleaseID, reason)
 		return nil, nil
 	}
 	metrics.M.FallbackReleaseAttempts.Add(1)
-	next, promoteErr := s.repo.FailSelectedReleaseAndPromoteNext(ctx, current.SelectedReleaseID, reason)
+	next, promoteErr := s.repo.FailSelectedReleaseAndPromoteNext(dbCtx, current.SelectedReleaseID, reason)
 	if promoteErr != nil {
 		return nil, promoteErr
 	}
@@ -1561,7 +1806,7 @@ func (s *Service) AutoManageFailedQueue(ctx context.Context) (BulkQueueRetryResu
 				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
 			}
 		case policy.QueueActionRemoveAndBlocklist:
-			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason); err != nil {
+			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, settings.BlocklistTTLDays); err != nil {
 				result.Failed++
 				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
 				continue
@@ -1571,7 +1816,7 @@ func (s *Service) AutoManageFailedQueue(ctx context.Context) (BulkQueueRetryResu
 				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
 			}
 		case policy.QueueActionRemoveBlocklistAndSearch:
-			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason); err != nil {
+			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, settings.BlocklistTTLDays); err != nil {
 				result.Failed++
 				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
 				continue
@@ -1594,6 +1839,35 @@ func (s *Service) AutoManageFailedQueue(ctx context.Context) (BulkQueueRetryResu
 	return result, nil
 }
 
+type UpgradeSearchResult struct {
+	Checked  int
+	Upgraded int
+	Failed   int
+}
+
+// SearchUpgrades re-searches library items whose quality profile has
+// allow_upgrade=true and that are currently in state 'available'. If a
+// higher-scored release is found it replaces the existing one.
+func (s *Service) SearchUpgrades(ctx context.Context) (UpgradeSearchResult, error) {
+	items, err := s.repo.ListUpgradableLibraryItems(ctx)
+	if err != nil {
+		return UpgradeSearchResult{}, err
+	}
+	result := UpgradeSearchResult{Checked: len(items)}
+	for _, libraryItemID := range items {
+		res, err := s.SearchLibrary(ctx, libraryItemID)
+		if err != nil {
+			s.logger.Warn().Int64("libraryItemId", libraryItemID).Err(err).Msg("upgrade search failed")
+			result.Failed++
+			continue
+		}
+		if res.SelectedReleaseID != nil {
+			result.Upgraded++
+		}
+	}
+	return result, nil
+}
+
 func parseCandidate(item hydra.SearchResult, history database.CandidateHistory) ranking.Candidate {
 	titleLower := strings.ToLower(item.Title)
 	return ranking.Candidate{
@@ -1608,47 +1882,234 @@ func parseCandidate(item hydra.SearchResult, history database.CandidateHistory) 
 		UploadedAt:   item.PublishedAt,
 		FailureCount: history.FailureCount,
 		Degraded:     history.FailureCount > 0,
+		Grabs:        item.Grabs,
+		IndexerScore: item.IndexerScore,
 	}
 }
 
-// defaultProfilePreferences returns the active quality profile as ranking
-// preferences. The result is cached for 5 minutes so batch searches don't
-// hit the database for every individual library item.
-func (s *Service) defaultProfilePreferences(ctx context.Context) ranking.Preferences {
+// SetDefaultProfileNames configures which quality profile names are used for
+// movies and TV episodes. Call this once at startup from the app config.
+func (s *Service) SetDefaultProfileNames(movie, tv string) {
+	s.movieProfileName = movie
+	s.tvProfileName = tv
+}
+
+// profilePreferencesForItem returns the ranking preferences for a specific
+// library item, using its per-item profile override if set, falling back to
+// the media-type default.
+func (s *Service) profilePreferencesForItem(ctx context.Context, libraryItemID int64, mediaType string) ranking.Preferences {
+	if libraryItemID > 0 {
+		if p, err := s.repo.GetLibraryItemQualityProfile(ctx, libraryItemID); err == nil && p != nil {
+			return ranking.Preferences{
+				Resolutions:      append([]string(nil), p.Resolutions...),
+				Sources:          append([]string(nil), p.Sources...),
+				Codecs:           append([]string(nil), p.Codecs...),
+				Languages:        append([]string(nil), p.Languages...),
+				AudioFormats:     append([]string(nil), p.AudioFormats...),
+				HdrFormats:       append([]string(nil), p.HdrFormats...),
+				ExcludePatterns:  append([]string(nil), p.ExcludePatterns...),
+				PreferProper:     p.PreferProper,
+				PreferRepack:     p.PreferRepack,
+				RejectCam:        p.RejectCam,
+				MinSizeMB:        p.MinSizeMB,
+				MaxSizeMB:        p.MaxSizeMB,
+				TierSizeLimits:   s.loadTierSizeLimits(ctx, mediaType),
+				MinimumAgeHours:  p.MinimumAgeHours,
+				CutoffResolution: p.CutoffResolution,
+				CustomFormats:    s.loadCustomFormats(ctx),
+			}
+		}
+	}
+	return s.defaultProfilePreferences(ctx, mediaType)
+}
+
+// defaultProfilePreferences returns the ranking preferences for the given
+// media type ("movie" or "episode"). Results are cached for 5 minutes.
+func (s *Service) defaultProfilePreferences(ctx context.Context, mediaType string) ranking.Preferences {
 	if s == nil || s.repo == nil {
 		return ranking.Preferences{}
 	}
 	const cacheTTL = 5 * time.Minute
+
 	s.profileCacheMu.Lock()
-	if time.Since(s.profileCacheAt) < cacheTTL {
-		prefs := s.profileCachedPrefs
+	if s.profileCacheAt == nil {
+		s.profileCacheAt = make(map[string]time.Time)
+		s.profileCachedPrefs = make(map[string]ranking.Preferences)
+	}
+	if time.Since(s.profileCacheAt[mediaType]) < cacheTTL {
+		prefs := s.profileCachedPrefs[mediaType]
 		s.profileCacheMu.Unlock()
 		return prefs
 	}
 	s.profileCacheMu.Unlock()
 
-	profile, err := s.repo.GetDefaultQualityProfile(ctx)
+	// Pick the configured profile name for this media type.
+	name := s.movieProfileName
+	if mediaType == "episode" && s.tvProfileName != "" {
+		name = s.tvProfileName
+	}
+
+	var profile database.QualityProfile
+	var err error
+	if name != "" {
+		profile, err = s.repo.GetQualityProfileByName(ctx, name)
+	}
+	if err != nil || name == "" {
+		profile, err = s.repo.GetDefaultQualityProfile(ctx)
+	}
 	if err != nil {
 		return ranking.Preferences{}
 	}
+
 	prefs := ranking.Preferences{
-		Resolutions:  append([]string(nil), profile.Resolutions...),
-		Sources:      append([]string(nil), profile.Sources...),
-		Codecs:       append([]string(nil), profile.Codecs...),
-		Languages:    append([]string(nil), profile.Languages...),
-		AudioFormats: append([]string(nil), profile.AudioFormats...),
-		HdrFormats:   append([]string(nil), profile.HdrFormats...),
-		PreferProper: profile.PreferProper,
-		PreferRepack: profile.PreferRepack,
-		RejectCam:    profile.RejectCam,
-		MinSizeMB:    profile.MinSizeMB,
-		MaxSizeMB:    profile.MaxSizeMB,
+		Resolutions:      append([]string(nil), profile.Resolutions...),
+		Sources:          append([]string(nil), profile.Sources...),
+		Codecs:           append([]string(nil), profile.Codecs...),
+		Languages:        append([]string(nil), profile.Languages...),
+		AudioFormats:     append([]string(nil), profile.AudioFormats...),
+		HdrFormats:       append([]string(nil), profile.HdrFormats...),
+		ExcludePatterns:  append([]string(nil), profile.ExcludePatterns...),
+		PreferProper:     profile.PreferProper,
+		PreferRepack:     profile.PreferRepack,
+		RejectCam:        profile.RejectCam,
+		MinSizeMB:        profile.MinSizeMB,
+		MaxSizeMB:        profile.MaxSizeMB,
+		TierSizeLimits:   s.loadTierSizeLimits(ctx, mediaType),
+		MinimumAgeHours:  profile.MinimumAgeHours,
+		CutoffResolution: profile.CutoffResolution,
+		CustomFormats:    s.loadCustomFormats(ctx),
 	}
+
 	s.profileCacheMu.Lock()
-	s.profileCachedPrefs = prefs
-	s.profileCacheAt = time.Now()
+	s.profileCachedPrefs[mediaType] = prefs
+	s.profileCacheAt[mediaType] = time.Now()
 	s.profileCacheMu.Unlock()
 	return prefs
+}
+
+// loadTierSizeLimits returns a map from resolution → [minMB, maxMB] built from
+// the quality_definitions table. Returns nil on error (silently degrades).
+func (s *Service) loadTierSizeLimits(ctx context.Context, mediaType string) map[string][2]int {
+	defs, err := s.repo.ListQualityDefinitions(ctx)
+	if err != nil || len(defs) == 0 {
+		return nil
+	}
+	// Map Radarr-style quality keys to resolution strings used in ranking.
+	keyToResolution := map[string]string{
+		"bluray-2160p": "2160p", "webdl-2160p": "2160p", "webrip-2160p": "2160p",
+		"bluray-1080p": "1080p", "webdl-1080p": "1080p", "webrip-1080p": "1080p", "hdtv-1080p": "1080p",
+		"bluray-720p": "720p", "webdl-720p": "720p", "webrip-720p": "720p", "hdtv-720p": "720p",
+		"dvd": "576p", "sdtv": "480p",
+	}
+	out := make(map[string][2]int)
+	for _, d := range defs {
+		if d.MediaType != mediaType {
+			continue
+		}
+		if d.MinSizeMB == 0 && d.MaxSizeMB == 0 {
+			continue
+		}
+		res, ok := keyToResolution[d.QualityKey]
+		if !ok {
+			continue
+		}
+		existing := out[res]
+		if d.MinSizeMB > 0 && (existing[0] == 0 || d.MinSizeMB < existing[0]) {
+			existing[0] = d.MinSizeMB
+		}
+		if d.MaxSizeMB > 0 && d.MaxSizeMB > existing[1] {
+			existing[1] = d.MaxSizeMB
+		}
+		out[res] = existing
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// loadCustomFormats fetches custom formats from the DB and converts them to
+// ranking.CustomFormat values. Returns nil on error (silently degrades).
+func (s *Service) loadCustomFormats(ctx context.Context) []ranking.CustomFormat {
+	if s == nil || s.repo == nil {
+		return nil
+	}
+	dbFormats, err := s.repo.ListCustomFormats(ctx)
+	if err != nil || len(dbFormats) == 0 {
+		return nil
+	}
+	out := make([]ranking.CustomFormat, len(dbFormats))
+	for i, f := range dbFormats {
+		out[i] = ranking.CustomFormat{
+			Name:    f.Name,
+			Pattern: f.Pattern,
+			Score:   f.Score,
+			Enabled: f.Enabled,
+		}
+	}
+	return out
+}
+
+// ImportNZBFromPush imports an NZB file received via the SABnzbd-compatible API
+// (pushed by Radarr/Sonarr). It bypasses the search/ranking pipeline and
+// immediately starts the import → preflight → publish sequence asynchronously.
+// Returns the nzo_id (e.g. "item-42") that Radarr/Sonarr use to poll status.
+func (s *Service) ImportNZBFromPush(ctx context.Context, content []byte, filename, mediaType string) (string, error) {
+	jobName := strings.TrimSuffix(filename, ".nzb")
+	idempotencyKey := fmt.Sprintf("sabnzbd-push:%s", filename)
+	imported, err := nzb.BuildImportedNZB(filename, content, idempotencyKey, "")
+	if err != nil {
+		return "", fmt.Errorf("parse nzb: %w", err)
+	}
+	imported.MediaType = mediaType
+
+	select {
+	case s.importSem <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	item, err := s.repo.CreateImportedNZB(ctx, imported)
+	<-s.importSem
+	if err != nil {
+		return "", fmt.Errorf("create imported nzb: %w", err)
+	}
+
+	current, err := s.repo.GetSelectedReleaseSummary(ctx, *item.SelectedRelease)
+	if err != nil {
+		return "", fmt.Errorf("get release summary: %w", err)
+	}
+	_ = jobName
+
+	go func() {
+		bgCtx := context.Background()
+		if err := s.repo.SetImportedNZBIndexed(bgCtx, item.QueueItemID); err != nil {
+			s.logger.Error().Err(err).Int64("queueItemId", item.QueueItemID).Msg("sabnzbd: SetImportedNZBIndexed failed")
+			return
+		}
+		item.State = database.QueuePreflight
+		if s.preflightChecker != nil {
+			if err := s.preflightChecker(bgCtx, item); err != nil {
+				s.promoteNextAfterFailure(bgCtx, current, err.Error()) //nolint:errcheck
+				return
+			}
+		}
+		updated, lookupErr := s.repo.GetSelectedReleaseSummary(bgCtx, current.SelectedReleaseID)
+		if lookupErr == nil && updated.VirtualFileCount == 0 {
+			reason := strings.TrimSpace(updated.ArchiveRejects)
+			if reason == "" {
+				reason = "no_publishable_files"
+			}
+			s.promoteNextAfterFailure(bgCtx, current, reason) //nolint:errcheck
+			return
+		}
+		if s.postImportHook != nil {
+			if err := s.postImportHook(bgCtx, item); err != nil {
+				s.promoteNextAfterFailure(bgCtx, current, err.Error()) //nolint:errcheck
+			}
+		}
+	}()
+
+	return fmt.Sprintf("item-%d", item.LibraryItemID), nil
 }
 
 func detectOne(title string, options ...string) string {

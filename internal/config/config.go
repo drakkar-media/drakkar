@@ -35,14 +35,71 @@ const (
 )
 
 type Settings struct {
-	Database  DatabaseConfig  `json:"database"`
-	Valkey    ValkeyConfig    `json:"valkey"`
-	NZBHydra2 ServiceConfig   `json:"nzbhydra2"`
-	Seerr     ServiceConfig   `json:"seerr"`
-	Usenet    UsenetConfig    `json:"usenet"`
-	Metadata  MetadataConfig  `json:"metadata"`
-	Subtitles SubtitlesConfig `json:"subtitles"`
-	Plex      PlexConfig      `json:"plex"`
+	Database      DatabaseConfig      `json:"database"`
+	Valkey        ValkeyConfig        `json:"valkey"`
+	NZBHydra2     ServiceConfig       `json:"nzbhydra2"`
+	Seerr         ServiceConfig       `json:"seerr"`
+	Usenet        UsenetConfig        `json:"usenet"`
+	Metadata      MetadataConfig      `json:"metadata"`
+	Subtitles     SubtitlesConfig     `json:"subtitles"`
+	Plex          PlexConfig          `json:"plex"`
+	Jellyfin      JellyfinConfig      `json:"jellyfin"`
+	Library       LibraryConfig       `json:"library"`
+	Indexer       IndexerConfig       `json:"indexer"`
+	Notifications NotificationsConfig `json:"notifications"`
+}
+
+// NotificationsConfig holds settings for outgoing event notifications.
+// Mirrors Sonarr/Radarr Settings → Connect.
+type NotificationsConfig struct {
+	// DiscordWebhookURL: if set, sends Discord embeds on selected events.
+	DiscordWebhookURL string `json:"discordWebhookUrl"`
+	// GenericWebhookURL: if set, sends a JSON POST for every selected event.
+	GenericWebhookURL string `json:"genericWebhookUrl"`
+	// OnGrab: fire when a release is selected for download.
+	OnGrab bool `json:"onGrab"`
+	// OnAvailable: fire when an item finishes importing.
+	OnAvailable bool `json:"onAvailable"`
+	// OnFailed: fire when an item permanently fails.
+	OnFailed bool `json:"onFailed"`
+}
+
+// IndexerConfig mirrors Sonarr/Radarr Settings → Indexers.
+// Defaults are applied in DefaultIndexerConfig().
+type IndexerConfig struct {
+	// TvRssSyncIntervalMinutes: how often to poll TV/episode RSS feeds.
+	// Valid range: 10–120, or 0 to disable. Sonarr default: 15. Minimum enforced: 15.
+	TvRssSyncIntervalMinutes int `json:"tvRssSyncIntervalMinutes"`
+
+	// MovieRssSyncIntervalMinutes: how often to poll movie RSS feeds.
+	// Valid range: 10–120, or 0 to disable. Radarr default: 30. Minimum enforced: 30.
+	MovieRssSyncIntervalMinutes int `json:"movieRssSyncIntervalMinutes"`
+
+	// MinimumAgeMinutes: don't grab a release younger than this.
+	// Gives time for the NZB to propagate across Usenet servers. Default: 0.
+	MinimumAgeMinutes int `json:"minimumAgeMinutes"`
+
+	// RetentionDays: skip releases older than this many days (0 = unlimited).
+	// Matches your Usenet provider's actual retention window. Default: 0.
+	RetentionDays int `json:"retentionDays"`
+
+	// MaximumSizeMB: reject releases larger than this (0 = unlimited). Default: 0.
+	MaximumSizeMB int `json:"maximumSizeMB"`
+
+	// SearchDelayMs: minimum milliseconds between consecutive NZBHydra2 search
+	// requests. 0 means no delay (Sonarr/Radarr behaviour). Default: 0.
+	SearchDelayMs int `json:"searchDelayMs"`
+}
+
+func DefaultIndexerConfig() IndexerConfig {
+	return IndexerConfig{
+		TvRssSyncIntervalMinutes:    15,
+		MovieRssSyncIntervalMinutes: 30,
+		MinimumAgeMinutes:           0,
+		RetentionDays:               0,
+		MaximumSizeMB:               0,
+		SearchDelayMs:               0,
+	}
 }
 
 // PlexConfig holds the Plex Media Server connection settings.
@@ -50,6 +107,12 @@ type PlexConfig struct {
 	URL        string `json:"url"`        // e.g. http://192.168.1.10:32400
 	Token      string `json:"token"`      // X-Plex-Token
 	SectionKey string `json:"sectionKey"` // library section key (empty = all)
+}
+
+// JellyfinConfig holds the Jellyfin Media Server connection settings.
+type JellyfinConfig struct {
+	URL    string `json:"url"`    // e.g. http://192.168.1.10:8096
+	APIKey string `json:"apiKey"` // Jellyfin API key
 }
 
 type DatabaseConfig struct {
@@ -89,12 +152,22 @@ type UsenetProvider struct {
 	Username       string `json:"username"`
 	Password       string `json:"password"`
 	MaxConnections int    `json:"maxConnections"`
+	Priority       int    `json:"priority"`
+	RetentionDays  int    `json:"retentionDays"`
+	Backup         bool   `json:"backup"`
 	Enabled        bool   `json:"enabled"`
 }
 
 type MetadataConfig struct {
-	TMDB APIKeyConfig `json:"tmdb"`
-	TVDB APIKeyConfig `json:"tvdb"`
+	TMDB          APIKeyConfig `json:"tmdb"`
+	TVDB          APIKeyConfig `json:"tvdb"`
+	Language      string       `json:"language"`
+	CacheTTLHours int          `json:"cacheTtlHours"`
+}
+
+type LibraryConfig struct {
+	DefaultMovieProfile string `json:"defaultMovieProfile"`
+	DefaultTvProfile    string `json:"defaultTvProfile"`
 }
 
 type APIKeyConfig struct {
@@ -186,6 +259,12 @@ func applyDefaults(cfg *Settings) {
 	}
 	if cfg.Usenet.ArticleBufferSize <= 0 {
 		cfg.Usenet.ArticleBufferSize = DefaultArticleBufferSize
+	}
+	if cfg.Indexer.TvRssSyncIntervalMinutes == 0 {
+		cfg.Indexer.TvRssSyncIntervalMinutes = DefaultIndexerConfig().TvRssSyncIntervalMinutes
+	}
+	if cfg.Indexer.MovieRssSyncIntervalMinutes == 0 {
+		cfg.Indexer.MovieRssSyncIntervalMinutes = DefaultIndexerConfig().MovieRssSyncIntervalMinutes
 	}
 }
 
@@ -288,6 +367,27 @@ func ValidatePaths(rt Runtime) error {
 
 	if !strings.HasPrefix(abs(rt.MovieLibraryPath), filepath.Dir(filepath.Dir(fuseRoot))+string(os.PathSeparator)) {
 		return fmt.Errorf("movie library path %s must live under /mnt/drakkar", rt.MovieLibraryPath)
+	}
+	return nil
+}
+
+// Save validates cfg and atomically writes it to path as indented JSON.
+func Save(path string, cfg Settings) error {
+	applyDefaults(&cfg)
+	if err := validate(cfg); err != nil {
+		return fmt.Errorf("invalid settings: %w", err)
+	}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal settings: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return fmt.Errorf("write settings: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("save settings: %w", err)
 	}
 	return nil
 }

@@ -16,11 +16,10 @@ import (
 	"github.com/hjongedijk/drakkar/internal/config"
 )
 
-// Keep Hydra pressure low. Active search fans out to real indexers; too much
-// parallelism trips upstream 429s quickly.
-const (
-	searchInterval = 500 * time.Millisecond // was 2s; NZBHydra2 itself throttles to indexers, 500ms is safe
-)
+// defaultSearchInterval is the built-in floor between consecutive Hydra calls.
+// Sonarr/Radarr apply no self-imposed delay (they rely on NZBHydra2's own
+// per-indexer rate limiting). Set to 0 to match that behaviour.
+const defaultSearchInterval = 0
 
 var ErrRateLimited = errors.New("nzbhydra2 rate limited")
 
@@ -43,6 +42,8 @@ type Client struct {
 	apiKey     string
 	httpClient *http.Client
 
+	searchInterval time.Duration // 0 = no throttle (Sonarr/Radarr behaviour)
+
 	rateMu        sync.Mutex
 	lastCall      time.Time
 	cooldownUntil time.Time
@@ -62,11 +63,14 @@ type cachedResults struct {
 }
 
 type SearchResult struct {
-	Title       string
-	Link        string
-	Indexer     string
-	SizeBytes   int64
-	PublishedAt time.Time
+	Title        string
+	Link         string
+	Indexer      string
+	SizeBytes    int64
+	PublishedAt  time.Time
+	Grabs        int
+	IndexerScore int
+	Passworded   bool
 }
 
 type SearchRequest struct {
@@ -98,12 +102,21 @@ func NewClient(cfg config.ServiceConfig) *Client {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		searchInterval: time.Duration(defaultSearchInterval),
 		searchCacheTTL: searchCacheTTL,
 		feedCacheTTL:   feedCacheTTL,
 		feedMaxResults: feedMaxResults,
 		searchCache:    make(map[string]cachedResults),
 		feedCache:      make(map[string]cachedResults),
 	}
+}
+
+// SetSearchDelay configures the minimum delay between consecutive Hydra API
+// calls. 0 means no delay (matches Sonarr/Radarr behaviour).
+func (c *Client) SetSearchDelay(d time.Duration) {
+	c.rateMu.Lock()
+	c.searchInterval = d
+	c.rateMu.Unlock()
 }
 
 func (c *Client) Name() string {
@@ -171,7 +184,7 @@ func (c *Client) throttle(ctx context.Context) error {
 		c.rateMu.Unlock()
 		return fmt.Errorf("%w until %s", ErrRateLimited, c.cooldownUntil.UTC().Format(time.RFC3339))
 	}
-	wait := time.Until(c.lastCall.Add(searchInterval))
+	wait := time.Until(c.lastCall.Add(c.searchInterval))
 	c.rateMu.Unlock()
 	if wait > 0 {
 		select {
@@ -224,7 +237,7 @@ func (c *Client) Search(ctx context.Context, request SearchRequest) ([]SearchRes
 			q.Set("ep", fmt.Sprintf("%d", request.EpisodeNumber))
 		}
 	}
-	q.Set("limit", "50")
+	q.Set("limit", "100")
 	q.Set("extended", "1")
 	if c.apiKey != "" {
 		q.Set("apikey", c.apiKey)
@@ -407,13 +420,16 @@ func (c *Client) apiURL() (*url.URL, error) {
 func parseJSONResults(body []byte) ([]SearchResult, error) {
 	var payload struct {
 		Results []struct {
-			Title     string `json:"title"`
-			Link      string `json:"link"`
-			Indexer   string `json:"indexer"`
-			Size      int64  `json:"size"`
-			PubDate   string `json:"pubDate"`
-			Published string `json:"publishedDate"`
-			Epoch     int64  `json:"epoch"`
+			Title        string `json:"title"`
+			Link         string `json:"link"`
+			Indexer      string `json:"indexer"`
+			Size         int64  `json:"size"`
+			Grabs        int    `json:"grabs"`
+			Password     int    `json:"password"`
+			IndexerScore int    `json:"hydraIndexerScore"`
+			PubDate      string `json:"pubDate"`
+			Published    string `json:"publishedDate"`
+			Epoch        int64  `json:"epoch"`
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -423,11 +439,14 @@ func parseJSONResults(body []byte) ([]SearchResult, error) {
 	out := make([]SearchResult, 0, len(payload.Results))
 	for _, item := range payload.Results {
 		out = append(out, SearchResult{
-			Title:       item.Title,
-			Link:        item.Link,
-			Indexer:     item.Indexer,
-			SizeBytes:   item.Size,
-			PublishedAt: parsePublished(item.Epoch, item.PubDate, item.Published),
+			Title:        item.Title,
+			Link:         item.Link,
+			Indexer:      item.Indexer,
+			SizeBytes:    item.Size,
+			PublishedAt:  parsePublished(item.Epoch, item.PubDate, item.Published),
+			Grabs:        item.Grabs,
+			IndexerScore: item.IndexerScore,
+			Passworded:   item.Password != 0,
 		})
 	}
 	return out, nil
@@ -462,9 +481,15 @@ func parseXMLResults(body []byte) ([]SearchResult, error) {
 			case "indexer", "hydraindexername":
 				result.Indexer = attr.Value
 			case "size":
-				var size int64
-				fmt.Sscan(attr.Value, &size)
-				result.SizeBytes = size
+				fmt.Sscan(attr.Value, &result.SizeBytes)
+			case "grabs":
+				fmt.Sscan(attr.Value, &result.Grabs)
+			case "hydraindexerscore":
+				fmt.Sscan(attr.Value, &result.IndexerScore)
+			case "password":
+				var v int
+				fmt.Sscan(attr.Value, &v)
+				result.Passworded = v != 0
 			}
 		}
 		out = append(out, result)

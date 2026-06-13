@@ -12,6 +12,17 @@ import (
 	"time"
 )
 
+// compilePatterns compiles a slice of regex strings, silently skipping invalid ones.
+func compilePatterns(patterns []string) []*regexp.Regexp {
+	out := make([]*regexp.Regexp, 0, len(patterns))
+	for _, p := range patterns {
+		if r, err := regexp.Compile(p); err == nil {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // ── Compiled regexes (Radarr/Sonarr QualityParser.cs patterns) ─────────────
 
 var (
@@ -71,6 +82,8 @@ type Candidate struct {
 	UploadedAt   time.Time
 	Degraded     bool
 	FailureCount int
+	Grabs        int
+	IndexerScore int
 }
 
 type Requirements struct {
@@ -88,18 +101,37 @@ type Requirements struct {
 	AlternateTitles []string
 }
 
+type CustomFormat struct {
+	Name    string
+	Pattern string
+	Score   int
+	Enabled bool
+}
+
 type Preferences struct {
-	Resolutions  []string
-	Sources      []string
-	Codecs       []string
-	Languages    []string
-	AudioFormats []string
-	HdrFormats   []string
-	PreferProper bool
-	PreferRepack bool
-	RejectCam    bool
-	MinSizeMB    int
-	MaxSizeMB    int
+	Resolutions     []string
+	Sources         []string
+	Codecs          []string
+	Languages       []string
+	AudioFormats    []string
+	HdrFormats      []string
+	ExcludePatterns []string
+	PreferProper    bool
+	PreferRepack    bool
+	RejectCam       bool
+	MinSizeMB       int
+	MaxSizeMB       int
+	// TierSizeLimits maps a resolution string (e.g. "1080p") to [minMB, maxMB].
+	// Zero values in either slot mean "no limit for that bound".
+	TierSizeLimits map[string][2]int
+	// MinimumAgeHours: reject candidates posted fewer than N hours ago.
+	MinimumAgeHours int
+	// CutoffResolution: once the grabbed release meets this resolution or better,
+	// the item is considered "at cutoff" and won't be upgraded further.
+	// Used by the upgrade scheduler to skip items already at quality cutoff.
+	CutoffResolution string
+	// CustomFormats: user-defined scoring rules applied on top of base score.
+	CustomFormats []CustomFormat
 }
 
 type Result struct {
@@ -125,6 +157,20 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 		}
 		if !matched {
 			return Result{Rejected: true, RejectReason: "wrong_title"}
+		}
+	}
+
+	// ── Minimum age ─────────────────────────────────────────────────────────
+	if prefs.MinimumAgeHours > 0 && !candidate.UploadedAt.IsZero() {
+		if time.Since(candidate.UploadedAt) < time.Duration(prefs.MinimumAgeHours)*time.Hour {
+			return Result{Rejected: true, RejectReason: "too_new"}
+		}
+	}
+
+	// ── Exclude patterns ────────────────────────────────────────────────────
+	for _, re := range compilePatterns(prefs.ExcludePatterns) {
+		if re.MatchString(candidate.Title) {
+			return Result{Rejected: true, RejectReason: "excluded_pattern"}
 		}
 	}
 
@@ -221,6 +267,20 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 		score += 25
 	}
 
+	// Indexer trust score from NZBHydra2 (1–3). Acts as a tiebreaker between
+	// otherwise equal candidates from different indexers.
+	score += candidate.IndexerScore * 10
+
+	// Community grab count — proxy for a release actually being complete and
+	// working. Capped at 50 points so it doesn't overpower quality signals.
+	if candidate.Grabs > 0 {
+		grabBonus := candidate.Grabs / 10
+		if grabBonus > 50 {
+			grabBonus = 50
+		}
+		score += grabBonus
+	}
+
 	// Sample penalty — word-boundary aware
 	if reSample.MatchString(candidate.Title) {
 		score -= 150
@@ -233,6 +293,20 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 		score -= 50000 // effectively excluded
 	} else if candidate.FailureCount > 0 {
 		score -= 300 * candidate.FailureCount
+	}
+
+	// ── Custom formats ────────────────────────────────────────────────────────
+	for _, cf := range prefs.CustomFormats {
+		if !cf.Enabled || cf.Pattern == "" {
+			continue
+		}
+		re, err := regexp.Compile(cf.Pattern)
+		if err != nil {
+			continue
+		}
+		if re.MatchString(candidate.Title) {
+			score += cf.Score
+		}
 	}
 
 	return Result{Score: score}
@@ -282,6 +356,16 @@ func rejectBySize(candidate Candidate, prefs Preferences) string {
 	}
 	if prefs.MaxSizeMB > 0 && sizeMB > prefs.MaxSizeMB {
 		return "too_large"
+	}
+	if len(prefs.TierSizeLimits) > 0 && candidate.Resolution != "" {
+		if lim, ok := prefs.TierSizeLimits[candidate.Resolution]; ok {
+			if lim[0] > 0 && sizeMB < lim[0] {
+				return "too_small"
+			}
+			if lim[1] > 0 && sizeMB > lim[1] {
+				return "too_large"
+			}
+		}
 	}
 	return ""
 }

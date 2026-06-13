@@ -17,7 +17,7 @@ func TestMovieDetails(t *testing.T) {
 		if got := r.URL.Query().Get("api_key"); got != "key" {
 			t.Fatalf("unexpected api key %q", got)
 		}
-		if got := r.URL.Query().Get("append_to_response"); got != "alternative_titles,credits,recommendations,similar" {
+		if got := r.URL.Query().Get("append_to_response"); got != "alternative_titles,credits,recommendations,similar,release_dates,videos" {
 			t.Fatalf("unexpected append value %q", got)
 		}
 		_, _ = w.Write([]byte(`{"title":"Dune","release_date":"2021-10-22","imdb_id":"tt1160419"}`))
@@ -42,7 +42,7 @@ func TestTVDetails(t *testing.T) {
 		if r.URL.Path != "/3/tv/84958" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
-		if got := r.URL.Query().Get("append_to_response"); got != "external_ids,alternative_titles,aggregate_credits,recommendations,similar" {
+		if got := r.URL.Query().Get("append_to_response"); got != "external_ids,alternative_titles,aggregate_credits,recommendations,similar,content_ratings,videos" {
 			t.Fatalf("unexpected append value %q", got)
 		}
 		_, _ = w.Write([]byte(`{"name":"Loki","first_air_date":"2021-06-09","external_ids":{"imdb_id":"tt9140554"},"alternative_titles":{"results":[]}}`))

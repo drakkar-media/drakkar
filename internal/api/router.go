@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"github.com/hjongedijk/drakkar/internal/metrics"
 	"github.com/hjongedijk/drakkar/internal/nzb"
 	"github.com/hjongedijk/drakkar/internal/policy"
+	"github.com/hjongedijk/drakkar/internal/jellyfin"
 	"github.com/hjongedijk/drakkar/internal/plex"
 	"github.com/hjongedijk/drakkar/internal/probe"
 	"github.com/hjongedijk/drakkar/internal/seerr"
@@ -58,6 +60,19 @@ type ProfilesRepository interface {
 	ListQualityProfiles(ctx context.Context) ([]database.QualityProfile, error)
 	UpsertQualityProfile(ctx context.Context, p database.QualityProfile) (database.QualityProfile, error)
 	DeleteQualityProfile(ctx context.Context, id int64) error
+	ListQualityDefinitions(ctx context.Context) ([]database.QualityDefinition, error)
+	UpdateQualityDefinition(ctx context.Context, d database.QualityDefinition) (database.QualityDefinition, error)
+	GetLibraryItemQualityProfile(ctx context.Context, libraryItemID int64) (*database.QualityProfile, error)
+	SetLibraryItemQualityProfile(ctx context.Context, libraryItemID int64, profileID *int64) error
+	GetGrabHistory(ctx context.Context, libraryItemID int64) ([]database.GrabHistoryEntry, error)
+	ListCustomFormats(ctx context.Context) ([]database.CustomFormat, error)
+	UpdateCustomFormat(ctx context.Context, f database.CustomFormat) (database.CustomFormat, error)
+	DeleteCustomFormat(ctx context.Context, id int64) error
+	UpsertCustomFormat(ctx context.Context, f database.CustomFormat) (database.CustomFormat, error)
+	SetTVShowMonitoringMode(ctx context.Context, tvShowID int64, mode string) error
+	ListSabQueueItems(ctx context.Context, category string, start, limit int) ([]database.SabQueueItem, int, error)
+	ListSabHistoryItems(ctx context.Context, category string, start, limit int) ([]database.SabHistoryItem, int, error)
+	DismissSabItems(ctx context.Context, libraryItemIDs []int64) error
 }
 
 type QueueService interface {
@@ -82,6 +97,7 @@ type CatalogService interface {
 type WorkflowService interface {
 	ListRequests(ctx context.Context) ([]database.MediaRequestSummary, error)
 	SyncRequests(ctx context.Context) (workflow.SyncResult, error)
+	CreateSeerrRequest(ctx context.Context, mediaType string, tmdbID int64) (workflow.SyncResult, error)
 	SearchPendingLibrary(ctx context.Context) (workflow.BulkSearchResult, error)
 	RetryFailedQueue(ctx context.Context) (workflow.BulkQueueRetryResult, error)
 	ClearFailedQueue(ctx context.Context) (int, error)
@@ -95,6 +111,7 @@ type WorkflowService interface {
 	BackfillMetadata(ctx context.Context) (workflow.BackfillMetadataResult, error)
 	FillMissingEpisodes(ctx context.Context) (workflow.FillMissingEpisodesResult, error)
 	ManualSearch(ctx context.Context, query string) ([]workflow.ManualSearchItem, error)
+	ImportNZBFromPush(ctx context.Context, content []byte, filename, mediaType string) (string, error)
 }
 
 type PublicationService interface {
@@ -148,6 +165,11 @@ type TaskScheduleProvider interface {
 type PolicyService interface {
 	Settings(ctx context.Context) (policy.Settings, error)
 	Update(ctx context.Context, input policy.Settings) (policy.Settings, error)
+}
+
+type SettingsService interface {
+	GetSettings(ctx context.Context) (config.Settings, error)
+	UpdateSettings(ctx context.Context, cfg config.Settings) (config.Settings, error)
 }
 
 type EventBroker struct {
@@ -205,7 +227,7 @@ func (b *EventBroker) Publish(event map[string]any) {
 	}
 }
 
-func Router(status StatusService, queue QueueService, workflow WorkflowService, publication PublicationService, maintenance MaintenanceService, cacheSvc CacheService, subtitleSvc SubtitleService, blocklistSvc BlocklistService, probeSvc IntegrationProbeService, catalogSvc CatalogService, broker *EventBroker, healthRepo HealthRepository, streamsProvider StreamsProvider, profilesRepo ProfilesRepository, taskSchedules TaskScheduleProvider, policySvc PolicyService, plexClient *plex.Client, metricsProvider ...MetricsProvider) chi.Router {
+func Router(status StatusService, queue QueueService, workflow WorkflowService, publication PublicationService, maintenance MaintenanceService, cacheSvc CacheService, subtitleSvc SubtitleService, blocklistSvc BlocklistService, probeSvc IntegrationProbeService, catalogSvc CatalogService, broker *EventBroker, healthRepo HealthRepository, streamsProvider StreamsProvider, profilesRepo ProfilesRepository, taskSchedules TaskScheduleProvider, policySvc PolicyService, plexClient *plex.Client, jellyfinClient *jellyfin.Client, settingsSvc SettingsService, metricsProvider ...MetricsProvider) chi.Router {
 	r := chi.NewRouter()
 	r.Use(corsMiddleware)
 	publishMutation := func(kind string, fields map[string]any) {
@@ -217,6 +239,23 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			event[key] = value
 		}
 		broker.Publish(event)
+	}
+
+	// SABnzbd-compatible API endpoint — allows Radarr/Sonarr to use Drakkar as a download client.
+	if workflow != nil {
+		sabH := &sabHandler{
+			importFn: workflow.ImportNZBFromPush,
+			repo:     profilesRepo,
+			fuseMountPath: func() string {
+				mp := status.Status().FuseMountPath
+				if mp == "" {
+					mp = config.DefaultFuseMountPath
+				}
+				return mp
+			}(),
+		}
+		r.HandleFunc("/sabnzbd/api", sabH.ServeHTTP)
+		r.HandleFunc("/api/sabnzbd/api", sabH.ServeHTTP)
 	}
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -377,6 +416,49 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 	})
 	r.Post("/api/nzbs/import", func(w http.ResponseWriter, r *http.Request) {
 		item, err := importNZBRequest(r, queue)
+		if err != nil {
+			switch {
+			case errors.Is(err, nzb.ErrUploadTooLarge):
+				respondError(w, http.StatusInsufficientStorage, err)
+			case errors.Is(err, nzb.ErrEmptyDocument):
+				respondError(w, http.StatusBadRequest, err)
+			default:
+				respondError(w, http.StatusBadRequest, err)
+			}
+			return
+		}
+		publishMutation("nzb.import", map[string]any{"queueItemId": item.QueueItemID, "libraryItemId": item.LibraryItemID})
+		respondJSON(w, http.StatusCreated, item)
+	})
+	r.Post("/api/nzbs/import-url", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			URL string `json:"url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.URL == "" {
+			respondError(w, http.StatusBadRequest, errors.New("url required"))
+			return
+		}
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, body.URL, nil)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, fmt.Errorf("invalid url: %w", err))
+			return
+		}
+		req.Header.Set("User-Agent", "Drakkar/1.0")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, fmt.Errorf("fetch url: %w", err))
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			respondError(w, http.StatusBadGateway, fmt.Errorf("remote returned HTTP %d", resp.StatusCode))
+			return
+		}
+		fileName := path.Base(body.URL)
+		if fileName == "" || fileName == "." {
+			fileName = "import.nzb"
+		}
+		item, err := queue.ImportNZB(r.Context(), fileName, resp.Body)
 		if err != nil {
 			switch {
 			case errors.Is(err, nzb.ErrUploadTooLarge):
@@ -688,6 +770,27 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			return
 		}
 		result, err := workflow.SyncRequests(r.Context())
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		publishMutation("requests.sync", map[string]any{"seen": result.Seen, "created": result.Created})
+		respondJSON(w, http.StatusAccepted, result)
+	})
+	r.Post("/api/discover/request", func(w http.ResponseWriter, r *http.Request) {
+		if workflow == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
+			return
+		}
+		var body struct {
+			MediaType string `json:"mediaType"`
+			TmdbID    int64  `json:"tmdbId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TmdbID == 0 {
+			respondError(w, http.StatusBadRequest, errors.New("tmdbId and mediaType required"))
+			return
+		}
+		result, err := workflow.CreateSeerrRequest(r.Context(), body.MediaType, body.TmdbID)
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -1032,6 +1135,37 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		publishMutation("policies.update", map[string]any{})
 		respondJSON(w, http.StatusOK, settings)
 	})
+	r.Get("/api/settings", func(w http.ResponseWriter, r *http.Request) {
+		if settingsSvc == nil {
+			respondError(w, http.StatusServiceUnavailable, errors.New("settings service unavailable"))
+			return
+		}
+		cfg, err := settingsSvc.GetSettings(r.Context())
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, cfg)
+	})
+	r.Put("/api/settings", func(w http.ResponseWriter, r *http.Request) {
+		if settingsSvc == nil {
+			respondError(w, http.StatusServiceUnavailable, errors.New("settings service unavailable"))
+			return
+		}
+		var input config.Settings
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			respondError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+			return
+		}
+		cfg, err := settingsSvc.UpdateSettings(r.Context(), input)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		publishMutation("settings.update", map[string]any{})
+		respondJSON(w, http.StatusOK, cfg)
+	})
+
 	// Recent structured log lines from the application log file.
 	r.Get("/api/logs", func(w http.ResponseWriter, r *http.Request) {
 		limitStr := r.URL.Query().Get("limit")
@@ -1117,6 +1251,41 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"deleted": id})
 	})
+	r.Get("/api/quality-definitions", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
+			return
+		}
+		defs, err := profilesRepo.ListQualityDefinitions(r.Context())
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"definitions": defs})
+	})
+	r.Put("/api/quality-definitions/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
+			return
+		}
+		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		var d database.QualityDefinition
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		d.ID = id
+		updated, err := profilesRepo.UpdateQualityDefinition(r.Context(), d)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, updated)
+	})
 	// Manual search — proxy a free-text Hydra query and return scored candidates.
 	r.Get("/api/search/manual", func(w http.ResponseWriter, r *http.Request) {
 		q := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -1154,7 +1323,20 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusOK, map[string]any{"stopped": true})
 	})
 
-	// Per-library-item quality profile override (stored in queue_items metadata).
+	// Per-library-item quality profile override.
+	r.Get("/api/library/{id}/profile", func(w http.ResponseWriter, r *http.Request) {
+		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		p, err := profilesRepo.GetLibraryItemQualityProfile(r.Context(), libraryItemID)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"profile": p})
+	})
 	r.Put("/api/library/{id}/profile", func(w http.ResponseWriter, r *http.Request) {
 		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 		if err != nil {
@@ -1162,10 +1344,14 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			return
 		}
 		var body struct {
-			ProfileID int64 `json:"profileId"`
+			ProfileID *int64 `json:"profileId"` // null = clear override
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := profilesRepo.SetLibraryItemQualityProfile(r.Context(), libraryItemID, body.ProfileID); err != nil {
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"libraryItemId": libraryItemID, "profileId": body.ProfileID})
@@ -1249,6 +1435,178 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"libraries": libs})
 	})
+	// Plex OAuth PIN flow
+	r.Post("/api/plex/oauth/start", func(w http.ResponseWriter, r *http.Request) {
+		pin, err := plex.StartOAuth(r.Context())
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, pin)
+	})
+	r.Post("/api/plex/oauth/poll", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			PinID int64 `json:"pinId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.PinID <= 0 {
+			respondError(w, http.StatusBadRequest, errors.New("pinId required"))
+			return
+		}
+		result, err := plex.PollOAuth(r.Context(), body.PinID)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, result)
+	})
+
+	// Jellyfin integration
+	r.Post("/api/jellyfin/test", func(w http.ResponseWriter, r *http.Request) {
+		if jellyfinClient == nil || !jellyfinClient.Enabled() {
+			respondJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "jellyfin not configured"})
+			return
+		}
+		result := jellyfinClient.Test(r.Context())
+		respondJSON(w, http.StatusOK, result)
+	})
+	r.Post("/api/jellyfin/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if jellyfinClient == nil || !jellyfinClient.Enabled() {
+			respondError(w, http.StatusNotImplemented, errors.New("jellyfin not configured"))
+			return
+		}
+		if err := jellyfinClient.RefreshLibraries(r.Context()); err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"status": "refreshed"})
+	})
+
+	// ── Grab history ────────────────────────────────────────────────────────────
+	r.Get("/api/library/{id}/grab-history", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
+			return
+		}
+		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		entries, err := profilesRepo.GetGrabHistory(r.Context(), id)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if entries == nil {
+			entries = []database.GrabHistoryEntry{}
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"items": entries})
+	})
+
+	// ── Custom formats ───────────────────────────────────────────────────────────
+	r.Get("/api/custom-formats", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
+			return
+		}
+		items, err := profilesRepo.ListCustomFormats(r.Context())
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if items == nil {
+			items = []database.CustomFormat{}
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"items": items})
+	})
+	r.Post("/api/custom-formats", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
+			return
+		}
+		var f database.CustomFormat
+		if err := json.NewDecoder(r.Body).Decode(&f); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		saved, err := profilesRepo.UpsertCustomFormat(r.Context(), f)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, saved)
+	})
+	r.Put("/api/custom-formats/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
+			return
+		}
+		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		var f database.CustomFormat
+		if err := json.NewDecoder(r.Body).Decode(&f); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		f.ID = id
+		updated, err := profilesRepo.UpdateCustomFormat(r.Context(), f)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, updated)
+	})
+	r.Delete("/api/custom-formats/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
+			return
+		}
+		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := profilesRepo.DeleteCustomFormat(r.Context(), id); err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"deleted": id})
+	})
+
+	// ── TV show monitoring mode ──────────────────────────────────────────────────
+	r.Put("/api/tv-shows/{id}/monitoring", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
+			return
+		}
+		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		var body struct {
+			Mode string `json:"mode"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		validModes := map[string]bool{"all": true, "future": true, "missing": true, "recent": true, "pilot": true, "none": true}
+		if !validModes[body.Mode] {
+			respondError(w, http.StatusBadRequest, fmt.Errorf("invalid monitoring mode: %q", body.Mode))
+			return
+		}
+		if err := profilesRepo.SetTVShowMonitoringMode(r.Context(), id, body.Mode); err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		publishMutation("tv_show.monitoring_mode", map[string]any{"tvShowId": id, "mode": body.Mode})
+		respondJSON(w, http.StatusOK, map[string]any{"tvShowId": id, "mode": body.Mode})
+	})
+
 	// Serve the embedded SvelteKit SPA for all non-API routes, with SPA fallback.
 	r.Mount("/", frontend.Handler())
 	return r

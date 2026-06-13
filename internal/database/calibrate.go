@@ -90,7 +90,9 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 	for _, f := range files {
 		actualFirst, err := sizer.DecodedSize(ctx, f.firstMsgID)
 		if err != nil {
-			slog.Warn("calibrate: could not fetch first segment", "nzb_file_id", f.id, "err", err)
+			slog.Warn("calibrate: could not fetch first segment — marking as skipped", "nzb_file_id", f.id, "err", err)
+			// Mark calibrated so expired/missing articles are not retried on every startup.
+			_, _ = db.SQL.ExecContext(ctx, `UPDATE nzb_files SET calibrated_at = now() WHERE id = $1`, f.id)
 			continue
 		}
 		if actualFirst <= 0 {

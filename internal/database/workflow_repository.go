@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // preDeleteVFRBySelectedRelease removes virtual_file_ranges rows that would be
@@ -221,7 +223,9 @@ func (db *DB) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID 
 	if _, err = tx.ExecContext(ctx, `
 		insert into queue_items (library_item_id, state, idempotency_key)
 		values ($1, $2, $3)
-		on conflict (idempotency_key) do nothing`,
+		on conflict (idempotency_key) do update set
+			state      = case when queue_items.state = 'failed' then 'requested' else queue_items.state end,
+			updated_at = case when queue_items.state = 'failed' then now() else queue_items.updated_at end`,
 		libraryItemID, QueueRequested, "seerr-movie-"+externalID,
 	); err != nil {
 		return 0, false, err
@@ -413,7 +417,9 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 	if _, err = tx.ExecContext(ctx, `
 		insert into queue_items (library_item_id, state, idempotency_key)
 		values ($1, $2, $3)
-		on conflict (idempotency_key) do nothing`,
+		on conflict (idempotency_key) do update set
+			state      = case when queue_items.state = 'failed' then 'requested' else queue_items.state end,
+			updated_at = case when queue_items.state = 'failed' then now() else queue_items.updated_at end`,
 		libraryItemID, QueueRequested, "seerr-tv-"+externalID,
 	); err != nil {
 		return 0, false, err
@@ -642,20 +648,41 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLib
 				q.id
 			from queue_items q
 			join library_items li on li.id = q.library_item_id
+			left join episodes ep on ep.id = li.episode_id
+			left join tv_shows tv on tv.id = ep.tv_show_id
 			where li.available = false
 			  and q.selected_release_id is null
 			  and q.state in ($1, $2)
 			  and li.media_type in ('movie', 'episode', 'tv')
-			  -- Skip movies that haven't been released yet (release_date in the future).
-			  -- These will never be on Usenet until after the theatrical release.
+			  -- Skip movies that haven't been released yet.
 			  and not exists (
 			      select 1 from movies m
 			      where m.id = li.movie_id
 			        and m.release_date is not null
 			        and m.release_date > current_date
 			  )
+			  -- TV monitoring mode filter (applies only to episode items).
+			  -- 'all'     → no extra filter (default)
+			  -- 'future'  → only episodes airing in the future
+			  -- 'missing' → only not-yet-available episodes (already covered by li.available=false)
+			  -- 'recent'  → aired within 30 days
+			  -- 'pilot'   → only S01E01
+			  -- 'none'    → skip all episodes for this show
+			  and (
+			    li.media_type != 'episode'
+			    or tv.id is null
+			    or coalesce(tv.monitoring_mode, 'all') = 'all'
+			    or (coalesce(tv.monitoring_mode, 'all') = 'missing')
+			    or (coalesce(tv.monitoring_mode, 'all') = 'future'  and ep.air_date >= current_date)
+			    or (coalesce(tv.monitoring_mode, 'all') = 'recent'  and ep.air_date >= current_date - interval '30 days')
+			    or (coalesce(tv.monitoring_mode, 'all') = 'pilot'   and ep.season_number = 1 and ep.episode_number = 1)
+			  )
+			  and not (
+			    li.media_type = 'episode'
+			    and tv.id is not null
+			    and coalesce(tv.monitoring_mode, 'all') = 'none'
+			  )
 			  -- Add cooldown for failed items: only retry after 2 hours.
-			  -- New 'requested' items have updated_at = created_at so they pass immediately.
 			  and (q.state != $2 or q.updated_at < now() - interval '2 hours')
 			order by q.library_item_id, q.created_at asc, q.id asc
 		) item
@@ -710,6 +737,42 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context) ([]FailedQueueRet
 			return nil, err
 		}
 		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// ListUpgradableLibraryItems returns library_item IDs that are available but
+// whose quality profile has allow_upgrade=true and whose latest queue item is
+// still in state 'available' (i.e. not already being re-downloaded).
+func (db *DB) ListUpgradableLibraryItems(ctx context.Context) ([]int64, error) {
+	rows, err := db.SQL.QueryContext(ctx, `
+		select li.id
+		from library_items li
+		join quality_profiles qp on qp.id = coalesce(
+			li.quality_profile_id,
+			(select id from quality_profiles where is_default = true order by id limit 1)
+		)
+		join lateral (
+			select state from queue_items
+			where library_item_id = li.id
+			order by created_at desc
+			limit 1
+		) q on true
+		where li.available = true
+		  and qp.allow_upgrade = true
+		  and q.state = $1`, QueueAvailable,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
 	}
 	return out, rows.Err()
 }
@@ -787,8 +850,8 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 		if err = tx.QueryRowContext(ctx, `
 			insert into release_candidates (
 				library_item_id, title, score, selected, rejected, reject_reason,
-				failure_count, last_failure_reason, external_url, indexer_name, size_bytes, posted_at
-			) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+				failure_count, last_failure_reason, external_url, indexer_name, size_bytes, posted_at, resolution
+			) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 			returning id`,
 			libraryItemID,
 			candidate.Title,
@@ -802,6 +865,7 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 			candidate.IndexerName,
 			candidate.SizeBytes,
 			nullTime(candidate.PostedAt),
+			candidate.Resolution,
 		).Scan(&releaseCandidateID); err != nil {
 			return nil, err
 		}
@@ -815,6 +879,14 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 			}
 			selectedReleaseID = &value
 			selectedAssigned = true
+			if _, err = tx.ExecContext(ctx, `
+				insert into grab_history (library_item_id, release_candidate_id, title, indexer_name, score, resolution)
+				values ($1, $2, $3, $4, $5, $6)`,
+				libraryItemID, releaseCandidateID,
+				candidate.Title, candidate.IndexerName, candidate.Score, candidate.Resolution,
+			); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -839,6 +911,33 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 		return nil, err
 	}
 	return selectedReleaseID, nil
+}
+
+func (db *DB) GetGrabHistory(ctx context.Context, libraryItemID int64) ([]GrabHistoryEntry, error) {
+	rows, err := db.SQL.QueryContext(ctx, `
+		SELECT id, library_item_id, release_candidate_id, title, indexer_name, score, resolution, grabbed_at
+		FROM grab_history
+		WHERE library_item_id = $1
+		ORDER BY grabbed_at DESC
+		LIMIT 50`, libraryItemID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []GrabHistoryEntry
+	for rows.Next() {
+		var e GrabHistoryEntry
+		var rcID sql.NullInt64
+		if err := rows.Scan(&e.ID, &e.LibraryItemID, &rcID, &e.Title, &e.IndexerName, &e.Score, &e.Resolution, &e.GrabbedAt); err != nil {
+			return nil, err
+		}
+		if rcID.Valid {
+			v := rcID.Int64
+			e.ReleaseCandidateID = &v
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 func (db *DB) MarkLibrarySearchFailed(ctx context.Context, libraryItemID int64, reason string) error {
@@ -1495,8 +1594,8 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		insert into failed_releases (release_candidate_id, reason)
 		values ($1, $2)
 		on conflict do nothing`, releaseCandidateID, reason,
-	); err != nil && !strings.Contains(err.Error(), "23503") {
-		// 23503 = FK violation (candidate was deleted by concurrent worker); safe to skip
+	); err != nil && !isFKViolation(err) {
+		// FK violation = candidate was deleted by concurrent worker; safe to skip
 		return nil, err
 	}
 	if hardReject && strings.TrimSpace(externalURL) != "" {
@@ -1597,14 +1696,36 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 	return &next, nil
 }
 
+// isFKViolation returns true when err is a PostgreSQL foreign-key constraint violation (SQLSTATE 23503).
+func isFKViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.SQLState() == "23503"
+}
+
 func isHardRejectReason(reason string) bool {
-	reason = strings.TrimSpace(strings.ToLower(reason))
-	return strings.HasPrefix(reason, "archive_")
+	r := strings.TrimSpace(strings.ToLower(reason))
+	if strings.HasPrefix(r, "archive_") {
+		return true
+	}
+	// Missing/expired articles are permanent — NNTP doesn't bring them back.
+	if strings.Contains(r, "missing_articles") ||
+		strings.Contains(r, "nntp_article_unavailable") ||
+		strings.Contains(r, "article not found") ||
+		strings.Contains(r, "430") {
+		return true
+	}
+	// Any NZB fetch HTTP error except 403 (quota exhausted — provider-level, not
+	// URL-level) is treated as permanent for that specific URL.
+	return strings.Contains(r, "nzb fetch status") && !strings.Contains(r, "status 403")
 }
 
 func shouldPersistBlocklistReason(reason string) bool {
-	reason = strings.TrimSpace(strings.ToLower(reason))
-	return strings.HasPrefix(reason, "archive_") || strings.HasPrefix(reason, "manual_")
+	r := strings.TrimSpace(strings.ToLower(reason))
+	if strings.HasPrefix(r, "archive_") || strings.HasPrefix(r, "manual_") {
+		return true
+	}
+	// Any NZB fetch HTTP error except 403 — blocklist the URL permanently.
+	return strings.Contains(r, "nzb fetch status") && !strings.Contains(r, "status 403")
 }
 
 func blocklistKeyForExternalURL(rawURL string) string {
@@ -1679,7 +1800,7 @@ func loadBlocklistMap(ctx context.Context, tx *sql.Tx) (map[string]string, error
 	return out, rows.Err()
 }
 
-func (db *DB) BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int64, reason string) error {
+func (db *DB) BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int64, reason string, ttlDays int) error {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1709,15 +1830,55 @@ func (db *DB) BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int
 	}
 
 	if selectedReleaseID.Valid && strings.TrimSpace(externalURL) != "" {
+		// Blocklist the specifically-selected release.
 		for _, key := range blocklistKeysForRelease(title, externalURL, indexerName, sizeBytes, postedAt) {
 			if _, err = tx.ExecContext(ctx, `
-				insert into blocklist_items (key, reason)
-				values ($1, $2)
+				insert into blocklist_items (key, reason, expires_at)
+				values ($1, $2, case when $3 > 0 then now() + ($3 * interval '1 day') else null end)
 				on conflict (key)
-				do update set reason = excluded.reason, expires_at = null`, key, reason,
+				do update set reason = excluded.reason, expires_at = excluded.expires_at`, key, reason, ttlDays,
 			); err != nil {
 				return err
 			}
+		}
+	} else {
+		// No selected release (e.g. all_candidates_wrong_title): blocklist all
+		// rejected candidates for this library item that have a known URL so
+		// they are not reconsidered in future search rounds.
+		var libraryItemID int64
+		if err = tx.QueryRowContext(ctx, `select library_item_id from queue_items where id = $1`, queueItemID).Scan(&libraryItemID); err != nil {
+			return err
+		}
+		candRows, qErr := tx.QueryContext(ctx, `
+			select coalesce(title,''), coalesce(external_url,''), coalesce(indexer_name,''), coalesce(size_bytes,0), coalesce(posted_at, to_timestamp(0))
+			from release_candidates
+			where library_item_id = $1
+			  and coalesce(external_url,'') <> ''`, libraryItemID)
+		if qErr != nil {
+			err = qErr
+			return err
+		}
+		defer candRows.Close()
+		for candRows.Next() {
+			var ct, cu, ci string
+			var cs int64
+			var cp time.Time
+			if err = candRows.Scan(&ct, &cu, &ci, &cs, &cp); err != nil {
+				return err
+			}
+			for _, key := range blocklistKeysForRelease(ct, cu, ci, cs, cp) {
+				if _, err = tx.ExecContext(ctx, `
+					insert into blocklist_items (key, reason, expires_at)
+					values ($1, $2, case when $3 > 0 then now() + ($3 * interval '1 day') else null end)
+					on conflict (key)
+					do update set reason = excluded.reason, expires_at = excluded.expires_at`, key, reason, ttlDays,
+				); err != nil {
+					return err
+				}
+			}
+		}
+		if err = candRows.Err(); err != nil {
+			return err
 		}
 	}
 
@@ -1754,13 +1915,26 @@ func (db *DB) ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) 
 		if _, err = tx.ExecContext(ctx, `delete from selected_releases where id = $1`, selectedReleaseID.Int64); err != nil {
 			return err
 		}
-	}
-	if _, err = tx.ExecContext(ctx, `
-		update queue_items
-		set selected_release_id = null, updated_at = now()
-		where id = $1`, queueItemID,
-	); err != nil {
-		return err
+		// Had a selected release: clear it and leave state as-is so the item
+		// can be re-dispatched by the normal retry loop.
+		if _, err = tx.ExecContext(ctx, `
+			update queue_items
+			set selected_release_id = null, updated_at = now()
+			where id = $1`, queueItemID,
+		); err != nil {
+			return err
+		}
+	} else {
+		// No selected release: reset to requested so the item leaves the
+		// failed state and re-enters the normal search cycle instead of
+		// looping forever in AutoManageFailedQueue.
+		if _, err = tx.ExecContext(ctx, `
+			update queue_items
+			set state = $2, failure_reason = '', selected_release_id = null, updated_at = now()
+			where id = $1`, queueItemID, QueueRequested,
+		); err != nil {
+			return err
+		}
 	}
 
 	return tx.Commit()
@@ -1914,6 +2088,17 @@ func (db *DB) EnsureEpisodeLibraryItem(ctx context.Context, tvShowID int64, show
 	_, err = db.SQL.ExecContext(ctx, `
 		INSERT INTO queue_items (library_item_id, state, idempotency_key)
 		VALUES ($1, 'requested', $2)
-		ON CONFLICT (idempotency_key) DO NOTHING`, libItemID, ikey)
+		ON CONFLICT (idempotency_key) DO UPDATE SET
+			state      = CASE WHEN queue_items.state = 'failed' THEN 'requested' ELSE queue_items.state END,
+			updated_at = CASE WHEN queue_items.state = 'failed' THEN now() ELSE queue_items.updated_at END`,
+		libItemID, ikey)
 	return err == nil, err
+}
+
+// SetTVShowMonitoringMode updates the monitoring_mode column on a tv_show.
+// Valid values: 'all', 'future', 'missing', 'recent', 'pilot', 'none'.
+func (db *DB) SetTVShowMonitoringMode(ctx context.Context, tvShowID int64, mode string) error {
+	_, err := db.SQL.ExecContext(ctx,
+		`UPDATE tv_shows SET monitoring_mode = $1 WHERE id = $2`, mode, tvShowID)
+	return err
 }

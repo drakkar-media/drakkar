@@ -11,13 +11,14 @@
   import { api } from '$lib/api';
   import { idFromSlug } from '$lib/detailsHref';
   import { toastError, toastSuccess } from '$lib/toast';
-  import type { DiscoverDetails, LibraryDetail, LibraryItem, SubtitleCandidate, SubtitleFile } from '$lib/types';
+  import type { DiscoverDetails, GrabHistoryEntry, LibraryDetail, LibraryItem, SubtitleCandidate, SubtitleFile } from '$lib/types';
 
   let detail: DiscoverDetails | null = null;
   let libraryMatch: LibraryItem | null = null;
   let localDetail: LibraryDetail | null = null;
   let subtitles: SubtitleFile[] = [];
   let subtitleCandidates: SubtitleCandidate[] = [];
+  let grabHistory: GrabHistoryEntry[] = [];
   let loading = true;
   let working = false;
   let activeKey = '';
@@ -50,18 +51,21 @@
       detail = discover;
       libraryMatch = library.items.find((item) => sameIdentity(item, mediaType, discover.title, discover.year, discover.tmdbId, discover.imdbId)) ?? null;
       if (libraryMatch) {
-        const [detailResult, subtitleResult, candidateResult] = await Promise.all([
+        const [detailResult, subtitleResult, candidateResult, historyResult] = await Promise.all([
           api.libraryDetail(libraryMatch.id),
           api.subtitles(libraryMatch.id),
-          api.subtitleCandidates(libraryMatch.id)
+          api.subtitleCandidates(libraryMatch.id),
+          api.grabHistory(libraryMatch.id).catch(() => ({ items: [] }))
         ]);
         localDetail = detailResult;
         subtitles = subtitleResult.items ?? [];
         subtitleCandidates = candidateResult.items ?? [];
+        grabHistory = historyResult.items ?? [];
       } else {
         localDetail = null;
         subtitles = [];
         subtitleCandidates = [];
+        grabHistory = [];
       }
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
@@ -212,7 +216,7 @@
             <div><span>Companies</span><strong>{detail.productionCompanies?.length || '—'}</strong></div>
           </div>
           {#if detail.genres?.length}
-            <div class="chips">{#each detail.genres as genre}<StatusPill tone="neutral">{genre}</StatusPill>{/each}</div>
+            <div class="chips genre-chips">{#each detail.genres as genre}<StatusPill tone="neutral">{genre}</StatusPill>{/each}</div>
           {/if}
         </section>
 
@@ -229,18 +233,24 @@
                   <div class="episode-list">
                     {#each season.episodes as episode}
                       <div class="episode-row">
-                        <span class="ep-code">E{String(episode.episodeNumber).padStart(2, '0')}</span>
-                        <span class="ep-title">{episode.title}</span>
-                        <StatusPill tone={episode.status === 'available' ? 'ok' : 'neutral'}>{episode.status}</StatusPill>
-                        {#if episode.status === 'available' && episode.libraryItemId}
-                          {@const epId = episode.libraryItemId}
-                          <button
-                            class="ep-sub-btn"
-                            title="Download subtitle for this episode"
-                            disabled={working}
-                            on:click={() => runSubtitleSearch(epId)}
-                          >🌐 Subs</button>
-                        {/if}
+                        <div class="ep-info">
+                          <span class="ep-code">E{String(episode.episodeNumber).padStart(2, '0')}</span>
+                          {#if episode.title}
+                            <span class="ep-title">{episode.title}</span>
+                          {/if}
+                        </div>
+                        <div class="ep-right">
+                          <StatusPill tone={episode.status === 'available' ? 'ok' : 'neutral'}>{episode.status}</StatusPill>
+                          {#if episode.status === 'available' && episode.libraryItemId}
+                            {@const epId = episode.libraryItemId}
+                            <button
+                              class="ep-sub-btn"
+                              title="Download subtitle for this episode"
+                              disabled={working}
+                              on:click={() => runSubtitleSearch(epId)}
+                            >🌐 Subs</button>
+                          {/if}
+                        </div>
                       </div>
                     {/each}
                   </div>
@@ -307,6 +317,30 @@
             {#if libraryMatch.failureReason}
               <div class="failure-box">{libraryMatch.failureReason.replaceAll('_', ' ')}</div>
             {/if}
+            {#if localDetail?.tvShowId}
+              <div class="monitoring-row">
+                <label for="monitoring-select">Monitoring</label>
+                <select
+                  id="monitoring-select"
+                  value={localDetail.monitoringMode ?? 'all'}
+                  on:change={async (e) => {
+                    if (!localDetail?.tvShowId) return;
+                    const mode = (e.currentTarget as HTMLSelectElement).value;
+                    try {
+                      await api.setTVShowMonitoring(localDetail.tvShowId, mode);
+                      localDetail = { ...localDetail, monitoringMode: mode };
+                    } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
+                  }}
+                >
+                  <option value="all">All episodes</option>
+                  <option value="future">Future only</option>
+                  <option value="missing">Missing only</option>
+                  <option value="recent">Recent (30d)</option>
+                  <option value="pilot">Pilot only</option>
+                  <option value="none">None (paused)</option>
+                </select>
+              </div>
+            {/if}
           {:else}
             <div class="empty-side">No local library item linked yet.</div>
           {/if}
@@ -361,6 +395,25 @@
               </div>
             </section>
           {/if}
+
+          {#if grabHistory.length > 0}
+            <section class="panel">
+              <h2>Grab History</h2>
+              <div class="stack-list">
+                {#each grabHistory as entry}
+                  <div class="stack-item">
+                    <div class="gh-info">
+                      <strong class="gh-title">{entry.title}</strong>
+                      <span class="gh-meta">
+                        {entry.indexerName}{entry.resolution ? ` · ${entry.resolution}` : ''} · score {entry.score}
+                      </span>
+                      <span class="gh-date">{new Date(entry.grabbedAt).toLocaleString('en-GB', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            </section>
+          {/if}
         {/if}
       </aside>
     </section>
@@ -391,6 +444,7 @@
   .copy p { max-width: 900px; color: hsl(var(--foreground) / 0.8); line-height: 1.65; }
   .tagline { margin-top: 10px; color: hsl(var(--foreground) / 0.82); font-weight: 700; }
   .badge-row, .action-row, .chips { display: flex; flex-wrap: wrap; gap: 10px; }
+  .genre-chips { margin-top: 18px; }
   .action-row { align-items: center; }
   .action-row :global(button) { min-height: 42px; }
   .action-row :global(button),
@@ -441,14 +495,19 @@
   .season-panel { border-radius: 18px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.02); overflow: hidden; }
   .season-panel summary { list-style: none; cursor: pointer; padding: 14px 16px; display: grid; gap: 6px; }
   .episode-row {
-    display: flex; align-items: center; gap: 10px;
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
     padding: 10px 16px; border-top: 1px solid hsl(0 0% 100% / 0.05);
   }
+  .ep-info { flex: 1; min-width: 0; display: grid; gap: 2px; }
   .ep-code {
-    font-family: 'JetBrains Mono', monospace; font-size: 11px;
-    color: hsl(var(--primary)); flex-shrink: 0; width: 44px;
+    font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 700;
+    color: hsl(var(--foreground));
   }
-  .ep-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+  .ep-title {
+    font-size: 12px; color: hsl(var(--muted-foreground));
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .ep-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
   .ep-sub-btn {
     display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px;
     border-radius: 8px; border: 1px solid hsl(0 0% 100% / 0.08);
@@ -485,4 +544,11 @@
     .hero-grid { padding: 18px; gap: 18px; }
     .action-row { align-items: stretch; }
   }
+  .gh-info { display: grid; gap: 2px; min-width: 0; }
+  .gh-title { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gh-meta { font-size: 11px; color: hsl(var(--muted-foreground)); font-family: 'JetBrains Mono', monospace; }
+  .gh-date { font-size: 11px; color: hsl(var(--muted-foreground)); }
+  .monitoring-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; padding-top: 12px; border-top: 1px solid hsl(0 0% 100% / 0.06); }
+  .monitoring-row label { font-size: 12px; font-weight: 600; color: hsl(var(--muted-foreground)); white-space: nowrap; }
+  .monitoring-row select { flex: 1; min-width: 0; height: 32px; border-radius: 8px; border: 1px solid hsl(0 0% 100% / 0.1); background: hsl(0 0% 100% / 0.05); color: inherit; font-size: 12px; padding: 0 8px; cursor: pointer; }
 </style>

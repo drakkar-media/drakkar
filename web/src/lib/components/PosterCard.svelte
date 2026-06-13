@@ -1,5 +1,6 @@
 <script lang="ts">
   import Tv from '@lucide/svelte/icons/tv';
+  import Plus from '@lucide/svelte/icons/plus';
   import { detailsHref } from '$lib/detailsHref';
   import { itemStatus } from '$lib/itemStatus';
   import type { LibraryItem } from '$lib/types';
@@ -7,7 +8,10 @@
   export let item: LibraryItem;
   export let href = '';
   export let compact = false;
-  export let showStatus = true; // set false for discover/recommendation cards not in library
+  export let showStatus = true;
+  export let onRequest: ((item: LibraryItem) => void) | null = null;
+
+  $: notInLibrary = !item.id && !!item.tmdbId;
 
   const isTv = (i: LibraryItem) => i.mediaType === 'tv' || i.mediaType === 'episode';
 
@@ -69,6 +73,11 @@
     {/if}
     {#if showStatus}
       <div class="status-badge status-badge-{status}">{statusLabel(item)}</div>
+    {/if}
+    {#if notInLibrary && onRequest}
+      <button class="request-btn" on:click|preventDefault|stopPropagation={() => onRequest && onRequest(item)} title="Request this title">
+        <Plus size={14} />
+      </button>
     {/if}
   </div>
 
@@ -158,6 +167,28 @@
   .status-badge-unreleased  { background: hsl(var(--status-unreleased) / 0.85);   color: hsl(0 0% 100%); }
   .status-badge-missing     { background: hsl(var(--status-missing) / 0.8);       color: hsl(0 0% 100%); }
   .status-badge-failed      { background: hsl(var(--status-failed) / 0.85);       color: hsl(0 0% 100%); }
+
+  /* Request button overlay — top-right corner */
+  .request-btn {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 26px;
+    height: 26px;
+    border-radius: 999px;
+    border: 1px solid hsl(0 0% 100% / 0.2);
+    background: hsl(var(--primary) / 0.85);
+    color: hsl(var(--primary-foreground));
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    backdrop-filter: blur(6px);
+    transition: background 0.15s, transform 0.15s;
+  }
+  .request-btn:hover {
+    background: hsl(var(--primary));
+    transform: scale(1.1);
+  }
 
   /* Title + meta */
   .poster-copy {

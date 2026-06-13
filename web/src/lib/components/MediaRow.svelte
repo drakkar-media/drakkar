@@ -10,9 +10,11 @@
   export let href = '';
   export let linkLabel = 'View All';
   export let itemWidth = 140;
+  export let onRequest: ((item: LibraryItem) => void) | null = null;
 
   let scroller: HTMLDivElement | null = null;
   let dragging = false;
+  let hasDragged = false;
   let startX = 0;
   let startScrollLeft = 0;
 
@@ -29,6 +31,7 @@
   function onPointerDown(event: PointerEvent) {
     if (!scroller) return;
     dragging = true;
+    hasDragged = false;
     startX = event.clientX;
     startScrollLeft = scroller.scrollLeft;
     scroller.setPointerCapture(event.pointerId);
@@ -37,6 +40,7 @@
   function onPointerMove(event: PointerEvent) {
     if (!dragging || !scroller) return;
     const dx = event.clientX - startX;
+    if (Math.abs(dx) > 4) hasDragged = true;
     scroller.scrollLeft = startScrollLeft - dx;
   }
 
@@ -45,6 +49,14 @@
     dragging = false;
     if (scroller.hasPointerCapture(event.pointerId)) {
       scroller.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  function onClickCapture(event: MouseEvent) {
+    if (hasDragged) {
+      event.preventDefault();
+      event.stopPropagation();
+      hasDragged = false;
     }
   }
 
@@ -90,10 +102,11 @@
       on:pointerup={onPointerUp}
       on:pointercancel={onPointerUp}
       on:wheel={onWheel}
+      on:click|capture={onClickCapture}
     >
       {#each items as item}
         <div class="row-item" style={`width:${itemWidth}px`}>
-          <PosterCard {item} compact showStatus={item.id !== 0} />
+          <PosterCard {item} compact showStatus={item.id !== 0} {onRequest} />
         </div>
       {/each}
     </div>

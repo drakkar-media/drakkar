@@ -54,6 +54,24 @@ type ImportedNZB struct {
 	SegmentCount   int
 	Files          []ImportedNZBFile
 	Archives       []ImportedArchive
+	MediaType      string // overrides default "manual_nzb" when set
+}
+
+type SabQueueItem struct {
+	LibraryItemID int64
+	Title         string
+	MediaType     string
+	State         string
+}
+
+type SabHistoryItem struct {
+	LibraryItemID     int64
+	Title             string
+	MediaType         string
+	State             string
+	FailureReason     string
+	SelectedReleaseID int64
+	TotalBytes        int64
 }
 
 type ImportedNZBFile struct {
@@ -259,6 +277,26 @@ type SearchCandidateRecord struct {
 	RejectReason      string
 	FailureCount      int
 	LastFailureReason string
+	Resolution        string
+}
+
+type GrabHistoryEntry struct {
+	ID                  int64     `json:"id"`
+	LibraryItemID       int64     `json:"libraryItemId"`
+	ReleaseCandidateID  *int64    `json:"releaseCandidateId,omitempty"`
+	Title               string    `json:"title"`
+	IndexerName         string    `json:"indexerName"`
+	Score               int       `json:"score"`
+	Resolution          string    `json:"resolution"`
+	GrabbedAt           time.Time `json:"grabbedAt"`
+}
+
+type CustomFormat struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name"`
+	Pattern   string `json:"pattern"`
+	Score     int    `json:"score"`
+	Enabled   bool   `json:"enabled"`
 }
 
 type CandidateHistory struct {

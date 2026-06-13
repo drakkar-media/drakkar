@@ -418,11 +418,9 @@
     flex-shrink: 0;
   }
   .dot-available   { background: hsl(var(--status-available)); }
-  .dot-partial     { background: hsl(var(--status-partial)); }
   .dot-active      { background: hsl(var(--status-downloading)); }
   .dot-unreleased  { background: hsl(var(--status-unreleased)); }
   .dot-missing     { background: hsl(var(--status-missing)); }
-  .dot-failed      { background: hsl(var(--status-failed)); }
 
   .empty {
     padding: 32px;

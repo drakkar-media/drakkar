@@ -11,7 +11,7 @@
   import MediaRow from '$lib/components/MediaRow.svelte';
   import { api, subscribeEvents } from '$lib/api';
   import { detailsHref } from '$lib/detailsHref';
-  import { toastError } from '$lib/toast';
+  import { toastError, toastSuccess } from '$lib/toast';
   import type { DashboardHome, LibraryItem, Status } from '$lib/types';
 
   let home: DashboardHome | null = null;
@@ -38,6 +38,18 @@
     finally { loading = false; }
   }
 
+  async function requestItem(item: LibraryItem) {
+    if (!item.tmdbId) return;
+    const mediaType = (item.mediaType === 'tv' || item.mediaType === 'episode') ? 'tv' : 'movie';
+    try {
+      const result = await api.requestMedia(item.tmdbId, mediaType);
+      toastSuccess(`Requested — ${result.created} item(s) added`);
+      void loadAll();
+    } catch (err) {
+      toastError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   function startCarousel(items: LibraryItem[]) {
     clearInterval(heroTimer);
     if (items.length > 1) {
@@ -54,14 +66,13 @@
     return () => { window.clearInterval(t); window.clearInterval(heroTimer); unsub(); };
   });
 
-  $: heroItems = ((home?.recentlyAdded ?? []).length > 0
-    ? (home?.recentlyAdded ?? [])
-    : [...(home?.trendingMovies ?? []), ...(home?.trendingTv ?? [])]).slice(0, 8);
+  $: heroItems = [...(home?.trendingMovies ?? []), ...(home?.trendingTv ?? [])].slice(0, 10);
   $: { if (heroItems.length) startCarousel(heroItems); }
   $: hero = heroItems[heroIndex] ?? heroItems[0];
   $: integrations = status?.integrations;
   $: heroKind = hero?.mediaType === 'episode' ? 'tv' : hero?.mediaType;
-  $: heroStatus = hero?.available ? 'available' : hero?.queueState || 'tracked';
+  $: heroStatus = hero?.available ? 'available' : hero?.queueState || null;
+  $: heroInLibrary = !!(hero?.id);
 </script>
 
 <svelte:head><title>Dashboard — Drakkar</title></svelte:head>
@@ -77,7 +88,7 @@
       <div class="hero-tags">
         <span class="tag">{heroKind}</span>
         {#if hero.year}<span class="tag">{hero.year}</span>{/if}
-        <span class="tag">{heroStatus}</span>
+        {#if heroStatus}<span class="tag">{heroStatus}</span>{/if}
         {#if hero.availableCount || hero.missingCount}
           <span class="tag">{hero.availableCount ?? 0} avail / {hero.missingCount ?? 0} miss</span>
         {/if}
@@ -88,10 +99,11 @@
       {/if}
       <div class="hero-actions">
         <a class="hero-btn primary" href={detailsHref(hero)}>More Info</a>
-        {#if hero.id}
+        {#if heroInLibrary}
           <a class="hero-btn secondary" href={`/library/${hero.id}`}>Open Library</a>
+        {:else if hero.tmdbId}
+          <button class="hero-btn secondary" on:click={() => hero && requestItem(hero)}>+ Request</button>
         {/if}
-        <a class="hero-btn secondary" href={heroKind === 'tv' ? '/discover/tv' : '/discover/movie'}>Browse {heroKind === 'tv' ? 'TV' : 'Movies'}</a>
       </div>
     </div>
     {#if heroItems.length > 1}
@@ -171,7 +183,7 @@
   {#if (home?.recentlyAdded ?? []).length > 0}
     <MediaRow
       title="Recently Added"
-      subtitle="Newest linked media from local library state."
+      subtitle="Latest completed media in your library."
       items={home?.recentlyAdded ?? []}
       href="/library"
       linkLabel="View Library →"
@@ -187,6 +199,7 @@
       href="/discover/movie"
       linkLabel="Browse →"
       itemWidth={140}
+      onRequest={requestItem}
     />
   {/if}
 
@@ -198,6 +211,7 @@
       href="/discover/tv"
       linkLabel="Browse →"
       itemWidth={140}
+      onRequest={requestItem}
     />
   {/if}
 

@@ -1,4 +1,5 @@
 /data/settings.json
+/data/settings.snapshot.md
 /data/rclone/
 /data/postgres/
 /data/logs/

@@ -123,6 +123,26 @@ type SymlinkPublication struct {
 	TargetPath  string
 }
 
+func (db *DB) GetSymlinkPathsForLibraryItem(ctx context.Context, libraryItemID int64) ([]string, error) {
+	rows, err := db.SQL.QueryContext(ctx, `
+		select library_path
+		from symlink_publications
+		where library_item_id = $1`, libraryItemID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 func (db *DB) ListSymlinkPublications(ctx context.Context) ([]SymlinkPublication, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select library_path, target_path

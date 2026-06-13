@@ -135,7 +135,8 @@ type LibraryDetail struct {
 	AvailableCount    int            `json:"availableCount"`
 	MissingCount      int            `json:"missingCount"`
 	Seasons           []SeasonDetail `json:"seasons,omitempty"`
-	TVShowID          int64          `json:"-"`
+	TVShowID          int64          `json:"tvShowId,omitempty"`
+	MonitoringMode    string         `json:"monitoringMode,omitempty"`
 }
 
 type SeasonDetail struct {
@@ -571,6 +572,7 @@ func (s *Service) recentlyAdded(ctx context.Context) ([]MediaCard, error) {
 		left join movies m on m.id = li.movie_id
 		left join episodes e on e.id = li.episode_id
 		left join tv_shows tv on tv.id = e.tv_show_id
+		where li.available = true
 		order by src.created_at desc
 		limit 40`)
 	if err != nil {
@@ -674,6 +676,7 @@ func (s *Service) LibraryDetail(ctx context.Context, libraryItemID int64) (Libra
 		showPoster        string
 		showBackdrop      string
 		tvShowID          int64
+		monitoringMode    string
 	)
 	err := s.db.SQL.QueryRowContext(ctx, `
 		select
@@ -697,7 +700,8 @@ func (s *Service) LibraryDetail(ctx context.Context, libraryItemID int64) (Libra
 			coalesce(tv.overview, ''),
 			coalesce(tv.poster_url, ''),
 			coalesce(tv.backdrop_url, ''),
-			coalesce(e.tv_show_id, 0)
+			coalesce(e.tv_show_id, 0),
+			coalesce(tv.monitoring_mode, 'all')
 		from library_items li
 		left join queue_items q on q.library_item_id = li.id
 		left join movies m on m.id = li.movie_id
@@ -726,6 +730,7 @@ func (s *Service) LibraryDetail(ctx context.Context, libraryItemID int64) (Libra
 		&showPoster,
 		&showBackdrop,
 		&tvShowID,
+		&monitoringMode,
 	)
 	if err != nil {
 		return LibraryDetail{}, err
@@ -757,6 +762,7 @@ func (s *Service) LibraryDetail(ctx context.Context, libraryItemID int64) (Libra
 	detail.PosterURL = showPoster
 	detail.BackdropURL = showBackdrop
 	detail.TVShowID = tvShowID
+	detail.MonitoringMode = monitoringMode
 
 	seasons, err := s.buildTVSeasons(ctx, detail)
 	if err != nil {
@@ -1136,7 +1142,12 @@ func (s *Service) ReleaseCalendar(ctx context.Context, month string) ([]Calendar
 		left join movies m on m.id = li.movie_id
 		left join episodes e on e.id = li.episode_id
 		left join tv_shows tv on tv.id = e.tv_show_id
-		left join queue_items q on q.library_item_id = li.id
+		left join lateral (
+			select state from queue_items
+			where library_item_id = li.id
+			order by created_at desc
+			limit 1
+		) q on true
 		where (
 			(li.media_type = 'movie' and m.release_date >= $1::date and m.release_date < $2::date)
 			or

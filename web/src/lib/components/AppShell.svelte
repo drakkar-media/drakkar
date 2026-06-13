@@ -10,6 +10,7 @@
   import { api } from '$lib/api';
   import { detailsHref } from '$lib/detailsHref';
   import { navItems, mobilePrimaryItems } from '$lib/nav';
+  import DrakkarLogo from '$lib/components/DrakkarLogo.svelte';
   import type { DiscoverMediaItem, DiscoverSearchResult } from '$lib/types';
 
   let mobileOpen = false;
@@ -78,7 +79,9 @@
 <div class="shell">
   <!-- Desktop sidebar -->
   <aside class="sidebar">
-    <a href="/dashboard" class="brandmark" aria-label="Dashboard">D</a>
+    <a href="/dashboard" class="brandmark" aria-label="Dashboard">
+      <DrakkarLogo size={22} />
+    </a>
     <nav class="side-nav">
       {#each navItems as item}
         <a href={item.href} class:active={isActive(item.href)} title={item.label} aria-label={item.label}>
@@ -87,7 +90,7 @@
       {/each}
     </nav>
     <div class="sidebar-tail">
-      <a href="/logs" title="Logs" aria-label="Logs"><Bell size={18} /></a>
+      <a href="/settings?tab=logs" title="Logs" aria-label="Logs"><Bell size={18} /></a>
     </div>
   </aside>
 
@@ -139,8 +142,8 @@
       </form>
 
       <div class="topbar-right">
-        <a class="icon-btn" href="/logs" aria-label="Logs"><BookOpen size={15} /></a>
-        <div class="avatar">D</div>
+        <a class="icon-btn" href="/settings?tab=logs" aria-label="Logs"><BookOpen size={15} /></a>
+        <div class="avatar"><DrakkarLogo size={18} /></div>
       </div>
     </header>
 
@@ -152,9 +155,12 @@
     <button class="mobile-backdrop" type="button" aria-label="Close" on:click={() => (mobileOpen = false)}></button>
     <div class="mobile-drawer" role="dialog" aria-modal="true" tabindex="-1">
       <div class="drawer-head">
-        <div>
-          <div class="drawer-brand">Drakkar</div>
-          <div class="drawer-sub">control plane</div>
+        <div class="drawer-brand-wrap">
+          <div class="drawer-brand-icon"><DrakkarLogo size={20} /></div>
+          <div>
+            <div class="drawer-brand">Drakkar</div>
+            <div class="drawer-sub">control plane</div>
+          </div>
         </div>
         <button class="icon-btn" type="button" aria-label="Close" on:click={() => (mobileOpen = false)}>
           <X size={18} />
@@ -200,7 +206,7 @@
   .brandmark {
     display: grid; place-items: center; width: 36px; height: 36px;
     border-radius: 12px; background: hsl(var(--primary));
-    color: hsl(var(--primary-foreground)); font-size: 13px; font-weight: 800;
+    color: hsl(var(--primary-foreground));
     text-decoration: none; margin-bottom: 8px;
   }
 
@@ -311,6 +317,11 @@
   .drawer-head {
     display: flex; justify-content: space-between; align-items: center;
     gap: 12px; margin-bottom: 18px;
+  }
+  .drawer-brand-wrap { display: flex; align-items: center; gap: 10px; }
+  .drawer-brand-icon {
+    display: grid; place-items: center; width: 36px; height: 36px; flex-shrink: 0;
+    border-radius: 10px; background: hsl(var(--primary)); color: hsl(var(--primary-foreground));
   }
   .drawer-brand { font-size: 18px; font-weight: 700; }
   .drawer-sub { color: hsl(var(--muted-foreground)); font-size: 12px; }

@@ -19,8 +19,12 @@ import type {
   BlocklistItem,
   LibraryDetail,
   QualityProfile,
+  QualityDefinition,
   TaskSchedule,
-  PolicySettings
+  PolicySettings,
+  FullSettings,
+  GrabHistoryEntry,
+  CustomFormat
 } from '$lib/types';
 
 function baseURL() {
@@ -120,6 +124,8 @@ export const api = {
   listProfiles: () => request<{ profiles: QualityProfile[] }>('/api/profiles'),
   saveProfile: (p: QualityProfile) => request<QualityProfile>('/api/profiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) }),
   deleteProfile: (id: number) => request<{ deleted: number }>(`/api/profiles/${id}`, { method: 'DELETE' }),
+  listQualityDefinitions: () => request<{ definitions: QualityDefinition[] }>('/api/quality-definitions'),
+  updateQualityDefinition: (d: QualityDefinition) => request<QualityDefinition>(`/api/quality-definitions/${d.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d) }),
   taskSchedules: () => request<{ items: TaskSchedule[] }>('/api/tasks/schedules'),
   policies: () => request<PolicySettings>('/api/policies'),
   savePolicies: (settings: PolicySettings) =>
@@ -127,6 +133,13 @@ export const api = {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(settings)
+    }),
+  getSettings: () => request<FullSettings>('/api/settings'),
+  saveSettings: (s: FullSettings) =>
+    request<FullSettings>('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(s)
     }),
   healthSummary: () => request<{ total: number; checked: number; healthy: number; neverChecked: number }>('/api/health/summary'),
   healthEntries: () => request<{ items: { id: number; libraryItemId: number; libraryPath: string; targetPath: string; createdAt: string; lastCheckedAt?: string; healthOk?: boolean }[] }>('/api/health/entries'),
@@ -148,6 +161,33 @@ export const api = {
   plexTest: () => request<{ ok: boolean; serverName?: string; libraries?: { key: string; title: string; type: string }[]; error?: string }>('/api/plex/test', { method: 'POST' }),
   plexRefresh: () => request<{ status: string }>('/api/plex/refresh', { method: 'POST' }),
   plexLibraries: () => request<{ libraries: { key: string; title: string; type: string }[] }>('/api/plex/libraries'),
+  plexOauthStart: () => request<{ pinId: number; code: string; authUrl: string; clientIdentifier: string }>('/api/plex/oauth/start', { method: 'POST' }),
+  plexOauthPoll: (pinId: number) => request<{ authorized: boolean; token?: string }>('/api/plex/oauth/poll', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pinId })
+  }),
+  jellyfinTest: () => request<{ ok: boolean; serverName?: string; version?: string; error?: string }>('/api/jellyfin/test', { method: 'POST' }),
+  jellyfinRefresh: () => request<{ status: string }>('/api/jellyfin/refresh', { method: 'POST' }),
+  // NZB file upload — multipart POST to the import endpoint
+  addNzb: (file: File) => {
+    const form = new FormData();
+    form.set('file', file, file.name);
+    return request<{ queueItemId: number; libraryItemId: number }>('/api/nzbs/import', { method: 'POST', body: form });
+  },
+  // NZB import by URL — backend fetches and imports
+  addNzbUrl: (url: string) => request<{ queueItemId: number; libraryItemId: number }>('/api/nzbs/import-url', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url })
+  }),
+  // Request media via Seerr then sync to library
+  requestMedia: (tmdbId: number, mediaType: 'movie' | 'tv') =>
+    request<{ seen: number; created: number }>('/api/discover/request', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tmdbId, mediaType })
+    }),
   // Manual search via Hydra
   manualSearch: (query: string, kind: 'movie' | 'tv' | 'all' = 'all') =>
     request<{ items: { title: string; externalUrl: string; indexer: string; sizeBytes: number; score: number; resolution: string; source: string; codec: string }[] }>(
@@ -171,6 +211,24 @@ export const api = {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ profileId })
+    }),
+  // Grab history
+  grabHistory: (libraryItemID: number) =>
+    request<{ items: GrabHistoryEntry[] }>(`/api/library/${libraryItemID}/grab-history`),
+  // Custom formats
+  listCustomFormats: () => request<{ items: CustomFormat[] }>('/api/custom-formats'),
+  createCustomFormat: (f: CustomFormat) =>
+    request<CustomFormat>('/api/custom-formats', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(f) }),
+  updateCustomFormat: (f: CustomFormat) =>
+    request<CustomFormat>(`/api/custom-formats/${f.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(f) }),
+  deleteCustomFormat: (id: number) =>
+    request<{ deleted: number }>(`/api/custom-formats/${id}`, { method: 'DELETE' }),
+  // TV show monitoring mode
+  setTVShowMonitoring: (tvShowId: number, mode: string) =>
+    request<{ tvShowId: number; mode: string }>(`/api/tv-shows/${tvShowId}/monitoring`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode })
     })
 };
 

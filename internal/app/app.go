@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hjongedijk/drakkar/internal/api"
@@ -23,8 +24,10 @@ import (
 	"github.com/hjongedijk/drakkar/internal/maintenance"
 	"github.com/hjongedijk/drakkar/internal/metrics"
 	"github.com/hjongedijk/drakkar/internal/nntp"
+	"github.com/hjongedijk/drakkar/internal/notifications"
 	"github.com/hjongedijk/drakkar/internal/nzb"
 	"github.com/hjongedijk/drakkar/internal/opensubtitles"
+	"github.com/hjongedijk/drakkar/internal/jellyfin"
 	"github.com/hjongedijk/drakkar/internal/plex"
 	"github.com/hjongedijk/drakkar/internal/policy"
 	"github.com/hjongedijk/drakkar/internal/probe"
@@ -54,14 +57,37 @@ const (
 	taskBrokenSymlinks         = "broken-media-symlinks"
 	taskOrphanedCompleted      = "orphaned-completed-symlinks"
 	taskFillMissingEpisodes    = "fill_missing_episodes"
+	taskSearchUpgrades         = "search_upgrades"
 )
 
 type runtimeStatus struct {
 	status api.Status
 }
 
+type fileSettingsService struct {
+	path string
+	mu   sync.Mutex
+}
+
+func (s *fileSettingsService) GetSettings(_ context.Context) (config.Settings, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return config.Load(s.path)
+}
+
+func (s *fileSettingsService) UpdateSettings(_ context.Context, cfg config.Settings) (config.Settings, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := config.Save(s.path, cfg); err != nil {
+		return config.Settings{}, err
+	}
+	return config.Load(s.path)
+}
+
 type taskScheduleStatusService struct {
-	db *database.DB
+	db                          *database.DB
+	tvRssSyncIntervalMinutes    int
+	movieRssSyncIntervalMinutes int
 }
 
 func (s *runtimeStatus) Status() api.Status {
@@ -84,8 +110,8 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 	defs := []api.TaskSchedule{
 		{ID: taskSeerrSync, Label: "Sync Seerr Requests", Group: "Indexing", Interval: "10m", Automated: true, LastRunState: "idle"},
 		{ID: taskPendingQueuePush, Label: "Dispatch Pending Queue", Group: "Indexing", Interval: "5m", Automated: true, LastRunState: "idle"},
-		{ID: maintenanceRecentTVTask, Label: "Recent TV Feed", Group: "Indexing", Interval: "15m", Automated: true, LastRunState: "idle"},
-		{ID: maintenanceRecentMovieTask, Label: "Recent Movie Feed", Group: "Indexing", Interval: "15m", Automated: true, LastRunState: "idle"},
+		{ID: maintenanceRecentTVTask, Label: "Recent TV Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", s.tvRssSyncIntervalMinutes), Automated: true, LastRunState: "idle"},
+		{ID: maintenanceRecentMovieTask, Label: "Recent Movie Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", s.movieRssSyncIntervalMinutes), Automated: true, LastRunState: "idle"},
 		{ID: taskRetryFailedQueue, Label: "Retry Failed Queue", Group: "Indexing", Interval: "15m", Automated: true, LastRunState: "idle"},
 		{ID: taskRepublishPending, Label: "Republish Pending", Group: "Publishing", Interval: "30m", Automated: true, LastRunState: "idle"},
 		{ID: taskHealthCheck, Label: "Run Health Check", Group: "Maintenance", Interval: "60m", Automated: true, LastRunState: "idle"},
@@ -94,6 +120,7 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 		{ID: taskBrokenSymlinks, Label: "Remove Broken Media Symlinks", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskOrphanedCompleted, Label: "Remove Orphaned History", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskFillMissingEpisodes, Label: "Fill Missing Episodes", Group: "Indexing", Interval: "6h", Automated: true, LastRunState: "idle"},
+		{ID: taskSearchUpgrades, Label: "Search Quality Upgrades", Group: "Indexing", Interval: "6h", Automated: true, LastRunState: "idle"},
 	}
 	for i := range defs {
 		if runAt, ok := lastRuns[defs[i].ID]; ok {
@@ -202,27 +229,47 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}()
 	}
 
-	valkey := redis.NewClient(&redis.Options{
-		Addr:     fmt.Sprintf("%s:%d", cfg.Valkey.Host, cfg.Valkey.Port),
-		Password: cfg.Valkey.Password,
-		DB:       0,
-		// Valkey 8 does not implement Redis maint_notifications; disable the
-		// go-redis auto probe so startup stays quiet and deterministic.
-		MaintNotificationsConfig: &maintnotifications.Config{
-			Mode: maintnotifications.ModeDisabled,
-		},
-	})
+	newValkeyClient := func() *redis.Client {
+		return redis.NewClient(&redis.Options{
+			Addr:     fmt.Sprintf("%s:%d", cfg.Valkey.Host, cfg.Valkey.Port),
+			Password: cfg.Valkey.Password,
+			DB:       0,
+			// Valkey 8 does not implement Redis maint_notifications; disable the
+			// go-redis auto probe so startup stays quiet and deterministic.
+			MaintNotificationsConfig: &maintnotifications.Config{
+				Mode: maintnotifications.ModeDisabled,
+			},
+		})
+	}
+	valkey := newValkeyClient()
 	defer valkey.Close()
 	if err := valkey.Ping(ctx).Err(); err != nil {
 		return err
 	}
+	// BullMQ requires separate Redis connections for the queue client and the
+	// worker client to avoid CLIENT SETNAME collisions (per gobullmq docs).
+	wqWorkerClient := newValkeyClient()
+	defer wqWorkerClient.Close()
 
 	startedAt := time.Now().UTC()
 	statusSvc := &runtimeStatus{status: api.StatusFromConfig(rt, cfg, startedAt, true)}
 	queueSvc := queue.NewService(db, nzb.NewImporter(rt.StagingNZBPath, rt.NZBUploadLimitBytes))
 	seerrClient := seerr.NewClient(cfg.Seerr)
 	hydraClient := hydra.NewClient(cfg.NZBHydra2)
+	if cfg.Indexer.SearchDelayMs > 0 {
+		hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)
+	}
 	workflowSvc := workflow.NewService(db, seerrClient, hydraClient)
+	wq, err := workflow.NewWorkQueue(6, valkey, wqWorkerClient)
+	if err != nil {
+		return fmt.Errorf("workqueue init: %w", err)
+	}
+	workflowSvc.WorkQueue = wq
+	workflowSvc.SetIndexerLimits(workflow.IndexerLimits{
+		MinimumAgeMinutes: cfg.Indexer.MinimumAgeMinutes,
+		RetentionDays:     cfg.Indexer.RetentionDays,
+		MaximumSizeMB:     cfg.Indexer.MaximumSizeMB,
+	})
 	if strings.TrimSpace(cfg.Metadata.TMDB.APIKey) != "" {
 		workflowSvc.SetTMDBClient(tmdb.NewClient(cfg.Metadata))
 	}
@@ -264,6 +311,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	blocklistSvc := blocklist.NewService(db)
 	probeSvc := probe.NewService(probeProviders...)
 	plexClient := plex.NewClient(cfg.Plex.URL, cfg.Plex.Token)
+	jellyfinClient := jellyfin.NewClient(cfg.Jellyfin.URL, cfg.Jellyfin.APIKey)
 	publicationSvc.SetPostPublishHook(func(ctx context.Context, libraryItemID int64) error {
 		// Run all post-publish work in a goroutine so nothing blocks the queue pipeline.
 		go func() {
@@ -274,18 +322,73 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			if plexClient.Enabled() {
 				plexCtx, plexCancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer plexCancel()
-				if err := plexClient.RefreshSection(plexCtx, cfg.Plex.SectionKey); err != nil {
-					logger.Warn().Err(err).Msg("plex library refresh failed")
+				var plexErr error
+				if cfg.Plex.SectionKey != "" {
+					// Targeted refresh: scan only the directories of the newly created symlinks.
+					if paths, err := db.GetSymlinkPathsForLibraryItem(plexCtx, libraryItemID); err == nil && len(paths) > 0 {
+						dirs := make(map[string]struct{})
+						for _, p := range paths {
+							dirs[filepath.Dir(p)] = struct{}{}
+						}
+						for dir := range dirs {
+							if plexErr = plexClient.RefreshPath(plexCtx, cfg.Plex.SectionKey, dir); plexErr != nil {
+								break
+							}
+						}
+					} else {
+						plexErr = plexClient.RefreshSection(plexCtx, cfg.Plex.SectionKey)
+					}
+				} else {
+					plexErr = plexClient.RefreshSection(plexCtx, "")
+				}
+				if plexErr != nil {
+					logger.Warn().Err(plexErr).Msg("plex library refresh failed")
+				}
+			}
+			if jellyfinClient.Enabled() {
+				jfCtx, jfCancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer jfCancel()
+				if err := jellyfinClient.RefreshLibraries(jfCtx); err != nil {
+					logger.Warn().Err(err).Msg("jellyfin library refresh failed")
 				}
 			}
 		}()
 		return nil
 	})
+	notifier := notifications.New(notifications.Config{
+		DiscordWebhookURL: cfg.Notifications.DiscordWebhookURL,
+		GenericWebhookURL: cfg.Notifications.GenericWebhookURL,
+		OnGrab:            cfg.Notifications.OnGrab,
+		OnAvailable:       cfg.Notifications.OnAvailable,
+		OnFailed:          cfg.Notifications.OnFailed,
+	}, nil)
+
 	postImport := func(ctx context.Context, item database.QueueSnapshot) error {
 		if item.SelectedRelease == nil {
 			return nil
 		}
-		return publicationSvc.PublishSelectedRelease(ctx, *item.SelectedRelease)
+		if err := publicationSvc.PublishSelectedRelease(ctx, *item.SelectedRelease); err != nil {
+			return err
+		}
+		// Notify Seerr + outgoing notifications (best-effort).
+		if input, err := db.GetLibrarySearchInput(ctx, item.LibraryItemID); err == nil {
+			tmdbID := input.MovieTMDBID
+			mediaType := input.MediaType
+			if mediaType == "episode" || mediaType == "tv" {
+				tmdbID = input.ShowTMDBID
+			}
+			if tmdbID > 0 {
+				if notifyErr := seerrClient.NotifyAvailable(ctx, tmdbID, mediaType); notifyErr != nil {
+					logger.Warn().Err(notifyErr).Int64("libraryItemId", item.LibraryItemID).Msg("seerr notify available failed")
+				}
+			}
+			notifier.Send(ctx, notifications.Event{
+				Type:      notifications.EventAvailable,
+				Title:     input.Title,
+				MediaType: mediaType,
+			})
+		}
+		return nil
 	}
 
 
@@ -293,6 +396,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	queueSvc.SetPostImportHook(postImport)
 	workflowSvc.SetPostImportHook(postImport)
 	workflowSvc.SetQueuePolicyProvider(policySvc)
+	workflowSvc.SetLogger(logger)
+	workflowSvc.SetDefaultProfileNames(cfg.Library.DefaultMovieProfile, cfg.Library.DefaultTvProfile)
 	// Attempt lazy unmount in case a previous process left a stale FUSE socket.
 	_ = fuse.LazyUnmount(rt.FuseMountPath)
 	fuseServer, fuseErr := fuse.Mount(rt.FuseMountPath, rt.StagingNZBPath, rt.NZBUploadLimitBytes, queueSvc)
@@ -315,11 +420,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		scheduled:  scheduledSrc,
 		blockCache: blockCache,
 	}
-	taskScheduleSvc := &taskScheduleStatusService{db: db}
+	taskScheduleSvc := &taskScheduleStatusService{db: db, tvRssSyncIntervalMinutes: cfg.Indexer.TvRssSyncIntervalMinutes, movieRssSyncIntervalMinutes: cfg.Indexer.MovieRssSyncIntervalMinutes}
 
 	server := &http.Server{
 		Addr:              rt.HTTPAddress,
-		Handler:           api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, metricsColl),
+		Handler:           api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, jellyfinClient, &fileSettingsService{path: rt.SettingsPath}, metricsColl),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -330,12 +435,16 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		logger.Info().Int("reset", n).Msg("reset stuck queue items to failed")
 	}
 
-	// Start the work queue — searches library items immediately when pushed.
-	workflowSvc.WorkQueue.Start(ctx, func(qCtx context.Context, libraryItemID int64) {
-		if _, err := workflowSvc.SearchLibrary(qCtx, libraryItemID); err != nil {
-			logger.Error().Err(err).Int64("libraryItemId", libraryItemID).Msg("workqueue: search failed")
+	// Start the BullMQ worker pool in the background.
+	go func() {
+		if err := workflowSvc.WorkQueue.Start(ctx, func(qCtx context.Context, libraryItemID int64) {
+			if _, err := workflowSvc.SearchLibrary(qCtx, libraryItemID); err != nil {
+				logger.Error().Err(err).Int64("libraryItemId", libraryItemID).Msg("workqueue: search error (see above for details)")
+			}
+		}); err != nil && err != context.Canceled {
+			logger.Error().Err(err).Msg("workqueue: worker stopped unexpectedly")
 		}
-	})
+	}()
 
 	runRecentPass := func(mediaType string) {
 		sr, err := workflowSvc.SearchRecentPending(ctx, mediaType)
@@ -367,8 +476,18 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}
 	}
 
-	// runRetryPass retries failed queue items.
+	// runRetryPass retries failed queue items using both the hardcoded
+	// search/preflight recovery rules and the user-configured queue rules.
 	runRetryPass := func() {
+		// Apply user-configured queue rules first (e.g. Remove and Blocklist,
+		// Remove Blocklist and Search) for import/processing failures.
+		if ar, err := workflowSvc.AutoManageFailedQueue(ctx); err != nil {
+			logger.Error().Err(err).Msg("monitoring: auto-manage queue error")
+		} else if ar.Retried > 0 || ar.Processed > 0 {
+			logger.Info().Int("processed", ar.Processed).Int("retried", ar.Retried).Msg("monitoring: auto-manage queue complete")
+		}
+
+		// Then apply hardcoded recovery for search/preflight failures.
 		rr, err := workflowSvc.RetryFailedQueue(ctx)
 		if err != nil {
 			logger.Error().Err(err).Msg("monitoring: retry failed queue error")
@@ -482,14 +601,21 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	startRecurring(taskSeerrSync, 10*time.Minute, true, runSyncOnce)
 	startRecurring(taskPendingQueuePush, 5*time.Minute, true, runPendingDispatch) // was 20m; push all pending every 5m for Radarr-like throughput
 
-	// background worker: TV recent feed, Servarr-style 15 minute floor.
-	startRecurring(maintenanceRecentTVTask, 15*time.Minute, shouldRunRecentOnStartup(ctx, db, maintenanceRecentTVTask, 15*time.Minute, time.Duration(cfg.NZBHydra2.FeedCacheTTLSeconds)*time.Second, time.Now().UTC()), func() {
+	// TV RSS interval — Sonarr default 15 min, minimum 15 min.
+	tvRssInterval := time.Duration(cfg.Indexer.TvRssSyncIntervalMinutes) * time.Minute
+	if tvRssInterval < 15*time.Minute {
+		tvRssInterval = 15 * time.Minute
+	}
+	// Movie RSS interval — Radarr default 30 min, minimum 30 min.
+	movieRssInterval := time.Duration(cfg.Indexer.MovieRssSyncIntervalMinutes) * time.Minute
+	if movieRssInterval < 30*time.Minute {
+		movieRssInterval = 30 * time.Minute
+	}
+
+	startRecurring(maintenanceRecentTVTask, tvRssInterval, shouldRunRecentOnStartup(ctx, db, maintenanceRecentTVTask, tvRssInterval, time.Duration(cfg.NZBHydra2.FeedCacheTTLSeconds)*time.Second, time.Now().UTC()), func() {
 		runRecentPass("tv")
 	})
-
-	// background worker: movie recent feed — now 15 min (was 60m) to match TV and
-	// Radarr/Sonarr RSS-style fast detection of new releases on indexers.
-	startRecurring(maintenanceRecentMovieTask, 15*time.Minute, shouldRunRecentOnStartup(ctx, db, maintenanceRecentMovieTask, 15*time.Minute, time.Duration(cfg.NZBHydra2.FeedCacheTTLSeconds)*time.Second, time.Now().UTC()), func() {
+	startRecurring(maintenanceRecentMovieTask, movieRssInterval, shouldRunRecentOnStartup(ctx, db, maintenanceRecentMovieTask, movieRssInterval, time.Duration(cfg.NZBHydra2.FeedCacheTTLSeconds)*time.Second, time.Now().UTC()), func() {
 		runRecentPass("movie")
 	})
 
@@ -504,6 +630,13 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	startRecurring(taskFillMissingEpisodes, 6*time.Hour, false, func() {
 		if _, err := workflowSvc.FillMissingEpisodes(ctx); err != nil {
 			logger.Error().Err(err).Msg("fill missing episodes failed")
+		}
+	})
+	startRecurring(taskSearchUpgrades, 6*time.Hour, false, func() {
+		if res, err := workflowSvc.SearchUpgrades(ctx); err != nil {
+			logger.Error().Err(err).Msg("upgrade search failed")
+		} else {
+			logger.Info().Int("checked", res.Checked).Int("upgraded", res.Upgraded).Int("failed", res.Failed).Msg("upgrade search complete")
 		}
 	})
 

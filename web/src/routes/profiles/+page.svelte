@@ -36,9 +36,13 @@
       languages: ['nl', 'en'],
       audioFormats: ['TrueHD', 'DTS-HD', 'DTS', 'DD+', 'AC3', 'AAC'],
       hdrFormats: ['HDR10', 'SDR'],
+      excludePatterns: [],
       preferProper: true,
       preferRepack: true,
       rejectCam: true,
+      allowUpgrade: false,
+      cutoffResolution: '',
+      minimumAgeHours: 0,
       minSizeMb: 0,
       maxSizeMb: 0,
     };

@@ -1,0 +1,103 @@
+services:
+  drakkar:
+    build:
+      context: .
+    image: drakkar:latest
+    container_name: drakkar
+    restart: unless-stopped
+    environment:
+      DRAKKAR_SETTINGS_PATH: /app/data/settings.json
+      DRAKKAR_HTTP_ADDR: :8080
+    volumes:
+      - ./data:/app/data
+      - /mnt/drakkar:/mnt/drakkar:rshared
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+
+  rclone:
+    image: rclone/rclone:latest
+    container_name: drakkar_rclone
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 10s
+    volumes:
+      - /mnt:/mnt:rshared
+      - ./data/rclone/rclone.conf:/config/rclone/rclone.conf
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    devices:
+      - /dev/fuse:/dev/fuse
+    depends_on:
+      drakkar:
+        condition: service_healthy
+    # Lazy-unmount any stale FUSE socket left by a previous container before
+    # mounting. Without this, a recreated drakkar container leaves a dead socket
+    # at the mountpoint and rclone fails with "Socket not connected" on restart.
+    entrypoint: ["sh", "-c"]
+    command:
+      - "fusermount3 -uz /mnt/drakkar/vfs 2>/dev/null; umount -l /mnt/drakkar/vfs 2>/dev/null; exec rclone mount drakkar: /mnt/drakkar/vfs --uid=0 --gid=0 --allow-other --allow-non-empty --links --use-cookies --vfs-cache-mode=off --buffer-size=0M --dir-cache-time=20s"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: drakkar_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: drakkar
+      POSTGRES_USER: drakkar
+      POSTGRES_PASSWORD: change-me
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drakkar -d drakkar"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    container_name: drakkar_valkey
+    restart: unless-stopped
+    volumes:
+      - ./data/valkey:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  seerr:
+    image: ghcr.io/sct/seerr:latest
+    container_name: drakkar_seerr
+    restart: unless-stopped
+    ports:
+      - "5055:5055"
+    volumes:
+      - ./data/seerr:/app/config
+
+  nzbhydra2:
+    image: lscr.io/linuxserver/nzbhydra2:latest
+    container_name: drakkar_nzbhydra2
+    restart: unless-stopped
+    ports:
+      - "5076:5076"
+    volumes:
+      - ./data/nzbhydra2:/config

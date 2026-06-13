@@ -134,7 +134,7 @@ func (r *repoStub) ListFailedQueueRetryTargets(ctx context.Context) ([]database.
 func (r *repoStub) GetQueueRetryTarget(ctx context.Context, queueItemID int64) (database.QueueRetryTarget, error) {
 	return r.retryTarget, nil
 }
-func (r *repoStub) BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int64, reason string) error {
+func (r *repoStub) BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int64, reason string, ttlDays int) error {
 	r.failed = append(r.failed, "blocklist:"+reason)
 	return nil
 }
@@ -244,6 +244,11 @@ func (r *repoStub) MarkSelectedReleaseFetching(ctx context.Context, selectedRele
 
 func (r *repoStub) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID int64, imported database.ImportedNZB) (database.QueueSnapshot, error) {
 	r.imported = imported
+	// Simulate real import creating virtual files so VirtualFileCount==0 fast-fail doesn't trigger.
+	// Only update r.selected when selectedByID has no explicit override for this release.
+	if _, hasOverride := r.selectedByID[selectedReleaseID]; !hasOverride {
+		r.selected.VirtualFileCount = 1
+	}
 	return database.QueueSnapshot{
 		QueueItemID:     99,
 		LibraryItemID:   42,
@@ -278,6 +283,42 @@ func (r *repoStub) RecordSeasonPackAttempt(_ context.Context, _ int64, _ int, _ 
 	return nil
 }
 
+func (r *repoStub) ClearFailedQueueItems(_ context.Context) (int, error) { return 0, nil }
+func (r *repoStub) ListMetadataBackfillTargets(_ context.Context) ([]database.MetadataBackfillTarget, error) {
+	return nil, nil
+}
+func (r *repoStub) ListShowsWithMissingEpisodes(_ context.Context) ([]database.ShowWithMissingEpisodes, error) {
+	return nil, nil
+}
+func (r *repoStub) EnsureEpisodeLibraryItem(_ context.Context, _ int64, _ string, _, _ int, _, _ string) (bool, error) {
+	return false, nil
+}
+func (r *repoStub) ListCustomFormats(_ context.Context) ([]database.CustomFormat, error) {
+	return nil, nil
+}
+func (r *repoStub) GetLibraryItemQualityProfile(_ context.Context, _ int64) (*database.QualityProfile, error) {
+	return nil, nil
+}
+func (r *repoStub) GetQualityProfileByName(_ context.Context, _ string) (database.QualityProfile, error) {
+	return database.QualityProfile{}, nil
+}
+func (r *repoStub) ListQualityDefinitions(_ context.Context) ([]database.QualityDefinition, error) {
+	return nil, nil
+}
+func (r *repoStub) ListUpgradableLibraryItems(_ context.Context) ([]int64, error) {
+	return nil, nil
+}
+func (r *repoStub) CreateImportedNZB(_ context.Context, _ database.ImportedNZB) (database.QueueSnapshot, error) {
+	return database.QueueSnapshot{}, nil
+}
+func (r *repoStub) ListSabQueueItems(_ context.Context, _ string, _, _ int) ([]database.SabQueueItem, int, error) {
+	return nil, 0, nil
+}
+func (r *repoStub) ListSabHistoryItems(_ context.Context, _ string, _, _ int) ([]database.SabHistoryItem, int, error) {
+	return nil, 0, nil
+}
+func (r *repoStub) DismissSabItems(_ context.Context, _ []int64) error { return nil }
+
 type seerrStub struct {
 	requests []seerr.Request
 }
@@ -285,6 +326,7 @@ type seerrStub struct {
 func (s seerrStub) PendingRequests(ctx context.Context) ([]seerr.Request, error) {
 	return s.requests, nil
 }
+func (s seerrStub) CreateRequest(_ context.Context, _ string, _ int64) error { return nil }
 
 type hydraStub struct {
 	results    []hydra.SearchResult
@@ -365,6 +407,10 @@ func (tmdbStub) MovieDetails(ctx context.Context, tmdbID int64) (tmdb.MovieDetai
 func (tmdbStub) TVDetails(ctx context.Context, tmdbID int64) (tmdb.TVDetails, error) {
 	return tmdb.TVDetails{Name: "Loki", Year: 2021, IMDbID: "tt9140554"}, nil
 }
+func (tmdbStub) TVSeasonNumbers(_ context.Context, _ int64) ([]int, error)    { return nil, nil }
+func (tmdbStub) TVSeason(_ context.Context, _ int64, _ int) (tmdb.TVSeason, error) {
+	return tmdb.TVSeason{}, nil
+}
 
 type tmdbDisabledStub struct{}
 
@@ -374,6 +420,10 @@ func (tmdbDisabledStub) MovieDetails(ctx context.Context, tmdbID int64) (tmdb.Mo
 }
 func (tmdbDisabledStub) TVDetails(ctx context.Context, tmdbID int64) (tmdb.TVDetails, error) {
 	return tmdb.TVDetails{}, nil
+}
+func (tmdbDisabledStub) TVSeasonNumbers(_ context.Context, _ int64) ([]int, error) { return nil, nil }
+func (tmdbDisabledStub) TVSeason(_ context.Context, _ int64, _ int) (tmdb.TVSeason, error) {
+	return tmdb.TVSeason{}, nil
 }
 
 type tvdbStub struct{}
@@ -398,6 +448,8 @@ func TestSyncRequests(t *testing.T) {
 	if result.Created != 2 || repo.movieCalls != 1 || repo.tvCalls != 1 {
 		t.Fatalf("unexpected sync result %+v repo=%+v", result, repo)
 	}
+	// Enrichment for new items runs in a goroutine — give it a moment.
+	time.Sleep(50 * time.Millisecond)
 	if repo.movieMeta.tmdbID != 438631 || repo.movieMeta.imdbID != "tt1160419" || repo.movieMeta.title != "Dune" {
 		t.Fatalf("unexpected movie metadata %+v", repo.movieMeta)
 	}
@@ -421,6 +473,8 @@ func TestSyncRequestsTVDBFallback(t *testing.T) {
 	if result.Created != 1 || repo.tvCalls != 1 {
 		t.Fatalf("unexpected sync result %+v repo=%+v", result, repo)
 	}
+	// Enrichment for new items runs in a goroutine — give it a moment.
+	time.Sleep(50 * time.Millisecond)
 	if repo.episodeMeta.tmdbID != 0 || repo.episodeMeta.show != "The Bear" || repo.episodeMeta.imdbID != "tt14452776" || repo.episodeMeta.year != 2022 {
 		t.Fatalf("unexpected episode metadata %+v", repo.episodeMeta)
 	}
@@ -566,7 +620,7 @@ func TestSearchLibraryFallsBackWhenEarlierQueryOnlyReturnsRejectedCandidates(t *
 	var queries []string
 	service := NewService(repo, seerrStub{}, hydraStub{byQuery: map[string][]hydra.SearchResult{
 		"tt1160419": {
-			{Title: "Other.Movie.2021.720p", Link: "http://example/bad", Indexer: "hydra", SizeBytes: 555, PublishedAt: time.Now()},
+			{Title: "Other.Movie.2022.720p", Link: "http://example/bad", Indexer: "hydra", SizeBytes: 555, PublishedAt: time.Now()},
 		},
 		"Dune 2021": {
 			{Title: "Dune.2021.1080p.WEB-DL.x265-GRP", Link: "http://example/good", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
@@ -905,7 +959,7 @@ func TestSearchLibraryKeepsEarlierUsableCandidatesWhenLaterQueryErrors(t *testin
 			"http://example/good": {
 				ExternalURL:       "http://example/good",
 				FailureCount:      1,
-				LastFailureReason: "context deadline exceeded",
+				LastFailureReason: "interrupted_by_restart",
 			},
 		},
 	}
@@ -1110,26 +1164,26 @@ func TestSearchPendingLibrary(t *testing.T) {
 	}
 }
 
-func TestSearchPendingLibraryQueuesLimitedBatch(t *testing.T) {
-	pending := make([]database.PendingLibrarySearchTarget, 0, pendingQueueBatchSize+10)
-	for i := range pendingQueueBatchSize + 10 {
+func TestSearchPendingLibraryQueuesAllItems(t *testing.T) {
+	const total = pendingQueueBatchSize + 10
+	pending := make([]database.PendingLibrarySearchTarget, 0, total)
+	for i := range total {
 		pending = append(pending, database.PendingLibrarySearchTarget{LibraryItemID: int64(i + 1)})
 	}
 	repo := &repoStub{pending: pending}
 	service := NewService(repo, seerrStub{}, hydraStub{})
+	service.WorkQueue = newWorkQueueStub()
 
 	result, err := service.SearchPendingLibrary(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Processed != len(pending) {
-		t.Fatalf("expected processed=%d got %+v", len(pending), result)
+	// BullMQ queue is Redis-backed — all items are pushed regardless of queue depth.
+	if result.Processed != total || result.Searched != total {
+		t.Fatalf("expected all %d items queued, got %+v", total, result)
 	}
-	if result.Searched != pendingQueueBatchSize {
-		t.Fatalf("expected queued batch=%d got %+v", pendingQueueBatchSize, result)
-	}
-	if depth := service.WorkQueue.Depth(); depth != pendingQueueBatchSize {
-		t.Fatalf("expected workqueue depth=%d got %d", pendingQueueBatchSize, depth)
+	if depth := service.WorkQueue.Depth(context.Background()); depth != total {
+		t.Fatalf("expected workqueue depth=%d got %d", total, depth)
 	}
 }
 
@@ -1197,10 +1251,11 @@ func TestSyncRequestsDoesNotQueueCreatedItems(t *testing.T) {
 			{ID: 1, Type: "movie", TMDBID: 11, MediaTitle: "Dune", MediaYear: 2021},
 		},
 	}, hydraStub{})
+	service.WorkQueue = newWorkQueueStub()
 	if _, err := service.SyncRequests(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if depth := service.WorkQueue.Depth(); depth != 0 {
+	if depth := service.WorkQueue.Depth(context.Background()); depth != 0 {
 		t.Fatalf("expected no auto-queued items after sync, got depth=%d", depth)
 	}
 }
@@ -1436,7 +1491,7 @@ func TestImportSelectedReleaseFallsBackBeforePublishHookWhenArchiveRejectHasNoVi
 	}, database.ImportedNZB{
 		FileName: "first.nzb",
 		XML:      []byte(`<nzb/>`),
-	})
+	}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

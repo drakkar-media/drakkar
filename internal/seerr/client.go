@@ -170,6 +170,96 @@ func (c *Client) fetchRequestPage(ctx context.Context, skip, take int) (requestL
 	return payload, nil
 }
 
+func (c *Client) CreateRequest(ctx context.Context, mediaType string, tmdbID int64) error {
+	body := map[string]any{
+		"mediaType": mediaType,
+		"mediaId":   tmdbID,
+	}
+	if mediaType == "tv" {
+		body["seasons"] = "all"
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/request", strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("X-Api-Key", c.apiKey)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("seerr create request status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// NotifyAvailable marks a media item as available in Seerr/Overseerr.
+// It first looks up the Seerr-internal media ID by TMDB ID, then POSTs to
+// the available endpoint. A 404 means the item isn't tracked in Seerr — not an error.
+func (c *Client) NotifyAvailable(ctx context.Context, tmdbID int64, mediaType string) error {
+	if c.baseURL == "" || c.apiKey == "" {
+		return nil
+	}
+	apiMediaType := "movie"
+	if strings.EqualFold(mediaType, "tv") || strings.EqualFold(mediaType, "episode") {
+		apiMediaType = "tv"
+	}
+	// Resolve TMDB ID to Seerr internal media ID.
+	infoURL := fmt.Sprintf("%s/api/v1/%s/%d", c.baseURL, apiMediaType, tmdbID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, infoURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Api-Key", c.apiKey)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil // item not tracked in Seerr
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("seerr media lookup status %d", resp.StatusCode)
+	}
+	var info struct {
+		MediaInfo *struct {
+			ID int64 `json:"id"`
+		} `json:"mediaInfo"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return err
+	}
+	if info.MediaInfo == nil || info.MediaInfo.ID == 0 {
+		return nil // no mediaInfo yet — Seerr doesn't track it
+	}
+	// Mark as available.
+	availURL := fmt.Sprintf("%s/api/v1/media/%d/available", c.baseURL, info.MediaInfo.ID)
+	postReq, err := http.NewRequestWithContext(ctx, http.MethodPost, availURL, strings.NewReader("{}"))
+	if err != nil {
+		return err
+	}
+	postReq.Header.Set("Content-Type", "application/json")
+	postReq.Header.Set("X-Api-Key", c.apiKey)
+	postResp, err := c.httpClient.Do(postReq)
+	if err != nil {
+		return err
+	}
+	defer postResp.Body.Close()
+	if postResp.StatusCode < 200 || postResp.StatusCode >= 300 {
+		return fmt.Errorf("seerr notify available status %d", postResp.StatusCode)
+	}
+	return nil
+}
+
 func parseYear(value string) int {
 	if len(value) < 4 {
 		return 0

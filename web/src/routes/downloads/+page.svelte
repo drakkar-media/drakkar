@@ -5,6 +5,8 @@
   import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
   import SearchCheck from '@lucide/svelte/icons/search-check';
   import Trash2 from '@lucide/svelte/icons/trash-2';
+  import Upload from '@lucide/svelte/icons/upload';
+  import Link from '@lucide/svelte/icons/link';
   import PageHeader from '$lib/components/PageHeader.svelte';
   import Panel from '$lib/components/Panel.svelte';
   import Button from '$lib/components/Button.svelte';
@@ -12,6 +14,10 @@
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
   import type { QueueItem } from '$lib/types';
+
+  let uploading = false;
+  let nzbUrl = '';
+  let addingUrl = false;
 
   let items: QueueItem[] = [];
   let loading = true;
@@ -49,6 +55,22 @@
       toastError(err instanceof Error ? err.message : String(err));
     } finally {
       loading = false;
+    }
+  }
+
+  async function refreshItems() {
+    try {
+      const queue = await api.queue();
+      const fresh = queue.items ?? [];
+      const freshMap = new Map(fresh.map((i) => [i.queueItemId, i]));
+      const existingIds = new Set(items.map((i) => i.queueItemId));
+      const updated = items
+        .filter((i) => freshMap.has(i.queueItemId))
+        .map((i) => freshMap.get(i.queueItemId)!);
+      const added = fresh.filter((i) => !existingIds.has(i.queueItemId));
+      items = [...updated, ...added];
+    } catch {
+      // ignore background refresh errors
     }
   }
 
@@ -142,10 +164,10 @@
   onMount(() => {
     void load();
     const unsub = subscribeEvents(() => {
-      if (!working) void load();
+      if (!working) void refreshItems();
     });
     const timer = window.setInterval(() => {
-      if (!working) void load();
+      if (!working) void refreshItems();
     }, 15000);
     return () => {
       window.clearInterval(timer);
@@ -175,6 +197,31 @@
       Clear Failed
     </Button>
   {/if}
+  <label class="upload-btn" class:disabled={uploading} title="Upload NZB file">
+    <Upload size={14} />
+    {uploading ? 'Uploading…' : 'Upload NZB'}
+    <input
+      type="file"
+      accept=".nzb,application/x-nzb,application/xml,text/xml"
+      class="upload-input"
+      disabled={uploading}
+      on:change={async (e) => {
+        const file = (e.currentTarget as HTMLInputElement).files?.[0];
+        if (!file) return;
+        uploading = true;
+        try {
+          await api.addNzb(file);
+          toastSuccess(`${file.name} queued`);
+          await load();
+        } catch (err) {
+          toastError(err instanceof Error ? err.message : String(err));
+        } finally {
+          uploading = false;
+          (e.currentTarget as HTMLInputElement).value = '';
+        }
+      }}
+    />
+  </label>
 </PageHeader>
 
 <section class="summary-grid">
@@ -195,6 +242,30 @@
     <div class="summary-label">Segments in flight</div>
   </div>
 </section>
+
+<form class="url-row" on:submit|preventDefault={async () => {
+  const url = nzbUrl.trim();
+  if (!url) return;
+  addingUrl = true;
+  try {
+    await api.addNzbUrl(url);
+    toastSuccess('NZB queued from URL');
+    nzbUrl = '';
+    await load();
+  } catch (err) {
+    toastError(err instanceof Error ? err.message : String(err));
+  } finally {
+    addingUrl = false;
+  }
+}}>
+  <div class="url-input-wrap">
+    <Link size={14} />
+    <input bind:value={nzbUrl} type="url" placeholder="Paste NZB URL to import…" class="url-input" disabled={addingUrl} />
+  </div>
+  <Button kind="secondary" disabled={!nzbUrl.trim() || addingUrl}>
+    {addingUrl ? 'Adding…' : 'Add NZB URL'}
+  </Button>
+</form>
 
 <div class="tab-row">
   <button class:active={tab === 'queue'} on:click={() => (tab = 'queue')}>queue</button>
@@ -222,7 +293,7 @@
         </div>
       </div>
       <div class="row-list">
-        {#each pagedQueueItems as item}
+        {#each pagedQueueItems as item (item.queueItemId)}
           {@const pct = stageProgress(item.state)}
           <div class="row-card">
             <div class="row-head">
@@ -259,7 +330,7 @@
         </div>
       </div>
       <div class="row-list">
-        {#each pagedHistoryItems as item}
+        {#each pagedHistoryItems as item (item.queueItemId)}
           <div class={`row-card ${item.state === 'failed' ? 'failed' : ''}`}>
             <div class="row-head">
               <div>
@@ -422,6 +493,7 @@
     height: 100%;
     border-radius: 999px;
     background: hsl(var(--primary));
+    transition: width 0.4s ease;
   }
 
   .row-foot {
@@ -439,6 +511,58 @@
     border: 1px solid hsl(0 0% 100% / 0.08);
     background: hsl(0 0% 100% / 0.04);
   }
+
+  .url-row {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 16px;
+  }
+
+  .url-input-wrap {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 40px;
+    padding: 0 14px;
+    border: 1px solid hsl(0 0% 100% / 0.08);
+    border-radius: 14px;
+    background: hsl(0 0% 100% / 0.04);
+    color: hsl(var(--muted-foreground));
+  }
+
+  .url-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: hsl(var(--foreground));
+    font-size: 13px;
+  }
+
+  .url-input::placeholder { color: hsl(var(--muted-foreground)); }
+  .url-input:disabled { opacity: 0.6; }
+
+  .upload-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 36px;
+    padding: 0 12px;
+    border-radius: 12px;
+    border: 1px solid hsl(0 0% 100% / 0.08);
+    background: hsl(0 0% 100% / 0.04);
+    color: hsl(var(--foreground));
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background .12s;
+  }
+
+  .upload-btn:hover:not(.disabled) { background: hsl(0 0% 100% / 0.08); }
+  .upload-btn.disabled { opacity: 0.55; cursor: default; }
+  .upload-input { display: none; }
 
   @media (max-width: 900px) {
     .summary-grid {
