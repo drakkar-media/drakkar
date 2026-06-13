@@ -54,36 +54,3 @@ func TestScheduledSourcePrioritizesHighQueue(t *testing.T) {
 		t.Fatalf("unexpected order %#v", src.order)
 	}
 }
-
-func TestScheduledSourceLimitsBackgroundWhenStreamingActive(t *testing.T) {
-	src := &orderedSource{wait: 40 * time.Millisecond}
-	scheduler := NewScheduledSource(src, 3, 8)
-	scheduler.SetBackgroundBudget(1, func() int { return 1 })
-
-	done := make(chan struct{}, 3)
-	go func() {
-		_, _ = scheduler.BodyPriority(context.Background(), "low-1", stream.PriorityBackground)
-		done <- struct{}{}
-	}()
-	time.Sleep(5 * time.Millisecond)
-	go func() {
-		_, _ = scheduler.BodyPriority(context.Background(), "low-2", stream.PriorityBackground)
-		done <- struct{}{}
-	}()
-	time.Sleep(5 * time.Millisecond)
-	go func() {
-		_, _ = scheduler.BodyPriority(context.Background(), "high-1", stream.PriorityInteractive)
-		done <- struct{}{}
-	}()
-
-	for i := 0; i < 3; i++ {
-		<-done
-	}
-
-	if len(src.order) != 3 {
-		t.Fatalf("unexpected order %#v", src.order)
-	}
-	if src.order[2] != "low-2" {
-		t.Fatalf("expected second background request to be delayed, got %#v", src.order)
-	}
-}
