@@ -143,6 +143,7 @@ type BlocklistService interface {
 	List(ctx context.Context) ([]database.BlocklistItemSummary, error)
 	Clear(ctx context.Context, id int64) error
 	ClearAll(ctx context.Context) (database.BlocklistClearResult, error)
+	ClearByReason(ctx context.Context, reason string) (database.BlocklistClearResult, error)
 }
 
 type IntegrationProbeService interface {
@@ -704,6 +705,16 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 	r.Delete("/api/blocklist", func(w http.ResponseWriter, r *http.Request) {
 		if blocklistSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("blocklist unavailable"))
+			return
+		}
+		if reason := r.URL.Query().Get("reason"); reason != "" {
+			result, err := blocklistSvc.ClearByReason(r.Context(), reason)
+			if err != nil {
+				respondError(w, http.StatusBadGateway, err)
+				return
+			}
+			publishMutation("blocklist.clear_reason", map[string]any{"reason": reason, "cleared": result.Cleared})
+			respondJSON(w, http.StatusOK, result)
 			return
 		}
 		result, err := blocklistSvc.ClearAll(r.Context())

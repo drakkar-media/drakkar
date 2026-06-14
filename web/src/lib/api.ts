@@ -107,6 +107,7 @@ export const api = {
   pruneCache: () => request<{ root: string; filesBefore: number; filesAfter: number; bytesBefore: number; bytesAfter: number; deletedFiles: number; deletedBytes: number; limitBytes: number }>('/api/cache/prune', { method: 'POST' }),
   clearBlocklist: (id: number) => request<{ status: string; blocklistItemId: number }>(`/api/blocklist/${id}`, { method: 'DELETE' }),
   clearAllBlocklist: () => request<{ cleared: number }>('/api/blocklist', { method: 'DELETE' }),
+  clearBlocklistByReason: (reason: string) => request<{ cleared: number }>(`/api/blocklist?reason=${encodeURIComponent(reason)}`, { method: 'DELETE' }),
   searchSubtitles: (libraryItemID: number, languages: string[]) =>
     request<{ libraryItemId: number; candidateCount: number }>(`/api/subtitles/${libraryItemID}/search`, {
       method: 'POST',

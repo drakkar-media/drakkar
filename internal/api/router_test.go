@@ -204,6 +204,10 @@ func (b *blocklistStub) ClearAll(ctx context.Context) (database.BlocklistClearRe
 	return b.all, nil
 }
 
+func (b *blocklistStub) ClearByReason(ctx context.Context, reason string) (database.BlocklistClearResult, error) {
+	return database.BlocklistClearResult{Cleared: 0}, nil
+}
+
 const sampleNZB = `<?xml version="1.0" encoding="UTF-8"?>
 <nzb>
   <file subject="&quot;Dune (2021).mkv&quot;" poster="poster" date="1710000000">

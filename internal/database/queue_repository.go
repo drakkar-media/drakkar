@@ -21,16 +21,17 @@ const maxSegmentBatch = 10000
 
 // vfRange is a single virtual_file_ranges row ready for bulk insert.
 type vfRange struct {
-	segmentID  int64
-	rangeStart int64
-	rangeEnd   int64
+	segmentID        int64
+	rangeStart       int64
+	rangeEnd         int64
+	segmentByteStart int64
 }
 
-// bulkInsertVFRanges inserts virtual_file_ranges rows in batches (4 params per
-// row → max 16381 rows per query). This replaces the previous one-INSERT-per-
+// bulkInsertVFRanges inserts virtual_file_ranges rows in batches (5 params per
+// row → max 13107 rows per query). This replaces the previous one-INSERT-per-
 // segment loop that caused measurable latency for large NZBs.
 func bulkInsertVFRanges(ctx context.Context, tx *sql.Tx, virtualFileID int64, ranges []vfRange) error {
-	const batchSize = 16000 // 4 params × 16000 = 64000 < 65535 limit
+	const batchSize = 13000 // 5 params × 13000 = 65000 < 65535 limit
 	for start := 0; start < len(ranges); start += batchSize {
 		end := start + batchSize
 		if end > len(ranges) {
@@ -38,15 +39,15 @@ func bulkInsertVFRanges(ctx context.Context, tx *sql.Tx, virtualFileID int64, ra
 		}
 		batch := ranges[start:end]
 		var sb strings.Builder
-		sb.WriteString(`INSERT INTO virtual_file_ranges (virtual_file_id, nzb_segment_id, range_start, range_end) VALUES `)
-		args := make([]any, 0, len(batch)*4)
+		sb.WriteString(`INSERT INTO virtual_file_ranges (virtual_file_id, nzb_segment_id, range_start, range_end, segment_byte_start) VALUES `)
+		args := make([]any, 0, len(batch)*5)
 		for i, r := range batch {
 			if i > 0 {
 				sb.WriteByte(',')
 			}
-			base := i * 4
-			fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d)", base+1, base+2, base+3, base+4)
-			args = append(args, virtualFileID, r.segmentID, r.rangeStart, r.rangeEnd)
+			base := i * 5
+			fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d)", base+1, base+2, base+3, base+4, base+5)
+			args = append(args, virtualFileID, r.segmentID, r.rangeStart, r.rangeEnd, r.segmentByteStart)
 		}
 		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
 			return err
@@ -577,7 +578,7 @@ func insertArchiveVirtualFile(ctx context.Context, tx *sql.Tx, selectedReleaseID
 		}
 		vfrs := make([]vfRange, len(ranges))
 		for i, r := range ranges {
-			vfrs[i] = vfRange{segmentID: r.SegmentID, rangeStart: r.RangeStart, rangeEnd: r.RangeEnd}
+			vfrs[i] = vfRange{segmentID: r.SegmentID, rangeStart: r.RangeStart, rangeEnd: r.RangeEnd, segmentByteStart: r.SegmentByteStart}
 		}
 		if err = bulkInsertVFRanges(ctx, tx, virtualFileID, vfrs); err != nil {
 			return 0, err
@@ -587,9 +588,10 @@ func insertArchiveVirtualFile(ctx context.Context, tx *sql.Tx, selectedReleaseID
 }
 
 type resolvedArchiveRange struct {
-	SegmentID  int64
-	RangeStart int64
-	RangeEnd   int64
+	SegmentID        int64
+	RangeStart       int64
+	RangeEnd         int64
+	SegmentByteStart int64
 }
 
 func resolveArchiveEntryRanges(source importedFileSegments, item ImportedArchiveRange) ([]resolvedArchiveRange, error) {
@@ -601,10 +603,16 @@ func resolveArchiveEntryRanges(source importedFileSegments, item ImportedArchive
 	for _, part := range parts {
 		start := item.EntryOffset + (part.RangeStart - item.ArchiveOffset)
 		end := start + (part.RangeEnd - part.RangeStart)
+		// part.RangeStart is an archive byte position; part.SegmentStart is the
+		// decoded_start_offset of the segment (also an archive byte position for
+		// source spans). Their difference is the byte offset within the decoded
+		// segment at which this span's content begins.
+		segByteStart := part.RangeStart - part.SegmentStart
 		out = append(out, resolvedArchiveRange{
-			SegmentID:  part.SegmentID,
-			RangeStart: start,
-			RangeEnd:   end,
+			SegmentID:        part.SegmentID,
+			RangeStart:       start,
+			RangeEnd:         end,
+			SegmentByteStart: segByteStart,
 		})
 	}
 	return out, nil

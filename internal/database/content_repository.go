@@ -110,8 +110,13 @@ func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, 
 		return nil, err
 	}
 	if entry.readerKind == "direct_nzb" || entry.readerKind == "stored_rar" {
+		// For stored_rar we need decoded_start_offset and segment_byte_start to
+		// translate VF byte positions into decoded-segment byte positions at read
+		// time. For direct_nzb these fields are zero (their default) because VF
+		// positions equal decoded positions.
 		rows, err := db.SQL.QueryContext(ctx, `
-			select ns.id, ns.message_id, vfr.range_start, vfr.range_end
+			select ns.id, ns.message_id, vfr.range_start, vfr.range_end,
+			       ns.decoded_start_offset, vfr.segment_byte_start
 			from virtual_file_ranges vfr
 			join nzb_segments ns on ns.id = vfr.nzb_segment_id
 			where vfr.virtual_file_id = $1
@@ -123,7 +128,8 @@ func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, 
 		defer rows.Close()
 		for rows.Next() {
 			var span stream.SegmentSpan
-			if err := rows.Scan(&span.SegmentID, &span.MessageID, &span.Start, &span.End); err != nil {
+			if err := rows.Scan(&span.SegmentID, &span.MessageID, &span.Start, &span.End,
+				&span.DecodedStart, &span.SegmentByteStart); err != nil {
 				return nil, err
 			}
 			entry.spans = append(entry.spans, span)

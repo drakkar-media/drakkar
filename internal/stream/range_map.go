@@ -5,19 +5,23 @@ import "errors"
 var ErrRangeOutsideFile = errors.New("range outside file")
 
 type SegmentRange struct {
-	SegmentID    int64
-	MessageID    string
-	RangeStart   int64
-	RangeEnd     int64
-	SegmentStart int64
-	SegmentEnd   int64
+	SegmentID        int64
+	MessageID        string
+	RangeStart       int64
+	RangeEnd         int64
+	SegmentStart     int64
+	SegmentEnd       int64
+	DecodedStart     int64 // decoded_start_offset of the NZB segment (stored_rar only)
+	SegmentByteStart int64 // byte within decoded segment where this span's content starts
 }
 
 type SegmentSpan struct {
-	SegmentID  int64
-	MessageID  string
-	Start      int64
-	End        int64
+	SegmentID        int64
+	MessageID        string
+	Start            int64
+	End              int64
+	DecodedStart     int64 // decoded_start_offset of the NZB segment (stored_rar only)
+	SegmentByteStart int64 // byte offset within decoded segment at span.Start (stored_rar only)
 }
 
 func ResolveRange(spans []SegmentSpan, offset, length int64) ([]SegmentRange, error) {
@@ -42,12 +46,14 @@ func ResolveRange(spans []SegmentSpan, offset, length int64) ([]SegmentRange, er
 			continue
 		}
 		out = append(out, SegmentRange{
-			SegmentID:    span.SegmentID,
-			MessageID:    span.MessageID,
-			RangeStart:   start,
-			RangeEnd:     end,
-			SegmentStart: span.Start,
-			SegmentEnd:   span.End,
+			SegmentID:        span.SegmentID,
+			MessageID:        span.MessageID,
+			RangeStart:       start,
+			RangeEnd:         end,
+			SegmentStart:     span.Start,
+			SegmentEnd:       span.End,
+			DecodedStart:     span.DecodedStart,
+			SegmentByteStart: span.SegmentByteStart,
 		})
 	}
 	if len(out) == 0 {

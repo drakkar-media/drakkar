@@ -51,12 +51,28 @@ func (r *StoredRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 		return 0, err
 	}
 	written := 0
-	for _, span := range ranges {
-		block, err := r.fetcher.FetchRange(ctx, span)
+	for _, rng := range ranges {
+		// Translate VF byte positions to decoded-segment byte positions.
+		// vfr.range_start/end are in VF space; the NNTP fetcher expects archive
+		// (decoded) byte positions. The offset into the decoded segment is:
+		//   segment_byte_start + (vf_pos - span_vf_start)
+		// where segment_byte_start accounts for the RAR header that precedes the
+		// embedded file in the first segment of each volume.
+		offset := rng.SegmentByteStart + (rng.RangeStart - rng.SegmentStart)
+		length := rng.RangeEnd - rng.RangeStart
+		adj := SegmentRange{
+			SegmentID:    rng.SegmentID,
+			MessageID:    rng.MessageID,
+			RangeStart:   rng.DecodedStart + offset,
+			RangeEnd:     rng.DecodedStart + offset + length,
+			SegmentStart: rng.DecodedStart,
+			SegmentEnd:   rng.DecodedStart + (rng.SegmentEnd-rng.SegmentStart) + rng.SegmentByteStart,
+		}
+		block, err := r.fetcher.FetchRange(ctx, adj)
 		if err != nil {
 			return written, err
 		}
-		expected := int(span.RangeEnd - span.RangeStart)
+		expected := int(length)
 		if len(block) < expected {
 			return written, errors.New("short fetch")
 		}

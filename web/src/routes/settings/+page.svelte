@@ -76,6 +76,8 @@
 
   let blockQuery = '';
   let blockReasonFilter = 'all';
+  let blockSortCol: 'reason' | 'key' | 'expires' = 'reason';
+  let blockSortDir: 'asc' | 'desc' = 'asc';
 
   // ── Seerr webhook ───────────────────────────────────────────────────────────
   let webhookCopied = false;
@@ -451,6 +453,19 @@
     }
   }
 
+  async function clearBlocklistByReason(reason: string) {
+    working = true;
+    try {
+      const r = await api.clearBlocklistByReason(reason);
+      toastSuccess(`Cleared ${r.cleared} ${reason} entr${r.cleared === 1 ? 'y' : 'ies'}`);
+      blocklist = blocklist.filter((b) => b.reason !== reason);
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : String(e));
+    } finally {
+      working = false;
+    }
+  }
+
   async function runMaintenance(task: 'orphaned-content' | 'broken-media-symlinks' | 'orphaned-completed-symlinks') {
     working = true;
     try {
@@ -520,11 +535,22 @@
   $: integrationEntries = status ? Object.entries(status.integrations).filter(([n]) => n !== 'subtitleProviders') : [];
   $: subtitleProviderEntries = status ? Object.entries(status.integrations.subtitleProviders) : [];
 
-  $: filteredBlocklist = (blocklist ?? []).filter((b) => {
-    const matchReason = blockReasonFilter === 'all' || b.reason === blockReasonFilter;
-    const matchQ = !blockQuery || `${b.key} ${b.reason}`.toLowerCase().includes(blockQuery.toLowerCase());
-    return matchReason && matchQ;
-  });
+  $: filteredBlocklist = (() => {
+    const filtered = (blocklist ?? []).filter((b) => {
+      const matchReason = blockReasonFilter === 'all' || b.reason === blockReasonFilter;
+      const matchQ = !blockQuery || `${b.key} ${b.reason}`.toLowerCase().includes(blockQuery.toLowerCase());
+      return matchReason && matchQ;
+    });
+    const dir = blockSortDir === 'asc' ? 1 : -1;
+    filtered.sort((a, b) => {
+      if (blockSortCol === 'reason') return dir * a.reason.localeCompare(b.reason);
+      if (blockSortCol === 'key') return dir * a.key.localeCompare(b.key);
+      const ea = a.expiresAt ?? '';
+      const eb = b.expiresAt ?? '';
+      return dir * ea.localeCompare(eb);
+    });
+    return filtered;
+  })();
 
   $: blocklistStats = {
     total: (blocklist ?? []).length,
@@ -1083,17 +1109,33 @@
     <!-- RULES -->
     {:else if activeTab === 'rules'}
       <Panel title="Blocklist" subtitle="Durable release blocks from manual, archive or metadata rejects.">
+        {#if blocklist.length > 0}
+          <!-- Reason summary row -->
+          <div class="bl-reasons">
+            {#each Object.entries(blocklistStats.byReason).sort(([,a],[,b]) => b - a) as [reason, count]}
+              <div class="bl-reason-chip reason-chip-{reason.split('_')[0]}" class:active={blockReasonFilter === reason}>
+                <button class="bl-reason-chip-btn" on:click={() => { blockReasonFilter = blockReasonFilter === reason ? 'all' : reason; }}>
+                  <span class="reason-badge reason-{reason.split('_')[0]}">{reason}</span>
+                  <span class="bl-reason-count">{count}</span>
+                </button>
+                <button class="clear-btn bl-reason-clear" on:click={() => clearBlocklistByReason(reason)} disabled={working} title="Clear all {reason}">
+                  <X size={11} />
+                </button>
+              </div>
+            {/each}
+          </div>
+        {/if}
+
         <div class="bl-toolbar">
           <div class="bl-search">
             <Search size={14} />
             <input bind:value={blockQuery} placeholder="Search by key or reason…" />
           </div>
-          <select bind:value={blockReasonFilter} class="bl-reason-select">
-            <option value="all">All reasons</option>
-            {#each REASONS as r}
-              <option value={r}>{r}</option>
-            {/each}
-          </select>
+          {#if blockReasonFilter !== 'all'}
+            <button class="bl-filter-active" on:click={() => blockReasonFilter = 'all'}>
+              {blockReasonFilter} <X size={11} />
+            </button>
+          {/if}
           <div class="bl-stats mono">
             {filteredBlocklist.length} / {blocklist.length} entries
           </div>
@@ -1110,9 +1152,15 @@
             <table class="bl-table">
               <thead>
                 <tr>
-                  <th>Reason</th>
-                  <th>Key / URL</th>
-                  <th>Expires</th>
+                  <th class="sortable" on:click={() => { if (blockSortCol === 'reason') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'reason'; blockSortDir = 'asc'; } }}>
+                    Reason {blockSortCol === 'reason' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
+                  </th>
+                  <th class="sortable" on:click={() => { if (blockSortCol === 'key') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'key'; blockSortDir = 'asc'; } }}>
+                    Key / URL {blockSortCol === 'key' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
+                  </th>
+                  <th class="sortable" on:click={() => { if (blockSortCol === 'expires') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'expires'; blockSortDir = 'asc'; } }}>
+                    Expires {blockSortCol === 'expires' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
+                  </th>
                   <th></th>
                 </tr>
               </thead>
@@ -2119,6 +2167,73 @@
   .int-info span   { display: block; margin-top: 3px; color: hsl(var(--muted-foreground)); font-size: 12px; overflow-wrap: anywhere; }
 
   /* blocklist */
+  .bl-reasons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+
+  .bl-reason-chip {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    border-radius: 12px;
+    border: 1px solid hsl(0 0% 100% / 0.08);
+    background: hsl(0 0% 100% / 0.04);
+    padding: 2px 4px 2px 2px;
+    transition: border-color 0.15s, background 0.15s;
+  }
+
+  .bl-reason-chip.active {
+    border-color: hsl(var(--primary) / 0.5);
+    background: hsl(var(--primary) / 0.08);
+  }
+
+  .bl-reason-chip-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 4px 6px;
+    border-radius: 8px;
+  }
+
+  .bl-reason-chip-btn:hover { background: hsl(0 0% 100% / 0.06); }
+
+  .bl-reason-count {
+    font-size: 12px;
+    font-weight: 700;
+    color: hsl(var(--foreground));
+    min-width: 16px;
+    text-align: right;
+  }
+
+  .bl-reason-clear {
+    width: 22px !important;
+    height: 22px !important;
+    border-radius: 6px !important;
+  }
+
+  .bl-filter-active {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    height: 32px;
+    padding: 0 10px;
+    border-radius: 10px;
+    border: 1px solid hsl(var(--primary) / 0.4);
+    background: hsl(var(--primary) / 0.1);
+    color: hsl(var(--primary));
+    font-size: 12px;
+    font-family: 'JetBrains Mono', monospace;
+    cursor: pointer;
+  }
+
+  .bl-filter-active:hover { background: hsl(var(--primary) / 0.15); }
+
   .bl-toolbar {
     display: flex;
     flex-wrap: wrap;
@@ -2180,6 +2295,9 @@
     color: hsl(var(--muted-foreground));
     border-bottom: 1px solid hsl(0 0% 100% / 0.06);
   }
+
+  .bl-table th.sortable { cursor: pointer; user-select: none; }
+  .bl-table th.sortable:hover { color: hsl(var(--foreground)); }
 
   .bl-table td {
     padding: 10px 14px;

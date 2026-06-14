@@ -61,3 +61,18 @@ func (db *DB) DeleteAllBlocklistItems(ctx context.Context) (int, error) {
 	}
 	return int(rows), nil
 }
+
+func (db *DB) DeleteBlocklistItemsByReason(ctx context.Context, reason string) (int, error) {
+	result, err := db.SQL.ExecContext(ctx, `
+		delete from blocklist_items
+		where reason = $1 and (expires_at is null or expires_at > now())`, reason,
+	)
+	if err != nil {
+		return 0, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(rows), nil
+}
