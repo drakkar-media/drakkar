@@ -296,6 +296,12 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 	}
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		// Browsers request text/html — let the SvelteKit health page handle those.
+		// Health checkers (wget, curl, Docker) send no Accept or */*, get JSON.
+		if strings.Contains(r.Header.Get("Accept"), "text/html") {
+			frontend.Handler().ServeHTTP(w, r)
+			return
+		}
 		respondJSON(w, http.StatusOK, map[string]any{"service": "drakkar", "healthy": status.Status().Healthy})
 	})
 	r.Get("/api/status", func(w http.ResponseWriter, r *http.Request) {
