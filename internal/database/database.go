@@ -63,6 +63,10 @@ func (db *DB) Close() error {
 	return db.SQL.Close()
 }
 
+// migrationLockID is the PostgreSQL advisory lock key used to serialise
+// concurrent migration runs (e.g. two containers starting simultaneously).
+const migrationLockID = 0x6472616b6b617200 // "drakkar\0"
+
 func (db *DB) ApplyMigrations(ctx context.Context, dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -80,6 +84,7 @@ func (db *DB) ApplyMigrations(ctx context.Context, dir string) error {
 	}
 	sort.Strings(files)
 	for _, name := range files {
+		// Quick pre-check without locking — skip already-applied migrations cheaply.
 		var exists bool
 		if err := db.SQL.QueryRowContext(ctx, `select exists(select 1 from schema_migrations where version = $1)`, name).Scan(&exists); err != nil {
 			return err
@@ -94,6 +99,23 @@ func (db *DB) ApplyMigrations(ctx context.Context, dir string) error {
 		tx, err := db.SQL.BeginTx(ctx, nil)
 		if err != nil {
 			return err
+		}
+		// Acquire a session-level advisory lock inside the transaction so that
+		// only one concurrent Drakkar instance applies any given migration. The
+		// lock is automatically released when the transaction commits or rolls back.
+		if _, err := tx.ExecContext(ctx, `select pg_advisory_xact_lock($1)`, migrationLockID); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("acquire migration lock: %w", err)
+		}
+		// Re-check inside the lock in case another instance applied this migration
+		// while we were waiting to acquire the lock.
+		if err := tx.QueryRowContext(ctx, `select exists(select 1 from schema_migrations where version = $1)`, name).Scan(&exists); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if exists {
+			_ = tx.Rollback()
+			continue
 		}
 		if _, err := tx.ExecContext(ctx, string(content)); err != nil {
 			_ = tx.Rollback()
