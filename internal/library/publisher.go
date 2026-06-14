@@ -21,6 +21,7 @@ type Repository interface {
 	ListSelectedReleasesForPublication(ctx context.Context) ([]int64, error)
 	ListSelectedReleasesByLibraryItem(ctx context.Context, libraryItemID int64) ([]int64, error)
 	FindSourceSelectedReleaseForItem(ctx context.Context, libraryItemID int64) (int64, error)
+	GetEpisodeMetadataForLibraryItem(ctx context.Context, libraryItemID int64) (database.EpisodeMetadata, error)
 	ListPendingRepublishTargets(ctx context.Context) ([]database.PendingRepublishTarget, error)
 	UpsertSymlinkPublication(ctx context.Context, libraryItemID, virtualFileID int64, libraryPath, targetPath string) error
 	MarkReleaseAvailable(ctx context.Context, selectedReleaseID int64) error
@@ -156,19 +157,58 @@ func (p *Publisher) RepublishLibraryItem(ctx context.Context, libraryItemID int6
 		return err
 	}
 	if len(selectedReleaseIDs) == 0 {
-		// Season-pack episode: virtual files live under the pack's selected
-		// release. Re-publishing it runs fulfillSeasonPackEpisodes, which
-		// creates the missing symlink for this episode.
+		// Season-pack episode: virtual files live under the pack's selected release.
+		// Rather than re-publishing the whole pack (which may have no show metadata),
+		// use the episode item's own metadata to find and publish the matching VF directly.
 		sourceID, err := p.repo.FindSourceSelectedReleaseForItem(ctx, libraryItemID)
 		if err != nil || sourceID == 0 {
 			return nil
 		}
-		selectedReleaseIDs = []int64{sourceID}
+		return p.republishEpisodeFromSourceRelease(ctx, libraryItemID, sourceID)
 	}
 	for _, selectedReleaseID := range selectedReleaseIDs {
 		if err := p.PublishSelectedRelease(ctx, selectedReleaseID); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// republishEpisodeFromSourceRelease creates the missing symlink for an episode
+// library item whose virtual files live under a season pack selected release.
+// It queries the episode item's own metadata (show title, season, episode) and
+// matches the corresponding virtual file by parsing the filename.
+func (p *Publisher) republishEpisodeFromSourceRelease(ctx context.Context, libraryItemID, sourceReleaseID int64) error {
+	meta, err := p.repo.GetEpisodeMetadataForLibraryItem(ctx, libraryItemID)
+	if err != nil || meta.ShowTitle == "" || meta.SeasonNumber <= 0 || meta.EpisodeNumber <= 0 {
+		return nil
+	}
+	files, err := p.repo.ListVirtualFilesForRelease(ctx, sourceReleaseID)
+	if err != nil {
+		return err
+	}
+	for _, f := range files {
+		s, e := database.ParseEpisodeFromFilename(f.FileName)
+		if s != meta.SeasonNumber || e != meta.EpisodeNumber {
+			continue
+		}
+		enriched := f
+		enriched.LibraryItemID = libraryItemID
+		enriched.MediaType = "episode"
+		enriched.ShowTitle = meta.ShowTitle
+		enriched.ShowYear = meta.ShowYear
+		enriched.ShowTVDBID = meta.ShowTVDBID
+		enriched.SeasonNumber = meta.SeasonNumber
+		enriched.EpisodeNumber = meta.EpisodeNumber
+		target := filepath.Join(p.runtime.FuseMountPath, "content", enriched.Path)
+		libraryPath := p.libraryPathFor(enriched)
+		if libraryPath == "" {
+			return nil
+		}
+		if err := p.syml.Publish(libraryPath, target); err != nil {
+			return err
+		}
+		return p.repo.UpsertSymlinkPublication(ctx, libraryItemID, f.VirtualFileID, libraryPath, target)
 	}
 	return nil
 }

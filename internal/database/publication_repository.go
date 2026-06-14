@@ -278,6 +278,30 @@ func (db *DB) ListUnrecoverableLibraryItems(ctx context.Context) ([]int64, error
 	return out, rows.Err()
 }
 
+// EpisodeMetadata holds the show/episode identifiers for a library item.
+type EpisodeMetadata struct {
+	ShowTitle     string
+	ShowYear      int
+	ShowTVDBID    int64
+	SeasonNumber  int
+	EpisodeNumber int
+}
+
+// GetEpisodeMetadataForLibraryItem returns the show and episode metadata for
+// a library item by joining through its episode_id → tv_shows.
+func (db *DB) GetEpisodeMetadataForLibraryItem(ctx context.Context, libraryItemID int64) (EpisodeMetadata, error) {
+	var m EpisodeMetadata
+	err := db.SQL.QueryRowContext(ctx, `
+		select coalesce(tv.title, ''), coalesce(tv.release_year, 0), coalesce(tv.tvdb_id, 0),
+		       coalesce(e.season_number, 0), coalesce(e.episode_number, 0)
+		from library_items li
+		left join episodes e on e.id = li.episode_id
+		left join tv_shows tv on tv.id = e.tv_show_id
+		where li.id = $1`, libraryItemID).Scan(
+		&m.ShowTitle, &m.ShowYear, &m.ShowTVDBID, &m.SeasonNumber, &m.EpisodeNumber)
+	return m, err
+}
+
 // FindSourceSelectedReleaseForItem returns the selected_release ID of the season
 // pack that owns the virtual files for a given library item. Used when an episode
 // item has a selected_release but no virtual files of its own — the files live
