@@ -2,7 +2,6 @@ package database
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 
 	"github.com/hjongedijk/drakkar/internal/stream"
@@ -64,26 +63,53 @@ func (db *DB) ListContentMountEntries(ctx context.Context) ([]ContentMountEntry,
 }
 
 func (db *DB) OpenVirtualMediaFile(ctx context.Context, virtualFileID int64) (stream.VirtualMediaFile, error) {
-	var (
-		name       string
-		readerKind string
-		inlineData []byte
-	)
+	entry, err := db.loadVFCache(ctx, virtualFileID)
+	if err != nil {
+		return nil, err
+	}
+	fetcher := db.SegmentFetcher
+	if fetcher == nil {
+		fetcher = unavailableSegmentFetcher{}
+	}
+	switch entry.readerKind {
+	case "inline":
+		return stream.NewByteVirtualFile(entry.name, entry.inlineData), nil
+	case "direct_nzb", "stored_rar":
+		// Each reader gets its own copy of the spans so realignSpans adjustments
+		// don't corrupt the cached canonical slice.
+		spans := make([]stream.SegmentSpan, len(entry.spans))
+		copy(spans, entry.spans)
+		if entry.readerKind == "stored_rar" {
+			return stream.NewStoredRarReader(entry.name, spanFileSize(spans), spans, fetcher, db.ReadAhead), nil
+		}
+		return stream.NewDirectNzbReader(entry.name, spanFileSize(spans), spans, fetcher, db.ReadAhead), nil
+	default:
+		return nil, errors.New("virtual media reader not implemented: " + entry.readerKind)
+	}
+}
+
+// loadVFCache returns the cached virtual-file metadata, querying the DB on
+// the first call for each virtualFileID and serving from memory thereafter.
+// Spans are immutable in the DB after the NZB is imported, so the cache
+// never needs invalidation.
+func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, error) {
+	db.vfCacheMu.RLock()
+	if entry, ok := db.vfCache[virtualFileID]; ok {
+		db.vfCacheMu.RUnlock()
+		return entry, nil
+	}
+	db.vfCacheMu.RUnlock()
+
+	var entry cachedVF
 	err := db.SQL.QueryRowContext(ctx, `
 		select file_name, reader_kind, inline_bytes
 		from virtual_files
 		where id = $1`, virtualFileID,
-	).Scan(&name, &readerKind, &inlineData)
+	).Scan(&entry.name, &entry.readerKind, &entry.inlineData)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, err
-		}
 		return nil, err
 	}
-	switch readerKind {
-	case "inline":
-		return stream.NewByteVirtualFile(name, inlineData), nil
-	case "direct_nzb", "stored_rar":
+	if entry.readerKind == "direct_nzb" || entry.readerKind == "stored_rar" {
 		rows, err := db.SQL.QueryContext(ctx, `
 			select ns.id, ns.message_id, vfr.range_start, vfr.range_end
 			from virtual_file_ranges vfr
@@ -95,29 +121,22 @@ func (db *DB) OpenVirtualMediaFile(ctx context.Context, virtualFileID int64) (st
 			return nil, err
 		}
 		defer rows.Close()
-
-		var spans []stream.SegmentSpan
 		for rows.Next() {
 			var span stream.SegmentSpan
 			if err := rows.Scan(&span.SegmentID, &span.MessageID, &span.Start, &span.End); err != nil {
 				return nil, err
 			}
-			spans = append(spans, span)
+			entry.spans = append(entry.spans, span)
 		}
 		if err := rows.Err(); err != nil {
 			return nil, err
 		}
-		fetcher := db.SegmentFetcher
-		if fetcher == nil {
-			fetcher = unavailableSegmentFetcher{}
-		}
-		if readerKind == "stored_rar" {
-			return stream.NewStoredRarReader(name, spanFileSize(spans), spans, fetcher, db.ReadAhead), nil
-		}
-		return stream.NewDirectNzbReader(name, spanFileSize(spans), spans, fetcher, db.ReadAhead), nil
-	default:
-		return nil, errors.New("virtual media reader not implemented: " + readerKind)
 	}
+
+	db.vfCacheMu.Lock()
+	db.vfCache[virtualFileID] = &entry
+	db.vfCacheMu.Unlock()
+	return &entry, nil
 }
 
 type unavailableSegmentFetcher struct{}

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/hjongedijk/drakkar/internal/config"
 	"github.com/hjongedijk/drakkar/internal/stream"
@@ -15,10 +16,23 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
+// cachedVF holds the immutable data for a virtual file so that repeated
+// OpenVirtualMediaFile calls (e.g. each rclone range request) don't re-query
+// the DB for the same 9000+ segment-span rows.
+type cachedVF struct {
+	name       string
+	readerKind string
+	inlineData []byte
+	spans      []stream.SegmentSpan // canonical DB spans — callers receive a copy
+}
+
 type DB struct {
 	SQL            *sql.DB
 	SegmentFetcher stream.SegmentFetcher
 	ReadAhead      *stream.ReadAheadManager
+
+	vfCacheMu sync.RWMutex
+	vfCache   map[int64]*cachedVF
 }
 
 func Open(cfg config.DatabaseConfig) (*DB, error) {
@@ -35,7 +49,7 @@ func Open(cfg config.DatabaseConfig) (*DB, error) {
 	sqlDB := stdlib.OpenDB(*pgxCfg)
 	sqlDB.SetMaxOpenConns(12)
 	sqlDB.SetMaxIdleConns(4)
-	return &DB{SQL: sqlDB}, nil
+	return &DB{SQL: sqlDB, vfCache: make(map[int64]*cachedVF)}, nil
 }
 
 func (db *DB) Ping(ctx context.Context) error {
