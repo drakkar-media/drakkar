@@ -20,6 +20,7 @@ type Repository interface {
 	ListVirtualFilesForRelease(ctx context.Context, selectedReleaseID int64) ([]database.ReleaseVirtualFile, error)
 	ListSelectedReleasesForPublication(ctx context.Context) ([]int64, error)
 	ListSelectedReleasesByLibraryItem(ctx context.Context, libraryItemID int64) ([]int64, error)
+	FindSourceSelectedReleaseForItem(ctx context.Context, libraryItemID int64) (int64, error)
 	ListPendingRepublishTargets(ctx context.Context) ([]database.PendingRepublishTarget, error)
 	UpsertSymlinkPublication(ctx context.Context, libraryItemID, virtualFileID int64, libraryPath, targetPath string) error
 	MarkReleaseAvailable(ctx context.Context, selectedReleaseID int64) error
@@ -111,11 +112,17 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 	}
 	// For season packs: fulfil any other episode library items that are covered
 	// by virtual files in this release but were searched as separate items.
-	// Also create per-episode library items for whole-show imports (season=0/episode=0).
-	// Skip during startup rebuild — episode items already exist from the initial publish.
-	if isNew && len(libraryItemIDs) == 1 {
+	// Runs on rebuild too — fills in symlinks for episodes created after the
+	// initial publish (e.g. by CreateSeasonPackEpisodeItems).
+	if len(libraryItemIDs) == 1 {
 		for triggeringID := range libraryItemIDs {
 			p.fulfillSeasonPackEpisodes(ctx, selectedReleaseID, triggeringID, files)
+		}
+	}
+	// Create per-episode library items for whole-show imports. Skip on rebuild —
+	// those items were already created on the initial publish.
+	if isNew && len(libraryItemIDs) == 1 {
+		for triggeringID := range libraryItemIDs {
 			if err := p.repo.CreateSeasonPackEpisodeItems(ctx, selectedReleaseID, triggeringID); err != nil {
 				_ = err // non-fatal
 			}
@@ -147,6 +154,16 @@ func (p *Publisher) RepublishLibraryItem(ctx context.Context, libraryItemID int6
 	selectedReleaseIDs, err := p.repo.ListSelectedReleasesByLibraryItem(ctx, libraryItemID)
 	if err != nil {
 		return err
+	}
+	if len(selectedReleaseIDs) == 0 {
+		// Season-pack episode: virtual files live under the pack's selected
+		// release. Re-publishing it runs fulfillSeasonPackEpisodes, which
+		// creates the missing symlink for this episode.
+		sourceID, err := p.repo.FindSourceSelectedReleaseForItem(ctx, libraryItemID)
+		if err != nil || sourceID == 0 {
+			return nil
+		}
+		selectedReleaseIDs = []int64{sourceID}
 	}
 	for _, selectedReleaseID := range selectedReleaseIDs {
 		if err := p.PublishSelectedRelease(ctx, selectedReleaseID); err != nil {

@@ -236,6 +236,27 @@ func (db *DB) ListSelectedReleasesByLibraryItem(ctx context.Context, libraryItem
 	return out, rows.Err()
 }
 
+// FindSourceSelectedReleaseForItem returns the selected_release ID of the season
+// pack that owns the virtual files for a given library item. Used when an episode
+// item has a selected_release but no virtual files of its own — the files live
+// under the pack's selected_release (same release_candidate_id).
+func (db *DB) FindSourceSelectedReleaseForItem(ctx context.Context, libraryItemID int64) (int64, error) {
+	var id int64
+	err := db.SQL.QueryRowContext(ctx, `
+		select pack_sr.id
+		from selected_releases ep_sr
+		join selected_releases pack_sr
+		  on pack_sr.release_candidate_id = ep_sr.release_candidate_id
+		 and pack_sr.library_item_id != $1
+		join virtual_files vf on vf.selected_release_id = pack_sr.id
+		where ep_sr.library_item_id = $1
+		limit 1`, libraryItemID).Scan(&id)
+	if err != nil {
+		return 0, nil // not found is not an error
+	}
+	return id, nil
+}
+
 func (db *DB) ListPendingRepublishTargets(ctx context.Context) ([]PendingRepublishTarget, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		-- Items stuck in active queue states but not yet marked available
@@ -247,17 +268,12 @@ func (db *DB) ListPendingRepublishTargets(ctx context.Context) ([]PendingRepubli
 		  and q.state in ($1, $2, $3)
 		union
 		-- Items marked available but missing their symlink publication
-		select distinct sr.library_item_id
-		from selected_releases sr
-		join library_items li on li.id = sr.library_item_id
-		where li.available = true
-		  and exists (
-		      select 1 from virtual_files vf
-		      where vf.selected_release_id = sr.id
-		  )
+		select id
+		from library_items
+		where available = true
 		  and not exists (
 		      select 1 from symlink_publications sp
-		      where sp.library_item_id = li.id
+		      where sp.library_item_id = library_items.id
 		  )
 		order by library_item_id asc`, QueuePreflight, QueuePublishing, QueueIndexing,
 	)

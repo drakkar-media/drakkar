@@ -50,6 +50,10 @@ func (r *repoStub) ListPendingRepublishTargets(ctx context.Context) ([]database.
 	return r.pending, nil
 }
 
+func (r *repoStub) FindSourceSelectedReleaseForItem(_ context.Context, _ int64) (int64, error) {
+	return 0, nil
+}
+
 func (r *repoStub) FindSeasonPackMatches(_ context.Context, _, _ int64) ([]database.SeasonPackEpisodeMatch, error) {
 	return nil, nil
 }
