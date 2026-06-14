@@ -17,6 +17,7 @@ import (
 	"os"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/hjongedijk/drakkar/internal/auth"
 	"github.com/hjongedijk/drakkar/internal/cache"
 	"github.com/hjongedijk/drakkar/internal/frontend"
 	"github.com/hjongedijk/drakkar/internal/catalog"
@@ -227,9 +228,10 @@ func (b *EventBroker) Publish(event map[string]any) {
 	}
 }
 
-func Router(status StatusService, queue QueueService, workflow WorkflowService, publication PublicationService, maintenance MaintenanceService, cacheSvc CacheService, subtitleSvc SubtitleService, blocklistSvc BlocklistService, probeSvc IntegrationProbeService, catalogSvc CatalogService, broker *EventBroker, healthRepo HealthRepository, streamsProvider StreamsProvider, profilesRepo ProfilesRepository, taskSchedules TaskScheduleProvider, policySvc PolicyService, plexClient *plex.Client, jellyfinClient *jellyfin.Client, settingsSvc SettingsService, metricsProvider ...MetricsProvider) chi.Router {
+func Router(status StatusService, queue QueueService, workflow WorkflowService, publication PublicationService, maintenance MaintenanceService, cacheSvc CacheService, subtitleSvc SubtitleService, blocklistSvc BlocklistService, probeSvc IntegrationProbeService, catalogSvc CatalogService, broker *EventBroker, healthRepo HealthRepository, streamsProvider StreamsProvider, profilesRepo ProfilesRepository, taskSchedules TaskScheduleProvider, policySvc PolicyService, plexClient *plex.Client, jellyfinClient *jellyfin.Client, settingsSvc SettingsService, userRepo UserRepository, metricsProvider ...MetricsProvider) chi.Router {
 	r := chi.NewRouter()
 	r.Use(corsMiddleware)
+	r.Use(authMiddlewareFor(userRepo))
 	publishMutation := func(kind string, fields map[string]any) {
 		if broker == nil {
 			return
@@ -1607,9 +1609,28 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusOK, map[string]any{"tvShowId": id, "mode": body.Mode})
 	})
 
+	// ── Auth, setup and user management ─────────────────────────────────────────
+	mountSetupRoutes(r, userRepo)
+	mountAuthRoutes(r, userRepo)
+	mountUserRoutes(r, userRepo)
+
 	// Serve the embedded SvelteKit SPA for all non-API routes, with SPA fallback.
 	r.Mount("/", frontend.Handler())
 	return r
+}
+
+// authMiddlewareFor builds the auth middleware using the user repo.
+// Public prefixes (setup, login/logout, webhooks, sabnzbd) pass through unauthenticated.
+func authMiddlewareFor(repo UserRepository) func(http.Handler) http.Handler {
+	exempt := []string{
+		"/api/setup/",
+		"/api/auth/login",
+		"/api/auth/logout",
+		"/api/webhooks/",
+		"/api/sabnzbd/",
+		"/sabnzbd/",
+	}
+	return auth.Middleware(repo, exempt)
 }
 
 func (b *EventBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {

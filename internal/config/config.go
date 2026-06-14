@@ -247,6 +247,36 @@ func Load(path string) (Settings, error) {
 	return cfg, nil
 }
 
+// LoadOrCreate loads settings from path. If the file does not exist a minimal
+// settings.json is created with Docker-Compose-compatible defaults and then
+// loaded. Other errors (parse, validation) are returned as-is.
+func LoadOrCreate(path string) (Settings, error) {
+	cfg, err := Load(path)
+	if err == nil {
+		return cfg, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) && !strings.Contains(err.Error(), "no such file") {
+		return Settings{}, err
+	}
+	if mkErr := os.MkdirAll(filepath.Dir(path), 0o755); mkErr != nil {
+		return Settings{}, fmt.Errorf("create settings dir: %w", mkErr)
+	}
+	blank := defaultSettings()
+	data, _ := json.MarshalIndent(blank, "", "  ")
+	if writeErr := os.WriteFile(path, data, 0o600); writeErr != nil {
+		return Settings{}, fmt.Errorf("write default settings: %w", writeErr)
+	}
+	return Load(path)
+}
+
+func defaultSettings() Settings {
+	s := Settings{}
+	s.Database = DatabaseConfig{Host: "postgres", Port: 5432, Name: "drakkar", Username: "drakkar", Password: "change-me"}
+	s.Valkey = ValkeyConfig{Host: "valkey", Port: 6379}
+	applyDefaults(&s)
+	return s
+}
+
 func applyDefaults(cfg *Settings) {
 	if cfg == nil {
 		return
@@ -265,6 +295,9 @@ func applyDefaults(cfg *Settings) {
 	}
 	if cfg.Indexer.MovieRssSyncIntervalMinutes == 0 {
 		cfg.Indexer.MovieRssSyncIntervalMinutes = DefaultIndexerConfig().MovieRssSyncIntervalMinutes
+	}
+	if len(cfg.Subtitles.Languages) == 0 {
+		cfg.Subtitles.Languages = []string{"en"}
 	}
 }
 
@@ -288,24 +321,18 @@ func validate(cfg Settings) error {
 	if cfg.Valkey.Port <= 0 {
 		problems = append(problems, "valkey.port must be positive")
 	}
-	if err := validateURL("nzbhydra2.url", cfg.NZBHydra2.URL); err != nil {
-		problems = append(problems, err.Error())
+	// External service URLs are optional — the app starts without them.
+	if cfg.NZBHydra2.URL != "" {
+		if err := validateURL("nzbhydra2.url", cfg.NZBHydra2.URL); err != nil {
+			problems = append(problems, err.Error())
+		}
 	}
-	if err := validateURL("seerr.url", cfg.Seerr.URL); err != nil {
-		problems = append(problems, err.Error())
+	if cfg.Seerr.URL != "" {
+		if err := validateURL("seerr.url", cfg.Seerr.URL); err != nil {
+			problems = append(problems, err.Error())
+		}
 	}
-	if len(cfg.Usenet.Providers) == 0 {
-		problems = append(problems, "usenet.providers required")
-	}
-	if cfg.Usenet.MaxDownloadConnections <= 0 {
-		problems = append(problems, "usenet.maxDownloadConnections must be positive")
-	}
-	if cfg.Usenet.StreamingPriorityPct < 0 || cfg.Usenet.StreamingPriorityPct > 100 {
-		problems = append(problems, "usenet.streamingPriorityPercent must be 0..100")
-	}
-	if cfg.Usenet.ArticleBufferSize <= 0 {
-		problems = append(problems, "usenet.articleBufferSize must be positive")
-	}
+	// Validate individual providers only when present.
 	for i, provider := range cfg.Usenet.Providers {
 		prefix := fmt.Sprintf("usenet.providers[%d]", i)
 		if provider.Name == "" {
@@ -317,9 +344,6 @@ func validate(cfg Settings) error {
 		if provider.MaxConnections <= 0 {
 			problems = append(problems, prefix+".maxConnections must be positive")
 		}
-	}
-	if len(cfg.Subtitles.Languages) == 0 {
-		problems = append(problems, "subtitles.languages required")
 	}
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))

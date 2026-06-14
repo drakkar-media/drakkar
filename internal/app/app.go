@@ -143,9 +143,12 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		rt.WebDAVAddress = env
 	}
 
-	cfg, err := config.Load(rt.SettingsPath)
+	cfg, err := config.LoadOrCreate(rt.SettingsPath)
 	if err != nil {
 		return err
+	}
+	if err := ensureRcloneConf(rt.SettingsPath); err != nil {
+		logger.Warn().Err(err).Msg("could not auto-create rclone.conf")
 	}
 	if err := config.ValidatePaths(rt); err != nil {
 		return err
@@ -424,7 +427,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 
 	server := &http.Server{
 		Addr:              rt.HTTPAddress,
-		Handler:           api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, jellyfinClient, &fileSettingsService{path: rt.SettingsPath}, metricsColl),
+		Handler:           api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, jellyfinClient, &fileSettingsService{path: rt.SettingsPath}, db, metricsColl),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -714,6 +717,20 @@ func shouldRunRecentOnStartup(ctx context.Context, db *database.DB, taskName str
 		skipWindow = ttl
 	}
 	return age >= skipWindow
+}
+
+// ensureRcloneConf writes a default rclone WebDAV config alongside settings.json
+// if it doesn't already exist. rclone.conf lives at {dataDir}/rclone/rclone.conf.
+func ensureRcloneConf(settingsPath string) error {
+	confPath := filepath.Join(filepath.Dir(settingsPath), "rclone", "rclone.conf")
+	if _, err := os.Stat(confPath); err == nil {
+		return nil // already exists
+	}
+	if err := os.MkdirAll(filepath.Dir(confPath), 0o755); err != nil {
+		return err
+	}
+	const content = "[drakkar]\ntype = webdav\nurl = http://drakkar:8888\nvendor = other\n"
+	return os.WriteFile(confPath, []byte(content), 0o644)
 }
 
 func max(a, b int) int {

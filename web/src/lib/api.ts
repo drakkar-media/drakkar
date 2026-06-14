@@ -1,4 +1,5 @@
 import { browser } from '$app/environment';
+import { goto } from '$app/navigation';
 import type {
   LibraryItem,
   MaintenanceResult,
@@ -24,7 +25,8 @@ import type {
   PolicySettings,
   FullSettings,
   GrabHistoryEntry,
-  CustomFormat
+  CustomFormat,
+  User
 } from '$lib/types';
 
 function baseURL() {
@@ -40,6 +42,10 @@ function eventsURL() {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${baseURL()}${path}`, init);
+  if (response.status === 401 && browser && !path.startsWith('/api/auth') && !path.startsWith('/api/setup')) {
+    await goto('/login', { replaceState: true });
+    throw new Error('Session expired');
+  }
   if (!response.ok) {
     const text = await response.text();
     throw new Error(text || `${response.status} ${response.statusText}`);
@@ -229,7 +235,20 @@ export const api = {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode })
-    })
+    }),
+  // Auth
+  me: () => request<User>('/api/auth/me'),
+  logout: () => fetch(`${baseURL()}/api/auth/logout`, { method: 'POST' }),
+  // User management
+  listUsers: () => request<User[]>('/api/users'),
+  createUser: (username: string, password: string, role = 'admin') =>
+    request<User>('/api/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password, role }) }),
+  deleteUser: (id: number) =>
+    fetch(`${baseURL()}/api/users/${id}`, { method: 'DELETE' }),
+  changePassword: (id: number, password: string) =>
+    fetch(`${baseURL()}/api/users/${id}/password`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) }),
+  // Setup
+  setupStatus: () => request<{ required: boolean }>('/api/setup/status'),
 };
 
 export function subscribeEvents(onMessage: () => void): () => void {
