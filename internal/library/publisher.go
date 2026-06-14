@@ -219,15 +219,18 @@ func (p *Publisher) RepublishPendingLibrary(ctx context.Context) (BulkRepublishR
 		return BulkRepublishResult{}, err
 	}
 	result := BulkRepublishResult{Processed: len(targets)}
+	slog.Info("republish pending: starting", "count", len(targets))
 	for _, target := range targets {
 		result.ProcessedLibrary = append(result.ProcessedLibrary, target.LibraryItemID)
 		if err := p.RepublishLibraryItem(ctx, target.LibraryItemID); err != nil {
+			slog.Warn("republish pending: item failed", "library_item_id", target.LibraryItemID, "err", err)
 			result.Failed++
 			result.FailedLibrary = append(result.FailedLibrary, target.LibraryItemID)
 			continue
 		}
 		result.Republished++
 	}
+	slog.Info("republish pending: done", "processed", result.Processed, "republished", result.Republished, "failed", result.Failed)
 	return result, nil
 }
 

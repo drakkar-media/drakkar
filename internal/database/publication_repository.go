@@ -89,7 +89,7 @@ func (db *DB) UpsertSymlinkPublication(ctx context.Context, libraryItemID, virtu
 	_, err := db.SQL.ExecContext(ctx, `
 		insert into symlink_publications (library_item_id, virtual_file_id, library_path, target_path)
 		values ($1, $2, $3, $4)
-		on conflict (library_path)
+		on conflict (library_item_id, library_path)
 		do update set
 			virtual_file_id = excluded.virtual_file_id,
 			target_path = excluded.target_path`,
