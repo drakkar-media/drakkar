@@ -7,8 +7,9 @@ import (
 
 // workQueueStub is an in-memory WorkQueuer for unit tests (no Redis needed).
 type workQueueStub struct {
-	mu    sync.Mutex
-	items map[int64]int // libraryItemID → priority
+	mu     sync.Mutex
+	items  map[int64]int // libraryItemID → priority
+	paused bool
 }
 
 func newWorkQueueStub() *workQueueStub {
@@ -27,6 +28,26 @@ func (s *workQueueStub) Depth(_ context.Context) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return int64(len(s.items))
+}
+
+func (s *workQueueStub) Pause(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.paused = true
+	return nil
+}
+
+func (s *workQueueStub) Resume(_ context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.paused = false
+	return nil
+}
+
+func (s *workQueueStub) IsPaused(_ context.Context) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.paused, nil
 }
 
 func (s *workQueueStub) Start(_ context.Context, _ func(context.Context, int64)) error {

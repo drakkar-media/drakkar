@@ -85,6 +85,19 @@ func withClaims(ctx context.Context, c Claims) context.Context {
 // SessionLookup is the minimal interface the auth middleware needs.
 type SessionLookup interface {
 	GetSessionByTokenHash(ctx context.Context, tokenHash string) (userID int64, username, role string, expiresAt time.Time, err error)
+	GetAPITokenByHash(ctx context.Context, tokenHash string) (userID int64, username, role string, expiresAt *time.Time, err error)
+	TouchAPITokenUsed(ctx context.Context, tokenHash string) error
+}
+
+func apiTokenFromRequest(r *http.Request) string {
+	if token := strings.TrimSpace(r.Header.Get("X-Api-Key")); token != "" {
+		return token
+	}
+	authz := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(authz), "bearer ") {
+		return strings.TrimSpace(authz[7:])
+	}
+	return ""
 }
 
 // Middleware validates the session cookie on all /api/* routes except the
@@ -101,6 +114,19 @@ func Middleware(repo SessionLookup, exemptPrefixes []string) func(http.Handler) 
 			for _, prefix := range exemptPrefixes {
 				if r.URL.Path == prefix || strings.HasPrefix(r.URL.Path, prefix) {
 					next.ServeHTTP(w, r)
+					return
+				}
+			}
+			if token := apiTokenFromRequest(r); token != "" {
+				hash := HashToken(token)
+				userID, username, role, expiresAt, err := repo.GetAPITokenByHash(r.Context(), hash)
+				if err == nil && (expiresAt == nil || time.Now().Before(*expiresAt)) {
+					_ = repo.TouchAPITokenUsed(r.Context(), hash)
+					next.ServeHTTP(w, r.WithContext(withClaims(r.Context(), Claims{
+						UserID:   userID,
+						Username: username,
+						Role:     role,
+					})))
 					return
 				}
 			}

@@ -56,7 +56,7 @@ Add Drakkar as a download client using the SABnzbd protocol:
 - **Host**: your Drakkar host
 - **Port**: `8080`
 - **API key**: any non-empty string (Drakkar accepts all keys)
-- **Category**: leave blank or use any value
+- **Category**: `movies` for Radarr, `tv` for Sonarr
 
 Set the remote path mapping so Radarr/Sonarr can find completed downloads:
 
@@ -84,6 +84,7 @@ Set the remote path mapping so Radarr/Sonarr can find completed downloads:
 - **Multi-provider fallback** — retries across multiple Usenet providers when articles are missing
 - **Automatic candidate fallback** — if an NZB fails to import, the next ranked result is tried automatically
 - **SABnzbd-compatible API** — drop-in replacement for Radarr/Sonarr download clients
+- **SAB-compatible aliases** — available at `/sabnzbd/api`, `/api/sabnzbd/api`, and `/dav/api`
 - **Quality profiles** — configurable resolution/codec preferences with cutoff support
 - **Custom formats** — regex-based release scoring on top of quality profiles
 - **Subtitle integration** — automatic search and download via SubDL and OpenSubtitles

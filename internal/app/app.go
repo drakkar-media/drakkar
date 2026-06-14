@@ -16,10 +16,11 @@ import (
 	"github.com/hjongedijk/drakkar/internal/cache"
 	"github.com/hjongedijk/drakkar/internal/catalog"
 	"github.com/hjongedijk/drakkar/internal/config"
-	"github.com/hjongedijk/drakkar/internal/dav"
 	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/hjongedijk/drakkar/internal/dav"
 	"github.com/hjongedijk/drakkar/internal/fuse"
 	"github.com/hjongedijk/drakkar/internal/hydra"
+	"github.com/hjongedijk/drakkar/internal/jellyfin"
 	"github.com/hjongedijk/drakkar/internal/library"
 	"github.com/hjongedijk/drakkar/internal/maintenance"
 	"github.com/hjongedijk/drakkar/internal/metrics"
@@ -27,7 +28,6 @@ import (
 	"github.com/hjongedijk/drakkar/internal/notifications"
 	"github.com/hjongedijk/drakkar/internal/nzb"
 	"github.com/hjongedijk/drakkar/internal/opensubtitles"
-	"github.com/hjongedijk/drakkar/internal/jellyfin"
 	"github.com/hjongedijk/drakkar/internal/plex"
 	"github.com/hjongedijk/drakkar/internal/policy"
 	"github.com/hjongedijk/drakkar/internal/probe"
@@ -52,6 +52,7 @@ const (
 	taskRetryFailedQueue       = "retry_failed_queue"
 	taskRepublishPending       = "republish_pending"
 	taskHealthCheck            = "health_check"
+	taskNZBHealthCheck         = "nzb_health_check"
 	taskCachePrune             = "cache_prune"
 	taskOrphanedContent        = "orphaned-content"
 	taskBrokenSymlinks         = "broken-media-symlinks"
@@ -115,6 +116,7 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 		{ID: taskRetryFailedQueue, Label: "Retry Failed Queue", Group: "Indexing", Interval: "15m", Automated: true, LastRunState: "idle"},
 		{ID: taskRepublishPending, Label: "Republish Pending", Group: "Publishing", Interval: "30m", Automated: true, LastRunState: "idle"},
 		{ID: taskHealthCheck, Label: "Run Health Check", Group: "Maintenance", Interval: "60m", Automated: true, LastRunState: "idle"},
+		{ID: taskNZBHealthCheck, Label: "Deep NZB Article Check", Group: "Maintenance", Interval: "168h", Automated: false, LastRunState: "idle"},
 		{ID: taskCachePrune, Label: "Prune Block Cache", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskOrphanedContent, Label: "Remove Orphaned Content", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskBrokenSymlinks, Label: "Remove Broken Media Symlinks", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
@@ -286,7 +288,12 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		workflowSvc.SetTVDBClient(tvdb.NewClient(cfg.Metadata))
 	}
 	publicationSvc := library.NewPublisher(db, rt)
-	maintenanceSvc := maintenance.NewService(db, rt)
+	maintenanceSvc := &maintenanceOpsService{
+		base:        maintenance.NewService(db, rt),
+		db:          db,
+		workflowSvc: workflowSvc,
+		logger:      logger,
+	}
 	cacheSvc := cache.NewService(cache.NewFileCache(rt.BlockCachePath, rt.DiskCacheLimitBytes))
 	catalogSvc := catalog.NewService(db, tmdb.NewClient(cfg.Metadata))
 	var subtitleProviders []subtitles.Provider
@@ -399,8 +406,6 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}
 		return nil
 	}
-
-
 
 	queueSvc.SetPostImportHook(postImport)
 	workflowSvc.SetPostImportHook(postImport)
@@ -632,6 +637,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	startRecurring(taskRetryFailedQueue, 15*time.Minute, true, runRetryPass) // was 30m
 	startRecurring(taskRepublishPending, 30*time.Minute, true, runRepublishPass)
 	startRecurring(taskHealthCheck, 60*time.Minute, true, runHealthCheck)
+	startRecurring(taskNZBHealthCheck, 168*time.Hour, false, func() {
+		if _, err := maintenanceSvc.DeepNZBHealthCheck(ctx); err != nil {
+			logger.Error().Err(err).Msg("deep nzb health check failed")
+		}
+	})
 	startRecurring(taskCachePrune, 6*time.Hour, true, runCachePrune)
 	startRecurring(taskOrphanedContent, 6*time.Hour, true, func() { _, _ = maintenanceSvc.RemoveOrphanedContent(ctx) })
 	startRecurring(taskBrokenSymlinks, 6*time.Hour, true, func() { _, _ = maintenanceSvc.RemoveBrokenMediaSymlinks(ctx) })
@@ -679,7 +689,9 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}
 	}()
 	go func() {
-		runNZBHealthCheck(ctx, db, workflowSvc, logger)
+		if _, err := maintenanceSvc.DeepNZBHealthCheck(ctx); err != nil {
+			logger.Error().Err(err).Msg("startup deep nzb health check failed")
+		}
 	}()
 
 	select {
@@ -747,121 +759,6 @@ func max(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// runNZBHealthCheck scans all available library items on startup and resets any
-// whose first NNTP segment is no longer retrievable. This mirrors nzbdav's
-// HealthCheckService and fixes items that were published before the preflight
-// check was wired up (e.g. Superman, Batman v Superman with expired articles).
-func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, logger zerolog.Logger) {
-	sizer, ok := db.SegmentFetcher.(database.SegmentSizer)
-	if !ok || sizer == nil {
-		return
-	}
-
-	type candidate struct {
-		libraryItemID int64
-		title         string
-		firstMsgID    string
-		lastMsgID     string
-	}
-
-	rows, err := db.SQL.QueryContext(ctx, `
-		SELECT DISTINCT ON (qi.library_item_id)
-		    qi.library_item_id,
-		    li.title,
-		    (SELECT ns.message_id FROM nzb_files nf JOIN nzb_segments ns ON ns.nzb_file_id=nf.id
-		     WHERE nf.nzb_document_id=nd.id ORDER BY nf.id ASC, ns.segment_number ASC LIMIT 1),
-		    (SELECT ns.message_id FROM nzb_files nf JOIN nzb_segments ns ON ns.nzb_file_id=nf.id
-		     WHERE nf.nzb_document_id=nd.id ORDER BY nf.id ASC, ns.segment_number DESC LIMIT 1)
-		FROM queue_items qi
-		JOIN library_items li ON li.id = qi.library_item_id
-		JOIN selected_releases sr ON sr.id = qi.selected_release_id
-		JOIN nzb_documents nd ON nd.selected_release_id = sr.id
-		WHERE qi.state = 'available' AND li.available = true
-		ORDER BY qi.library_item_id ASC, qi.id DESC`)
-	if err != nil {
-		logger.Error().Err(err).Msg("health check: query failed")
-		return
-	}
-	defer rows.Close()
-
-	var candidates []candidate
-	for rows.Next() {
-		var c candidate
-		if err := rows.Scan(&c.libraryItemID, &c.title, &c.firstMsgID, &c.lastMsgID); err != nil {
-			continue
-		}
-		if c.firstMsgID != "" {
-			candidates = append(candidates, c)
-		}
-	}
-	_ = rows.Err()
-
-	logger.Info().Int("count", len(candidates)).Msg("health check: scanning available library items")
-	reset := 0
-	for _, c := range candidates {
-		if ctx.Err() != nil {
-			break
-		}
-		isMissing := func(msgID string) bool {
-			checkCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-			_, err := sizer.DecodedSize(checkCtx, msgID)
-			cancel()
-			if err == nil {
-				return false
-			}
-			msg := err.Error()
-			return strings.Contains(msg, "not found") || strings.Contains(msg, "430")
-		}
-		broken := isMissing(c.firstMsgID) || (c.lastMsgID != c.firstMsgID && isMissing(c.lastMsgID))
-		if !broken {
-			continue
-		}
-		logger.Warn().
-			Int64("libraryItemId", c.libraryItemID).
-			Str("title", c.title).
-			Msg("health check: segment missing — resetting item for re-queue")
-		if resetErr := workflowSvc.ResetLibraryItem(ctx, c.libraryItemID); resetErr != nil {
-			logger.Error().Err(resetErr).Int64("libraryItemId", c.libraryItemID).Msg("health check: reset failed")
-		} else {
-			reset++
-		}
-	}
-	if reset > 0 {
-		logger.Info().Int("reset", reset).Msg("health check: reset broken items for re-queue")
-	}
-
-	// Second pass: find items whose only published virtual file is a sample clip
-	// (e.g. Maze Runner that got Sample.mkv published instead of the real movie).
-	sampleRows, err := db.SQL.QueryContext(ctx, `
-		SELECT DISTINCT qi.library_item_id, li.title
-		FROM queue_items qi
-		JOIN library_items li ON li.id = qi.library_item_id
-		JOIN selected_releases sr ON sr.id = qi.selected_release_id
-		JOIN virtual_files vf ON vf.selected_release_id = sr.id
-		WHERE qi.state = 'available' AND li.available = true
-		  AND lower(vf.file_name) ~ '^(sample|sample[-_].+|.+[-_]sample)\.(mkv|mp4|avi)$'
-		  AND NOT EXISTS (
-		      SELECT 1 FROM virtual_files vf2
-		      WHERE vf2.selected_release_id = sr.id
-		        AND lower(vf2.file_name) !~ '^(sample|sample[-_].+|.+[-_]sample)\.(mkv|mp4|avi)$'
-		  )`)
-	if err == nil {
-		defer sampleRows.Close()
-		for sampleRows.Next() {
-			var libID int64
-			var title string
-			if err := sampleRows.Scan(&libID, &title); err != nil {
-				continue
-			}
-			logger.Warn().Int64("libraryItemId", libID).Str("title", title).
-				Msg("health check: only sample file published — resetting item for re-queue")
-			if resetErr := workflowSvc.ResetLibraryItem(ctx, libID); resetErr != nil {
-				logger.Error().Err(resetErr).Int64("libraryItemId", libID).Msg("health check: sample reset failed")
-			}
-		}
-	}
 }
 
 type liveMetricsCollector struct {

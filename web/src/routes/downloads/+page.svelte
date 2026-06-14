@@ -4,6 +4,8 @@
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
   import SearchCheck from '@lucide/svelte/icons/search-check';
+  import Pause from '@lucide/svelte/icons/pause';
+  import Play from '@lucide/svelte/icons/play';
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import Upload from '@lucide/svelte/icons/upload';
   import Link from '@lucide/svelte/icons/link';
@@ -13,18 +15,20 @@
   import StatusPill from '$lib/components/StatusPill.svelte';
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
-  import type { QueueItem } from '$lib/types';
+  import type { QueueItem, WorkQueueStatus } from '$lib/types';
 
   let uploading = false;
   let nzbUrl = '';
   let addingUrl = false;
 
   let items: QueueItem[] = [];
+  let workQueue: WorkQueueStatus = { paused: false, depth: 0 };
   let loading = true;
   let working = false;
   let tab: 'queue' | 'history' = 'queue';
   let queuePage = 1;
   let historyPage = 1;
+  let selectedHistoryIds = new Set<number>();
 
   const activeStates = ['requested', 'searching', 'ranking', 'selected', 'fetching_nzb', 'indexing', 'preflight', 'publishing'];
   const doneStates = ['available', 'failed'];
@@ -34,6 +38,9 @@
   $: queueItems = items.filter((item) => activeStates.includes(item.state));
   $: historyItems = items.filter((item) => doneStates.includes(item.state));
   $: failedItems = items.filter((item) => item.state === 'failed');
+  $: failedHistoryIds = new Set(failedItems.map((item) => item.queueItemId));
+  $: selectedFailedIds = Array.from(selectedHistoryIds).filter((id) => failedHistoryIds.has(id));
+  $: selectedFailedCount = selectedFailedIds.length;
   $: totalSegments = queueItems.reduce((sum, item) => sum + (item.nzbSegmentCount || 0), 0);
   $: queueTotalPages = Math.max(1, Math.ceil(queueItems.length / queuePageSize));
   $: historyTotalPages = Math.max(1, Math.ceil(historyItems.length / historyPageSize));
@@ -45,12 +52,17 @@
   $: queueRangeEnd = Math.min(queuePage * queuePageSize, queueItems.length);
   $: historyRangeStart = historyItems.length ? (historyPage - 1) * historyPageSize + 1 : 0;
   $: historyRangeEnd = Math.min(historyPage * historyPageSize, historyItems.length);
+  $: visibleFailedHistoryIds = pagedHistoryItems.filter((item) => item.state === 'failed').map((item) => item.queueItemId);
+  $: visibleFailedSelectedCount = visibleFailedHistoryIds.filter((id) => selectedHistoryIds.has(id)).length;
 
   async function load() {
     loading = true;
     try {
       const queue = await api.queue();
-      items = queue.items ?? [];
+      const fresh = queue.items ?? [];
+      workQueue = queue.workQueue ?? { paused: false, depth: 0 };
+      retainFailedSelections(fresh);
+      items = fresh;
     } catch (err) {
       toastError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -62,6 +74,8 @@
     try {
       const queue = await api.queue();
       const fresh = queue.items ?? [];
+      workQueue = queue.workQueue ?? workQueue;
+      retainFailedSelections(fresh);
       const freshMap = new Map(fresh.map((i) => [i.queueItemId, i]));
       const existingIds = new Set(items.map((i) => i.queueItemId));
       const updated = items
@@ -71,6 +85,19 @@
       items = [...updated, ...added];
     } catch {
       // ignore background refresh errors
+    }
+  }
+
+  async function toggleQueuePause() {
+    working = true;
+    try {
+      workQueue = workQueue.paused ? await api.resumeQueue() : await api.pauseQueue();
+      toastSuccess(workQueue.paused ? 'Background queue paused' : 'Background queue resumed');
+      await load();
+    } catch (err) {
+      toastError(err instanceof Error ? err.message : String(err));
+    } finally {
+      working = false;
     }
   }
 
@@ -105,6 +132,65 @@
     try {
       const result = await api.clearFailedQueue();
       toastSuccess(`Cleared ${result.cleared} failed item${result.cleared === 1 ? '' : 's'}`);
+      await load();
+    } catch (err) {
+      toastError(err instanceof Error ? err.message : String(err));
+    } finally {
+      working = false;
+    }
+  }
+
+  async function manageFailedItem(id: number, action: 'remove' | 'remove_and_blocklist' | 'remove_blocklist_and_search') {
+    const messages: Record<typeof action, string> = {
+      remove: 'Remove this failed queue item from history and retry state?',
+      remove_and_blocklist: 'Remove this failed queue item and add its release to the runtime blocklist?',
+      remove_blocklist_and_search: 'Remove this failed queue item, blocklist its release, and search for a replacement now?'
+    };
+    if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
+    working = true;
+    try {
+      const result = await api.queueAction(id, action);
+      toastSuccess(result.action.replaceAll('_', ' '));
+      await load();
+    } catch (err) {
+      toastError(err instanceof Error ? err.message : String(err));
+    } finally {
+      working = false;
+    }
+  }
+
+  async function manageAllFailed(action: 'remove' | 'remove_and_blocklist' | 'remove_blocklist_and_search') {
+    const messages: Record<typeof action, string> = {
+      remove: `Remove all ${failedItems.length} failed queue items from history and retry state?`,
+      remove_and_blocklist: `Remove and blocklist all ${failedItems.length} failed queue items?`,
+      remove_blocklist_and_search: `Remove, blocklist, and re-search all ${failedItems.length} failed queue items?`
+    };
+    if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
+    working = true;
+    try {
+      const result = await api.failedQueueAction(action);
+      toastSuccess(`${result.retried} handled, ${result.failed} failed`);
+      await load();
+    } catch (err) {
+      toastError(err instanceof Error ? err.message : String(err));
+    } finally {
+      working = false;
+    }
+  }
+
+  async function manageSelectedFailed(action: 'remove' | 'remove_and_blocklist' | 'remove_blocklist_and_search') {
+    if (selectedFailedIds.length === 0) return;
+    const messages: Record<typeof action, string> = {
+      remove: `Remove ${selectedFailedIds.length} selected failed queue item${selectedFailedIds.length === 1 ? '' : 's'} from history and retry state?`,
+      remove_and_blocklist: `Remove and blocklist ${selectedFailedIds.length} selected failed queue item${selectedFailedIds.length === 1 ? '' : 's'}?`,
+      remove_blocklist_and_search: `Remove, blocklist, and re-search ${selectedFailedIds.length} selected failed queue item${selectedFailedIds.length === 1 ? '' : 's'}?`
+    };
+    if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
+    working = true;
+    try {
+      const result = await api.bulkQueueAction(selectedFailedIds, action);
+      toastSuccess(`${result.retried} handled, ${result.failed} failed`);
+      selectedHistoryIds = new Set();
       await load();
     } catch (err) {
       toastError(err instanceof Error ? err.message : String(err));
@@ -161,6 +247,27 @@
     return value.replaceAll('_', ' ');
   }
 
+  function retainFailedSelections(nextItems: QueueItem[]) {
+    const failedIds = new Set(nextItems.filter((item) => item.state === 'failed').map((item) => item.queueItemId));
+    selectedHistoryIds = new Set(Array.from(selectedHistoryIds).filter((id) => failedIds.has(id)));
+  }
+
+  function toggleHistorySelection(queueItemId: number, checked: boolean) {
+    const next = new Set(selectedHistoryIds);
+    if (checked) next.add(queueItemId);
+    else next.delete(queueItemId);
+    selectedHistoryIds = next;
+  }
+
+  function toggleVisibleFailedSelection(checked: boolean) {
+    const next = new Set(selectedHistoryIds);
+    for (const queueItemId of visibleFailedHistoryIds) {
+      if (checked) next.add(queueItemId);
+      else next.delete(queueItemId);
+    }
+    selectedHistoryIds = next;
+  }
+
   onMount(() => {
     void load();
     const unsub = subscribeEvents(() => {
@@ -183,6 +290,15 @@
     <RefreshCw size={14} />
     Refresh
   </Button>
+  <Button kind="secondary" on:click={toggleQueuePause} disabled={loading || working}>
+    {#if workQueue.paused}
+      <Play size={14} />
+      Resume Queue
+    {:else}
+      <Pause size={14} />
+      Pause Queue
+    {/if}
+  </Button>
   <Button kind="secondary" on:click={processPending} disabled={working}>
     <SearchCheck size={14} />
     Process Pending
@@ -191,6 +307,14 @@
     <Button kind="secondary" on:click={retryAll} disabled={working}>
       <RotateCcw size={14} />
       Retry Failed ({failedItems.length})
+    </Button>
+    <Button kind="secondary" on:click={() => manageAllFailed('remove_and_blocklist')} disabled={working}>
+      <Trash2 size={14} />
+      Blocklist Failed
+    </Button>
+    <Button kind="secondary" on:click={() => manageAllFailed('remove_blocklist_and_search')} disabled={working}>
+      <SearchCheck size={14} />
+      Blocklist + Search
     </Button>
     <Button kind="danger" on:click={clearFailed} disabled={working}>
       <Trash2 size={14} />
@@ -238,8 +362,12 @@
     <div class="summary-label">Failed items</div>
   </div>
   <div class="summary-card">
-    <div class="summary-value">{totalSegments}</div>
-    <div class="summary-label">Segments in flight</div>
+    <div class="summary-value">{workQueue.depth}</div>
+    <div class="summary-label">Background queue depth</div>
+  </div>
+  <div class="summary-card">
+    <div class="summary-value">{workQueue.paused ? 'Paused' : 'Running'}</div>
+    <div class="summary-label">Background queue state</div>
   </div>
 </section>
 
@@ -278,6 +406,7 @@
 >
   <div slot="actions">
     <StatusPill tone="neutral">{tab === 'queue' ? `${queueItems.length} active` : `${historyItems.length} rows`}</StatusPill>
+    <StatusPill tone={workQueue.paused ? 'warn' : 'ok'}>{workQueue.paused ? 'Dispatch paused' : 'Dispatch running'}</StatusPill>
   </div>
 
   {#if tab === 'queue'}
@@ -287,9 +416,9 @@
       <div class="pager">
         <div class="pager-copy">Showing {queueRangeStart}-{queueRangeEnd} of {queueItems.length}</div>
         <div class="pager-actions">
-          <button on:click={() => (queuePage = Math.max(1, queuePage - 1))} disabled={queuePage === 1}>Prev</button>
-          <span>{queuePage}/{queueTotalPages}</span>
-          <button on:click={() => (queuePage = Math.min(queueTotalPages, queuePage + 1))} disabled={queuePage === queueTotalPages}>Next</button>
+                  <button type="button" on:click={() => (queuePage = Math.max(1, queuePage - 1))} disabled={queuePage === 1}>Prev</button>
+                  <span>{queuePage}/{queueTotalPages}</span>
+                  <button type="button" on:click={() => (queuePage = Math.min(queueTotalPages, queuePage + 1))} disabled={queuePage === queueTotalPages}>Next</button>
         </div>
       </div>
       <div class="row-list">
@@ -321,22 +450,61 @@
     {#if historyItems.length === 0 && !loading}
       <div class="empty-state">No history yet.</div>
     {:else}
+      {#if failedItems.length > 0}
+        <div class="history-toolbar">
+          <label class="history-select-all">
+            <input
+              type="checkbox"
+              checked={visibleFailedHistoryIds.length > 0 && visibleFailedSelectedCount === visibleFailedHistoryIds.length}
+              disabled={visibleFailedHistoryIds.length === 0 || working}
+              on:change={(e) => toggleVisibleFailedSelection((e.currentTarget as HTMLInputElement).checked)}
+            />
+            <span>Select visible failed ({visibleFailedHistoryIds.length})</span>
+          </label>
+          <div class="history-toolbar-actions">
+            <StatusPill tone="neutral">{selectedFailedCount} selected</StatusPill>
+            <Button kind="secondary" on:click={() => manageSelectedFailed('remove_and_blocklist')} disabled={working || selectedFailedCount === 0}>
+              <Trash2 size={14} />
+              Blocklist Selected
+            </Button>
+            <Button kind="secondary" on:click={() => manageSelectedFailed('remove_blocklist_and_search')} disabled={working || selectedFailedCount === 0}>
+              <SearchCheck size={14} />
+              Replace Selected
+            </Button>
+            <Button kind="secondary" on:click={() => (selectedHistoryIds = new Set())} disabled={working || selectedFailedCount === 0}>
+              Clear Selection
+            </Button>
+          </div>
+        </div>
+      {/if}
       <div class="pager">
         <div class="pager-copy">Showing {historyRangeStart}-{historyRangeEnd} of {historyItems.length}</div>
         <div class="pager-actions">
-          <button on:click={() => (historyPage = Math.max(1, historyPage - 1))} disabled={historyPage === 1}>Prev</button>
-          <span>{historyPage}/{historyTotalPages}</span>
-          <button on:click={() => (historyPage = Math.min(historyTotalPages, historyPage + 1))} disabled={historyPage === historyTotalPages}>Next</button>
+                  <button type="button" on:click={() => (historyPage = Math.max(1, historyPage - 1))} disabled={historyPage === 1}>Prev</button>
+                  <span>{historyPage}/{historyTotalPages}</span>
+                  <button type="button" on:click={() => (historyPage = Math.min(historyTotalPages, historyPage + 1))} disabled={historyPage === historyTotalPages}>Next</button>
         </div>
       </div>
       <div class="row-list">
         {#each pagedHistoryItems as item (item.queueItemId)}
           <div class={`row-card ${item.state === 'failed' ? 'failed' : ''}`}>
             <div class="row-head">
-              <div>
-                <div class="row-title">{item.libraryTitle}</div>
-                <div class="row-sub">
-                  {item.nzbFileName ? `${item.nzbFileName} · ` : ''}{item.nzbSegmentCount} segments
+              <div class="history-main">
+                {#if item.state === 'failed'}
+                  <label class="history-checkbox">
+                    <input
+                      type="checkbox"
+                      checked={selectedHistoryIds.has(item.queueItemId)}
+                      disabled={working}
+                      on:change={(e) => toggleHistorySelection(item.queueItemId, (e.currentTarget as HTMLInputElement).checked)}
+                    />
+                  </label>
+                {/if}
+                <div>
+                  <div class="row-title">{item.libraryTitle}</div>
+                  <div class="row-sub">
+                    {item.nzbFileName ? `${item.nzbFileName} · ` : ''}{item.nzbSegmentCount} segments
+                  </div>
                 </div>
               </div>
               <div class="history-actions">
@@ -350,6 +518,14 @@
                   <Button kind="secondary" on:click={() => retryItem(item.queueItemId)} disabled={working}>
                     <RotateCcw size={14} />
                     Retry
+                  </Button>
+                  <Button kind="secondary" on:click={() => manageFailedItem(item.queueItemId, 'remove_and_blocklist')} disabled={working}>
+                    <Trash2 size={14} />
+                    Blocklist
+                  </Button>
+                  <Button kind="secondary" on:click={() => manageFailedItem(item.queueItemId, 'remove_blocklist_and_search')} disabled={working}>
+                    <SearchCheck size={14} />
+                    Replace
                   </Button>
                 {/if}
               </div>
@@ -369,7 +545,7 @@
 <style>
   .summary-grid {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 14px;
     margin-bottom: 20px;
   }
@@ -481,6 +657,49 @@
     font-weight: 600;
   }
 
+  .history-main,
+  .history-toolbar,
+  .history-toolbar-actions,
+  .history-select-all,
+  .history-checkbox {
+    display: flex;
+    align-items: center;
+  }
+
+  .history-main {
+    gap: 10px;
+  }
+
+  .history-checkbox {
+    flex: 0 0 auto;
+  }
+
+  .history-checkbox input,
+  .history-select-all input {
+    width: 16px;
+    height: 16px;
+  }
+
+  .history-toolbar {
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 14px;
+    margin-bottom: 14px;
+    border: 1px solid hsl(0 0% 100% / 0.08);
+    border-radius: 16px;
+    background: hsl(0 0% 100% / 0.03);
+  }
+
+  .history-toolbar-actions,
+  .history-select-all {
+    gap: 10px;
+  }
+
+  .history-select-all {
+    color: hsl(var(--muted-foreground));
+    font-size: 13px;
+  }
+
   .progress-track {
     height: 8px;
     border-radius: 999px;
@@ -573,7 +792,8 @@
   @media (max-width: 700px) {
     .pager,
     .row-head,
-    .row-foot {
+    .row-foot,
+    .history-toolbar {
       flex-direction: column;
       align-items: flex-start;
     }

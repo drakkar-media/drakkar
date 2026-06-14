@@ -245,8 +245,8 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 
 	var releaseCandidateID int64
 	if err = tx.QueryRowContext(ctx, `
-		insert into release_candidates (library_item_id, title, score, selected)
-		values ($1, $2, 0, true)
+		insert into release_candidates (library_item_id, title, score, custom_format_score, selected)
+		values ($1, $2, 0, 0, true)
 		returning id`, libraryItemID, imported.FileName).Scan(&releaseCandidateID); err != nil {
 		return QueueSnapshot{}, err
 	}

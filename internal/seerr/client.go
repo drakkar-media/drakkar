@@ -201,6 +201,35 @@ func (c *Client) CreateRequest(ctx context.Context, mediaType string, tmdbID int
 	return nil
 }
 
+func (c *Client) CreateTVSeasonRequest(ctx context.Context, tmdbID int64, seasons []int) error {
+	body := map[string]any{
+		"mediaType": "tv",
+		"mediaId":   tmdbID,
+		"seasons":   seasons,
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/request", strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("X-Api-Key", c.apiKey)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("seerr create season request status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // NotifyAvailable marks a media item as available in Seerr/Overseerr.
 // It first looks up the Seerr-internal media ID by TMDB ID, then POSTs to
 // the available endpoint. A 404 means the item isn't tracked in Seerr — not an error.

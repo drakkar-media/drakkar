@@ -3,41 +3,71 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"time"
 )
 
 type QualityProfile struct {
-	ID              int64     `json:"id"`
-	Name            string    `json:"name"`
-	IsDefault       bool      `json:"isDefault"`
-	Resolutions     []string  `json:"resolutions"`
-	Sources         []string  `json:"sources"`
-	Codecs          []string  `json:"codecs"`
-	Languages       []string  `json:"languages"`
-	AudioFormats    []string  `json:"audioFormats"`
-	HdrFormats      []string  `json:"hdrFormats"`
-	ExcludePatterns []string  `json:"excludePatterns"`
-	PreferProper    bool      `json:"preferProper"`
-	PreferRepack    bool      `json:"preferRepack"`
-	RejectCam          bool      `json:"rejectCam"`
-	AllowUpgrade       bool      `json:"allowUpgrade"`
-	CutoffResolution   string    `json:"cutoffResolution"`
-	MinimumAgeHours    int       `json:"minimumAgeHours"`
-	MinSizeMB          int       `json:"minSizeMb"`
-	MaxSizeMB          int       `json:"maxSizeMb"`
-	CreatedAt       time.Time `json:"createdAt"`
-	UpdatedAt       time.Time `json:"updatedAt"`
+	ID                              int64     `json:"id"`
+	Name                            string    `json:"name"`
+	IsDefault                       bool      `json:"isDefault"`
+	Resolutions                     []string  `json:"resolutions"`
+	Sources                         []string  `json:"sources"`
+	Codecs                          []string  `json:"codecs"`
+	Languages                       []string  `json:"languages"`
+	AudioFormats                    []string  `json:"audioFormats"`
+	HdrFormats                      []string  `json:"hdrFormats"`
+	ExcludePatterns                 []string  `json:"excludePatterns"`
+	PreferProper                    bool      `json:"preferProper"`
+	PreferRepack                    bool      `json:"preferRepack"`
+	RejectCam                       bool      `json:"rejectCam"`
+	AllowUpgrade                    bool      `json:"allowUpgrade"`
+	MinimumUpgradeCustomFormatScore int       `json:"minimumUpgradeCustomFormatScore"`
+	CutoffResolution                string    `json:"cutoffResolution"`
+	MinimumAgeHours                 int       `json:"minimumAgeHours"`
+	MinMBPerMinute                  int       `json:"minMbPerMinute"`
+	MaxMBPerMinute                  int       `json:"maxMbPerMinute"`
+	CreatedAt                       time.Time `json:"createdAt"`
+	UpdatedAt                       time.Time `json:"updatedAt"`
+}
+
+func (p *QualityProfile) UnmarshalJSON(data []byte) error {
+	type Alias QualityProfile
+	aux := struct {
+		Alias
+		MinSizeMb      *int `json:"minSizeMb"`
+		MaxSizeMb      *int `json:"maxSizeMb"`
+		MinMbPerMinute *int `json:"minMbPerMinute"`
+		MaxMbPerMinute *int `json:"maxMbPerMinute"`
+	}{}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	*p = QualityProfile(aux.Alias)
+	switch {
+	case aux.MinMbPerMinute != nil:
+		p.MinMBPerMinute = *aux.MinMbPerMinute
+	case aux.MinSizeMb != nil:
+		p.MinMBPerMinute = *aux.MinSizeMb
+	}
+	switch {
+	case aux.MaxMbPerMinute != nil:
+		p.MaxMBPerMinute = *aux.MaxMbPerMinute
+	case aux.MaxSizeMb != nil:
+		p.MaxMBPerMinute = *aux.MaxSizeMb
+	}
+	return nil
 }
 
 type QualityDefinition struct {
-	ID         int64  `json:"id"`
-	MediaType  string `json:"mediaType"`
-	QualityKey string `json:"qualityKey"`
-	Title      string `json:"title"`
-	MinSizeMB  int    `json:"minSizeMb"`
-	MaxSizeMB  int    `json:"maxSizeMb"`
-	SortOrder  int    `json:"sortOrder"`
+	ID             int64  `json:"id"`
+	MediaType      string `json:"mediaType"`
+	QualityKey     string `json:"qualityKey"`
+	Title          string `json:"title"`
+	MinMBPerMinute int    `json:"minMbPerMinute"`
+	MaxMBPerMinute int    `json:"maxMbPerMinute"`
+	SortOrder      int    `json:"sortOrder"`
 }
 
 const profileSelectCols = ` id, name, is_default, resolutions, sources, codecs, languages,
@@ -45,8 +75,9 @@ const profileSelectCols = ` id, name, is_default, resolutions, sources, codecs, 
 	coalesce(exclude_patterns,'{}'),
 	coalesce(prefer_proper,true), coalesce(prefer_repack,true), coalesce(reject_cam,true),
 	coalesce(allow_upgrade,false),
+	coalesce(minimum_upgrade_custom_format_score,0),
 	coalesce(cutoff_resolution,''), coalesce(minimum_age_hours,0),
-	min_size_mb, max_size_mb, created_at, updated_at `
+	min_mb_per_minute, max_mb_per_minute, created_at, updated_at `
 
 func scanProfile(row interface {
 	Scan(dest ...interface{}) error
@@ -59,9 +90,9 @@ func scanProfile(row interface {
 		pgTextArrayScan(&p.AudioFormats), pgTextArrayScan(&p.HdrFormats),
 		pgTextArrayScan(&p.ExcludePatterns),
 		&p.PreferProper, &p.PreferRepack, &p.RejectCam,
-		&p.AllowUpgrade,
+		&p.AllowUpgrade, &p.MinimumUpgradeCustomFormatScore,
 		&p.CutoffResolution, &p.MinimumAgeHours,
-		&p.MinSizeMB, &p.MaxSizeMB, &p.CreatedAt, &p.UpdatedAt,
+		&p.MinMBPerMinute, &p.MaxMBPerMinute, &p.CreatedAt, &p.UpdatedAt,
 	)
 	return p, err
 }
@@ -95,11 +126,11 @@ func (db *DB) UpsertQualityProfile(ctx context.Context, p QualityProfile) (Quali
 		INSERT INTO quality_profiles
 		    (name, is_default, resolutions, sources, codecs, languages,
 		     audio_formats, hdr_formats, exclude_patterns,
-		     prefer_proper, prefer_repack, reject_cam, allow_upgrade,
+		     prefer_proper, prefer_repack, reject_cam, allow_upgrade, minimum_upgrade_custom_format_score,
 		     cutoff_resolution, minimum_age_hours,
-		     min_size_mb, max_size_mb, updated_at)
+		     min_mb_per_minute, max_mb_per_minute, updated_at)
 		VALUES ($1,$2,$3::text[],$4::text[],$5::text[],$6::text[],
-		        $7::text[],$8::text[],$9::text[],$10,$11,$12,$13,$14,$15,$16,$17,now())
+		        $7::text[],$8::text[],$9::text[],$10,$11,$12,$13,$14,$15,$16,$17,$18,now())
 		ON CONFLICT (name) DO UPDATE SET
 		    is_default         = excluded.is_default,
 		    resolutions        = excluded.resolutions,
@@ -113,10 +144,11 @@ func (db *DB) UpsertQualityProfile(ctx context.Context, p QualityProfile) (Quali
 		    prefer_repack      = excluded.prefer_repack,
 		    reject_cam         = excluded.reject_cam,
 		    allow_upgrade      = excluded.allow_upgrade,
+		    minimum_upgrade_custom_format_score = excluded.minimum_upgrade_custom_format_score,
 		    cutoff_resolution  = excluded.cutoff_resolution,
 		    minimum_age_hours  = excluded.minimum_age_hours,
-		    min_size_mb        = excluded.min_size_mb,
-		    max_size_mb        = excluded.max_size_mb,
+		    min_mb_per_minute  = excluded.min_mb_per_minute,
+		    max_mb_per_minute  = excluded.max_mb_per_minute,
 		    updated_at         = now()
 		RETURNING`+profileSelectCols,
 		p.Name, p.IsDefault,
@@ -124,9 +156,9 @@ func (db *DB) UpsertQualityProfile(ctx context.Context, p QualityProfile) (Quali
 		pgTextArray(p.Codecs), pgTextArray(p.Languages),
 		pgTextArray(p.AudioFormats), pgTextArray(p.HdrFormats),
 		pgTextArray(p.ExcludePatterns),
-		p.PreferProper, p.PreferRepack, p.RejectCam, p.AllowUpgrade,
+		p.PreferProper, p.PreferRepack, p.RejectCam, p.AllowUpgrade, p.MinimumUpgradeCustomFormatScore,
 		p.CutoffResolution, p.MinimumAgeHours,
-		p.MinSizeMB, p.MaxSizeMB,
+		p.MinMBPerMinute, p.MaxMBPerMinute,
 	)
 	return scanProfile(row)
 }
@@ -163,9 +195,37 @@ func (db *DB) SetLibraryItemQualityProfile(ctx context.Context, libraryItemID in
 	return err
 }
 
+func (db *DB) SetMediaRequestQualityProfile(ctx context.Context, requestID int64, profileID *int64) (int64, error) {
+	var libraryItemID int64
+	err := db.SQL.QueryRowContext(ctx, `
+		with target as (
+			select li.id as library_item_id
+			from media_requests mr
+			left join queue_items q on q.id = (
+				select q2.id from queue_items q2
+				where q2.idempotency_key in ('seerr-movie-' || coalesce(mr.external_id, ''), 'seerr-tv-' || coalesce(mr.external_id, ''))
+				order by q2.id desc
+				limit 1
+			)
+			left join library_items li on li.id = q.library_item_id
+			where mr.id = $2
+			limit 1
+		)
+		update library_items li
+		set quality_profile_id = $1
+		from target
+		where li.id = target.library_item_id
+		returning li.id
+	`, profileID, requestID).Scan(&libraryItemID)
+	if err != nil {
+		return 0, err
+	}
+	return libraryItemID, nil
+}
+
 func (db *DB) ListQualityDefinitions(ctx context.Context) ([]QualityDefinition, error) {
 	rows, err := db.SQL.QueryContext(ctx,
-		`SELECT id, media_type, quality_key, title, min_size_mb, max_size_mb, sort_order
+		`SELECT id, media_type, quality_key, title, min_mb_per_minute, max_mb_per_minute, sort_order
 		 FROM quality_definitions ORDER BY media_type, sort_order`)
 	if err != nil {
 		return nil, err
@@ -174,7 +234,7 @@ func (db *DB) ListQualityDefinitions(ctx context.Context) ([]QualityDefinition, 
 	var out []QualityDefinition
 	for rows.Next() {
 		var d QualityDefinition
-		if err := rows.Scan(&d.ID, &d.MediaType, &d.QualityKey, &d.Title, &d.MinSizeMB, &d.MaxSizeMB, &d.SortOrder); err != nil {
+		if err := rows.Scan(&d.ID, &d.MediaType, &d.QualityKey, &d.Title, &d.MinMBPerMinute, &d.MaxMBPerMinute, &d.SortOrder); err != nil {
 			return nil, err
 		}
 		out = append(out, d)
@@ -185,11 +245,11 @@ func (db *DB) ListQualityDefinitions(ctx context.Context) ([]QualityDefinition, 
 func (db *DB) UpdateQualityDefinition(ctx context.Context, d QualityDefinition) (QualityDefinition, error) {
 	var out QualityDefinition
 	err := db.SQL.QueryRowContext(ctx,
-		`UPDATE quality_definitions SET min_size_mb=$1, max_size_mb=$2
+		`UPDATE quality_definitions SET min_mb_per_minute=$1, max_mb_per_minute=$2
 		 WHERE id=$3
-		 RETURNING id, media_type, quality_key, title, min_size_mb, max_size_mb, sort_order`,
-		d.MinSizeMB, d.MaxSizeMB, d.ID,
-	).Scan(&out.ID, &out.MediaType, &out.QualityKey, &out.Title, &out.MinSizeMB, &out.MaxSizeMB, &out.SortOrder)
+		 RETURNING id, media_type, quality_key, title, min_mb_per_minute, max_mb_per_minute, sort_order`,
+		d.MinMBPerMinute, d.MaxMBPerMinute, d.ID,
+	).Scan(&out.ID, &out.MediaType, &out.QualityKey, &out.Title, &out.MinMBPerMinute, &out.MaxMBPerMinute, &out.SortOrder)
 	return out, err
 }
 

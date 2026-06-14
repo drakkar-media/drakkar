@@ -3,6 +3,7 @@
   import HeartPulse from '@lucide/svelte/icons/heart-pulse';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import ShieldCheck from '@lucide/svelte/icons/shield-check';
+  import AlertTriangle from '@lucide/svelte/icons/alert-triangle';
   import PageHeader from '$lib/components/PageHeader.svelte';
   import Panel from '$lib/components/Panel.svelte';
   import Button from '$lib/components/Button.svelte';
@@ -10,7 +11,7 @@
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
 
-  type HealthSummary = { total: number; checked: number; healthy: number; neverChecked: number };
+  type HealthSummary = { total: number; checked: number; healthy: number; neverChecked: number; consistencyIssues: number };
   type HealthEntry = {
     id: number;
     libraryItemId: number;
@@ -20,18 +21,30 @@
     lastCheckedAt?: string;
     healthOk?: boolean;
   };
+  type ConsistencyIssue = {
+    libraryItemId: number;
+    title: string;
+    mediaType: string;
+    queueState: string;
+  };
 
   let summary: HealthSummary | null = null;
   let entries: HealthEntry[] = [];
+  let consistency: ConsistencyIssue[] = [];
   let loading = true;
   let checking = false;
 
   async function load() {
     loading = true;
     try {
-      const [nextSummary, nextEntries] = await Promise.all([api.healthSummary(), api.healthEntries()]);
+      const [nextSummary, nextEntries, nextConsistency] = await Promise.all([
+        api.healthSummary(),
+        api.healthEntries(),
+        api.healthConsistency()
+      ]);
       summary = nextSummary;
       entries = nextEntries.items ?? [];
+      consistency = nextConsistency.items ?? [];
     } catch (err) {
       toastError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -73,6 +86,7 @@
   $: healthy = summary?.healthy ?? 0;
   $: broken = checked - healthy;
   $: healthyPct = checked > 0 ? Math.round((healthy / checked) * 100) : 0;
+  $: consistencyIssues = summary?.consistencyIssues ?? 0;
 
   onMount(() => {
     void load();
@@ -84,7 +98,7 @@
 
 <svelte:head><title>Health — Drakkar</title></svelte:head>
 
-<PageHeader title="Health" subtitle="Health-check outcomes and schedule for published media.">
+<PageHeader title="Health" subtitle="Symlink health, library consistency, and NZB article availability.">
   <Button kind="secondary" on:click={load} disabled={loading || checking}>
     <RefreshCw size={14} />
     Refresh
@@ -99,11 +113,11 @@
   <section class="stats-grid">
     <div class="stat-card">
       <div class="stat-value">{summary.total}</div>
-      <div class="stat-label">Total published</div>
+      <div class="stat-label">Total published symlinks</div>
     </div>
     <div class="stat-card">
       <div class="stat-value ok">{healthy}</div>
-      <div class="stat-label">Healthy ({healthyPct}%)</div>
+      <div class="stat-label">Healthy symlinks ({healthyPct}%)</div>
       <div class="bar"><div class="fill ok" style={`width:${healthyPct}%`}></div></div>
     </div>
     <div class="stat-card">
@@ -114,20 +128,66 @@
       <div class="stat-value danger">{broken}</div>
       <div class="stat-label">Broken symlinks</div>
     </div>
+    <div class="stat-card {consistencyIssues > 0 ? 'has-issue' : ''}">
+      <div class="stat-value {consistencyIssues > 0 ? 'danger' : 'ok'}">{consistencyIssues}</div>
+      <div class="stat-label">Consistency issues</div>
+      <div class="stat-hint">Available items with no symlink</div>
+    </div>
   </section>
 
   {#if summary.neverChecked > 0}
     <div class="attention">
       <div class="attention-title"><HeartPulse size={16} /> Attention</div>
       <ul>
-        <li>{summary.neverChecked} item(s) never health-checked yet.</li>
-        <li>Run a check now if you want immediate verification.</li>
-        <li>Normal publish flow updates health state automatically.</li>
+        <li>{summary.neverChecked} item(s) have never been health-checked.</li>
+        <li>Run a check now for immediate verification, or wait for the hourly background task.</li>
       </ul>
     </div>
   {/if}
 
-  <Panel title="Schedule" subtitle="Reference-style schedule table, backed by Drakkar health rows.">
+  {#if consistencyIssues > 0}
+    <div class="attention attention-danger">
+      <div class="attention-title"><AlertTriangle size={16} /> Consistency Issues</div>
+      <p>
+        {consistencyIssues} library item(s) are marked <strong>available</strong> but have no published symlink.
+        These items may show as available in the library but will not stream.
+        Use <strong>Reset</strong> on the item in the library to re-queue them, or trigger <strong>Republish Pending</strong> from the Tasks tab.
+      </p>
+    </div>
+  {/if}
+
+  {#if consistency.length > 0}
+    <Panel title="Consistency Issues" subtitle="Items marked available but missing a published symlink.">
+      <div slot="actions">
+        <StatusPill tone="danger">{consistency.length} item(s)</StatusPill>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Title</th>
+              <th>Type</th>
+              <th>Queue State</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each consistency as issue}
+              <tr>
+                <td>
+                  <div class="row-title">{issue.title}</div>
+                  <div class="row-sub">ID {issue.libraryItemId}</div>
+                </td>
+                <td><StatusPill tone="neutral">{issue.mediaType}</StatusPill></td>
+                <td><StatusPill tone={issue.queueState === 'available' ? 'ok' : 'warn'}>{issue.queueState || 'unknown'}</StatusPill></td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    </Panel>
+  {/if}
+
+  <Panel title="Symlink Health Schedule" subtitle="All published media — symlink verified hourly against VFS target paths.">
     <div slot="actions">
       <StatusPill tone={broken > 0 ? 'warn' : 'ok'}>{entries.length} item(s)</StatusPill>
     </div>
@@ -157,7 +217,7 @@
                   {:else if entry.healthOk === false}
                     <StatusPill tone="danger">Broken</StatusPill>
                   {:else}
-                    <StatusPill tone="warn">ASAP</StatusPill>
+                    <StatusPill tone="warn">Unchecked</StatusPill>
                   {/if}
                 </td>
               </tr>
@@ -169,18 +229,30 @@
       <div class="empty-state">{loading ? 'Loading health entries…' : 'No published media yet.'}</div>
     {/if}
   </Panel>
+
+  <div class="info-card">
+    <div class="info-title">Deep NZB Article Check</div>
+    <p>
+      In addition to symlink verification, Drakkar probes NNTP providers weekly to confirm that
+      the actual NNTP articles behind each published item are still available. Items whose articles
+      have expired are automatically reset to <em>requested</em> so a fresh release can be selected.
+      This check also runs on startup. It cannot be triggered manually — see the Tasks tab for
+      the scheduled run time.
+    </p>
+  </div>
 {/if}
 
 <style>
   .stats-grid {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 14px;
     margin-bottom: 18px;
   }
 
   .stat-card,
-  .attention {
+  .attention,
+  .info-card {
     border: 1px solid hsl(0 0% 100% / 0.08);
     border-radius: 20px;
     background: hsl(var(--card) / 0.82);
@@ -188,6 +260,10 @@
 
   .stat-card {
     padding: 22px;
+  }
+
+  .stat-card.has-issue {
+    border-color: hsl(0 96% 82% / 0.28);
   }
 
   .stat-value {
@@ -199,12 +275,20 @@
   .stat-value.ok { color: hsl(141 80% 68%); }
   .stat-value.warn { color: hsl(47 100% 77%); }
   .stat-value.danger { color: hsl(0 96% 82%); }
+
   .stat-label,
   .row-sub,
   .empty-state {
     margin-top: 8px;
     font-size: 13px;
     color: hsl(var(--muted-foreground));
+  }
+
+  .stat-hint {
+    margin-top: 4px;
+    font-size: 11px;
+    color: hsl(var(--muted-foreground));
+    opacity: 0.7;
   }
 
   .bar {
@@ -230,18 +314,52 @@
     background: hsl(43 96% 44% / 0.08);
   }
 
+  .attention-danger {
+    border-color: hsl(0 96% 82% / 0.28);
+    background: hsl(0 96% 82% / 0.06);
+  }
+
   .attention-title {
     display: flex;
     align-items: center;
     gap: 8px;
     font-weight: 700;
     color: hsl(47 100% 77%);
+    margin-bottom: 8px;
+  }
+
+  .attention-danger .attention-title {
+    color: hsl(0 96% 82%);
   }
 
   .attention ul {
-    margin: 10px 0 0;
+    margin: 0;
     padding-left: 18px;
     color: hsl(var(--foreground));
+  }
+
+  .attention p {
+    margin: 0;
+    color: hsl(var(--foreground));
+  }
+
+  .info-card {
+    padding: 20px 22px;
+    margin-top: 18px;
+  }
+
+  .info-title {
+    font-weight: 700;
+    font-size: 14px;
+    margin-bottom: 8px;
+    color: hsl(var(--foreground));
+  }
+
+  .info-card p {
+    margin: 0;
+    font-size: 13px;
+    color: hsl(var(--muted-foreground));
+    line-height: 1.6;
   }
 
   .table-wrap {
@@ -272,7 +390,13 @@
     font-weight: 600;
   }
 
-  @media (max-width: 900px) {
+  @media (max-width: 1100px) {
+    .stats-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+  }
+
+  @media (max-width: 700px) {
     .stats-grid {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }

@@ -6,6 +6,7 @@ import Server from '@lucide/svelte/icons/server';
 import FolderTree from '@lucide/svelte/icons/folder-tree';
 import Settings2 from '@lucide/svelte/icons/settings-2';
 import CalendarDays from '@lucide/svelte/icons/calendar-days';
+import Users from '@lucide/svelte/icons/users';
 
 // All nav items — shown in sidebar on desktop and in mobile drawer
 export const navItems = [
@@ -16,6 +17,7 @@ export const navItems = [
   { href: '/health',     label: 'Health',     icon: HeartPulse },
   { href: '/services',   label: 'Services',   icon: Server },
   { href: '/vfs',        label: 'Files',      icon: FolderTree },
+  { href: '/users',      label: 'Users',      icon: Users },
   { href: '/settings',   label: 'Settings',   icon: Settings2 },
 ] as const;
 

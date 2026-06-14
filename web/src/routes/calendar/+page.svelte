@@ -242,8 +242,15 @@
 <!-- Detail modal -->
 {#if selected}
   {@const s = selected}
-  <div class="modal-backdrop" on:click={() => (selected = null)} role="presentation">
-    <div class="modal" on:click|stopPropagation role="dialog" aria-modal="true">
+  <div
+    class="modal-backdrop"
+    on:click={(e) => e.target === e.currentTarget && (selected = null)}
+    on:keydown={(e) => e.key === 'Escape' && (selected = null)}
+    role="button"
+    tabindex="0"
+    aria-label="Close details dialog"
+  >
+    <div class="modal" role="dialog" aria-modal="true" tabindex="-1">
       <div class="modal-inner">
         {#if s.posterUrl}
           <img class="modal-poster" src={s.posterUrl} alt={s.title} loading="lazy" />

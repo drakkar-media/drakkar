@@ -66,6 +66,23 @@
     event.preventDefault();
     scroller.scrollLeft += event.deltaY;
   }
+
+  function onKeyDown(event: KeyboardEvent) {
+    if (!scroller) return;
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      scrollByDelta(-pageDelta());
+    } else if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      scrollByDelta(pageDelta());
+    } else if (event.key === 'Home') {
+      event.preventDefault();
+      scroller.scrollTo({ left: 0, behavior: 'smooth' });
+    } else if (event.key === 'End') {
+      event.preventDefault();
+      scroller.scrollTo({ left: scroller.scrollWidth, behavior: 'smooth' });
+    }
+  }
 </script>
 
 <section class="media-row">
@@ -95,14 +112,16 @@
       class="row-scroll drag-scroll"
       class:dragging
       bind:this={scroller}
-      role="group"
+      role="button"
       aria-label={title}
+      tabindex="0"
       on:pointerdown={onPointerDown}
       on:pointermove={onPointerMove}
       on:pointerup={onPointerUp}
       on:pointercancel={onPointerUp}
       on:wheel={onWheel}
       on:click|capture={onClickCapture}
+      on:keydown={onKeyDown}
     >
       {#each items as item}
         <div class="row-item" style={`width:${itemWidth}px`}>

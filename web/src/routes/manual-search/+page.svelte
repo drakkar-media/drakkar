@@ -21,6 +21,7 @@
   let results: Item[] = [];
   let loading = false;
   let searched = false;
+  let queryInput: HTMLInputElement | null = null;
 
   async function doSearch() {
     if (!query.trim()) return;
@@ -42,6 +43,7 @@
   onMount(() => {
     const q = new URLSearchParams(window.location.search).get('q');
     if (q) { query = q; void doSearch(); }
+    queryInput?.focus();
   });
 </script>
 
@@ -54,7 +56,7 @@
 <form class="sf" on:submit|preventDefault={doSearch}>
   <div class="si-wrap">
     <Search size={15} />
-    <input class="si" bind:value={query} placeholder="e.g. The Dark Knight 2008 1080p BluRay" autofocus />
+    <input class="si" bind:this={queryInput} bind:value={query} placeholder="e.g. The Dark Knight 2008 1080p BluRay" />
   </div>
   <Button kind="primary" type="submit" disabled={loading || !query.trim()}>
     {loading ? 'Searching…' : 'Search Hydra'}

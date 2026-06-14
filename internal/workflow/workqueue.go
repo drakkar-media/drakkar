@@ -15,6 +15,9 @@ const bullmqQueueName = "drakkar:search"
 type WorkQueuer interface {
 	Push(ctx context.Context, libraryItemID int64, priority int)
 	Depth(ctx context.Context) int64
+	Pause(ctx context.Context) error
+	Resume(ctx context.Context) error
+	IsPaused(ctx context.Context) (bool, error)
 	Start(ctx context.Context, fn func(ctx context.Context, libraryItemID int64)) error
 }
 
@@ -76,6 +79,18 @@ func (q *WorkQueue) Push(ctx context.Context, libraryItemID int64, priority int)
 func (q *WorkQueue) Depth(ctx context.Context) int64 {
 	n, _ := q.queue.GetWaitingCount(ctx)
 	return n
+}
+
+func (q *WorkQueue) Pause(ctx context.Context) error {
+	return q.queue.Pause(ctx)
+}
+
+func (q *WorkQueue) Resume(ctx context.Context) error {
+	return q.queue.Resume(ctx)
+}
+
+func (q *WorkQueue) IsPaused(ctx context.Context) (bool, error) {
+	return q.queue.IsPaused(ctx)
 }
 
 // Start launches the BullMQ worker pool. Blocks until ctx is cancelled.

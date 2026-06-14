@@ -10,22 +10,25 @@
   import { api, subscribeEvents } from '$lib/api';
   import { dateTime, sentence } from '$lib/format';
   import { toastError, toastSuccess } from '$lib/toast';
-  import type { RequestItem, Status } from '$lib/types';
+  import type { QualityProfile, RequestItem, Status } from '$lib/types';
 
   let status: Status | null = null;
   let requests: RequestItem[] = [];
+  let profiles: QualityProfile[] = [];
   let loading = true;
   let working = false;
   let errorMessage = '';
   let infoMessage = '';
+  let profileSaving: Record<number, boolean> = {};
 
   async function loadRequests() {
     loading = true;
     errorMessage = '';
     try {
-      const [statusResult, result] = await Promise.all([api.status(), api.requests()]);
+      const [statusResult, result, profileResult] = await Promise.all([api.status(), api.requests(), api.listProfiles()]);
       status = statusResult;
       requests = result.requests;
+      profiles = profileResult.profiles ?? [];
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);
       toastError(errorMessage);
@@ -65,6 +68,32 @@
       toastError(errorMessage);
     } finally {
       working = false;
+    }
+  }
+
+  async function setProfile(requestID: number, nextValue: string) {
+    profileSaving = { ...profileSaving, [requestID]: true };
+    try {
+      const parsed = nextValue ? Number(nextValue) : null;
+      const profileId = parsed != null && Number.isFinite(parsed) ? parsed : null;
+      await api.setRequestProfile(requestID, profileId);
+      requests = requests.map((item) =>
+        item.id === requestID
+          ? {
+              ...item,
+              qualityProfileId: profileId ?? undefined,
+              qualityProfileName: profileId == null ? undefined : profiles.find((p) => p.id === profileId)?.name
+            }
+          : item
+      );
+      toastSuccess(profileId == null ? 'Request profile cleared' : 'Request profile updated');
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      errorMessage = detail;
+      toastError(detail);
+      await loadRequests();
+    } finally {
+      profileSaving = { ...profileSaving, [requestID]: false };
     }
   }
 
@@ -120,6 +149,7 @@
       <div class="thead">
         <span>Title</span>
         <span>Type</span>
+        <span>Profile</span>
         <span>Queue</span>
         <span>Created</span>
       </div>
@@ -127,6 +157,23 @@
         <div class="row">
           <span><strong>{item.title || item.externalId}</strong></span>
           <span>{item.requestType} · {item.mediaType}</span>
+          <span>
+            {#if item.libraryItemId}
+              <select
+                class="profile-select"
+                value={item.qualityProfileId == null ? '' : String(item.qualityProfileId)}
+                disabled={working || !!profileSaving[item.id]}
+                on:change={(event) => setProfile(item.id, (event.currentTarget as HTMLSelectElement).value)}
+              >
+                <option value="">Default profile</option>
+                {#each profiles as profile}
+                  <option value={profile.id}>{profile.name}{profile.isDefault ? ' · default' : ''}</option>
+                {/each}
+              </select>
+            {:else}
+              <span class="muted">Unlinked</span>
+            {/if}
+          </span>
           <span><StatusPill tone={item.queueState === 'available' ? 'ok' : 'neutral'}>{sentence(item.queueState)}</StatusPill></span>
           <span>{dateTime(item.createdAt)}</span>
         </div>
@@ -173,7 +220,7 @@
   .thead,
   .row {
     display: grid;
-    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) 130px minmax(0, 1fr);
+    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(180px, 1fr) 130px minmax(0, 1fr);
     gap: 12px;
     align-items: center;
   }
@@ -196,8 +243,20 @@
     display: block;
   }
 
-  .empty {
+  .empty,
+  .muted {
     color: hsl(var(--muted-foreground));
+  }
+
+  .profile-select {
+    width: 100%;
+    min-height: 36px;
+    border-radius: 12px;
+    border: 1px solid hsl(0 0% 100% / 0.08);
+    background: hsl(0 0% 100% / 0.04);
+    color: hsl(var(--foreground));
+    padding: 0 10px;
+    font-size: 13px;
   }
 
   @media (max-width: 900px) {

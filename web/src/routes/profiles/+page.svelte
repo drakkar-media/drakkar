@@ -41,10 +41,11 @@
       preferRepack: true,
       rejectCam: true,
       allowUpgrade: false,
+      minimumUpgradeCustomFormatScore: 0,
       cutoffResolution: '',
       minimumAgeHours: 0,
-      minSizeMb: 0,
-      maxSizeMb: 0,
+      minMbPerMinute: 0,
+      maxMbPerMinute: 0,
     };
   }
 
@@ -305,7 +306,27 @@
                 <span>Hard-reject low-quality cam captures and telesyncs</span>
               </div>
             </label>
+            <label class="flag-row">
+              <input type="checkbox" bind:checked={selected.allowUpgrade} />
+              <div>
+                <strong>Allow Quality Upgrade</strong>
+                <span>Periodically re-search available items for better releases</span>
+              </div>
+            </label>
           </div>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="field">
+          <div class="field-label">Upgrade Rules</div>
+          <div class="size-row">
+            <label>
+              <span>Minimum CF Upgrade</span>
+              <input type="number" min="0" bind:value={selected.minimumUpgradeCustomFormatScore} class="size-input" placeholder="0 = no minimum" />
+            </label>
+          </div>
+          <div class="field-hint" style="margin-top:8px">When upgrades are enabled, the new release must improve the custom-format subtotal by at least this amount.</div>
         </div>
 
         <div class="divider"></div>
@@ -315,14 +336,15 @@
           <div class="field-label">Size Limits</div>
           <div class="size-row">
             <label>
-              <span>Min (MB)</span>
-              <input type="number" min="0" bind:value={selected.minSizeMb} class="size-input" placeholder="0 = no limit" />
+              <span>Min (MB/min)</span>
+              <input type="number" min="0" bind:value={selected.minMbPerMinute} class="size-input" placeholder="0 = no limit" />
             </label>
             <label>
-              <span>Max (MB)</span>
-              <input type="number" min="0" bind:value={selected.maxSizeMb} class="size-input" placeholder="0 = no limit" />
+              <span>Max (MB/min)</span>
+              <input type="number" min="0" bind:value={selected.maxMbPerMinute} class="size-input" placeholder="0 = no limit" />
             </label>
           </div>
+          <div class="field-hint" style="margin-top:8px">Applied per runtime minute. Releases without runtime metadata skip these limits.</div>
         </div>
 
         <div class="divider"></div>

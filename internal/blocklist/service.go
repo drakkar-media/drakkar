@@ -8,6 +8,10 @@ import (
 
 type Repository interface {
 	ListBlocklistItems(ctx context.Context) ([]database.BlocklistItemSummary, error)
+	ListBlocklistItemsPaged(ctx context.Context, f database.BlocklistFilter) (database.BlocklistPage, error)
+	BlocklistStats(ctx context.Context) (database.BlocklistStats, error)
+	CreateBlocklistItem(ctx context.Context, item database.BlocklistMutation) (database.BlocklistItemSummary, error)
+	UpdateBlocklistItem(ctx context.Context, id int64, item database.BlocklistMutation) (database.BlocklistItemSummary, error)
 	DeleteBlocklistItem(ctx context.Context, id int64) error
 	DeleteAllBlocklistItems(ctx context.Context) (int, error)
 	DeleteBlocklistItemsByReason(ctx context.Context, reason string) (int, error)
@@ -23,6 +27,22 @@ func NewService(repo Repository) *Service {
 
 func (s *Service) List(ctx context.Context) ([]database.BlocklistItemSummary, error) {
 	return s.repo.ListBlocklistItems(ctx)
+}
+
+func (s *Service) ListPaged(ctx context.Context, f database.BlocklistFilter) (database.BlocklistPage, error) {
+	return s.repo.ListBlocklistItemsPaged(ctx, f)
+}
+
+func (s *Service) Stats(ctx context.Context) (database.BlocklistStats, error) {
+	return s.repo.BlocklistStats(ctx)
+}
+
+func (s *Service) Create(ctx context.Context, item database.BlocklistMutation) (database.BlocklistItemSummary, error) {
+	return s.repo.CreateBlocklistItem(ctx, item)
+}
+
+func (s *Service) Update(ctx context.Context, id int64, item database.BlocklistMutation) (database.BlocklistItemSummary, error) {
+	return s.repo.UpdateBlocklistItem(ctx, id, item)
 }
 
 func (s *Service) Clear(ctx context.Context, id int64) error {

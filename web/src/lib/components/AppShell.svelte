@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import Bell from '@lucide/svelte/icons/bell';
   import BookOpen from '@lucide/svelte/icons/book-open';
+  import LogOut from '@lucide/svelte/icons/log-out';
   import Menu from '@lucide/svelte/icons/menu';
   import Search from '@lucide/svelte/icons/search';
   import X from '@lucide/svelte/icons/x';
@@ -11,7 +12,7 @@
   import { detailsHref } from '$lib/detailsHref';
   import { navItems, mobilePrimaryItems } from '$lib/nav';
   import DrakkarLogo from '$lib/components/DrakkarLogo.svelte';
-  import type { DiscoverMediaItem, DiscoverSearchResult } from '$lib/types';
+  import type { DiscoverMediaItem, DiscoverSearchResult, User } from '$lib/types';
 
   let mobileOpen = false;
   let globalSearch = '';
@@ -20,6 +21,7 @@
   let searchBusy = false;
   let searchToken = 0;
   let debounceTimer: number | undefined;
+  let currentUser: User | null = null;
 
   function isActive(href: string) {
     if (href === '/dashboard' && page.url.pathname === '/') return true;
@@ -71,8 +73,25 @@
 
   function onBlur() { window.setTimeout(() => { searchOpen = false; }, 120); }
 
+  async function loadMe() {
+    try {
+      currentUser = await api.me();
+    } catch {
+      currentUser = null;
+    }
+  }
+
+  async function logout() {
+    await api.logout();
+    currentUser = null;
+    void goto('/login', { replaceState: true });
+  }
+
   $: if (page.url.pathname !== '/search' && !globalSearch) suggestions = null;
 
+  onMount(() => {
+    void loadMe();
+  });
   onDestroy(() => window.clearTimeout(debounceTimer));
 </script>
 
@@ -143,6 +162,15 @@
 
       <div class="topbar-right">
         <a class="icon-btn" href="/settings?tab=logs" aria-label="Logs"><BookOpen size={15} /></a>
+        {#if currentUser}
+          <a class="user-chip" href="/users" aria-label="Open users">
+            <span class="user-name">{currentUser.username}</span>
+            <span class="user-role">{currentUser.role}</span>
+          </a>
+        {/if}
+        <button class="icon-btn" type="button" aria-label="Log out" on:click={logout}>
+          <LogOut size={15} />
+        </button>
         <div class="avatar"><DrakkarLogo size={18} /></div>
       </div>
     </header>
@@ -278,6 +306,31 @@
   /* ── Topbar right ────────────────────────────── */
   .topbar-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 
+  .user-chip {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    min-height: 40px;
+    padding: 0 12px;
+    border-radius: 14px;
+    border: 1px solid hsl(0 0% 100% / 0.08);
+    background: hsl(0 0% 100% / 0.04);
+    color: hsl(var(--foreground));
+    text-decoration: none;
+  }
+
+  .user-name {
+    font-size: 13px;
+    font-weight: 700;
+  }
+
+  .user-role {
+    color: hsl(var(--muted-foreground));
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+  }
+
   .icon-btn {
     display: grid; place-items: center; width: 40px; height: 40px;
     border-radius: 14px; border: 1px solid hsl(0 0% 100% / 0.08);
@@ -372,6 +425,7 @@
     .content-wrap { padding-left: 56px; }
     .topbar { padding: 12px 32px; justify-content: center; }
     .searchbar { max-width: 520px; }
+    .user-chip { display: inline-flex; }
     .main { padding: 8px 32px 32px; }
     .hamburger, .mobile-overlay, .bottom-nav { display: none !important; }
   }

@@ -23,12 +23,20 @@ type UserRepository interface {
 	CreateSession(ctx context.Context, userID int64, tokenHash string, expiresAt time.Time) error
 	GetSessionByTokenHash(ctx context.Context, tokenHash string) (userID int64, username, role string, expiresAt time.Time, err error)
 	DeleteSession(ctx context.Context, tokenHash string) error
+	ListAPITokens(ctx context.Context, userID int64) ([]database.APIToken, error)
+	CreateAPIToken(ctx context.Context, userID int64, name, tokenHash string, expiresAt *time.Time) (database.APIToken, error)
+	GetAPITokenByHash(ctx context.Context, tokenHash string) (userID int64, username, role string, expiresAt *time.Time, err error)
+	TouchAPITokenUsed(ctx context.Context, tokenHash string) error
+	DeleteAPIToken(ctx context.Context, userID, tokenID int64) error
 }
 
 func mountAuthRoutes(r chi.Router, repo UserRepository) {
 	r.Post("/api/auth/login", handleLogin(repo))
 	r.Post("/api/auth/logout", handleLogout(repo))
 	r.Get("/api/auth/me", handleMe())
+	r.Get("/api/auth/tokens", handleListAPITokens(repo))
+	r.Post("/api/auth/tokens", handleCreateAPIToken(repo))
+	r.Delete("/api/auth/tokens/{id}", handleDeleteAPIToken(repo))
 }
 
 func mountUserRoutes(r chi.Router, repo UserRepository) {
@@ -96,6 +104,91 @@ func handleMe() http.HandlerFunc {
 			"username": claims.Username,
 			"role":     claims.Role,
 		})
+	}
+}
+
+func handleListAPITokens(repo UserRepository) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := auth.FromContext(r.Context())
+		if !ok {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		items, err := repo.ListAPITokens(r.Context(), claims.UserID)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if items == nil {
+			items = []database.APIToken{}
+		}
+		respondJSON(w, http.StatusOK, items)
+	}
+}
+
+func handleCreateAPIToken(repo UserRepository) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := auth.FromContext(r.Context())
+		if !ok {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var body struct {
+			Name      string `json:"name"`
+			ExpiresAt string `json:"expiresAt"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" {
+			http.Error(w, `{"error":"name required"}`, http.StatusBadRequest)
+			return
+		}
+		var expiresAt *time.Time
+		if body.ExpiresAt != "" {
+			ts, err := time.Parse(time.RFC3339, body.ExpiresAt)
+			if err != nil {
+				http.Error(w, `{"error":"invalid expiresAt"}`, http.StatusBadRequest)
+				return
+			}
+			expiresAt = &ts
+		}
+		token, tokenHash, err := auth.GenerateToken()
+		if err != nil {
+			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+			return
+		}
+		item, err := repo.CreateAPIToken(r.Context(), claims.UserID, body.Name, tokenHash, expiresAt)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		respondJSON(w, http.StatusCreated, map[string]any{
+			"id":         item.ID,
+			"userId":     item.UserID,
+			"name":       item.Name,
+			"createdAt":  item.CreatedAt,
+			"lastUsedAt": item.LastUsedAt,
+			"expiresAt":  item.ExpiresAt,
+			"token":      token,
+		})
+	}
+}
+
+func handleDeleteAPIToken(repo UserRepository) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := auth.FromContext(r.Context())
+		if !ok {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+			return
+		}
+		if err := repo.DeleteAPIToken(r.Context(), claims.UserID, id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
 	}
 }
 

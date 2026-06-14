@@ -107,10 +107,13 @@ func (h *sabHandler) handleAddFile(w http.ResponseWriter, r *http.Request) {
 	}
 	file := r.MultipartForm.File["nzbFile"]
 	if len(file) == 0 {
+		file = r.MultipartForm.File["nzbfile"]
+	}
+	if len(file) == 0 {
 		file = r.MultipartForm.File["name"]
 	}
 	if len(file) == 0 {
-		h.writeError(w, "missing nzbFile or name field")
+		h.writeError(w, "missing nzbFile, nzbfile, or name field")
 		return
 	}
 	fh := file[0]
@@ -125,11 +128,8 @@ func (h *sabHandler) handleAddFile(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, "read upload: "+err.Error())
 		return
 	}
-	cat := r.FormValue("cat")
-	if cat == "" {
-		cat = r.URL.Query().Get("cat")
-	}
-	nzoID, err := h.importFn(r.Context(), content, fh.Filename, catToMediaType(cat))
+	filename := multipartFilename(r, fh.Filename)
+	nzoID, err := h.importFn(r.Context(), content, filename, catToMediaType(sabCategory(r)))
 	if err != nil {
 		h.writeError(w, "import: "+err.Error())
 		return
@@ -176,11 +176,7 @@ func (h *sabHandler) handleAddURL(w http.ResponseWriter, r *http.Request) {
 		filename += ".nzb"
 	}
 
-	cat := r.FormValue("cat")
-	if cat == "" {
-		cat = r.URL.Query().Get("cat")
-	}
-	nzoID, err := h.importFn(r.Context(), content, filename, catToMediaType(cat))
+	nzoID, err := h.importFn(r.Context(), content, filename, catToMediaType(sabCategory(r)))
 	if err != nil {
 		h.writeError(w, "import: "+err.Error())
 		return
@@ -189,14 +185,10 @@ func (h *sabHandler) handleAddURL(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *sabHandler) handleQueue(w http.ResponseWriter, r *http.Request) {
-	cat := r.FormValue("cat")
-	if cat == "" {
-		cat = r.URL.Query().Get("cat")
-	}
 	start := intParam(r, "start", 0)
 	limit := intParam(r, "limit", 100)
 
-	items, total, err := h.repo.ListSabQueueItems(r.Context(), cat, start, limit)
+	items, total, err := h.repo.ListSabQueueItems(r.Context(), sabCategory(r), start, limit)
 	if err != nil {
 		h.writeError(w, err.Error())
 		return
@@ -240,14 +232,10 @@ func (h *sabHandler) handleQueueDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *sabHandler) handleHistory(w http.ResponseWriter, r *http.Request) {
-	cat := r.FormValue("cat")
-	if cat == "" {
-		cat = r.URL.Query().Get("cat")
-	}
 	start := intParam(r, "start", 0)
 	limit := intParam(r, "limit", 100)
 
-	items, total, err := h.repo.ListSabHistoryItems(r.Context(), cat, start, limit)
+	items, total, err := h.repo.ListSabHistoryItems(r.Context(), sabCategory(r), start, limit)
 	if err != nil {
 		h.writeError(w, err.Error())
 		return
@@ -410,6 +398,34 @@ func filenameFromURL(rawURL string) string {
 		}
 	}
 	return "download.nzb"
+}
+
+func multipartFilename(r *http.Request, fallback string) string {
+	name := strings.TrimSpace(r.FormValue("nzbname"))
+	if name == "" {
+		name = strings.TrimSpace(r.URL.Query().Get("nzbname"))
+	}
+	if name == "" {
+		name = fallback
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".nzb") {
+		name += ".nzb"
+	}
+	return name
+}
+
+func sabCategory(r *http.Request) string {
+	cat := strings.TrimSpace(r.FormValue("cat"))
+	if cat == "" {
+		cat = strings.TrimSpace(r.URL.Query().Get("cat"))
+	}
+	if cat == "" {
+		cat = strings.TrimSpace(r.FormValue("category"))
+	}
+	if cat == "" {
+		cat = strings.TrimSpace(r.URL.Query().Get("category"))
+	}
+	return cat
 }
 
 func intParam(r *http.Request, key string, defaultVal int) int {
