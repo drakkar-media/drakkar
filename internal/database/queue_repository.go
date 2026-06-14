@@ -698,10 +698,22 @@ func (db *DB) ListNZBMountEntries(ctx context.Context) ([]NZBMountEntry, error) 
 func isPlayableMedia(name string) bool {
 	switch strings.ToLower(filepath.Ext(name)) {
 	case ".mkv", ".mp4", ".avi":
-		return true
+		return !isSampleFilename(name)
 	default:
 		return false
 	}
+}
+
+// isSampleFilename returns true when the filename (without extension) is or
+// looks like a sample clip: exactly "sample", "sample-something",
+// "something-sample", etc. Mirrors the reSample logic in ranking.
+func isSampleFilename(name string) bool {
+	base := strings.ToLower(strings.TrimSuffix(filepath.Base(name), filepath.Ext(name)))
+	return base == "sample" ||
+		strings.HasPrefix(base, "sample-") ||
+		strings.HasPrefix(base, "sample_") ||
+		strings.HasSuffix(base, "-sample") ||
+		strings.HasSuffix(base, "_sample")
 }
 
 func (db *DB) applyImportPolicies(ctx context.Context, imported ImportedNZB) ImportedNZB {

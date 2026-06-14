@@ -11,40 +11,45 @@ type SegmentSizer interface {
 	DecodedSize(ctx context.Context, messageID string) (int64, error)
 }
 
-// PreflightCheckFirstSegments verifies that the first segment of every NZB file
-// in the given document is reachable on NNTP. Unlike CalibrateNZBOffsets (which
-// silently skips missing segments), this returns an error immediately so the
-// workqueue can reject the release and fall back to the next candidate.
+// PreflightCheckFirstSegments verifies that the first AND last segment of every
+// NZB file in the given document is reachable on NNTP. Unlike CalibrateNZBOffsets
+// (which silently skips missing segments), this returns an error immediately so
+// the workqueue can reject the release and fall back to the next candidate.
 func (db *DB) PreflightCheckFirstSegments(ctx context.Context, nzbDocumentID int64) error {
 	sizer, ok := db.SegmentFetcher.(SegmentSizer)
 	if !ok || sizer == nil {
 		return nil // NNTP fetcher not available; skip preflight
 	}
 	rows, err := db.SQL.QueryContext(ctx, `
-		SELECT DISTINCT ON (nf.id)
-		    ns.message_id
+		SELECT
+		    (SELECT ns.message_id FROM nzb_segments ns WHERE ns.nzb_file_id = nf.id ORDER BY ns.segment_number ASC  LIMIT 1),
+		    (SELECT ns.message_id FROM nzb_segments ns WHERE ns.nzb_file_id = nf.id ORDER BY ns.segment_number DESC LIMIT 1)
 		FROM nzb_files nf
-		JOIN nzb_segments ns ON ns.nzb_file_id = nf.id
-		WHERE nf.nzb_document_id = $1
-		ORDER BY nf.id, ns.segment_number ASC`, nzbDocumentID)
+		WHERE nf.nzb_document_id = $1`, nzbDocumentID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	var msgIDs []string
+	type segPair struct{ first, last string }
+	var pairs []segPair
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var p segPair
+		if err := rows.Scan(&p.first, &p.last); err != nil {
 			return err
 		}
-		msgIDs = append(msgIDs, id)
+		pairs = append(pairs, p)
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	for _, msgID := range msgIDs {
-		if _, err := sizer.DecodedSize(ctx, msgID); err != nil {
-			return fmt.Errorf("preflight: first segment %s unavailable: %w", msgID, err)
+	for _, p := range pairs {
+		if _, err := sizer.DecodedSize(ctx, p.first); err != nil {
+			return fmt.Errorf("preflight: first segment %s unavailable: %w", p.first, err)
+		}
+		if p.last != p.first {
+			if _, err := sizer.DecodedSize(ctx, p.last); err != nil {
+				return fmt.Errorf("preflight: last segment %s unavailable: %w", p.last, err)
+			}
 		}
 	}
 	return nil
