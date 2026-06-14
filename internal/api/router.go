@@ -7,11 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"path"
-	"strconv"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1256,26 +1257,30 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("publication unavailable"))
 			return
 		}
-		result, err := publication.RepublishPendingLibrary(r.Context())
-		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
-			return
-		}
-		publishMutation("library.republish_pending", map[string]any{"processed": result.Processed, "republished": result.Republished, "failed": result.Failed})
-		respondJSON(w, http.StatusAccepted, result)
+		go func() {
+			result, err := publication.RepublishPendingLibrary(context.Background())
+			if err != nil {
+				slog.Error("republish pending background", "err", err)
+				return
+			}
+			publishMutation("library.republish_pending", map[string]any{"processed": result.Processed, "republished": result.Republished, "failed": result.Failed})
+		}()
+		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
 	})
 	r.Post("/api/library/reset-orphaned-available", func(w http.ResponseWriter, r *http.Request) {
 		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		result, err := workflowSvc.ResetOrphanedAvailableItems(r.Context())
-		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
-			return
-		}
-		publishMutation("library.reset_orphaned", map[string]any{"found": result.Found, "reset": result.Reset, "failed": result.Failed})
-		respondJSON(w, http.StatusAccepted, result)
+		go func() {
+			result, err := workflowSvc.ResetOrphanedAvailableItems(context.Background())
+			if err != nil {
+				slog.Error("reset orphaned available background", "err", err)
+				return
+			}
+			publishMutation("library.reset_orphaned", map[string]any{"found": result.Found, "reset": result.Reset, "failed": result.Failed})
+		}()
+		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
 	})
 	r.Post("/api/library/backfill-metadata", func(w http.ResponseWriter, r *http.Request) {
 		if workflowSvc == nil {
