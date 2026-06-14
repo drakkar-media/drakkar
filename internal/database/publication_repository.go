@@ -238,13 +238,28 @@ func (db *DB) ListSelectedReleasesByLibraryItem(ctx context.Context, libraryItem
 
 func (db *DB) ListPendingRepublishTargets(ctx context.Context) ([]PendingRepublishTarget, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
+		-- Items stuck in active queue states but not yet marked available
 		select distinct sr.library_item_id
 		from selected_releases sr
 		join queue_items q on q.selected_release_id = sr.id
 		join library_items li on li.id = sr.library_item_id
 		where li.available = false
 		  and q.state in ($1, $2, $3)
-		order by sr.library_item_id asc`, QueuePreflight, QueuePublishing, QueueIndexing,
+		union
+		-- Items marked available but missing their symlink publication
+		select distinct sr.library_item_id
+		from selected_releases sr
+		join library_items li on li.id = sr.library_item_id
+		where li.available = true
+		  and exists (
+		      select 1 from virtual_files vf
+		      where vf.selected_release_id = sr.id
+		  )
+		  and not exists (
+		      select 1 from symlink_publications sp
+		      where sp.library_item_id = li.id
+		  )
+		order by library_item_id asc`, QueuePreflight, QueuePublishing, QueueIndexing,
 	)
 	if err != nil {
 		return nil, err
