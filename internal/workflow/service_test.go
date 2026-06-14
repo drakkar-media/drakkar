@@ -16,32 +16,34 @@ import (
 )
 
 type repoStub struct {
-	requests      []database.MediaRequestSummary
-	searchInput   database.LibrarySearchInput
-	history       map[string]database.CandidateHistory
+	requests       []database.MediaRequestSummary
+	searchInput    database.LibrarySearchInput
+	history        map[string]database.CandidateHistory
 	defaultProfile database.QualityProfile
-	conflict      string
-	searchApplied []database.SearchCandidateRecord
-	searchFailed  []string
-	pending       []database.PendingLibrarySearchTarget
-	failedQueues  []database.FailedQueueRetryTarget
-	movieCalls    int
-	tvCalls       int
-	fetching      int64
-	imported      database.ImportedNZB
-	indexed       int64
-	selected      database.ReleaseSummary
-	selectedByID  map[int64]database.ReleaseSummary
-	promoted      *database.ReleaseSummary
-	alternative   *database.ReleaseSummary
-	next          *database.ReleaseSummary
-	failed        []string
-	rejected      []string
-	retryTarget   database.QueueRetryTarget
-	skipped       []int64
-	stored        database.StoredNZBDocument
-	restoredGroup []int64
-	movieMeta     struct {
+	itemProfile    *database.QualityProfile
+	conflict       string
+	searchApplied  []database.SearchCandidateRecord
+	searchFailed   []string
+	pending        []database.PendingLibrarySearchTarget
+	failedQueues   []database.FailedQueueRetryTarget
+	upgradable     []int64
+	movieCalls     int
+	tvCalls        int
+	fetching       int64
+	imported       database.ImportedNZB
+	indexed        int64
+	selected       database.ReleaseSummary
+	selectedByID   map[int64]database.ReleaseSummary
+	promoted       *database.ReleaseSummary
+	alternative    *database.ReleaseSummary
+	next           *database.ReleaseSummary
+	failed         []string
+	rejected       []string
+	retryTarget    database.QueueRetryTarget
+	skipped        []int64
+	stored         database.StoredNZBDocument
+	restoredGroup  []int64
+	movieMeta      struct {
 		libraryItemID int64
 		tmdbID        int64
 		title         string
@@ -172,6 +174,14 @@ func (r *repoStub) GetSelectedReleaseSummary(ctx context.Context, selectedReleas
 	return r.selected, nil
 }
 
+func (r *repoStub) GetLatestSelectedReleaseSummaryByLibraryItem(_ context.Context, libraryItemID int64) (*database.ReleaseSummary, error) {
+	if r.selected.LibraryItemID == libraryItemID && r.selected.SelectedReleaseID != 0 {
+		item := r.selected
+		return &item, nil
+	}
+	return nil, nil
+}
+
 func (r *repoStub) GetStoredNZBDocument(ctx context.Context, selectedReleaseID int64) (database.StoredNZBDocument, error) {
 	return r.stored, nil
 }
@@ -297,7 +307,7 @@ func (r *repoStub) ListCustomFormats(_ context.Context) ([]database.CustomFormat
 	return nil, nil
 }
 func (r *repoStub) GetLibraryItemQualityProfile(_ context.Context, _ int64) (*database.QualityProfile, error) {
-	return nil, nil
+	return r.itemProfile, nil
 }
 func (r *repoStub) GetQualityProfileByName(_ context.Context, _ string) (database.QualityProfile, error) {
 	return database.QualityProfile{}, nil
@@ -306,7 +316,7 @@ func (r *repoStub) ListQualityDefinitions(_ context.Context) ([]database.Quality
 	return nil, nil
 }
 func (r *repoStub) ListUpgradableLibraryItems(_ context.Context) ([]int64, error) {
-	return nil, nil
+	return r.upgradable, nil
 }
 func (r *repoStub) CreateImportedNZB(_ context.Context, _ database.ImportedNZB) (database.QueueSnapshot, error) {
 	return database.QueueSnapshot{}, nil
@@ -322,6 +332,13 @@ func (r *repoStub) DeleteSymlinkPublicationsForLibraryItem(_ context.Context, _ 
 	return nil, nil
 }
 func (r *repoStub) ResetLibraryItemState(_ context.Context, _ int64) error { return nil }
+func (r *repoStub) ListReleaseBlockRules(_ context.Context) ([]database.ReleaseBlockRule, error) {
+	return nil, nil
+}
+
+func (r *repoStub) LoadIndexerPolicyMap(_ context.Context) (map[string]int, error) {
+	return nil, nil
+}
 
 type seerrStub struct {
 	requests []seerr.Request
@@ -330,7 +347,20 @@ type seerrStub struct {
 func (s seerrStub) PendingRequests(ctx context.Context) ([]seerr.Request, error) {
 	return s.requests, nil
 }
-func (s seerrStub) CreateRequest(_ context.Context, _ string, _ int64) error { return nil }
+func (s seerrStub) CreateRequest(_ context.Context, _ string, _ int64) error        { return nil }
+func (s seerrStub) CreateTVSeasonRequest(_ context.Context, _ int64, _ []int) error { return nil }
+
+type seasonRequestSeerrStub struct {
+	seerrStub
+	seasonRequestID int64
+	seasonNumbers   []int
+}
+
+func (s *seasonRequestSeerrStub) CreateTVSeasonRequest(_ context.Context, tmdbID int64, seasons []int) error {
+	s.seasonRequestID = tmdbID
+	s.seasonNumbers = append([]int(nil), seasons...)
+	return nil
+}
 
 type hydraStub struct {
 	results    []hydra.SearchResult
@@ -411,7 +441,7 @@ func (tmdbStub) MovieDetails(ctx context.Context, tmdbID int64) (tmdb.MovieDetai
 func (tmdbStub) TVDetails(ctx context.Context, tmdbID int64) (tmdb.TVDetails, error) {
 	return tmdb.TVDetails{Name: "Loki", Year: 2021, IMDbID: "tt9140554"}, nil
 }
-func (tmdbStub) TVSeasonNumbers(_ context.Context, _ int64) ([]int, error)    { return nil, nil }
+func (tmdbStub) TVSeasonNumbers(_ context.Context, _ int64) ([]int, error) { return nil, nil }
 func (tmdbStub) TVSeason(_ context.Context, _ int64, _ int) (tmdb.TVSeason, error) {
 	return tmdb.TVSeason{}, nil
 }
@@ -481,6 +511,31 @@ func TestSyncRequestsTVDBFallback(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if repo.episodeMeta.tmdbID != 0 || repo.episodeMeta.show != "The Bear" || repo.episodeMeta.imdbID != "tt14452776" || repo.episodeMeta.year != 2022 {
 		t.Fatalf("unexpected episode metadata %+v", repo.episodeMeta)
+	}
+}
+
+func TestCreateSeerrSeasonRequest(t *testing.T) {
+	seerrClient := &seasonRequestSeerrStub{
+		seerrStub: seerrStub{
+			requests: []seerr.Request{
+				{ID: 2, Type: "tv", MediaTitle: "Loki", MediaYear: 2021, TVDBID: 362472, TMDBID: 84958, SeasonNumber: 2, EpisodeNumber: 1},
+			},
+		},
+	}
+	service := NewService(&repoStub{}, seerrClient, hydraStub{})
+
+	result, err := service.CreateSeerrSeasonRequest(context.Background(), 84958, []int{2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Seen != 1 || result.Created != 1 {
+		t.Fatalf("unexpected sync result %+v", result)
+	}
+	if seerrClient.seasonRequestID != 84958 {
+		t.Fatalf("unexpected tmdb id %d", seerrClient.seasonRequestID)
+	}
+	if len(seerrClient.seasonNumbers) != 1 || seerrClient.seasonNumbers[0] != 2 {
+		t.Fatalf("unexpected seasons %+v", seerrClient.seasonNumbers)
 	}
 }
 
@@ -1759,6 +1814,46 @@ func TestRetryQueueItemUsesExistingCandidateBeforeResearch(t *testing.T) {
 	}
 	if len(repo.searchApplied) != 0 {
 		t.Fatalf("did not expect fresh search, got candidates %+v", repo.searchApplied)
+	}
+}
+
+func TestSearchUpgradesRequiresMinimumCustomFormatScoreIncrement(t *testing.T) {
+	repo := &repoStub{
+		upgradable: []int64{42},
+		itemProfile: &database.QualityProfile{
+			Name:                            "Upgrade Gate",
+			AllowUpgrade:                    true,
+			MinimumUpgradeCustomFormatScore: 100,
+		},
+		searchInput: database.LibrarySearchInput{
+			LibraryItemID: 42,
+			MediaType:     "movie",
+			Title:         "Dune",
+			MovieYear:     2021,
+		},
+		selected: database.ReleaseSummary{
+			SelectedReleaseID:  90,
+			LibraryItemID:      42,
+			CustomFormatScore:  50,
+			ReleaseCandidateID: 9,
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
+		{Title: "Dune.2021.1080p.WEB-DL.Atmos-GRP", Link: "http://example/nzb", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+	}})
+
+	result, err := service.SearchUpgrades(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Upgraded != 0 {
+		t.Fatalf("expected upgrade to be blocked by CF threshold, got %+v", result)
+	}
+	if len(repo.searchApplied) != 1 {
+		t.Fatalf("expected one candidate, got %+v", repo.searchApplied)
+	}
+	if !repo.searchApplied[0].Rejected || repo.searchApplied[0].RejectReason != "upgrade_custom_format_score" {
+		t.Fatalf("expected upgrade_custom_format_score reject, got %+v", repo.searchApplied[0])
 	}
 }
 

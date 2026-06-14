@@ -183,6 +183,7 @@ type ReleaseSummary struct {
 	SizeBytes          int64                   `json:"sizeBytes"`
 	PostedAt           time.Time               `json:"postedAt,omitempty"`
 	Score              int                     `json:"score"`
+	CustomFormatScore  int                     `json:"customFormatScore"`
 	Selected           bool                    `json:"selected"`
 	Rejected           bool                    `json:"rejected"`
 	RejectReason       string                  `json:"rejectReason"`
@@ -195,7 +196,9 @@ type ReleaseSummary struct {
 	VirtualFileCount   int                     `json:"virtualFileCount"`
 	Archives           []ReleaseArchiveSummary `json:"archives,omitempty"`
 	FailedAttempts     []FailedReleaseAttempt  `json:"failedAttempts,omitempty"`
-	CreatedAt          time.Time               `json:"createdAt"`
+	Explanations            []string                `json:"explanations,omitempty"`
+	CompatibilityWarnings   []string                `json:"compatibilityWarnings,omitempty"`
+	CreatedAt               time.Time               `json:"createdAt"`
 	NZBDocumentID      *int64                  `json:"nzbDocumentId,omitempty"`
 	NZBFileName        string                  `json:"nzbFileName,omitempty"`
 }
@@ -225,14 +228,16 @@ type ReleaseArchiveEntry struct {
 }
 
 type MediaRequestSummary struct {
-	ID            int64      `json:"id"`
-	ExternalID    string     `json:"externalId"`
-	RequestType   string     `json:"requestType"`
-	Title         string     `json:"title"`
-	MediaType     string     `json:"mediaType"`
-	LibraryItemID *int64     `json:"libraryItemId,omitempty"`
-	QueueState    QueueState `json:"queueState"`
-	CreatedAt     time.Time  `json:"createdAt"`
+	ID                 int64      `json:"id"`
+	ExternalID         string     `json:"externalId"`
+	RequestType        string     `json:"requestType"`
+	Title              string     `json:"title"`
+	MediaType          string     `json:"mediaType"`
+	LibraryItemID      *int64     `json:"libraryItemId,omitempty"`
+	QualityProfileID   *int64     `json:"qualityProfileId,omitempty"`
+	QualityProfileName string     `json:"qualityProfileName,omitempty"`
+	QueueState         QueueState `json:"queueState"`
+	CreatedAt          time.Time  `json:"createdAt"`
 }
 
 type SubtitleFileSummary struct {
@@ -260,43 +265,76 @@ type SubtitleCandidateSummary struct {
 }
 
 type BlocklistItemSummary struct {
-	ID        int64      `json:"id"`
+	ID                int64      `json:"id"`
+	Key               string     `json:"key"`
+	KeyType           string     `json:"keyType,omitempty"`
+	Reason            string     `json:"reason"`
+	CreatedAt         time.Time  `json:"createdAt"`
+	ExpiresAt         *time.Time `json:"expiresAt,omitempty"`
+	SelectedReleaseID *int64     `json:"selectedReleaseId,omitempty"`
+	LibraryItemID     *int64     `json:"libraryItemId,omitempty"`
+	ReleaseTitle      string     `json:"releaseTitle,omitempty"`
+	IndexerName       string     `json:"indexerName,omitempty"`
+	SizeBytes         int64      `json:"sizeBytes,omitempty"`
+	PostedAt          *time.Time `json:"postedAt,omitempty"`
+}
+
+type BlocklistMutation struct {
 	Key       string     `json:"key"`
 	Reason    string     `json:"reason"`
 	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
 }
 
+type BlocklistPage struct {
+	Items      []BlocklistItemSummary `json:"items"`
+	Page       int                    `json:"page"`
+	PageSize   int                    `json:"pageSize"`
+	Total      int                    `json:"total"`
+	TotalPages int                    `json:"totalPages"`
+}
+
+type BlocklistStats struct {
+	Total    int            `json:"total"`
+	Expired  int            `json:"expired"`
+	Active   int            `json:"active"`
+	ByReason map[string]int `json:"byReason"`
+}
+
 type SearchCandidateRecord struct {
-	Title             string
-	ExternalURL       string
-	IndexerName       string
-	SizeBytes         int64
-	PostedAt          time.Time
-	Score             int
-	Rejected          bool
-	RejectReason      string
-	FailureCount      int
-	LastFailureReason string
-	Resolution        string
+	Title                 string
+	ExternalURL           string
+	IndexerName           string
+	SizeBytes             int64
+	PostedAt              time.Time
+	Score                 int
+	CustomFormatScore     int
+	Explanations          []string
+	CompatibilityWarnings []string
+	Rejected              bool
+	RejectReason          string
+	FailureCount          int
+	LastFailureReason     string
+	Resolution            string
 }
 
 type GrabHistoryEntry struct {
-	ID                  int64     `json:"id"`
-	LibraryItemID       int64     `json:"libraryItemId"`
-	ReleaseCandidateID  *int64    `json:"releaseCandidateId,omitempty"`
-	Title               string    `json:"title"`
-	IndexerName         string    `json:"indexerName"`
-	Score               int       `json:"score"`
-	Resolution          string    `json:"resolution"`
-	GrabbedAt           time.Time `json:"grabbedAt"`
+	ID                 int64     `json:"id"`
+	LibraryItemID      int64     `json:"libraryItemId"`
+	ReleaseCandidateID *int64    `json:"releaseCandidateId,omitempty"`
+	Title              string    `json:"title"`
+	IndexerName        string    `json:"indexerName"`
+	Score              int       `json:"score"`
+	Resolution         string    `json:"resolution"`
+	GrabbedAt          time.Time `json:"grabbedAt"`
 }
 
 type CustomFormat struct {
-	ID        int64  `json:"id"`
-	Name      string `json:"name"`
-	Pattern   string `json:"pattern"`
-	Score     int    `json:"score"`
-	Enabled   bool   `json:"enabled"`
+	ID      int64  `json:"id"`
+	Name    string `json:"name"`
+	Pattern string `json:"pattern"`
+	Score   int    `json:"score"`
+	Enabled bool   `json:"enabled"`
+	Source  string `json:"source"`
 }
 
 type ReleaseBlockRule struct {
@@ -326,6 +364,27 @@ type BlockFilterResult struct {
 	Blocked      bool               `json:"blocked"`
 	ScorePenalty int                `json:"scorePenalty"`
 	MatchedRules []BlockFilterMatch `json:"matchedRules"`
+}
+
+type SubtitleProfile struct {
+	ID                   int64     `json:"id"`
+	Name                 string    `json:"name"`
+	Languages            []string  `json:"languages"`
+	PreferHearingImpaired bool     `json:"preferHearingImpaired"`
+	RequireExactLanguage  bool     `json:"requireExactLanguage"`
+	IsDefault            bool      `json:"isDefault"`
+	CreatedAt            time.Time `json:"createdAt"`
+	UpdatedAt            time.Time `json:"updatedAt"`
+}
+
+type IndexerPolicy struct {
+	ID            int64     `json:"id"`
+	IndexerName   string    `json:"indexerName"`
+	ScoreModifier int       `json:"scoreModifier"`
+	Enabled       bool      `json:"enabled"`
+	Note          string    `json:"note"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
 }
 
 type CandidateHistory struct {
@@ -379,17 +438,18 @@ type LibrarySearchInput struct {
 	Title           string
 	IMDbID          string
 	MovieYear       int
-	MovieTMDBID     int64  // used in tmdbid= query parameter (Radarr approach)
+	MovieTMDBID     int64 // used in tmdbid= query parameter (Radarr approach)
 	ShowTitle       string
 	EpisodeTitle    string
 	ShowIMDbID      string
 	ShowTVDBID      int64
-	ShowTMDBID      int64  // used in tmdbid= query parameter for TV (Sonarr approach)
+	ShowTMDBID      int64 // used in tmdbid= query parameter for TV (Sonarr approach)
 	ShowYear        int
 	SeasonNumber    int
 	EpisodeNumber   int
-	TVShowID        int64  // DB primary key of tv_shows row, used for season pack tracking
+	TVShowID        int64    // DB primary key of tv_shows row, used for season pack tracking
 	AlternateTitles []string // mirrors Radarr/Sonarr AlternativeTitles; checked as fallback
+	RuntimeMinutes  int      // movie runtime; 0 for episodes/unknown; used for MB/min size checks
 }
 
 type SymlinkPublicationRecord struct {

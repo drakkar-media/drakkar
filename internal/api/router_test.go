@@ -31,14 +31,25 @@ type workflowStub struct {
 	requests   []database.MediaRequestSummary
 	sync       workflow.SyncResult
 	pending    workflow.BulkSearchResult
+	workQueue  workflow.WorkQueueStatus
 	retryAll   workflow.BulkQueueRetryResult
 	search     workflow.SearchResult
+	upgrades   workflow.UpgradeSearchResult
 	selectr    workflow.ReleaseActionResult
 	reject     workflow.ReleaseActionResult
 	restore    workflow.ReleaseActionResult
 	restoreAll database.RejectedReleaseRestoreResult
 	skip       workflow.ReleaseActionResult
 	retry      workflow.QueueRetryResult
+	queueAct   workflow.QueueManageResult
+	queueBulk  workflow.BulkQueueRetryResult
+	importCall *sabImportCall
+}
+
+type sabImportCall struct {
+	filename  string
+	mediaType string
+	size      int
 }
 
 type publicationStub struct {
@@ -60,9 +71,19 @@ type subtitleStub struct {
 	deleted    int64
 }
 type blocklistStub struct {
-	items   []database.BlocklistItemSummary
-	cleared int64
-	all     database.BlocklistClearResult
+	items    []database.BlocklistItemSummary
+	cleared  int64
+	all      database.BlocklistClearResult
+	created  database.BlocklistItemSummary
+	updated  database.BlocklistItemSummary
+	lastBody database.BlocklistMutation
+}
+
+type profilesStub struct {
+	profiles         []database.QualityProfile
+	requestLibraryID int64
+	lastRequestID    int64
+	lastProfileID    *int64
 }
 
 func (statusStub) Status() Status {
@@ -81,8 +102,28 @@ func (w workflowStub) CreateSeerrRequest(ctx context.Context, mediaType string, 
 	return w.sync, nil
 }
 
+func (w workflowStub) CreateSeerrSeasonRequest(ctx context.Context, tmdbID int64, seasons []int) (workflow.SyncResult, error) {
+	return w.sync, nil
+}
+
 func (w workflowStub) SearchPendingLibrary(ctx context.Context) (workflow.BulkSearchResult, error) {
 	return w.pending, nil
+}
+
+func (w workflowStub) WorkQueueStatus(ctx context.Context) (workflow.WorkQueueStatus, error) {
+	return w.workQueue, nil
+}
+
+func (w workflowStub) PauseWorkQueue(ctx context.Context) (workflow.WorkQueueStatus, error) {
+	status := w.workQueue
+	status.Paused = true
+	return status, nil
+}
+
+func (w workflowStub) ResumeWorkQueue(ctx context.Context) (workflow.WorkQueueStatus, error) {
+	status := w.workQueue
+	status.Paused = false
+	return status, nil
 }
 
 func (w workflowStub) RetryFailedQueue(ctx context.Context) (workflow.BulkQueueRetryResult, error) {
@@ -105,6 +146,18 @@ func (w workflowStub) RetryQueueItem(ctx context.Context, queueItemID int64) (wo
 	return w.retry, nil
 }
 
+func (w workflowStub) ManageQueueItem(ctx context.Context, queueItemID int64, action string) (workflow.QueueManageResult, error) {
+	return w.queueAct, nil
+}
+
+func (w workflowStub) ManageQueueItems(ctx context.Context, queueItemIDs []int64, action string) (workflow.BulkQueueRetryResult, error) {
+	return w.queueBulk, nil
+}
+
+func (w workflowStub) ManageFailedQueue(ctx context.Context, action string) (workflow.BulkQueueRetryResult, error) {
+	return w.retryAll, nil
+}
+
 func (w workflowStub) RestoreRelease(ctx context.Context, releaseCandidateID int64) (workflow.ReleaseActionResult, error) {
 	return w.restore, nil
 }
@@ -123,12 +176,39 @@ func (w workflowStub) ClearFailedQueue(_ context.Context) (int, error) { return 
 func (w workflowStub) FillMissingEpisodes(_ context.Context) (workflow.FillMissingEpisodesResult, error) {
 	return workflow.FillMissingEpisodesResult{}, nil
 }
+func (w workflowStub) SearchUpgrades(_ context.Context) (workflow.UpgradeSearchResult, error) {
+	return w.upgrades, nil
+}
 func (w workflowStub) ManualSearch(_ context.Context, _ string) ([]workflow.ManualSearchItem, error) {
 	return nil, nil
 }
-func (w workflowStub) ImportNZBFromPush(_ context.Context, _ []byte, _, _ string) (string, error) {
-	return "", nil
+func (w workflowStub) ResetLibraryItem(_ context.Context, _ int64) error { return nil }
+
+func (w workflowStub) ImportNZBFromPush(_ context.Context, content []byte, filename, mediaType string) (string, error) {
+	if w.importCall != nil {
+		w.importCall.filename = filename
+		w.importCall.mediaType = mediaType
+		w.importCall.size = len(content)
+	}
+	return "item-42", nil
 }
+
+type sabRepoStub struct {
+	lastQueueCategory   string
+	lastHistoryCategory string
+}
+
+func (s *sabRepoStub) ListSabQueueItems(_ context.Context, category string, _, _ int) ([]database.SabQueueItem, int, error) {
+	s.lastQueueCategory = category
+	return nil, 0, nil
+}
+
+func (s *sabRepoStub) ListSabHistoryItems(_ context.Context, category string, _, _ int) ([]database.SabHistoryItem, int, error) {
+	s.lastHistoryCategory = category
+	return nil, 0, nil
+}
+
+func (s *sabRepoStub) DismissSabItems(_ context.Context, _ []int64) error { return nil }
 
 func (p *publicationStub) RepublishLibraryItem(ctx context.Context, libraryItemID int64) error {
 	p.republished = libraryItemID
@@ -149,6 +229,10 @@ func (maintenanceStub) RemoveBrokenMediaSymlinks(ctx context.Context) (maintenan
 
 func (maintenanceStub) RemoveOrphanedCompletedSymlinks(ctx context.Context) (maintenance.Result, error) {
 	return maintenance.Result{TaskName: "orphaned-completed-symlinks", DeletedRows: 1}, nil
+}
+
+func (maintenanceStub) DeepNZBHealthCheck(ctx context.Context) (maintenance.Result, error) {
+	return maintenance.Result{TaskName: "nzb-health-check", ScannedRows: 4, ResetItems: 2}, nil
 }
 
 func (cacheStub) Prune(ctx context.Context) (cache.PruneResult, error) {
@@ -208,6 +292,134 @@ func (b *blocklistStub) ClearByReason(ctx context.Context, reason string) (datab
 	return database.BlocklistClearResult{Cleared: 0}, nil
 }
 
+func (b *blocklistStub) ListPaged(ctx context.Context, f database.BlocklistFilter) (database.BlocklistPage, error) {
+	return database.BlocklistPage{Items: b.items}, nil
+}
+
+func (b *blocklistStub) Stats(ctx context.Context) (database.BlocklistStats, error) {
+	return database.BlocklistStats{ByReason: map[string]int{}}, nil
+}
+
+func (b *blocklistStub) Create(ctx context.Context, item database.BlocklistMutation) (database.BlocklistItemSummary, error) {
+	b.lastBody = item
+	if b.created.ID != 0 {
+		return b.created, nil
+	}
+	return database.BlocklistItemSummary{ID: 12, Key: item.Key, Reason: item.Reason}, nil
+}
+
+func (b *blocklistStub) Update(ctx context.Context, id int64, item database.BlocklistMutation) (database.BlocklistItemSummary, error) {
+	b.lastBody = item
+	if b.updated.ID != 0 {
+		return b.updated, nil
+	}
+	return database.BlocklistItemSummary{ID: id, Key: item.Key, Reason: item.Reason}, nil
+}
+
+func (p *profilesStub) ListQualityProfiles(ctx context.Context) ([]database.QualityProfile, error) {
+	return p.profiles, nil
+}
+
+func (p *profilesStub) UpsertQualityProfile(ctx context.Context, profile database.QualityProfile) (database.QualityProfile, error) {
+	return profile, nil
+}
+
+func (p *profilesStub) DeleteQualityProfile(ctx context.Context, id int64) error { return nil }
+
+func (p *profilesStub) ListQualityDefinitions(ctx context.Context) ([]database.QualityDefinition, error) {
+	return nil, nil
+}
+
+func (p *profilesStub) UpdateQualityDefinition(ctx context.Context, d database.QualityDefinition) (database.QualityDefinition, error) {
+	return d, nil
+}
+
+func (p *profilesStub) GetLibraryItemQualityProfile(ctx context.Context, libraryItemID int64) (*database.QualityProfile, error) {
+	return nil, nil
+}
+
+func (p *profilesStub) SetLibraryItemQualityProfile(ctx context.Context, libraryItemID int64, profileID *int64) error {
+	return nil
+}
+
+func (p *profilesStub) SetMediaRequestQualityProfile(ctx context.Context, requestID int64, profileID *int64) (int64, error) {
+	p.lastRequestID = requestID
+	p.lastProfileID = profileID
+	return p.requestLibraryID, nil
+}
+
+func (p *profilesStub) GetGrabHistory(ctx context.Context, libraryItemID int64) ([]database.GrabHistoryEntry, error) {
+	return nil, nil
+}
+
+func (p *profilesStub) ListCustomFormats(ctx context.Context) ([]database.CustomFormat, error) {
+	return nil, nil
+}
+
+func (p *profilesStub) UpdateCustomFormat(ctx context.Context, f database.CustomFormat) (database.CustomFormat, error) {
+	return f, nil
+}
+
+func (p *profilesStub) DeleteCustomFormat(ctx context.Context, id int64) error { return nil }
+
+func (p *profilesStub) UpsertCustomFormat(ctx context.Context, f database.CustomFormat) (database.CustomFormat, error) {
+	return f, nil
+}
+
+func (p *profilesStub) UpsertCustomFormatByName(ctx context.Context, f database.CustomFormat) (database.CustomFormat, error) {
+	return f, nil
+}
+
+func (p *profilesStub) ListReleaseBlockRules(ctx context.Context) ([]database.ReleaseBlockRule, error) {
+	return nil, nil
+}
+
+func (p *profilesStub) UpsertReleaseBlockRule(ctx context.Context, r database.ReleaseBlockRule) (database.ReleaseBlockRule, error) {
+	return r, nil
+}
+
+func (p *profilesStub) UpdateReleaseBlockRule(ctx context.Context, r database.ReleaseBlockRule) (database.ReleaseBlockRule, error) {
+	return r, nil
+}
+
+func (p *profilesStub) DeleteReleaseBlockRule(ctx context.Context, id int64) error { return nil }
+
+func (p *profilesStub) ListIndexerPolicies(ctx context.Context) ([]database.IndexerPolicy, error) {
+	return nil, nil
+}
+func (p *profilesStub) UpsertIndexerPolicy(ctx context.Context, pol database.IndexerPolicy) (database.IndexerPolicy, error) {
+	return pol, nil
+}
+func (p *profilesStub) UpdateIndexerPolicy(ctx context.Context, pol database.IndexerPolicy) (database.IndexerPolicy, error) {
+	return pol, nil
+}
+func (p *profilesStub) DeleteIndexerPolicy(ctx context.Context, id int64) error { return nil }
+
+func (p *profilesStub) ListSubtitleProfiles(ctx context.Context) ([]database.SubtitleProfile, error) {
+	return nil, nil
+}
+func (p *profilesStub) CreateSubtitleProfile(ctx context.Context, sp database.SubtitleProfile) (database.SubtitleProfile, error) {
+	return sp, nil
+}
+func (p *profilesStub) UpdateSubtitleProfile(ctx context.Context, sp database.SubtitleProfile) (database.SubtitleProfile, error) {
+	return sp, nil
+}
+func (p *profilesStub) DeleteSubtitleProfile(ctx context.Context, id int64) error { return nil }
+
+func (p *profilesStub) SetTVShowMonitoringMode(ctx context.Context, tvShowID int64, mode string) error {
+	return nil
+}
+
+func (p *profilesStub) ListSabQueueItems(ctx context.Context, category string, start, limit int) ([]database.SabQueueItem, int, error) {
+	return nil, 0, nil
+}
+
+func (p *profilesStub) ListSabHistoryItems(ctx context.Context, category string, start, limit int) ([]database.SabHistoryItem, int, error) {
+	return nil, 0, nil
+}
+
+func (p *profilesStub) DismissSabItems(ctx context.Context, libraryItemIDs []int64) error { return nil }
+
 const sampleNZB = `<?xml version="1.0" encoding="UTF-8"?>
 <nzb>
   <file subject="&quot;Dune (2021).mkv&quot;" poster="poster" date="1710000000">
@@ -220,7 +432,7 @@ const sampleNZB = `<?xml version="1.0" encoding="UTF-8"?>
 
 func TestImportNZBEndpoint(t *testing.T) {
 	queueSvc := queue.NewService(queue.NewMemoryRepository(), nzb.NewImporter(t.TempDir(), 1024*1024))
-	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/nzbs/import", strings.NewReader(sampleNZB))
 	req.Header.Set("Content-Disposition", `attachment; filename="dune.nzb"`)
@@ -250,7 +462,7 @@ func TestCancelNZBEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/nzbs/"+itoa(*item.NZBDocumentID), nil)
 	rec := httptest.NewRecorder()
@@ -267,13 +479,55 @@ func TestCancelNZBEndpoint(t *testing.T) {
 	}
 }
 
+func TestQueueEndpointIncludesWorkQueueStatus(t *testing.T) {
+	queueSvc := queue.NewService(queue.NewMemoryRepository(), nzb.NewImporter(t.TempDir(), 1024*1024))
+	workflowSvc := workflowStub{workQueue: workflow.WorkQueueStatus{Paused: true, Depth: 7}}
+	router := Router(statusStub{}, queueSvc, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/queue", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"workQueue":{"paused":true,"depth":7}`) {
+		t.Fatalf("unexpected queue payload %s", rec.Body.String())
+	}
+}
+
+func TestQueuePauseResumeEndpoints(t *testing.T) {
+	workflowSvc := workflowStub{workQueue: workflow.WorkQueueStatus{Paused: false, Depth: 3}}
+	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	pauseReq := httptest.NewRequest(http.MethodPost, "/api/queue/pause", nil)
+	pauseRec := httptest.NewRecorder()
+	router.ServeHTTP(pauseRec, pauseReq)
+	if pauseRec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 from pause, got %d: %s", pauseRec.Code, pauseRec.Body.String())
+	}
+	if !strings.Contains(pauseRec.Body.String(), `"paused":true`) {
+		t.Fatalf("unexpected pause payload %s", pauseRec.Body.String())
+	}
+
+	resumeReq := httptest.NewRequest(http.MethodPost, "/api/queue/resume", nil)
+	resumeRec := httptest.NewRecorder()
+	router.ServeHTTP(resumeRec, resumeReq)
+	if resumeRec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 from resume, got %d: %s", resumeRec.Code, resumeRec.Body.String())
+	}
+	if !strings.Contains(resumeRec.Body.String(), `"paused":false`) {
+		t.Fatalf("unexpected resume payload %s", resumeRec.Body.String())
+	}
+}
+
 func TestLibraryEndpoints(t *testing.T) {
 	queueSvc := queue.NewService(queue.NewMemoryRepository(), nzb.NewImporter(t.TempDir(), 1024*1024))
 	item, err := queueSvc.ImportNZB(context.Background(), "dune.nzb", strings.NewReader(sampleNZB))
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	libraryReq := httptest.NewRequest(http.MethodGet, "/api/library", nil)
 	libraryRec := httptest.NewRecorder()
@@ -405,7 +659,7 @@ func TestWorkflowEndpoints(t *testing.T) {
 			{Name: "seerr", OK: true, Detail: "ok", CheckedAt: time.Now().UTC(), DurationMS: 12},
 		},
 	}}
-	router := Router(statusStub{}, queueSvc, workflowSvc, pub, maint, cacheSvc, subtitles, blocklist, probes, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, workflowSvc, pub, maint, cacheSvc, subtitles, blocklist, probes, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	requestsReq := httptest.NewRequest(http.MethodGet, "/api/requests", nil)
 	requestsRec := httptest.NewRecorder()
@@ -419,6 +673,13 @@ func TestWorkflowEndpoints(t *testing.T) {
 	router.ServeHTTP(syncRec, syncReq)
 	if syncRec.Code != http.StatusAccepted || !strings.Contains(syncRec.Body.String(), `"created":1`) {
 		t.Fatalf("unexpected sync response %d %s", syncRec.Code, syncRec.Body.String())
+	}
+
+	requestReq := httptest.NewRequest(http.MethodPost, "/api/discover/request", strings.NewReader(`{"mediaType":"tv","tmdbId":84958,"seasons":[2]}`))
+	requestRec := httptest.NewRecorder()
+	router.ServeHTTP(requestRec, requestReq)
+	if requestRec.Code != http.StatusAccepted || !strings.Contains(requestRec.Body.String(), `"created":1`) {
+		t.Fatalf("unexpected season request response %d %s", requestRec.Code, requestRec.Body.String())
 	}
 
 	pendingReq := httptest.NewRequest(http.MethodPost, "/api/library/search-pending", nil)
@@ -440,6 +701,13 @@ func TestWorkflowEndpoints(t *testing.T) {
 	router.ServeHTTP(retryAllRec, retryAllReq)
 	if retryAllRec.Code != http.StatusAccepted || !strings.Contains(retryAllRec.Body.String(), `"processed":3`) {
 		t.Fatalf("unexpected bulk retry response %d %s", retryAllRec.Code, retryAllRec.Body.String())
+	}
+
+	nzbHealthReq := httptest.NewRequest(http.MethodPost, "/api/maintenance/nzb-health-check", nil)
+	nzbHealthRec := httptest.NewRecorder()
+	router.ServeHTTP(nzbHealthRec, nzbHealthReq)
+	if nzbHealthRec.Code != http.StatusAccepted || !strings.Contains(nzbHealthRec.Body.String(), `"resetItems":2`) {
+		t.Fatalf("unexpected nzb health response %d %s", nzbHealthRec.Code, nzbHealthRec.Body.String())
 	}
 
 	searchReq := httptest.NewRequest(http.MethodPost, "/api/library/42/search", nil)
@@ -597,6 +865,250 @@ func TestWorkflowEndpoints(t *testing.T) {
 	}
 }
 
+func TestSABAPIAddFileAliasAcceptsLowercaseFieldAndNzbname(t *testing.T) {
+	importCall := &sabImportCall{}
+	workflowSvc := workflowStub{importCall: importCall}
+	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	if err := writer.WriteField("mode", "addfile"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("nzbname", "Expected Folder"); err != nil {
+		t.Fatal(err)
+	}
+	part, err := writer.CreateFormFile("nzbfile", "ignored-upload-name.nzb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(part, strings.NewReader(sampleNZB)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/dav/api?category=movies", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"item-42"`) {
+		t.Fatalf("expected nzo id in response, got %s", rec.Body.String())
+	}
+	if importCall.filename != "Expected Folder.nzb" {
+		t.Fatalf("expected nzbname override, got %q", importCall.filename)
+	}
+	if importCall.mediaType != "movie" {
+		t.Fatalf("expected movie media type, got %q", importCall.mediaType)
+	}
+	if importCall.size == 0 {
+		t.Fatal("expected uploaded nzb content to be passed through")
+	}
+}
+
+func TestSABAPIHistoryAcceptsCategoryAlias(t *testing.T) {
+	repo := &sabRepoStub{}
+	handler := &sabHandler{repo: repo}
+
+	req := httptest.NewRequest(http.MethodGet, "/dav/api?mode=history&category=movies", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if repo.lastHistoryCategory != "movies" {
+		t.Fatalf("expected history category movies, got %q", repo.lastHistoryCategory)
+	}
+}
+
+func TestQueueActionEndpoint(t *testing.T) {
+	workflowSvc := workflowStub{
+		queueAct: workflow.QueueManageResult{QueueItemID: 4, Action: "remove_blocklist_and_search"},
+	}
+	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/queue/4/action", strings.NewReader(`{"action":"remove_blocklist_and_search"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"remove_blocklist_and_search"`) {
+		t.Fatalf("unexpected response %s", rec.Body.String())
+	}
+}
+
+func TestQueueBulkActionEndpoint(t *testing.T) {
+	workflowSvc := workflowStub{
+		queueBulk: workflow.BulkQueueRetryResult{Processed: 2, Retried: 2, Failed: 0, ProcessedQueues: []int64{4, 5}},
+	}
+	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/queue/bulk-action", strings.NewReader(`{"queueItemIds":[4,5],"action":"remove_and_blocklist"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"processed":2`) {
+		t.Fatalf("unexpected response %s", rec.Body.String())
+	}
+}
+
+func TestRequestProfileEndpoint(t *testing.T) {
+	profiles := &profilesStub{requestLibraryID: 42}
+	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, profiles, nil, nil, nil, nil, nil, nil)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/requests/7/profile", strings.NewReader(`{"profileId":3}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if profiles.lastRequestID != 7 {
+		t.Fatalf("expected request id 7, got %d", profiles.lastRequestID)
+	}
+	if profiles.lastProfileID == nil || *profiles.lastProfileID != 3 {
+		t.Fatalf("expected profile id 3, got %#v", profiles.lastProfileID)
+	}
+}
+
+func TestSearchUpgradesEndpoint(t *testing.T) {
+	workflowSvc := workflowStub{
+		upgrades: workflow.UpgradeSearchResult{Checked: 4, Upgraded: 2, Failed: 1},
+	}
+	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/library/search-upgrades", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"upgraded":2`) {
+		t.Fatalf("unexpected response %s", rec.Body.String())
+	}
+}
+
+func TestManualBlocklistCreateEndpoint(t *testing.T) {
+	blocklist := &blocklistStub{
+		created: database.BlocklistItemSummary{ID: 21, Key: "external_url:https://example.invalid/a.nzb", Reason: "manual"},
+	}
+	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, blocklist, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/blocklist/manual", strings.NewReader(`{"keyType":"external_url","externalUrl":"https://example.invalid/a.nzb","reason":"manual"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if blocklist.lastBody.Key != "external_url:https://example.invalid/a.nzb" {
+		t.Fatalf("expected normalized external_url key, got %q", blocklist.lastBody.Key)
+	}
+}
+
+func TestManualBlocklistUpdateEndpoint(t *testing.T) {
+	blocklist := &blocklistStub{
+		updated: database.BlocklistItemSummary{ID: 9, Key: "release_signature:dune 2021|nzb finder|7000|2026-06-14", Reason: "manual"},
+	}
+	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, blocklist, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	req := httptest.NewRequest(http.MethodPut, "/api/blocklist/9", strings.NewReader(`{"keyType":"raw","key":"release_signature:dune 2021|nzb finder|7000|2026-06-14","reason":"manual"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if blocklist.lastBody.Key == "" {
+		t.Fatal("expected update payload to include a key")
+	}
+}
+
 func itoa(value int64) string {
 	return strconv.FormatInt(value, 10)
+}
+
+func TestCustomFormatsImportEndpoint(t *testing.T) {
+	profiles := &profilesStub{}
+	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, profiles, nil, nil, nil, nil, nil, nil)
+
+	body := `[{"name":"BluRay","pattern":"(?i)bluray","score":50,"enabled":true}]`
+	req := httptest.NewRequest(http.MethodPost, "/api/custom-formats/import", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestIndexerPoliciesEndpoints(t *testing.T) {
+	profiles := &profilesStub{}
+	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, profiles, nil, nil, nil, nil, nil, nil)
+
+	// GET list
+	req := httptest.NewRequest(http.MethodGet, "/api/indexer-policies", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/indexer-policies expected 200, got %d", rec.Code)
+	}
+
+	// POST create
+	req = httptest.NewRequest(http.MethodPost, "/api/indexer-policies", strings.NewReader(`{"indexerName":"NZBGeek","scoreModifier":25,"enabled":true,"note":""}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /api/indexer-policies expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// DELETE
+	req = httptest.NewRequest(http.MethodDelete, "/api/indexer-policies/1", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE /api/indexer-policies/1 expected 200, got %d", rec.Code)
+	}
+}
+
+func TestSubtitleProfilesEndpoints(t *testing.T) {
+	profiles := &profilesStub{}
+	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, profiles, nil, nil, nil, nil, nil, nil)
+
+	// GET list
+	req := httptest.NewRequest(http.MethodGet, "/api/subtitle-profiles", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/subtitle-profiles expected 200, got %d", rec.Code)
+	}
+
+	// POST create
+	req = httptest.NewRequest(http.MethodPost, "/api/subtitle-profiles",
+		strings.NewReader(`{"name":"English Only","languages":["en"],"preferHearingImpaired":false,"requireExactLanguage":false,"isDefault":false}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /api/subtitle-profiles expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
 }

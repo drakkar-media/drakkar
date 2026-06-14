@@ -14,7 +14,7 @@
   import { api } from '$lib/api';
   import { idFromSlug } from '$lib/detailsHref';
   import { toastError, toastSuccess } from '$lib/toast';
-  import type { DiscoverDetails, GrabHistoryEntry, LibraryDetail, LibraryItem, ReleaseItem, SubtitleCandidate, SubtitleFile } from '$lib/types';
+  import type { DiscoverDetails, GrabHistoryEntry, LibraryDetail, LibraryItem, QualityProfile, ReleaseItem, SubtitleCandidate, SubtitleFile } from '$lib/types';
 
   let detail: DiscoverDetails | null = null;
   let libraryMatch: LibraryItem | null = null;
@@ -23,6 +23,8 @@
   let subtitleCandidates: SubtitleCandidate[] = [];
   let grabHistory: GrabHistoryEntry[] = [];
   let releaseCandidates: ReleaseItem[] = [];
+  let profiles: QualityProfile[] = [];
+  let activeProfileId: number | null = null;
   let showReleasePicker = false;
   let pickerLabel = '';
   let loading = true;
@@ -52,7 +54,15 @@
   }
 
   function normalizeTitle(value: string) {
-    return value.toLowerCase().replace(/['’]/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+    return value.toLowerCase().replace(/[''']/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
+  }
+
+  type ParsedExplanation = { text: string; delta: number | null; isReject: boolean };
+  function parseExplanation(line: string): ParsedExplanation {
+    const isReject = line.startsWith('Rejected:') || line.startsWith('Rejected by');
+    const m = line.match(/\(([+-]\d+)\)$/);
+    const delta = m ? parseInt(m[1], 10) : null;
+    return { text: line, delta, isReject };
   }
 
   function sameIdentity(item: LibraryItem, mediaType: string, title: string, year?: number, tmdbId?: number, imdbId?: string) {
@@ -79,21 +89,27 @@
       detail = discover;
       libraryMatch = library.items.find((item) => sameIdentity(item, mediaType, discover.title, discover.year, discover.tmdbId, discover.imdbId)) ?? null;
       if (libraryMatch) {
-        const [detailResult, subtitleResult, candidateResult, historyResult] = await Promise.all([
+        const [detailResult, subtitleResult, candidateResult, historyResult, profilesResult, activeProfileResult] = await Promise.all([
           api.libraryDetail(libraryMatch.id),
           api.subtitles(libraryMatch.id),
           api.subtitleCandidates(libraryMatch.id),
-          api.grabHistory(libraryMatch.id).catch(() => ({ items: [] }))
+          api.grabHistory(libraryMatch.id).catch(() => ({ items: [] })),
+          api.listProfiles().catch(() => ({ profiles: [] })),
+          api.getLibraryProfile(libraryMatch.id).catch(() => ({ profile: null }))
         ]);
         localDetail = detailResult;
         subtitles = subtitleResult.items ?? [];
         subtitleCandidates = candidateResult.items ?? [];
         grabHistory = historyResult.items ?? [];
+        profiles = profilesResult.profiles ?? [];
+        activeProfileId = activeProfileResult.profile?.id ?? null;
       } else {
         localDetail = null;
         subtitles = [];
         subtitleCandidates = [];
         grabHistory = [];
+        profiles = [];
+        activeProfileId = null;
       }
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
@@ -102,6 +118,8 @@
       localDetail = null;
       subtitles = [];
       subtitleCandidates = [];
+      profiles = [];
+      activeProfileId = null;
     } finally {
       loading = false;
     }
@@ -120,8 +138,7 @@
     releaseCandidates = [];
     pickerLabel = label;
     try {
-      await api.searchLibrary(libraryItemID);
-      const result = await api.releases(libraryItemID);
+      const result = await api.replacementCandidates(libraryItemID);
       releaseCandidates = (result.items ?? []).sort((a, b) => b.score - a.score);
       showReleasePicker = true;
     } catch (error) {
@@ -133,7 +150,8 @@
 
   async function runLocalSearch() {
     if (!libraryMatch) return;
-    const label = detail?.title ?? 'this item';
+    const action = libraryMatch.available ? 'replacement' : 'search';
+    const label = `${detail?.title ?? 'this item'} · ${action}`;
     return openReleasePicker(libraryMatch.id, label);
   }
 
@@ -199,6 +217,20 @@
     }
   }
 
+  async function requestSeason(seasonNumber: number, seasonLabel: string) {
+    if (!detail?.tmdbId) return;
+    working = true;
+    try {
+      const result = await api.requestMedia(detail.tmdbId, 'tv', [seasonNumber]);
+      toastSuccess(`Requested ${seasonLabel} — ${result.created} item(s) added`);
+      await loadDetail();
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : String(error));
+    } finally {
+      working = false;
+    }
+  }
+
   async function downloadSubtitle(candidateID: number) {
     if (!libraryMatch) return;
     working = true;
@@ -208,6 +240,23 @@
       await loadDetail();
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
+    } finally {
+      working = false;
+    }
+  }
+
+  async function updateQualityProfile(nextValue: string) {
+    if (!libraryMatch) return;
+    const parsedProfileId = nextValue ? Number(nextValue) : null;
+    const nextProfileId = parsedProfileId != null && Number.isFinite(parsedProfileId) ? parsedProfileId : null;
+    working = true;
+    try {
+      await api.setLibraryProfile(libraryMatch.id, nextProfileId);
+      activeProfileId = nextProfileId;
+      toastSuccess(activeProfileId ? 'quality profile updated' : 'quality profile override cleared');
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : String(error));
+      await loadDetail();
     } finally {
       working = false;
     }
@@ -251,7 +300,7 @@
             {#if libraryMatch}
               <Button kind="secondary" on:click={runLocalSearch} disabled={working}>
                 <Search size={15} />
-                Search
+                {libraryMatch.available ? 'Find Upgrade' : 'Search'}
               </Button>
               <Button kind="secondary" on:click={() => runSubtitleSearch()} disabled={working}>
                 <Languages size={15} />
@@ -301,7 +350,22 @@
                 <details class="season-panel" open={season.missingCount > 0}>
                   <summary>
                     <strong>{season.name}</strong>
-                    <div class="summary-meta">{season.availableCount}/{season.episodeCount} available · {season.missingCount} missing</div>
+                    <div class="summary-meta">
+                      {season.availableCount}/{season.episodeCount} available · {season.missingCount} missing
+                      {#if season.missingCount > 0 && detail?.tmdbId}
+                        <button
+                          class="ep-sub-btn"
+                          type="button"
+                          aria-label={`Request ${season.name} in Seerr`}
+                          title={`Request ${season.name} in Seerr`}
+                          disabled={working}
+                          on:click|preventDefault|stopPropagation={() => requestSeason(season.seasonNumber, season.name)}
+                        >
+                          <Download size={11} />
+                          Request
+                        </button>
+                      {/if}
+                    </div>
                   </summary>
                   <div class="episode-list">
                     {#each season.episodes as episode}
@@ -400,6 +464,20 @@
               <div><span>Queue</span><strong>{libraryMatch.queueState || '—'}</strong></div>
               <div><span>Available</span><strong>{libraryMatch.availableCount ?? 0}</strong></div>
               <div><span>Missing</span><strong>{libraryMatch.missingCount ?? 0}</strong></div>
+            </div>
+            <div class="monitoring-row">
+              <label for="profile-select">Quality Profile</label>
+              <select
+                id="profile-select"
+                value={activeProfileId == null ? '' : String(activeProfileId)}
+                disabled={working || profiles.length === 0}
+                on:change={(e) => updateQualityProfile((e.currentTarget as HTMLSelectElement).value)}
+              >
+                <option value="">Default profile</option>
+                {#each profiles as profile}
+                  <option value={profile.id}>{profile.name}{profile.isDefault ? ' · default' : ''}</option>
+                {/each}
+              </select>
             </div>
             {#if libraryMatch.failureReason}
               <div class="failure-box">{libraryMatch.failureReason.replaceAll('_', ' ')}</div>
@@ -510,8 +588,15 @@
 {/if}
 
 {#if showReleasePicker}
-  <div class="modal-backdrop" on:click={() => (showReleasePicker = false)} role="presentation">
-    <div class="rel-modal" on:click|stopPropagation role="dialog" aria-modal="true" aria-label="Select release">
+  <div
+    class="modal-backdrop"
+    on:click={(e) => e.target === e.currentTarget && (showReleasePicker = false)}
+    on:keydown={(e) => e.key === 'Escape' && (showReleasePicker = false)}
+    role="button"
+    tabindex="0"
+    aria-label="Close release picker"
+  >
+    <div class="rel-modal" role="dialog" aria-modal="true" aria-label="Select release" tabindex="-1">
       <div class="rel-header">
         <h2>Select Release{#if pickerLabel} <span class="picker-ctx">— {pickerLabel}</span>{/if}</h2>
         <button class="close-btn" on:click={() => (showReleasePicker = false)} aria-label="Close">
@@ -531,11 +616,35 @@
                   {#if c.indexerName}<span class="rel-pill">{c.indexerName}</span>{/if}
                   <span class="rel-pill mono">{fmtBytes(c.sizeBytes)}</span>
                   <span class="rel-pill mono">score {c.score}</span>
+                  <span class="rel-pill mono">cf {c.customFormatScore}</span>
                   {#each tags as tag}<span class="rel-pill rel-quality">{tag}</span>{/each}
                   {#if c.selected}<span class="rel-pill rel-pill-ok">selected</span>{/if}
                   {#if c.rejected && !c.selected}<span class="rel-pill rel-pill-danger">{c.rejectReason || 'rejected'}</span>{/if}
                   {#if c.failureCount > 0}<span class="rel-pill rel-pill-warn">{c.failureCount}× failed</span>{/if}
                 </div>
+                {#if c.compatibilityWarnings && c.compatibilityWarnings.length > 0}
+                  <div class="compat-warnings">
+                    {#each c.compatibilityWarnings as w}
+                      <span class="compat-badge" title={w}>⚠ {w.split('—')[0].trim()}</span>
+                    {/each}
+                  </div>
+                {/if}
+                {#if c.explanations && c.explanations.length > 0}
+                  <details class="rel-why">
+                    <summary class="rel-why-toggle">Why? ({c.explanations.length} factors)</summary>
+                    <div class="rel-explanations">
+                      {#each c.explanations as line}
+                        {@const ex = parseExplanation(line)}
+                        <div class="rel-explanation" class:rel-exp-reject={ex.isReject} class:rel-exp-pos={!ex.isReject && ex.delta !== null && ex.delta > 0} class:rel-exp-neg={!ex.isReject && ex.delta !== null && ex.delta < 0}>
+                          {#if ex.delta !== null}
+                            <span class="rel-exp-delta">{ex.delta > 0 ? '+' : ''}{ex.delta}</span>
+                          {/if}
+                          <span>{ex.text}</span>
+                        </div>
+                      {/each}
+                    </div>
+                  </details>
+                {/if}
               </div>
               <Button kind={c.selected ? 'primary' : 'secondary'} on:click={() => pickRelease(c.releaseCandidateId)} disabled={working}>
                 <Download size={14} />
@@ -717,6 +826,33 @@
   .rel-info { flex: 1; min-width: 0; display: grid; gap: 7px; }
   .rel-title { font-size: 13px; font-weight: 600; line-height: 1.4; word-break: break-word; }
   .rel-meta { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+  .compat-warnings { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+  .compat-badge {
+    font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 8px;
+    background: hsl(38 92% 50% / 0.15); color: hsl(38 92% 70%);
+    border: 1px solid hsl(38 92% 50% / 0.3); cursor: default;
+  }
+  .rel-why { margin-top: 4px; }
+  .rel-why-toggle {
+    font-size: 11px; color: hsl(var(--muted-foreground)); cursor: pointer;
+    padding: 2px 0; list-style: none; display: inline-flex; align-items: center; gap: 4px;
+    user-select: none;
+  }
+  .rel-why-toggle::-webkit-details-marker { display: none; }
+  .rel-why-toggle::before { content: '▶'; font-size: 9px; transition: transform 0.15s; }
+  details[open] .rel-why-toggle::before { transform: rotate(90deg); }
+  .rel-explanations { display: grid; gap: 3px; padding-top: 6px; }
+  .rel-explanation {
+    font-size: 11px; color: hsl(var(--muted-foreground)); line-height: 1.5;
+    display: flex; align-items: baseline; gap: 6px;
+  }
+  .rel-exp-pos { color: hsl(142 71% 55% / 0.9); }
+  .rel-exp-neg { color: hsl(0 72% 62% / 0.85); }
+  .rel-exp-reject { color: hsl(0 72% 62%); font-weight: 500; }
+  .rel-exp-delta {
+    font-family: 'JetBrains Mono', monospace; font-size: 10px; min-width: 36px;
+    text-align: right; flex-shrink: 0; opacity: 0.9;
+  }
   .rel-pill {
     font-size: 11px; padding: 2px 7px; border-radius: 6px;
     background: hsl(0 0% 100% / 0.07); border: 1px solid hsl(0 0% 100% / 0.09);

@@ -85,6 +85,8 @@ func (db *DB) ListMediaRequests(ctx context.Context) ([]MediaRequestSummary, err
 			coalesce(li.title, ''),
 			coalesce(li.media_type, ''),
 			li.id,
+			qp.id,
+			coalesce(qp.name, ''),
 			coalesce(q.state, ''),
 			mr.created_at
 		from media_requests mr
@@ -95,6 +97,7 @@ func (db *DB) ListMediaRequests(ctx context.Context) ([]MediaRequestSummary, err
 			limit 1
 		)
 		left join library_items li on li.id = q.library_item_id
+		left join quality_profiles qp on qp.id = li.quality_profile_id
 		order by mr.created_at desc, mr.id desc`)
 	if err != nil {
 		return nil, err
@@ -104,9 +107,10 @@ func (db *DB) ListMediaRequests(ctx context.Context) ([]MediaRequestSummary, err
 	var out []MediaRequestSummary
 	for rows.Next() {
 		var (
-			item          MediaRequestSummary
-			libraryItemID sql.NullInt64
-			queueState    string
+			item             MediaRequestSummary
+			libraryItemID    sql.NullInt64
+			qualityProfileID sql.NullInt64
+			queueState       string
 		)
 		if err := rows.Scan(
 			&item.ID,
@@ -115,6 +119,8 @@ func (db *DB) ListMediaRequests(ctx context.Context) ([]MediaRequestSummary, err
 			&item.Title,
 			&item.MediaType,
 			&libraryItemID,
+			&qualityProfileID,
+			&item.QualityProfileName,
 			&queueState,
 			&item.CreatedAt,
 		); err != nil {
@@ -124,6 +130,10 @@ func (db *DB) ListMediaRequests(ctx context.Context) ([]MediaRequestSummary, err
 		if libraryItemID.Valid {
 			value := libraryItemID.Int64
 			item.LibraryItemID = &value
+		}
+		if qualityProfileID.Valid {
+			value := qualityProfileID.Int64
+			item.QualityProfileID = &value
 		}
 		out = append(out, item)
 	}
@@ -239,31 +249,31 @@ func (db *DB) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID 
 
 // MovieEnrichment carries all enrichable movie fields from TMDB/Seerr.
 type MovieEnrichment struct {
-	TMDBID               int64
-	Title                string
-	OriginalTitle        string
-	Year                 int
-	ReleaseDate          string   // "YYYY-MM-DD"
-	IMDbID               string
-	Overview             string
-	Tagline              string
-	Status               string   // "Released", "In Production", etc.
-	ContentRating        string   // "PG-13", "R", etc.
-	OriginalLanguage     string
-	RuntimeMinutes       int
-	PosterURL            string
-	BackdropURL          string
-	TrailerURL           string
-	Genres               []string
-	AlternativeTitles    []string
-	ProductionCompanies  []string
-	Popularity           float64
-	VoteAverage          float64
-	VoteCount            int
-	Budget               int64
-	Revenue              int64
-	CastJSON             []byte   // JSON: [{name,character,profile_url}]
-	RawTMDB              []byte   // full /movie/:id TMDB JSON response
+	TMDBID              int64
+	Title               string
+	OriginalTitle       string
+	Year                int
+	ReleaseDate         string // "YYYY-MM-DD"
+	IMDbID              string
+	Overview            string
+	Tagline             string
+	Status              string // "Released", "In Production", etc.
+	ContentRating       string // "PG-13", "R", etc.
+	OriginalLanguage    string
+	RuntimeMinutes      int
+	PosterURL           string
+	BackdropURL         string
+	TrailerURL          string
+	Genres              []string
+	AlternativeTitles   []string
+	ProductionCompanies []string
+	Popularity          float64
+	VoteAverage         float64
+	VoteCount           int
+	Budget              int64
+	Revenue             int64
+	CastJSON            []byte // JSON: [{name,character,profile_url}]
+	RawTMDB             []byte // full /movie/:id TMDB JSON response
 }
 
 func (db *DB) EnrichMovieMetadata(ctx context.Context, libraryItemID, tmdbID int64, title string, year int, imdbID string) error {
@@ -433,34 +443,34 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 
 // TVShowEnrichment carries all enrichable TV show fields from TMDB/TVDB/Seerr.
 type TVShowEnrichment struct {
-	TMDBID               int64
-	ShowTitle            string
-	OriginalName         string
-	Year                 int
-	FirstAirDate         string   // "YYYY-MM-DD"
-	LastAirDate          string   // "YYYY-MM-DD"
-	IMDbID               string
-	Overview             string
-	Tagline              string
-	Status               string   // "Returning Series", "Ended", etc.
-	ContentRating        string   // "TV-MA", "TV-14", etc.
-	OriginalLanguage     string
-	Network              string
-	EpisodeRunTime       int
-	NumberOfSeasons      int
-	NumberOfEpisodes     int
-	InProduction         bool
-	PosterURL            string
-	BackdropURL          string
-	TrailerURL           string
-	Genres               []string
-	AlternativeTitles    []string
-	ProductionCompanies  []string
-	Popularity           float64
-	VoteAverage          float64
-	VoteCount            int
-	CastJSON             []byte   // JSON: [{name,character,profile_url}]
-	RawTMDB              []byte
+	TMDBID              int64
+	ShowTitle           string
+	OriginalName        string
+	Year                int
+	FirstAirDate        string // "YYYY-MM-DD"
+	LastAirDate         string // "YYYY-MM-DD"
+	IMDbID              string
+	Overview            string
+	Tagline             string
+	Status              string // "Returning Series", "Ended", etc.
+	ContentRating       string // "TV-MA", "TV-14", etc.
+	OriginalLanguage    string
+	Network             string
+	EpisodeRunTime      int
+	NumberOfSeasons     int
+	NumberOfEpisodes    int
+	InProduction        bool
+	PosterURL           string
+	BackdropURL         string
+	TrailerURL          string
+	Genres              []string
+	AlternativeTitles   []string
+	ProductionCompanies []string
+	Popularity          float64
+	VoteAverage         float64
+	VoteCount           int
+	CastJSON            []byte // JSON: [{name,character,profile_url}]
+	RawTMDB             []byte
 }
 
 func (db *DB) EnrichEpisodeMetadata(ctx context.Context, libraryItemID, tmdbID int64, show string, year int, imdbID, episodeTitle string) error {
@@ -587,7 +597,8 @@ func (db *DB) GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (L
 			coalesce(e.season_number, 0),
 			coalesce(e.episode_number, 0),
 			coalesce(tv.id, 0),
-			coalesce(m.alternative_titles, '{}') || coalesce(tv.alternative_titles, '{}')
+			coalesce(m.alternative_titles, '{}') || coalesce(tv.alternative_titles, '{}'),
+			coalesce(m.runtime_minutes, 0)
 		from library_items li
 		left join movies m on m.id = li.movie_id
 		left join episodes e on e.id = li.episode_id
@@ -610,6 +621,7 @@ func (db *DB) GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (L
 		&item.EpisodeNumber,
 		&item.TVShowID,
 		pgTextArrayScan(&item.AlternateTitles),
+		&item.RuntimeMinutes,
 	)
 	return item, err
 }
@@ -849,13 +861,14 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 		var releaseCandidateID int64
 		if err = tx.QueryRowContext(ctx, `
 			insert into release_candidates (
-				library_item_id, title, score, selected, rejected, reject_reason,
-				failure_count, last_failure_reason, external_url, indexer_name, size_bytes, posted_at, resolution
-			) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				library_item_id, title, score, custom_format_score, selected, rejected, reject_reason,
+				failure_count, last_failure_reason, external_url, indexer_name, size_bytes, posted_at, resolution, explanations, compatibility_warnings
+			) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 			returning id`,
 			libraryItemID,
 			candidate.Title,
 			candidate.Score,
+			candidate.CustomFormatScore,
 			shouldSelect,
 			candidate.Rejected,
 			candidate.RejectReason,
@@ -866,6 +879,8 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 			candidate.SizeBytes,
 			nullTime(candidate.PostedAt),
 			candidate.Resolution,
+			candidate.Explanations,
+			candidate.CompatibilityWarnings,
 		).Scan(&releaseCandidateID); err != nil {
 			return nil, err
 		}
@@ -1006,11 +1021,14 @@ func (db *DB) GetSelectedReleaseSummary(ctx context.Context, selectedReleaseID i
 			rc.size_bytes,
 			coalesce(rc.posted_at, to_timestamp(0)),
 			rc.score,
+			coalesce(rc.custom_format_score, 0),
 			rc.selected,
 			rc.rejected,
 			rc.reject_reason,
 			rc.failure_count,
 			rc.last_failure_reason,
+			rc.explanations,
+			rc.compatibility_warnings,
 			coalesce((select count(*) from archives a where a.selected_release_id = sr.id), 0),
 			coalesce((select count(*) from archive_volumes av join archives a on a.id = av.archive_id where a.selected_release_id = sr.id), 0),
 			coalesce((select string_agg(distinct a.status, ',' order by a.status) from archives a where a.selected_release_id = sr.id), ''),
@@ -1033,11 +1051,14 @@ func (db *DB) GetSelectedReleaseSummary(ctx context.Context, selectedReleaseID i
 		&item.SizeBytes,
 		&item.PostedAt,
 		&item.Score,
+		&item.CustomFormatScore,
 		&item.Selected,
 		&item.Rejected,
 		&item.RejectReason,
 		&item.FailureCount,
 		&item.LastFailureReason,
+		&item.Explanations,
+		&item.CompatibilityWarnings,
 		&item.ArchiveCount,
 		&item.ArchiveVolumeCount,
 		&item.ArchiveStatuses,
@@ -1054,7 +1075,30 @@ func (db *DB) GetSelectedReleaseSummary(ctx context.Context, selectedReleaseID i
 		value := nzbDocument.Int64
 		item.NZBDocumentID = &value
 	}
+	item.Explanations = releaseSummaryExplanations(item)
 	return item, nil
+}
+
+func (db *DB) GetLatestSelectedReleaseSummaryByLibraryItem(ctx context.Context, libraryItemID int64) (*ReleaseSummary, error) {
+	var selectedReleaseID int64
+	err := db.SQL.QueryRowContext(ctx, `
+		select sr.id
+		from selected_releases sr
+		where sr.library_item_id = $1
+		order by sr.id desc
+		limit 1`, libraryItemID,
+	).Scan(&selectedReleaseID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	item, err := db.GetSelectedReleaseSummary(ctx, selectedReleaseID)
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
 }
 
 func (db *DB) GetStoredNZBDocument(ctx context.Context, selectedReleaseID int64) (StoredNZBDocument, error) {

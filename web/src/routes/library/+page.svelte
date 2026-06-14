@@ -6,6 +6,7 @@
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import SearchCheck from '@lucide/svelte/icons/search-check';
   import Play from '@lucide/svelte/icons/play';
+  import Pagination from '$lib/components/Pagination.svelte';
   import PosterCard from '$lib/components/PosterCard.svelte';
   import { itemStatus, STATUS_ORDER } from '$lib/itemStatus';
   import MetricCard from '$lib/components/MetricCard.svelte';
@@ -211,9 +212,7 @@
     <div class="pager">
       <div class="pager-copy">Showing {rangeStart}-{rangeEnd} of {visibleSorted.length}</div>
       <div class="pager-actions">
-        <button on:click={() => (currentPage = Math.max(1, currentPage - 1))} disabled={currentPage === 1}>Prev</button>
-        <span>{currentPage}/{totalPages}</span>
-        <button on:click={() => (currentPage = Math.min(totalPages, currentPage + 1))} disabled={currentPage === totalPages}>Next</button>
+        <Pagination page={currentPage} {totalPages} showFirstLast={false} on:change={(e) => (currentPage = e.detail)} />
       </div>
     </div>
     <div class="poster-grid">
@@ -349,21 +348,6 @@
     display: inline-flex;
     align-items: center;
     gap: 8px;
-  }
-
-  .pager-actions button {
-    min-height: 32px;
-    padding: 0 10px;
-    border-radius: 10px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.03);
-    color: hsl(var(--foreground));
-    cursor: pointer;
-  }
-
-  .pager-actions button:disabled {
-    opacity: 0.45;
-    cursor: default;
   }
 
   .poster-grid {

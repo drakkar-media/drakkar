@@ -3,6 +3,8 @@ package database
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"strings"
 )
 
 func (db *DB) ListLibraryItems(ctx context.Context) ([]LibraryItemSummary, error) {
@@ -65,11 +67,14 @@ func (db *DB) ListReleaseSummaries(ctx context.Context, libraryItemID int64) ([]
 			rc.size_bytes,
 			coalesce(rc.posted_at, to_timestamp(0)),
 			rc.score,
+			coalesce(rc.custom_format_score, 0),
 			rc.selected,
 			rc.rejected,
 			rc.reject_reason,
 			rc.failure_count,
 			rc.last_failure_reason,
+			rc.explanations,
+			rc.compatibility_warnings,
 			coalesce((select count(*) from archives a where a.selected_release_id = sr.id), 0),
 			coalesce((select count(*) from archive_volumes av join archives a on a.id = av.archive_id where a.selected_release_id = sr.id), 0),
 			coalesce((select string_agg(distinct a.status, ',' order by a.status) from archives a where a.selected_release_id = sr.id), ''),
@@ -104,11 +109,14 @@ func (db *DB) ListReleaseSummaries(ctx context.Context, libraryItemID int64) ([]
 			&item.SizeBytes,
 			&item.PostedAt,
 			&item.Score,
+			&item.CustomFormatScore,
 			&item.Selected,
 			&item.Rejected,
 			&item.RejectReason,
 			&item.FailureCount,
 			&item.LastFailureReason,
+			&item.Explanations,
+			&item.CompatibilityWarnings,
 			&item.ArchiveCount,
 			&item.ArchiveVolumeCount,
 			&item.ArchiveStatuses,
@@ -137,9 +145,38 @@ func (db *DB) ListReleaseSummaries(ctx context.Context, libraryItemID int64) ([]
 			value := nzbDocument.Int64
 			item.NZBDocumentID = &value
 		}
+		item.Explanations = releaseSummaryExplanations(item)
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func releaseSummaryExplanations(item ReleaseSummary) []string {
+	out := append([]string{}, item.Explanations...)
+	if item.Selected {
+		out = append(out, "Currently selected for this library item.")
+	}
+	if item.Rejected && strings.TrimSpace(item.RejectReason) != "" {
+		if strings.HasPrefix(item.RejectReason, "blocklist:") {
+			out = append(out, "Rejected by a release filtering rule: "+strings.TrimPrefix(item.RejectReason, "blocklist:"))
+		} else {
+			out = append(out, "Rejected: "+item.RejectReason)
+		}
+	}
+	if item.FailureCount > 0 {
+		message := fmt.Sprintf("Previously failed %d time(s).", item.FailureCount)
+		if strings.TrimSpace(item.LastFailureReason) != "" {
+			message += " Latest failure: " + item.LastFailureReason + "."
+		}
+		out = append(out, message)
+	}
+	if strings.TrimSpace(item.ArchiveRejects) != "" {
+		out = append(out, "Archive inspection rejected content: "+item.ArchiveRejects)
+	}
+	if len(out) == 0 && !item.Rejected && item.FailureCount == 0 && strings.TrimSpace(item.ArchiveRejects) == "" && !item.Selected {
+		out = append(out, "No stored rejections or failed attempts for this candidate.")
+	}
+	return out
 }
 
 func (db *DB) listFailedReleaseAttempts(ctx context.Context, releaseCandidateID int64) ([]FailedReleaseAttempt, error) {

@@ -13,10 +13,11 @@ export type QualityProfile = {
   preferRepack: boolean;
   rejectCam: boolean;
   allowUpgrade: boolean;
+  minimumUpgradeCustomFormatScore: number;
   cutoffResolution: string;
   minimumAgeHours: number;
-  minSizeMb: number;
-  maxSizeMb: number;
+  minMbPerMinute: number;
+  maxMbPerMinute: number;
   createdAt?: string;
   updatedAt?: string;
 };
@@ -38,6 +39,28 @@ export type CustomFormat = {
   pattern: string;
   score: number;
   enabled: boolean;
+  source?: string;
+};
+
+export type SubtitleProfile = {
+  id?: number;
+  name: string;
+  languages: string[];
+  preferHearingImpaired: boolean;
+  requireExactLanguage: boolean;
+  isDefault: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type IndexerPolicy = {
+  id?: number;
+  indexerName: string;
+  scoreModifier: number;
+  enabled: boolean;
+  note: string;
+  createdAt?: string;
+  updatedAt?: string;
 };
 
 export type ReleaseBlockRule = {
@@ -74,8 +97,8 @@ export type QualityDefinition = {
   mediaType: string;
   qualityKey: string;
   title: string;
-  minSizeMb: number;
-  maxSizeMb: number;
+  minMbPerMinute: number;
+  maxMbPerMinute: number;
   sortOrder: number;
 };
 
@@ -133,6 +156,13 @@ export type QueueItem = {
   nzbFileName?: string;
   nzbFileCount: number;
   nzbSegmentCount: number;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type WorkQueueStatus = {
+  paused: boolean;
+  depth: number;
 };
 
 export type BulkQueueRetryResult = {
@@ -150,6 +180,8 @@ export type RequestItem = {
   title: string;
   mediaType: string;
   libraryItemId?: number;
+  qualityProfileId?: number;
+  qualityProfileName?: string;
   queueState: string;
   createdAt: string;
 };
@@ -332,6 +364,7 @@ export type ReleaseItem = {
   sizeBytes: number;
   postedAt?: string;
   score: number;
+  customFormatScore: number;
   selected: boolean;
   rejected: boolean;
   rejectReason: string;
@@ -343,6 +376,8 @@ export type ReleaseItem = {
   archiveRejects: string;
   archives?: ReleaseArchive[];
   failedAttempts?: FailedReleaseAttempt[];
+  explanations?: string[];
+  compatibilityWarnings?: string[];
   nzbDocumentId?: number;
   nzbFileName?: string;
 };
@@ -377,6 +412,7 @@ export type MaintenanceResult = {
   deletedRows: number;
   scannedFiles: number;
   scannedRows: number;
+  resetItems: number;
 };
 
 export type SubtitleFile = {
@@ -405,6 +441,26 @@ export type SubtitleCandidate = {
 export type BlocklistItem = {
   id: number;
   key: string;
+  keyType?: string;
+  reason: string;
+  createdAt: string;
+  expiresAt?: string;
+  selectedReleaseId?: number;
+  libraryItemId?: number;
+  releaseTitle?: string;
+  indexerName?: string;
+  sizeBytes?: number;
+  postedAt?: string;
+};
+
+export type BlocklistMutation = {
+  key: string;
+  keyType?: 'raw' | 'external_url' | 'release_signature';
+  externalUrl?: string;
+  releaseTitle?: string;
+  indexerName?: string;
+  sizeMb?: number;
+  postedDate?: string;
   reason: string;
   expiresAt?: string;
 };
@@ -465,4 +521,13 @@ export type User = {
   username: string;
   role: string;
   createdAt: string;
+};
+
+export type APIToken = {
+  id: number;
+  userId: number;
+  name: string;
+  createdAt: string;
+  lastUsedAt?: string;
+  expiresAt?: string;
 };

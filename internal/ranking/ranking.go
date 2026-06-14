@@ -96,6 +96,9 @@ type Candidate struct {
 	FailureCount int
 	Grabs        int
 	IndexerScore int
+	// IndexerPolicyScore is a static modifier from the indexer_policies table.
+	// Loaded by the workflow service at search time and added directly to the score.
+	IndexerPolicyScore int
 }
 
 type Requirements struct {
@@ -111,6 +114,9 @@ type Requirements struct {
 	// for UK release of "The Avengers"). Matches any one of these before
 	// declaring wrong_title. Mirrors Radarr's AlternativeTitles check.
 	AlternateTitles []string
+	// RuntimeMinutes: used to convert TierMBPerMinuteLimits into expected total sizes.
+	// When 0, per-tier MB/min checks are skipped (graceful degradation).
+	RuntimeMinutes int
 }
 
 type CustomFormat struct {
@@ -118,6 +124,7 @@ type CustomFormat struct {
 	Pattern string
 	Score   int
 	Enabled bool
+	Source  string
 }
 
 // BlockRule is a release filter rule loaded from the release_block_rules table.
@@ -133,6 +140,54 @@ type BlockRule struct {
 	Note         string
 }
 
+// unifiedRule is the internal normalized form of both a CustomFormat and a BlockRule.
+// It is constructed by buildUnifiedRules and evaluated in a single pass inside
+// ScoreWithPreferences.
+type unifiedRule struct {
+	id          int64
+	name        string   // custom format name; empty for block rules
+	patternType string   // "regex" | "release_group" | "title_pattern" | "missing_release_group"
+	pattern     string
+	mediaType   string // "movie" | "tv" | "both"
+	action      string // "score" | "penalty" | "block"
+	score       int    // used when action=="score" (may be negative)
+	penalty     int    // used when action=="penalty"
+	enabled     bool
+}
+
+// buildUnifiedRules merges custom formats (action=score) and block rules into a
+// single ordered slice. Custom formats come first; block rules follow.
+func buildUnifiedRules(customFormats []CustomFormat, blockRules []BlockRule) []unifiedRule {
+	out := make([]unifiedRule, 0, len(customFormats)+len(blockRules))
+	for _, cf := range customFormats {
+		out = append(out, unifiedRule{
+			name:        cf.Name,
+			patternType: "regex",
+			pattern:     cf.Pattern,
+			mediaType:   "both",
+			action:      "score",
+			score:       cf.Score,
+			enabled:     cf.Enabled,
+		})
+	}
+	for _, br := range blockRules {
+		action := br.Action
+		if action == "" {
+			action = "block"
+		}
+		out = append(out, unifiedRule{
+			id:          br.ID,
+			patternType: br.Type,
+			pattern:     br.Pattern,
+			mediaType:   br.MediaType,
+			action:      action,
+			penalty:     br.ScorePenalty,
+			enabled:     br.Enabled,
+		})
+	}
+	return out
+}
+
 type Preferences struct {
 	Resolutions     []string
 	Sources         []string
@@ -144,17 +199,21 @@ type Preferences struct {
 	PreferProper    bool
 	PreferRepack    bool
 	RejectCam       bool
-	MinSizeMB       int
-	MaxSizeMB       int
-	// TierSizeLimits maps a resolution string (e.g. "1080p") to [minMB, maxMB].
+	MinMBPerMinute  int
+	MaxMBPerMinute  int
+	// TierMBPerMinuteLimits maps a resolution string (e.g. "1080p") to [minMB/min, maxMB/min].
 	// Zero values in either slot mean "no limit for that bound".
-	TierSizeLimits map[string][2]int
+	// Applied only when Requirements.RuntimeMinutes > 0.
+	TierMBPerMinuteLimits map[string][2]int
 	// MinimumAgeHours: reject candidates posted fewer than N hours ago.
 	MinimumAgeHours int
 	// CutoffResolution: once the grabbed release meets this resolution or better,
 	// the item is considered "at cutoff" and won't be upgraded further.
 	// Used by the upgrade scheduler to skip items already at quality cutoff.
 	CutoffResolution string
+	// MinimumUpgradeCustomFormatScore requires an upgrade candidate to improve the
+	// custom-format subtotal by at least this amount versus the current release.
+	MinimumUpgradeCustomFormatScore int
 	// CustomFormats: user-defined scoring rules applied on top of base score.
 	CustomFormats []CustomFormat
 	// BlockRules: release filter rules. Block action rejects; penalty action subtracts score.
@@ -162,9 +221,12 @@ type Preferences struct {
 }
 
 type Result struct {
-	Score        int
-	Rejected     bool
-	RejectReason string
+	Score                  int
+	CustomFormatScore      int
+	Explanations           []string
+	CompatibilityWarnings  []string
+	Rejected               bool
+	RejectReason           string
 }
 
 // ── Scoring entry points ─────────────────────────────────────────────────────
@@ -174,6 +236,10 @@ func Score(candidate Candidate, required Requirements) Result {
 }
 
 func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Preferences) Result {
+	explanations := []string{}
+	addExplanation := func(format string, args ...any) {
+		explanations = append(explanations, fmt.Sprintf(format, args...))
+	}
 	titleLower := strings.ToLower(candidate.Title)
 	requiredLower := strings.ToLower(required.Title)
 
@@ -189,21 +255,21 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 			matched = containsNormalized(titleLower, strings.ToLower(required.AlternateTitles[i]))
 		}
 		if !matched {
-			return Result{Rejected: true, RejectReason: "wrong_title"}
+			return Result{Rejected: true, RejectReason: "wrong_title", Explanations: []string{"Rejected: title did not match the requested title."}}
 		}
 	}
 
 	// ── Minimum age ─────────────────────────────────────────────────────────
 	if prefs.MinimumAgeHours > 0 && !candidate.UploadedAt.IsZero() {
 		if time.Since(candidate.UploadedAt) < time.Duration(prefs.MinimumAgeHours)*time.Hour {
-			return Result{Rejected: true, RejectReason: "too_new"}
+			return Result{Rejected: true, RejectReason: "too_new", Explanations: []string{fmt.Sprintf("Rejected: upload is newer than the minimum age of %dh.", prefs.MinimumAgeHours)}}
 		}
 	}
 
 	// ── Exclude patterns ────────────────────────────────────────────────────
 	for _, re := range compilePatterns(prefs.ExcludePatterns) {
 		if re.MatchString(candidate.Title) {
-			return Result{Rejected: true, RejectReason: "excluded_pattern"}
+			return Result{Rejected: true, RejectReason: "excluded_pattern", Explanations: []string{"Rejected: matched an excluded profile pattern."}}
 		}
 	}
 
@@ -211,18 +277,18 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 
 	// CAM/TS/Screener — Radarr QualityParser extended set
 	if hasRejectedSource(titleLower) {
-		return Result{Rejected: true, RejectReason: "bad_source"}
+		return Result{Rejected: true, RejectReason: "bad_source", Explanations: []string{"Rejected: low-quality source such as CAM/TS/Screener was detected."}}
 	}
 	// Unencoded Blu-ray disc (BD-ISO, BDMV, COMPLETE.BLURAY) — always reject
 	if reBRDisk.MatchString(candidate.Title) {
-		return Result{Rejected: true, RejectReason: "br_disk"}
+		return Result{Rejected: true, RejectReason: "br_disk", Explanations: []string{"Rejected: raw Blu-ray disc content was detected."}}
 	}
 	// Hardcoded/burned subs
 	if reHardSubs.MatchString(candidate.Title) {
-		return Result{Rejected: true, RejectReason: "hardsub"}
+		return Result{Rejected: true, RejectReason: "hardsub", Explanations: []string{"Rejected: hardcoded subtitles were detected."}}
 	}
-	if sizeReject := rejectBySize(candidate, prefs); sizeReject != "" {
-		return Result{Rejected: true, RejectReason: sizeReject}
+	if sizeReject := rejectBySize(candidate, prefs, required.RuntimeMinutes); sizeReject != "" {
+		return Result{Rejected: true, RejectReason: sizeReject, Explanations: []string{"Rejected: size was outside configured MB/min limits."}}
 	}
 
 	// ── Year / episode match ─────────────────────────────────────────────────
@@ -232,77 +298,122 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 	case "movie":
 		switch matchYear(titleLower, required.Year) {
 		case yearMismatch:
-			return Result{Rejected: true, RejectReason: "wrong_year"}
+			return Result{Rejected: true, RejectReason: "wrong_year", Explanations: []string{"Rejected: release year did not match the requested year."}}
 		case yearExact:
 			score += 90
+			addExplanation("Exact year match (+90)")
 		}
 	case "episode":
 		switch matchEpisode(titleLower, required.SeasonNumber, required.EpisodeNumber) {
 		case episodeMismatch:
-			return Result{Rejected: true, RejectReason: "wrong_episode"}
+			return Result{Rejected: true, RejectReason: "wrong_episode", Explanations: []string{"Rejected: season/episode did not match the requested episode."}}
 		case episodeExact:
 			score += 350
+			addExplanation("Exact episode match (+350)")
 		case episodeSeasonPack:
 			score += 120
+			addExplanation("Season pack match (+120)")
 		}
 		switch matchYear(titleLower, required.Year) {
 		case yearExact:
 			score += 30
+			addExplanation("Year matched show metadata (+30)")
 		case yearMismatch:
 			score -= 40
+			addExplanation("Year mismatched show metadata (-40)")
 		}
 	}
 
 	// ── Quality scoring ──────────────────────────────────────────────────────
 
-	score += scoreResolution(candidate.Resolution, prefs)
-	score += scoreSourceField(candidate.Source, titleLower, prefs)
-	score += scoreCodec(candidate.Codec, prefs)
-	score += scoreLanguage(candidate.Language, prefs)
+	if points := scoreResolution(candidate.Resolution, prefs); points != 0 {
+		score += points
+		addExplanation("Resolution %s (%+d)", candidate.Resolution, points)
+	}
+	if points := scoreSourceField(candidate.Source, titleLower, prefs); points != 0 {
+		score += points
+		label := candidate.Source
+		if strings.TrimSpace(label) == "" {
+			label = "detected source"
+		}
+		addExplanation("Source %s (%+d)", label, points)
+	}
+	if points := scoreCodec(candidate.Codec, prefs); points != 0 {
+		score += points
+		addExplanation("Codec %s (%+d)", candidate.Codec, points)
+	}
+	if points := scoreLanguage(candidate.Language, prefs); points != 0 {
+		score += points
+		addExplanation("Language %s (%+d)", candidate.Language, points)
+	}
 
 	audio := ParseAudioFormat(candidate.Title)
-	score += scoreAudio(audio, prefs)
+	if points := scoreAudio(audio, prefs); points != 0 {
+		score += points
+		addExplanation("Audio %s (%+d)", audio, points)
+	}
 
 	hdr := ParseHDRFormat(candidate.Title)
-	score += scoreHDR(hdr, prefs)
+	if points := scoreHDR(hdr, prefs); points != 0 {
+		score += points
+		addExplanation("HDR %s (%+d)", hdr, points)
+	}
 
 	// ── Release quality signals ───────────────────────────────────────────────
 
 	// Remux — Radarr pattern: BD.Remux, UHD.Remux, Hybrid-Remux
 	if reRemux.MatchString(candidate.Title) {
 		score += 40
+		addExplanation("Remux detected (+40)")
 	}
 
 	// Proper/Repack — Radarr uses \bproper\b, \brepack\d?\b, \brerip\d?\b
 	isProper := reProper.MatchString(candidate.Title)
 	isRepack := reRepack.MatchString(candidate.Title)
-	isReal   := reReal.MatchString(candidate.Title)
+	isReal := reReal.MatchString(candidate.Title)
 	if (isProper || isReal) && prefs.PreferProper {
 		score += 80
+		addExplanation("Preferred proper/real release (+80)")
 	} else if isProper || isReal {
 		score += 40
+		addExplanation("Proper/real release (+40)")
 	}
 	if isRepack && prefs.PreferRepack {
 		score += 60
+		addExplanation("Preferred repack release (+60)")
 	} else if isRepack {
 		score += 20
+		addExplanation("Repack release (+20)")
 	}
 
 	if candidate.Indexer != "" {
 		score += 75
+		addExplanation("Named indexer bonus (+75)")
 	}
 	if candidate.ReleaseGroup != "" {
 		score += 50
+		addExplanation("Release group detected (+50)")
 	}
 
 	// Upload recency — trash-guides: prefer recent uploads
 	if candidate.UploadedAt.After(time.Now().Add(-30 * 24 * time.Hour)) {
 		score += 25
+		addExplanation("Recent upload bonus (+25)")
 	}
 
 	// Indexer trust score from NZBHydra2 (1–3). Acts as a tiebreaker between
 	// otherwise equal candidates from different indexers.
-	score += candidate.IndexerScore * 10
+	if candidate.IndexerScore != 0 {
+		points := candidate.IndexerScore * 10
+		score += points
+		addExplanation("Indexer trust score (%+d)", points)
+	}
+
+	// Per-indexer policy modifier configured by the operator in Settings → Indexers.
+	if candidate.IndexerPolicyScore != 0 {
+		score += candidate.IndexerPolicyScore
+		addExplanation("Indexer policy %s (%+d)", candidate.Indexer, candidate.IndexerPolicyScore)
+	}
 
 	// Community grab count — proxy for a release actually being complete and
 	// working. Capped at 50 points so it doesn't overpower quality signals.
@@ -312,68 +423,111 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 			grabBonus = 50
 		}
 		score += grabBonus
+		addExplanation("Community grab count bonus (%+d)", grabBonus)
 	}
 
 	// Sample penalty — word-boundary aware
 	if reSample.MatchString(candidate.Title) {
 		score -= 150
+		addExplanation("Sample content penalty (-150)")
 	}
 
 	// Failure penalties
 	if candidate.Degraded {
 		score -= 300
+		addExplanation("Degraded candidate penalty (-300)")
 	} else if candidate.FailureCount >= 5 {
 		score -= 50000 // effectively excluded
+		addExplanation("Heavy prior failure penalty (-50000)")
 	} else if candidate.FailureCount > 0 {
-		score -= 300 * candidate.FailureCount
+		penalty := 300 * candidate.FailureCount
+		score -= penalty
+		addExplanation("Prior failure penalty (-%d)", penalty)
 	}
 
-	// ── Custom formats ────────────────────────────────────────────────────────
-	for _, cf := range prefs.CustomFormats {
-		if !cf.Enabled || cf.Pattern == "" {
-			continue
-		}
-		re, err := regexp.Compile(cf.Pattern)
-		if err != nil {
-			continue
-		}
-		if re.MatchString(candidate.Title) {
-			score += cf.Score
-		}
-	}
-
-	// ── Release block rules ───────────────────────────────────────────────────
-	if len(prefs.BlockRules) > 0 {
+	// ── Custom formats + release block rules (unified evaluation pass) ──────────
+	customFormatScore := 0
+	if len(prefs.CustomFormats)+len(prefs.BlockRules) > 0 {
 		effectiveMediaType := required.MediaType
 		if effectiveMediaType == "episode" {
 			effectiveMediaType = "tv"
 		}
-		titleLower := strings.ToLower(candidate.Title)
-		// Prefer the pre-parsed ReleaseGroup field; fall back to parsing the title.
+		candidateTitleLower := strings.ToLower(candidate.Title)
 		releaseGroup := candidate.ReleaseGroup
 		if releaseGroup == "" {
 			releaseGroup = ParseReleaseGroup(candidate.Title)
 		}
 		releaseGroupLower := strings.ToLower(releaseGroup)
 
-		for _, rule := range prefs.BlockRules {
-			if !rule.Enabled {
+		for _, rule := range buildUnifiedRules(prefs.CustomFormats, prefs.BlockRules) {
+			if !rule.enabled {
 				continue
 			}
-			if rule.MediaType != "both" && rule.MediaType != effectiveMediaType {
+			// Media-type filter applies to block rules; scoring rules always apply.
+			if rule.mediaType != "both" && rule.mediaType != effectiveMediaType {
 				continue
 			}
-			if !matchBlockRule(rule, titleLower, releaseGroupLower) {
-				continue
+			switch rule.action {
+			case "score":
+				if rule.pattern == "" {
+					continue
+				}
+				re, err := regexp.Compile(rule.pattern)
+				if err != nil {
+					continue
+				}
+				if re.MatchString(candidate.Title) {
+					score += rule.score
+					customFormatScore += rule.score
+					addExplanation("Custom format %s (%+d)", rule.name, rule.score)
+				}
+			case "penalty":
+				br := BlockRule{ID: rule.id, Type: rule.patternType, Pattern: rule.pattern,
+					MediaType: rule.mediaType, Action: rule.action, ScorePenalty: rule.penalty, Enabled: rule.enabled}
+				if matchBlockRule(br, candidateTitleLower, releaseGroupLower) {
+					score -= rule.penalty
+					addExplanation("Release rule penalty %s:%s (-%d)", rule.patternType, rule.pattern, rule.penalty)
+				}
+			case "block":
+				br := BlockRule{ID: rule.id, Type: rule.patternType, Pattern: rule.pattern,
+					MediaType: rule.mediaType, Action: rule.action, Enabled: rule.enabled}
+				if matchBlockRule(br, candidateTitleLower, releaseGroupLower) {
+					explanations = append(explanations, fmt.Sprintf("Rejected by release rule %s:%s", rule.patternType, rule.pattern))
+					return Result{Rejected: true, RejectReason: "blocklist:" + rule.patternType + ":" + rule.pattern, Explanations: explanations}
+				}
 			}
-			if rule.Action == "block" {
-				return Result{Rejected: true, RejectReason: "blocklist:" + rule.Type + ":" + rule.Pattern}
-			}
-			score -= rule.ScorePenalty
 		}
 	}
 
-	return Result{Score: score}
+	if len(explanations) == 0 {
+		explanations = append(explanations, "No special ranking adjustments were applied beyond the baseline candidate checks.")
+	}
+	return Result{
+		Score:                 score,
+		CustomFormatScore:     customFormatScore,
+		Explanations:          explanations,
+		CompatibilityWarnings: compatibilityWarnings(candidate),
+	}
+}
+
+// compatibilityWarnings returns a list of informational strings for formats
+// that may require transcoding or specific hardware in Plex/Jellyfin.
+// These do not affect the score; they are surfaced as UI badges.
+func compatibilityWarnings(candidate Candidate) []string {
+	var out []string
+	hdr := ParseHDRFormat(candidate.Title)
+	if hdr == "DV" {
+		out = append(out, "Dolby Vision — requires DV-capable client or will transcode")
+	}
+	audio := ParseAudioFormat(candidate.Title)
+	if audio == "Atmos" || audio == "TrueHD" {
+		out = append(out, "TrueHD/Atmos — requires passthrough or will transcode to lossy")
+	}
+	codec := strings.ToLower(candidate.Codec)
+	if strings.Contains(codec, "av1") {
+		out = append(out, "AV1 — limited hardware decode support on older devices")
+	}
+	return out
 }
 
 // ParseReleaseGroup extracts the release group from a release title using scene convention:
@@ -518,24 +672,27 @@ func scoreSourceField(source, titleLower string, prefs Preferences) int {
 
 // ── Size / resolution / codec / language ────────────────────────────────────
 
-func rejectBySize(candidate Candidate, prefs Preferences) string {
+func rejectBySize(candidate Candidate, prefs Preferences, runtimeMinutes int) string {
 	if candidate.SizeBytes <= 0 {
 		return ""
 	}
 	sizeMB := int(candidate.SizeBytes / (1024 * 1024))
-	if prefs.MinSizeMB > 0 && sizeMB < prefs.MinSizeMB {
-		return "too_small"
-	}
-	if prefs.MaxSizeMB > 0 && sizeMB > prefs.MaxSizeMB {
-		return "too_large"
-	}
-	if len(prefs.TierSizeLimits) > 0 && candidate.Resolution != "" {
-		if lim, ok := prefs.TierSizeLimits[candidate.Resolution]; ok {
-			if lim[0] > 0 && sizeMB < lim[0] {
-				return "too_small"
-			}
-			if lim[1] > 0 && sizeMB > lim[1] {
-				return "too_large"
+	// Profile-level and tier limits are MB/min; skip if runtime unknown.
+	if runtimeMinutes > 0 {
+		if prefs.MinMBPerMinute > 0 && sizeMB < prefs.MinMBPerMinute*runtimeMinutes {
+			return "too_small"
+		}
+		if prefs.MaxMBPerMinute > 0 && sizeMB > prefs.MaxMBPerMinute*runtimeMinutes {
+			return "too_large"
+		}
+		if len(prefs.TierMBPerMinuteLimits) > 0 && candidate.Resolution != "" {
+			if lim, ok := prefs.TierMBPerMinuteLimits[candidate.Resolution]; ok {
+				if lim[0] > 0 && sizeMB < lim[0]*runtimeMinutes {
+					return "too_small"
+				}
+				if lim[1] > 0 && sizeMB > lim[1]*runtimeMinutes {
+					return "too_large"
+				}
 			}
 		}
 	}

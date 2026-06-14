@@ -55,6 +55,7 @@ type Repository interface {
 	ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord) (*int64, error)
 	MarkLibrarySearchFailed(ctx context.Context, libraryItemID int64, reason string) error
 	GetSelectedReleaseSummary(ctx context.Context, selectedReleaseID int64) (database.ReleaseSummary, error)
+	GetLatestSelectedReleaseSummaryByLibraryItem(ctx context.Context, libraryItemID int64) (*database.ReleaseSummary, error)
 	GetStoredNZBDocument(ctx context.Context, selectedReleaseID int64) (database.StoredNZBDocument, error)
 	PromoteBestRetryCandidate(ctx context.Context, libraryItemID int64) (*database.ReleaseSummary, error)
 	PromoteAlternativeRetryCandidate(ctx context.Context, libraryItemID int64, excludeReleaseCandidateID int64) (*database.ReleaseSummary, error)
@@ -74,6 +75,7 @@ type Repository interface {
 	EnsureEpisodeLibraryItem(ctx context.Context, tvShowID int64, showTitle string, seasonNum, episodeNum int, episodeTitle, airDate string) (created bool, err error)
 	ListCustomFormats(ctx context.Context) ([]database.CustomFormat, error)
 	ListReleaseBlockRules(ctx context.Context) ([]database.ReleaseBlockRule, error)
+	LoadIndexerPolicyMap(ctx context.Context) (map[string]int, error)
 	CreateImportedNZB(ctx context.Context, imported database.ImportedNZB) (database.QueueSnapshot, error)
 	ListSabQueueItems(ctx context.Context, category string, start, limit int) ([]database.SabQueueItem, int, error)
 	ListSabHistoryItems(ctx context.Context, category string, start, limit int) ([]database.SabHistoryItem, int, error)
@@ -85,6 +87,7 @@ type Repository interface {
 type SeerrClient interface {
 	PendingRequests(ctx context.Context) ([]seerr.Request, error)
 	CreateRequest(ctx context.Context, mediaType string, tmdbID int64) error
+	CreateTVSeasonRequest(ctx context.Context, tmdbID int64, seasons []int) error
 }
 
 type HydraClient interface {
@@ -99,12 +102,12 @@ type IndexerLimits struct {
 }
 
 type Service struct {
-	repo           Repository
-	seerr          SeerrClient
-	hydra          HydraClient
-	tmdb           TMDBClient
-	tvdb           TVDBClient
-	fetcher        NZBFetcher
+	repo             Repository
+	seerr            SeerrClient
+	hydra            HydraClient
+	tmdb             TMDBClient
+	tvdb             TVDBClient
+	fetcher          NZBFetcher
 	postImportHook   func(context.Context, database.QueueSnapshot) error
 	preflightChecker func(context.Context, database.QueueSnapshot) error
 	queuePolicy      QueuePolicyProvider
@@ -119,8 +122,8 @@ type Service struct {
 	tvProfileName    string
 
 	// profileCacheMu guards the cached quality profiles (keyed by media type).
-	profileCacheMu   sync.Mutex
-	profileCacheAt   map[string]time.Time
+	profileCacheMu     sync.Mutex
+	profileCacheAt     map[string]time.Time
 	profileCachedPrefs map[string]ranking.Preferences
 
 	// importSem limits fetchAndImportSelectedRelease to 1 concurrent execution.
@@ -128,6 +131,11 @@ type Service struct {
 	// NZB may go through preflight + publish at a time to avoid exhausting the
 	// NNTP connection pool.
 	importSem chan struct{}
+}
+
+type WorkQueueStatus struct {
+	Paused bool  `json:"paused"`
+	Depth  int64 `json:"depth"`
 }
 
 type QueuePolicyProvider interface {
@@ -187,6 +195,13 @@ type ReleaseActionResult struct {
 }
 
 type QueueRetryResult struct {
+	QueueItemID        int64  `json:"queueItemId"`
+	Action             string `json:"action"`
+	SelectedReleaseID  *int64 `json:"selectedReleaseId,omitempty"`
+	SearchCandidateCnt int    `json:"searchCandidateCount,omitempty"`
+}
+
+type QueueManageResult struct {
 	QueueItemID        int64  `json:"queueItemId"`
 	Action             string `json:"action"`
 	SelectedReleaseID  *int64 `json:"selectedReleaseId,omitempty"`
@@ -303,6 +318,19 @@ func (s *Service) CreateSeerrRequest(ctx context.Context, mediaType string, tmdb
 		return SyncResult{}, fmt.Errorf("seerr client unavailable")
 	}
 	if err := s.seerr.CreateRequest(ctx, mediaType, tmdbID); err != nil {
+		return SyncResult{}, err
+	}
+	return s.SyncRequests(ctx)
+}
+
+func (s *Service) CreateSeerrSeasonRequest(ctx context.Context, tmdbID int64, seasons []int) (SyncResult, error) {
+	if s == nil || s.seerr == nil {
+		return SyncResult{}, fmt.Errorf("seerr client unavailable")
+	}
+	if len(seasons) == 0 {
+		return SyncResult{}, fmt.Errorf("at least one season is required")
+	}
+	if err := s.seerr.CreateTVSeasonRequest(ctx, tmdbID, seasons); err != nil {
 		return SyncResult{}, err
 	}
 	return s.SyncRequests(ctx)
@@ -464,6 +492,40 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 	return result, nil
 }
 
+func (s *Service) WorkQueueStatus(ctx context.Context) (WorkQueueStatus, error) {
+	if s == nil || s.WorkQueue == nil {
+		return WorkQueueStatus{}, nil
+	}
+	paused, err := s.WorkQueue.IsPaused(ctx)
+	if err != nil {
+		return WorkQueueStatus{}, err
+	}
+	return WorkQueueStatus{
+		Paused: paused,
+		Depth:  s.WorkQueue.Depth(ctx),
+	}, nil
+}
+
+func (s *Service) PauseWorkQueue(ctx context.Context) (WorkQueueStatus, error) {
+	if s == nil || s.WorkQueue == nil {
+		return WorkQueueStatus{}, errors.New("work queue unavailable")
+	}
+	if err := s.WorkQueue.Pause(ctx); err != nil {
+		return WorkQueueStatus{}, err
+	}
+	return s.WorkQueueStatus(ctx)
+}
+
+func (s *Service) ResumeWorkQueue(ctx context.Context) (WorkQueueStatus, error) {
+	if s == nil || s.WorkQueue == nil {
+		return WorkQueueStatus{}, errors.New("work queue unavailable")
+	}
+	if err := s.WorkQueue.Resume(ctx); err != nil {
+		return WorkQueueStatus{}, err
+	}
+	return s.WorkQueueStatus(ctx)
+}
+
 func (s *Service) SearchRecentPending(ctx context.Context, mediaType string) (BulkSearchResult, error) {
 	if s == nil || s.hydra == nil {
 		return BulkSearchResult{}, fmt.Errorf("nzbhydra2 client unavailable")
@@ -504,7 +566,7 @@ func (s *Service) SearchRecentPending(ctx context.Context, mediaType string) (Bu
 			continue
 		}
 		profilePrefs := s.profilePreferencesForItem(ctx, target.LibraryItemID, input.MediaType)
-		candidates := buildSearchCandidates(recent, searchRequirements(input), history, profilePrefs, s.indexerLimits)
+		candidates := buildSearchCandidates(recent, searchRequirements(input), history, profilePrefs, s.indexerLimits, s.loadIndexerPolicyMap(ctx))
 		if len(candidates) == 0 {
 			continue
 		}
@@ -635,7 +697,7 @@ func isDeadlock(err error) bool {
 func (s *Service) SearchLibrary(ctx context.Context, libraryItemID int64) (SearchResult, error) {
 	const maxDeadlockRetries = 3
 	for attempt := 0; attempt < maxDeadlockRetries; attempt++ {
-		result, err := s.searchLibraryOnce(ctx, libraryItemID)
+		result, err := s.searchLibraryOnceWithMode(ctx, libraryItemID, false)
 		if isDeadlock(err) {
 			time.Sleep(time.Duration(50+attempt*50) * time.Millisecond)
 			continue
@@ -646,6 +708,10 @@ func (s *Service) SearchLibrary(ctx context.Context, libraryItemID int64) (Searc
 }
 
 func (s *Service) searchLibraryOnce(ctx context.Context, libraryItemID int64) (SearchResult, error) {
+	return s.searchLibraryOnceWithMode(ctx, libraryItemID, false)
+}
+
+func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID int64, upgradeSearch bool) (SearchResult, error) {
 	if s == nil || s.hydra == nil {
 		return SearchResult{}, fmt.Errorf("nzbhydra2 client unavailable")
 	}
@@ -673,6 +739,13 @@ func (s *Service) searchLibraryOnce(ctx context.Context, libraryItemID int64) (S
 	}
 	s.logger.Debug().Int64("libraryItemId", libraryItemID).Str("title", input.Title).Str("mediaType", input.MediaType).Msg("workqueue: searching item")
 	profilePrefs := s.profilePreferencesForItem(ctx, libraryItemID, input.MediaType)
+	var currentSelected *database.ReleaseSummary
+	if upgradeSearch && profilePrefs.MinimumUpgradeCustomFormatScore > 0 {
+		currentSelected, err = s.repo.GetLatestSelectedReleaseSummaryByLibraryItem(ctx, libraryItemID)
+		if err != nil {
+			return SearchResult{}, err
+		}
+	}
 
 	// For TV episodes, try the full season pack first if the rate limit allows.
 	// A season pack covers all episodes in the season and avoids many separate downloads.
@@ -717,7 +790,10 @@ func (s *Service) searchLibraryOnce(ctx context.Context, libraryItemID int64) (S
 				continue
 			}
 			lastSearchErr = nil
-			candidates = buildSearchCandidates(results, req, history, profilePrefs, s.indexerLimits)
+			candidates = buildSearchCandidates(results, req, history, profilePrefs, s.indexerLimits, s.loadIndexerPolicyMap(ctx))
+			if upgradeSearch {
+				candidates = applyUpgradeCustomFormatMinimum(candidates, currentSelected, profilePrefs.MinimumUpgradeCustomFormatScore)
+			}
 			combinedCandidates = mergeSearchCandidates(combinedCandidates, candidates)
 			selectedReleaseID, err = s.repo.ReplaceSearchCandidates(ctx, libraryItemID, combinedCandidates)
 			if err != nil {
@@ -733,7 +809,7 @@ func (s *Service) searchLibraryOnce(ctx context.Context, libraryItemID int64) (S
 	// Tier 1: ID-based queries (tmdbid / imdbid / tvdbid).
 	// If these return a usable candidate we skip title queries entirely —
 	// same logic as Radarr/Sonarr's IndexerPageableRequestChain.AddTier().
-	tier1Done := searchTier(plan.Tier1, true)  // ID-based: trust indexer
+	tier1Done := searchTier(plan.Tier1, true) // ID-based: trust indexer
 	if err != nil {
 		return SearchResult{}, err
 	}
@@ -821,7 +897,7 @@ func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearc
 		if err != nil || len(results) == 0 {
 			continue
 		}
-		candidates := buildSearchCandidates(results, searchRequirements(packInput), history, profilePrefs, s.indexerLimits)
+		candidates := buildSearchCandidates(results, searchRequirements(packInput), history, profilePrefs, s.indexerLimits, s.loadIndexerPolicyMap(ctx))
 		combinedCandidates = mergeSearchCandidates(combinedCandidates, candidates)
 		selectedReleaseID, err = s.repo.ReplaceSearchCandidates(ctx, libraryItemID, combinedCandidates)
 		if err != nil {
@@ -1132,7 +1208,7 @@ func sizesClose(a, b int64) bool {
 	return diff*20 <= max
 }
 
-func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requirements, history map[string]database.CandidateHistory, prefs ranking.Preferences, limits IndexerLimits) []database.SearchCandidateRecord {
+func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requirements, history map[string]database.CandidateHistory, prefs ranking.Preferences, limits IndexerLimits, indexerPolicies map[string]int) []database.SearchCandidateRecord {
 	results = dedupeSearchResults(results)
 	now := time.Now()
 	candidates := make([]database.SearchCandidateRecord, 0, len(results))
@@ -1174,6 +1250,7 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 					SizeBytes:         result.SizeBytes,
 					PostedAt:          result.PublishedAt,
 					Score:             0,
+					Explanations:      []string{"Rejected before ranking: this exact release URL previously failed and is durably blocked."},
 					Rejected:          true,
 					RejectReason:      "previously_failed",
 					FailureCount:      known.FailureCount,
@@ -1182,20 +1259,23 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 				continue
 			}
 		}
-		parsed := parseCandidate(result, known)
+		parsed := parseCandidate(result, known, indexerPolicies)
 		score := ranking.ScoreWithPreferences(parsed, required, prefs)
 		candidates = append(candidates, database.SearchCandidateRecord{
-			Title:             result.Title,
-			ExternalURL:       result.Link,
-			IndexerName:       result.Indexer,
-			SizeBytes:         result.SizeBytes,
-			PostedAt:          result.PublishedAt,
-			Score:             score.Score,
-			Rejected:          score.Rejected,
-			RejectReason:      score.RejectReason,
-			FailureCount:      known.FailureCount,
-			LastFailureReason: known.LastFailureReason,
-			Resolution:        parsed.Resolution,
+			Title:                 result.Title,
+			ExternalURL:           result.Link,
+			IndexerName:           result.Indexer,
+			SizeBytes:             result.SizeBytes,
+			PostedAt:              result.PublishedAt,
+			Score:                 score.Score,
+			CustomFormatScore:     score.CustomFormatScore,
+			Explanations:          score.Explanations,
+			CompatibilityWarnings: score.CompatibilityWarnings,
+			Rejected:              score.Rejected,
+			RejectReason:          score.RejectReason,
+			FailureCount:          known.FailureCount,
+			LastFailureReason:     known.LastFailureReason,
+			Resolution:            parsed.Resolution,
 		})
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
@@ -1204,6 +1284,23 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 		}
 		return candidates[i].Score > candidates[j].Score
 	})
+	return candidates
+}
+
+func applyUpgradeCustomFormatMinimum(candidates []database.SearchCandidateRecord, current *database.ReleaseSummary, minimumIncrement int) []database.SearchCandidateRecord {
+	if current == nil || minimumIncrement <= 0 {
+		return candidates
+	}
+	requiredScore := current.CustomFormatScore + minimumIncrement
+	for i := range candidates {
+		if candidates[i].Rejected {
+			continue
+		}
+		if candidates[i].CustomFormatScore < requiredScore {
+			candidates[i].Rejected = true
+			candidates[i].RejectReason = "upgrade_custom_format_score"
+		}
+	}
 	return candidates
 }
 
@@ -1219,6 +1316,7 @@ func searchRequirements(input database.LibrarySearchInput) ranking.Requirements 
 		EpisodeNumber:   input.EpisodeNumber,
 		Title:           input.Title,
 		AlternateTitles: input.AlternateTitles,
+		RuntimeMinutes:  input.RuntimeMinutes,
 	}
 	if input.ShowTitle != "" {
 		required.Title = input.ShowTitle
@@ -1550,12 +1648,12 @@ func (s *Service) SkipRelease(ctx context.Context, releaseCandidateID int64) (Re
 // buildSearchRequests creates a tiered list of Hydra search requests matching
 // Radarr/Sonarr's NewznabRequestGenerator strategy:
 //
-//   Tier 1 (ID-based):  tmdbid, imdbid, tvdbid — sent first to NZBHydra2.
-//                       If any tier-1 query returns candidates the search
-//                       stops (title queries are NOT sent).  This is identical
-//                       to Radarr calling chain.Add() then chain.AddTier().
-//   Tier 2 (title):     title+year variants — only used when ID queries return
-//                       nothing or when no IDs are available.
+//	Tier 1 (ID-based):  tmdbid, imdbid, tvdbid — sent first to NZBHydra2.
+//	                    If any tier-1 query returns candidates the search
+//	                    stops (title queries are NOT sent).  This is identical
+//	                    to Radarr calling chain.Add() then chain.AddTier().
+//	Tier 2 (title):     title+year variants — only used when ID queries return
+//	                    nothing or when no IDs are available.
 //
 // The caller's search loop breaks as soon as a selectedRelease is chosen, so
 // the tiers naturally prevent unnecessary Hydra calls.
@@ -1781,6 +1879,99 @@ func (s *Service) RetryQueueItem(ctx context.Context, queueItemID int64) (QueueR
 	}, nil
 }
 
+func (s *Service) ManageQueueItem(ctx context.Context, queueItemID int64, action string) (QueueManageResult, error) {
+	target, err := s.repo.GetQueueRetryTarget(ctx, queueItemID)
+	if err != nil {
+		return QueueManageResult{}, err
+	}
+	settings := policy.DefaultSettings()
+	if s.queuePolicy != nil {
+		if loaded, loadErr := s.queuePolicy.Settings(ctx); loadErr == nil {
+			settings = loaded
+		}
+	}
+	switch strings.TrimSpace(action) {
+	case string(policy.QueueActionRemove):
+		if err := s.repo.ClearQueueSelectedRelease(ctx, queueItemID); err != nil {
+			return QueueManageResult{}, err
+		}
+		return QueueManageResult{QueueItemID: queueItemID, Action: string(policy.QueueActionRemove)}, nil
+	case string(policy.QueueActionRemoveAndBlocklist):
+		if err := s.repo.BlocklistQueueSelectedRelease(ctx, queueItemID, "manual_reject", settings.BlocklistTTLDays); err != nil {
+			return QueueManageResult{}, err
+		}
+		if err := s.repo.ClearQueueSelectedRelease(ctx, queueItemID); err != nil {
+			return QueueManageResult{}, err
+		}
+		return QueueManageResult{QueueItemID: queueItemID, Action: string(policy.QueueActionRemoveAndBlocklist)}, nil
+	case string(policy.QueueActionRemoveBlocklistAndSearch):
+		if err := s.repo.BlocklistQueueSelectedRelease(ctx, queueItemID, "manual_reject", settings.BlocklistTTLDays); err != nil {
+			return QueueManageResult{}, err
+		}
+		if err := s.repo.ClearQueueSelectedRelease(ctx, queueItemID); err != nil {
+			return QueueManageResult{}, err
+		}
+		search, err := s.SearchLibrary(ctx, target.LibraryItemID)
+		if err != nil {
+			return QueueManageResult{}, err
+		}
+		return QueueManageResult{
+			QueueItemID:        queueItemID,
+			Action:             string(policy.QueueActionRemoveBlocklistAndSearch),
+			SelectedReleaseID:  search.SelectedReleaseID,
+			SearchCandidateCnt: search.CandidateCount,
+		}, nil
+	default:
+		return QueueManageResult{}, fmt.Errorf("unsupported queue action: %q", action)
+	}
+}
+
+func (s *Service) ManageFailedQueue(ctx context.Context, action string) (BulkQueueRetryResult, error) {
+	targets, err := s.repo.ListFailedQueueRetryTargets(ctx)
+	if err != nil {
+		return BulkQueueRetryResult{}, err
+	}
+	result := BulkQueueRetryResult{Processed: len(targets)}
+	for _, target := range targets {
+		result.ProcessedQueues = append(result.ProcessedQueues, target.QueueItemID)
+		item, err := s.ManageQueueItem(ctx, target.QueueItemID, action)
+		if err != nil {
+			result.Failed++
+			result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+			continue
+		}
+		if item.Action == string(policy.QueueActionRemoveBlocklistAndSearch) {
+			if item.SelectedReleaseID != nil || item.SearchCandidateCnt > 0 {
+				result.Retried++
+			}
+			continue
+		}
+		result.Retried++
+	}
+	return result, nil
+}
+
+func (s *Service) ManageQueueItems(ctx context.Context, queueItemIDs []int64, action string) (BulkQueueRetryResult, error) {
+	result := BulkQueueRetryResult{Processed: len(queueItemIDs)}
+	for _, queueItemID := range queueItemIDs {
+		result.ProcessedQueues = append(result.ProcessedQueues, queueItemID)
+		item, err := s.ManageQueueItem(ctx, queueItemID, action)
+		if err != nil {
+			result.Failed++
+			result.FailedQueues = append(result.FailedQueues, queueItemID)
+			continue
+		}
+		if item.Action == string(policy.QueueActionRemoveBlocklistAndSearch) {
+			if item.SelectedReleaseID != nil || item.SearchCandidateCnt > 0 {
+				result.Retried++
+			}
+			continue
+		}
+		result.Retried++
+	}
+	return result, nil
+}
+
 func (s *Service) AutoManageFailedQueue(ctx context.Context) (BulkQueueRetryResult, error) {
 	targets, err := s.repo.ListFailedQueueRetryTargets(ctx)
 	if err != nil {
@@ -1844,9 +2035,9 @@ func (s *Service) AutoManageFailedQueue(ctx context.Context) (BulkQueueRetryResu
 }
 
 type UpgradeSearchResult struct {
-	Checked  int
-	Upgraded int
-	Failed   int
+	Checked  int `json:"checked"`
+	Upgraded int `json:"upgraded"`
+	Failed   int `json:"failed"`
 }
 
 // SearchUpgrades re-searches library items whose quality profile has
@@ -1859,7 +2050,7 @@ func (s *Service) SearchUpgrades(ctx context.Context) (UpgradeSearchResult, erro
 	}
 	result := UpgradeSearchResult{Checked: len(items)}
 	for _, libraryItemID := range items {
-		res, err := s.SearchLibrary(ctx, libraryItemID)
+		res, err := s.searchLibraryOnceWithMode(ctx, libraryItemID, true)
 		if err != nil {
 			s.logger.Warn().Int64("libraryItemId", libraryItemID).Err(err).Msg("upgrade search failed")
 			result.Failed++
@@ -1872,22 +2063,27 @@ func (s *Service) SearchUpgrades(ctx context.Context) (UpgradeSearchResult, erro
 	return result, nil
 }
 
-func parseCandidate(item hydra.SearchResult, history database.CandidateHistory) ranking.Candidate {
+func parseCandidate(item hydra.SearchResult, history database.CandidateHistory, indexerPolicies map[string]int) ranking.Candidate {
 	titleLower := strings.ToLower(item.Title)
+	policyScore := 0
+	if indexerPolicies != nil {
+		policyScore = indexerPolicies[item.Indexer]
+	}
 	return ranking.Candidate{
-		Title:        item.Title,
-		SizeBytes:    item.SizeBytes,
-		Resolution:   detectOne(titleLower, "2160p", "1080p", "720p"),
-		Source:       detectOne(titleLower, "web-dl", "webrip", "bluray", "remux", "hdtv", "cam", "camrip", "hdcam", "telesync", "telecine", "ts", "tc"),
-		Codec:        detectOne(titleLower, "x265", "h265", "x264", "h264", "av1"),
-		Language:     detectLanguage(titleLower),
-		Indexer:      item.Indexer,
-		ReleaseGroup: detectReleaseGroup(item.Title),
-		UploadedAt:   item.PublishedAt,
-		FailureCount: history.FailureCount,
-		Degraded:     history.FailureCount > 0,
-		Grabs:        item.Grabs,
-		IndexerScore: item.IndexerScore,
+		Title:              item.Title,
+		SizeBytes:          item.SizeBytes,
+		Resolution:         detectOne(titleLower, "2160p", "1080p", "720p"),
+		Source:             detectOne(titleLower, "web-dl", "webrip", "bluray", "remux", "hdtv", "cam", "camrip", "hdcam", "telesync", "telecine", "ts", "tc"),
+		Codec:              detectOne(titleLower, "x265", "h265", "x264", "h264", "av1"),
+		Language:           detectLanguage(titleLower),
+		Indexer:            item.Indexer,
+		ReleaseGroup:       detectReleaseGroup(item.Title),
+		UploadedAt:         item.PublishedAt,
+		FailureCount:       history.FailureCount,
+		Degraded:           history.FailureCount > 0,
+		Grabs:              item.Grabs,
+		IndexerScore:       item.IndexerScore,
+		IndexerPolicyScore: policyScore,
 	}
 }
 
@@ -1905,23 +2101,24 @@ func (s *Service) profilePreferencesForItem(ctx context.Context, libraryItemID i
 	if libraryItemID > 0 {
 		if p, err := s.repo.GetLibraryItemQualityProfile(ctx, libraryItemID); err == nil && p != nil {
 			return ranking.Preferences{
-				Resolutions:      append([]string(nil), p.Resolutions...),
-				Sources:          append([]string(nil), p.Sources...),
-				Codecs:           append([]string(nil), p.Codecs...),
-				Languages:        append([]string(nil), p.Languages...),
-				AudioFormats:     append([]string(nil), p.AudioFormats...),
-				HdrFormats:       append([]string(nil), p.HdrFormats...),
-				ExcludePatterns:  append([]string(nil), p.ExcludePatterns...),
-				PreferProper:     p.PreferProper,
-				PreferRepack:     p.PreferRepack,
-				RejectCam:        p.RejectCam,
-				MinSizeMB:        p.MinSizeMB,
-				MaxSizeMB:        p.MaxSizeMB,
-				TierSizeLimits:   s.loadTierSizeLimits(ctx, mediaType),
-				MinimumAgeHours:  p.MinimumAgeHours,
-				CutoffResolution: p.CutoffResolution,
-				CustomFormats:    s.loadCustomFormats(ctx),
-				BlockRules:       s.loadBlockRules(ctx),
+				Resolutions:                     append([]string(nil), p.Resolutions...),
+				Sources:                         append([]string(nil), p.Sources...),
+				Codecs:                          append([]string(nil), p.Codecs...),
+				Languages:                       append([]string(nil), p.Languages...),
+				AudioFormats:                    append([]string(nil), p.AudioFormats...),
+				HdrFormats:                      append([]string(nil), p.HdrFormats...),
+				ExcludePatterns:                 append([]string(nil), p.ExcludePatterns...),
+				PreferProper:                    p.PreferProper,
+				PreferRepack:                    p.PreferRepack,
+				RejectCam:                       p.RejectCam,
+				MinimumUpgradeCustomFormatScore: p.MinimumUpgradeCustomFormatScore,
+				MinMBPerMinute:                  p.MinMBPerMinute,
+				MaxMBPerMinute:                  p.MaxMBPerMinute,
+				TierMBPerMinuteLimits:           s.loadTierSizeLimits(ctx, mediaType),
+				MinimumAgeHours:                 p.MinimumAgeHours,
+				CutoffResolution:                p.CutoffResolution,
+				CustomFormats:                   s.loadCustomFormats(ctx),
+				BlockRules:                      s.loadBlockRules(ctx),
 			}
 		}
 	}
@@ -1967,23 +2164,24 @@ func (s *Service) defaultProfilePreferences(ctx context.Context, mediaType strin
 	}
 
 	prefs := ranking.Preferences{
-		Resolutions:      append([]string(nil), profile.Resolutions...),
-		Sources:          append([]string(nil), profile.Sources...),
-		Codecs:           append([]string(nil), profile.Codecs...),
-		Languages:        append([]string(nil), profile.Languages...),
-		AudioFormats:     append([]string(nil), profile.AudioFormats...),
-		HdrFormats:       append([]string(nil), profile.HdrFormats...),
-		ExcludePatterns:  append([]string(nil), profile.ExcludePatterns...),
-		PreferProper:     profile.PreferProper,
-		PreferRepack:     profile.PreferRepack,
-		RejectCam:        profile.RejectCam,
-		MinSizeMB:        profile.MinSizeMB,
-		MaxSizeMB:        profile.MaxSizeMB,
-		TierSizeLimits:   s.loadTierSizeLimits(ctx, mediaType),
-		MinimumAgeHours:  profile.MinimumAgeHours,
-		CutoffResolution: profile.CutoffResolution,
-		CustomFormats:    s.loadCustomFormats(ctx),
-		BlockRules:       s.loadBlockRules(ctx),
+		Resolutions:                     append([]string(nil), profile.Resolutions...),
+		Sources:                         append([]string(nil), profile.Sources...),
+		Codecs:                          append([]string(nil), profile.Codecs...),
+		Languages:                       append([]string(nil), profile.Languages...),
+		AudioFormats:                    append([]string(nil), profile.AudioFormats...),
+		HdrFormats:                      append([]string(nil), profile.HdrFormats...),
+		ExcludePatterns:                 append([]string(nil), profile.ExcludePatterns...),
+		PreferProper:                    profile.PreferProper,
+		PreferRepack:                    profile.PreferRepack,
+		RejectCam:                       profile.RejectCam,
+		MinimumUpgradeCustomFormatScore: profile.MinimumUpgradeCustomFormatScore,
+		MinMBPerMinute:                  profile.MinMBPerMinute,
+		MaxMBPerMinute:                  profile.MaxMBPerMinute,
+		TierMBPerMinuteLimits:           s.loadTierSizeLimits(ctx, mediaType),
+		MinimumAgeHours:                 profile.MinimumAgeHours,
+		CutoffResolution:                profile.CutoffResolution,
+		CustomFormats:                   s.loadCustomFormats(ctx),
+		BlockRules:                      s.loadBlockRules(ctx),
 	}
 
 	s.profileCacheMu.Lock()
@@ -2000,11 +2198,11 @@ func (s *Service) loadTierSizeLimits(ctx context.Context, mediaType string) map[
 	if err != nil || len(defs) == 0 {
 		return nil
 	}
-	// Map Radarr-style quality keys to resolution strings used in ranking.
+	// Map DB quality keys (no dashes) to resolution strings used in ranking.
 	keyToResolution := map[string]string{
-		"bluray-2160p": "2160p", "webdl-2160p": "2160p", "webrip-2160p": "2160p",
-		"bluray-1080p": "1080p", "webdl-1080p": "1080p", "webrip-1080p": "1080p", "hdtv-1080p": "1080p",
-		"bluray-720p": "720p", "webdl-720p": "720p", "webrip-720p": "720p", "hdtv-720p": "720p",
+		"bluray2160p": "2160p", "webdl2160p": "2160p", "webrip2160p": "2160p",
+		"bluray1080p": "1080p", "webdl1080p": "1080p", "webrip1080p": "1080p", "hdtv1080p": "1080p",
+		"bluray720p": "720p", "webdl720p": "720p", "webrip720p": "720p", "hdtv720p": "720p",
 		"dvd": "576p", "sdtv": "480p",
 	}
 	out := make(map[string][2]int)
@@ -2012,7 +2210,7 @@ func (s *Service) loadTierSizeLimits(ctx context.Context, mediaType string) map[
 		if d.MediaType != mediaType {
 			continue
 		}
-		if d.MinSizeMB == 0 && d.MaxSizeMB == 0 {
+		if d.MinMBPerMinute == 0 && d.MaxMBPerMinute == 0 {
 			continue
 		}
 		res, ok := keyToResolution[d.QualityKey]
@@ -2020,11 +2218,11 @@ func (s *Service) loadTierSizeLimits(ctx context.Context, mediaType string) map[
 			continue
 		}
 		existing := out[res]
-		if d.MinSizeMB > 0 && (existing[0] == 0 || d.MinSizeMB < existing[0]) {
-			existing[0] = d.MinSizeMB
+		if d.MinMBPerMinute > 0 && (existing[0] == 0 || d.MinMBPerMinute < existing[0]) {
+			existing[0] = d.MinMBPerMinute
 		}
-		if d.MaxSizeMB > 0 && d.MaxSizeMB > existing[1] {
-			existing[1] = d.MaxSizeMB
+		if d.MaxMBPerMinute > 0 && d.MaxMBPerMinute > existing[1] {
+			existing[1] = d.MaxMBPerMinute
 		}
 		out[res] = existing
 	}
@@ -2051,6 +2249,7 @@ func (s *Service) loadCustomFormats(ctx context.Context) []ranking.CustomFormat 
 			Pattern: f.Pattern,
 			Score:   f.Score,
 			Enabled: f.Enabled,
+			Source:  f.Source,
 		}
 	}
 	return out
@@ -2081,6 +2280,19 @@ func (s *Service) loadBlockRules(ctx context.Context) []ranking.BlockRule {
 		}
 	}
 	return out
+}
+
+// loadIndexerPolicyMap fetches the enabled indexer policy score modifiers.
+// Returns nil map on error (silently degrades — no per-indexer adjustment applied).
+func (s *Service) loadIndexerPolicyMap(ctx context.Context) map[string]int {
+	if s == nil || s.repo == nil {
+		return nil
+	}
+	m, err := s.repo.LoadIndexerPolicyMap(ctx)
+	if err != nil {
+		return nil
+	}
+	return m
 }
 
 // ImportNZBFromPush imports an NZB file received via the SABnzbd-compatible API
@@ -2233,10 +2445,10 @@ func (f HTTPNZBFetcher) Fetch(ctx context.Context, rawURL string) (string, []byt
 
 // BackfillMetadataResult summarises a metadata re-enrichment pass.
 type BackfillMetadataResult struct {
-	ProcessedMovies   int `json:"processedMovies"`
-	ProcessedShows    int `json:"processedShows"`
-	Enriched          int `json:"enriched"`
-	Failed            int `json:"failed"`
+	ProcessedMovies int `json:"processedMovies"`
+	ProcessedShows  int `json:"processedShows"`
+	Enriched        int `json:"enriched"`
+	Failed          int `json:"failed"`
 }
 
 // BackfillMetadata re-fetches TMDB metadata for all movies and TV shows that
@@ -2396,16 +2608,16 @@ func (s *Service) ManualSearch(ctx context.Context, query string) ([]ManualSearc
 			BlockRules:    s.loadBlockRules(ctx),
 		})
 		out = append(out, ManualSearchItem{
-			Title:      r.Title,
+			Title:       r.Title,
 			ExternalURL: r.Link,
-			Indexer:    r.Indexer,
-			SizeBytes:  r.SizeBytes,
-			Score:      result.Score,
-			Resolution: resolution,
-			Source:     source,
-			Codec:      codec,
-			Audio:      audio,
-			HDR:        hdr,
+			Indexer:     r.Indexer,
+			SizeBytes:   r.SizeBytes,
+			Score:       result.Score,
+			Resolution:  resolution,
+			Source:      source,
+			Codec:       codec,
+			Audio:       audio,
+			HDR:         hdr,
 		})
 	}
 	return out, nil

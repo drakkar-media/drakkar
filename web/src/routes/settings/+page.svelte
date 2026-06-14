@@ -25,20 +25,23 @@
   import ChevronUp from '@lucide/svelte/icons/chevron-up';
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
   import Trash2 from '@lucide/svelte/icons/trash-2';
+  import Pencil from '@lucide/svelte/icons/pencil';
   import ExternalLink from '@lucide/svelte/icons/external-link';
   import Copy from '@lucide/svelte/icons/copy';
   import Check from '@lucide/svelte/icons/check';
   import Webhook from '@lucide/svelte/icons/webhook';
+  import Languages from '@lucide/svelte/icons/languages';
   import Button from '$lib/components/Button.svelte';
   import PageHeader from '$lib/components/PageHeader.svelte';
+  import Pagination from '$lib/components/Pagination.svelte';
   import Panel from '$lib/components/Panel.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
   import { api, subscribeEvents } from '$lib/api';
   import { bytes, dateTime } from '$lib/format';
   import { toastError, toastSuccess } from '$lib/toast';
-  import type { BlocklistItem, BlockTestResult, CustomFormat, FullSettings, IntegrationProbeReport, MaintenanceResult, PolicySettings, QualityDefinition, QualityProfile, ReleaseBlockRule, Status, TaskSchedule, UsenetProvider } from '$lib/types';
+  import type { BlocklistItem, BlocklistMutation, BlockTestResult, CustomFormat, FullSettings, IndexerPolicy, IntegrationProbeReport, MaintenanceResult, PolicySettings, QualityDefinition, QualityProfile, ReleaseBlockRule, Status, SubtitleProfile, TaskSchedule, UsenetProvider } from '$lib/types';
 
-  type SettingsTab = 'integrations' | 'providers' | 'indexers' | 'queue' | 'library' | 'rules' | 'quality' | 'formats' | 'filtering' | 'notifications' | 'logs' | 'tasks' | 'media-players' | 'system';
+  type SettingsTab = 'integrations' | 'providers' | 'indexers' | 'queue' | 'library' | 'rules' | 'quality' | 'formats' | 'filtering' | 'subtitle-profiles' | 'notifications' | 'logs' | 'tasks' | 'media-players' | 'system';
 
   const tabs: { id: SettingsTab; label: string; short: string; icon: typeof PlugZap }[] = [
     { id: 'integrations',  label: 'Integrations',  short: 'Apps',     icon: PlugZap },
@@ -49,7 +52,8 @@
     { id: 'rules',         label: 'Rules',         short: 'Rules',    icon: ShieldAlert },
     { id: 'quality',       label: 'Quality',       short: 'Quality',  icon: SlidersHorizontal },
     { id: 'formats',       label: 'Custom Formats',    short: 'Formats',   icon: Star },
-    { id: 'filtering',     label: 'Release Filtering', short: 'Filtering', icon: Ban },
+    { id: 'filtering',        label: 'Release Filtering', short: 'Filtering', icon: Ban },
+    { id: 'subtitle-profiles', label: 'Subtitle Profiles', short: 'Subtitles', icon: Languages },
     { id: 'notifications', label: 'Notifications',     short: 'Notify',    icon: Webhook },
     { id: 'logs',          label: 'Logs',          short: 'Logs',     icon: ScrollText },
     { id: 'tasks',         label: 'Tasks',         short: 'Tasks',    icon: ClipboardList },
@@ -65,6 +69,12 @@
   let loading = true;
   let working = false;
   let blocklist: BlocklistItem[] = [];
+  let blPage = 1;
+  let blPageSize = 50;
+  let blTotal = 0;
+  let blTotalPages = 1;
+  let blLoading = false;
+  let blStats: { total: number; active: number; expired: number; byReason: Record<string, number> } | null = null;
   let lastProbe: IntegrationProbeReport | null = null;
   let profiles: QualityProfile[] = [];
   let qualityDefs: QualityDefinition[] = [];
@@ -78,8 +88,36 @@
 
   let blockQuery = '';
   let blockReasonFilter = 'all';
-  let blockSortCol: 'reason' | 'key' | 'expires' = 'reason';
-  let blockSortDir: 'asc' | 'desc' = 'asc';
+  let blockSortCol: 'reason' | 'key' | 'expires' | 'createdAt' = 'createdAt';
+  let blockSortDir: 'asc' | 'desc' = 'desc';
+  type BlocklistEditor = {
+    id?: number;
+    keyType: 'raw' | 'external_url' | 'release_signature';
+    key: string;
+    externalUrl: string;
+    releaseTitle: string;
+    indexerName: string;
+    sizeMb: number;
+    postedDate: string;
+    reason: string;
+    expiresAt: string;
+  };
+
+  function blankBlocklistEditor(): BlocklistEditor {
+    return {
+      keyType: 'external_url',
+      key: '',
+      externalUrl: '',
+      releaseTitle: '',
+      indexerName: '',
+      sizeMb: 0,
+      postedDate: '',
+      reason: 'manual',
+      expiresAt: '',
+    };
+  }
+
+  let blockEditor: BlocklistEditor = blankBlocklistEditor();
 
   // ── Seerr webhook ───────────────────────────────────────────────────────────
   let webhookCopied = false;
@@ -141,6 +179,7 @@
     { id: 'fill_missing_episodes', label: 'Fill Missing Episodes', description: 'Use TMDB episode lists to create library items for episodes not yet tracked, then queue them for search.', group: 'Indexing', interval: 'Manual', manual: true, run: async () => { const r = await api.fillMissingEpisodes(); return `processed ${r.showsProcessed} shows, found ${r.episodesFound} episodes, created ${r.itemsCreated} new items`; } },
     { id: 'backfill_metadata', label: 'Backfill Metadata', description: 'Re-enrich movies and TV shows with new TMDB fields.', group: 'Indexing', interval: 'Manual', manual: true, run: async () => { const r = await api.backfillMetadata(); return `enriched ${r.enriched} items`; } },
     { id: 'health_check', label: 'Run Health Check', description: 'Verify published symlinks still point to valid VFS targets.', group: 'Maintenance', interval: '60m', manual: true, run: async () => { const r = await api.runHealthCheck(); return `checked ${r.checked}, healthy ${r.healthy}`; } },
+    { id: 'nzb_health_check', label: 'Deep NZB Article Check', description: 'Probe NNTP for first/last segments of every available item and reset any whose articles have expired. Runs automatically weekly. Cannot be triggered manually.', group: 'Maintenance', interval: '168h', manual: false, run: async () => '' },
     { id: 'cache_prune', label: 'Prune Block Cache', description: 'Delete oldest decoded articles from disk cache.', group: 'Maintenance', interval: '6h', manual: true, run: async () => { const r = await api.pruneCache(); return `deleted ${r.deletedFiles} files`; } },
     { id: 'orphaned-content', label: 'Remove Orphaned Content', description: 'Delete content rows with no matching publication.', group: 'Maintenance', interval: '6h', manual: true, run: async () => { const r = await api.maintenance('orphaned-content'); return `deleted ${r.deletedFiles} files`; } },
     { id: 'broken-media-symlinks', label: 'Remove Broken Media Symlinks', description: 'Delete broken host-side media symlinks.', group: 'Maintenance', interval: '6h', manual: true, run: async () => { const r = await api.maintenance('broken-media-symlinks'); return `deleted ${r.deletedFiles} symlinks`; } },
@@ -185,15 +224,115 @@
   let selectedProfile: QualityProfile | null = null;
   let profileSaving = false;
 
+  // ── Indexer Policies tab state ──────────────────────────────────────────────
+  let indexerPolicies: IndexerPolicy[] = [];
+  let editingPolicy: IndexerPolicy | null = null;
+  let ipSaving = false;
+
+  async function loadIndexerPolicies() {
+    try {
+      const res = await api.listIndexerPolicies();
+      indexerPolicies = res.items ?? [];
+    } catch { /* ignore */ }
+  }
+
+  async function saveIndexerPolicy() {
+    if (!editingPolicy) return;
+    ipSaving = true;
+    try {
+      let saved: IndexerPolicy;
+      if (editingPolicy.id) {
+        saved = await api.updateIndexerPolicy(editingPolicy);
+        indexerPolicies = indexerPolicies.map(p => p.id === saved.id ? saved : p);
+      } else {
+        saved = await api.upsertIndexerPolicy(editingPolicy);
+        const existing = indexerPolicies.findIndex(p => p.indexerName === saved.indexerName);
+        if (existing >= 0) {
+          indexerPolicies = indexerPolicies.map(p => p.indexerName === saved.indexerName ? saved : p);
+        } else {
+          indexerPolicies = [...indexerPolicies, saved];
+        }
+      }
+      editingPolicy = null;
+      toastSuccess('Saved');
+    } catch (e) { toastError(e instanceof Error ? e.message : String(e)); }
+    finally { ipSaving = false; }
+  }
+
+  async function deleteIndexerPolicy(id: number) {
+    try {
+      await api.deleteIndexerPolicy(id);
+      indexerPolicies = indexerPolicies.filter(p => p.id !== id);
+      editingPolicy = null;
+      toastSuccess('Deleted');
+    } catch (e) { toastError(e instanceof Error ? e.message : String(e)); }
+  }
+
+  // ── Subtitle Profiles tab state ─────────────────────────────────────────────
+  let subtitleProfiles: SubtitleProfile[] = [];
+  let editingSubtitleProfile: SubtitleProfile | null = null;
+  let spSaving = false;
+
+  async function loadSubtitleProfiles() {
+    try {
+      const res = await api.listSubtitleProfiles();
+      subtitleProfiles = res.items ?? [];
+    } catch { /* ignore */ }
+  }
+
+  async function saveSubtitleProfile() {
+    if (!editingSubtitleProfile) return;
+    spSaving = true;
+    try {
+      let saved: SubtitleProfile;
+      if (editingSubtitleProfile.id) {
+        saved = await api.updateSubtitleProfile(editingSubtitleProfile);
+        subtitleProfiles = subtitleProfiles.map(p => p.id === saved.id ? saved : p);
+      } else {
+        saved = await api.createSubtitleProfile(editingSubtitleProfile);
+        subtitleProfiles = [...subtitleProfiles, saved];
+      }
+      editingSubtitleProfile = null;
+      toastSuccess('Saved');
+    } catch (e) { toastError(e instanceof Error ? e.message : String(e)); }
+    finally { spSaving = false; }
+  }
+
+  async function deleteSubtitleProfile(id: number) {
+    try {
+      await api.deleteSubtitleProfile(id);
+      subtitleProfiles = subtitleProfiles.filter(p => p.id !== id);
+      editingSubtitleProfile = null;
+      toastSuccess('Deleted');
+    } catch (e) { toastError(e instanceof Error ? e.message : String(e)); }
+  }
+
   // ── Custom Formats tab state ────────────────────────────────────────────────
   let customFormats: CustomFormat[] = [];
   let cfSaving = false;
+  let cfImportOpen = false;
+  let cfImportJson = '';
+  let cfImporting = false;
 
   function blankFormat(): CustomFormat {
-    return { name: '', pattern: '', score: 0, enabled: true };
+    return { name: '', pattern: '', score: 0, enabled: true, source: 'custom' };
   }
 
   let editingFormat: CustomFormat | null = null;
+
+  async function importCustomFormats() {
+    cfImporting = true;
+    try {
+      const parsed = JSON.parse(cfImportJson);
+      const formats: CustomFormat[] = Array.isArray(parsed) ? parsed : [parsed];
+      const result = await api.importCustomFormats(formats);
+      toastSuccess(`Imported ${result.imported} of ${result.total} custom formats`);
+      cfImportOpen = false;
+      cfImportJson = '';
+      await loadCustomFormats();
+    } catch (e) { toastError(e instanceof Error ? e.message : String(e)); }
+    finally { cfImporting = false; }
+  }
 
   async function loadCustomFormats() {
     try {
@@ -293,7 +432,7 @@
   }
 
   function blankProfile(): QualityProfile {
-    return { name: 'New Profile', isDefault: false, resolutions: ['1080p', '2160p', '720p'], sources: ['WEB-DL', 'BluRay', 'WEBRip'], codecs: ['x265', 'x264'], languages: ['nl', 'en'], audioFormats: ['TrueHD', 'DTS-HD', 'DTS', 'DD+', 'AC3', 'AAC'], hdrFormats: ['HDR10', 'SDR'], excludePatterns: [], preferProper: true, preferRepack: true, rejectCam: true, allowUpgrade: false, cutoffResolution: '', minimumAgeHours: 0, minSizeMb: 0, maxSizeMb: 0 };
+    return { name: 'New Profile', isDefault: false, resolutions: ['1080p', '2160p', '720p'], sources: ['WEB-DL', 'BluRay', 'WEBRip'], codecs: ['x265', 'x264'], languages: ['nl', 'en'], audioFormats: ['TrueHD', 'DTS-HD', 'DTS', 'DD+', 'AC3', 'AAC'], hdrFormats: ['HDR10', 'SDR'], excludePatterns: [], preferProper: true, preferRepack: true, rejectCam: true, allowUpgrade: false, minimumUpgradeCustomFormatScore: 0, cutoffResolution: '', minimumAgeHours: 0, minMbPerMinute: 0, maxMbPerMinute: 0 };
   }
 
   async function saveSelectedProfile() {
@@ -421,16 +560,14 @@
   async function loadAll() {
     loading = true;
     try {
-      const [s, bl, pr, qdRes, pol, fs] = await Promise.all([
+      const [s, pr, qdRes, pol, fs] = await Promise.all([
         api.status(),
-        api.blocklist(),
         api.listProfiles(),
         api.listQualityDefinitions(),
         api.policies(),
         api.getSettings()
       ]);
       status = s;
-      blocklist = bl.items ?? [];
       profiles = pr.profiles;
       qualityDefs = qdRes.definitions ?? [];
       policySettings = pol;
@@ -493,12 +630,31 @@
     draft.usenet.providers = draft.usenet.providers.filter((_, idx) => idx !== i);
   }
 
+  async function loadBlocklist() {
+    blLoading = true;
+    try {
+      const [page, stats] = await Promise.all([
+        api.blocklistPaged({ page: blPage, pageSize: blPageSize, q: blockQuery || undefined, reason: blockReasonFilter !== 'all' ? blockReasonFilter : undefined, sort: blockSortCol === 'expires' ? 'expiresAt' : blockSortCol === 'createdAt' ? 'createdAt' : blockSortCol, dir: blockSortDir }),
+        api.blocklistStats()
+      ]);
+      blocklist = page.items ?? [];
+      blTotal = page.total;
+      blTotalPages = page.totalPages;
+      blStats = stats;
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : String(e));
+    } finally {
+      blLoading = false;
+    }
+  }
+
   async function clearBlocklist(id: number) {
+    if (typeof window !== 'undefined' && !window.confirm('Clear this runtime blocklist entry?')) return;
     working = true;
     try {
       await api.clearBlocklist(id);
       toastSuccess('Blocklist item cleared');
-      blocklist = blocklist.filter((b) => b.id !== id);
+      await loadBlocklist();
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -507,11 +663,13 @@
   }
 
   async function clearAllBlocklist() {
+    if (typeof window !== 'undefined' && !window.confirm('Clear all active runtime blocklist entries?')) return;
     working = true;
     try {
       const r = await api.clearAllBlocklist();
       toastSuccess(`Cleared ${r.cleared} blocklist entr${r.cleared === 1 ? 'y' : 'ies'}`);
-      blocklist = [];
+      blPage = 1;
+      await loadBlocklist();
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -520,16 +678,100 @@
   }
 
   async function clearBlocklistByReason(reason: string) {
+    if (typeof window !== 'undefined' && !window.confirm(`Clear all active runtime blocklist entries with reason "${reason}"?`)) return;
     working = true;
     try {
       const r = await api.clearBlocklistByReason(reason);
       toastSuccess(`Cleared ${r.cleared} ${reason} entr${r.cleared === 1 ? 'y' : 'ies'}`);
-      blocklist = blocklist.filter((b) => b.reason !== reason);
+      blPage = 1;
+      await loadBlocklist();
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
       working = false;
     }
+  }
+
+  async function copyBlocklistKey(key: string) {
+    try {
+      await navigator.clipboard.writeText(key);
+      toastSuccess('Blocklist key copied');
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  function resetBlockEditor() {
+    blockEditor = blankBlocklistEditor();
+  }
+
+  function toDatetimeLocal(value?: string) {
+    if (!value) return '';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  }
+
+  function startEditBlocklist(item: BlocklistItem) {
+    blockEditor = {
+      id: item.id,
+      keyType: 'raw',
+      key: item.key,
+      externalUrl: item.keyType === 'external_url' ? item.key.replace(/^external_url:/, '') : '',
+      releaseTitle: item.releaseTitle || '',
+      indexerName: item.indexerName || '',
+      sizeMb: item.sizeBytes ? Math.round(item.sizeBytes / (1024 * 1024)) : 0,
+      postedDate: item.postedAt ? item.postedAt.slice(0, 10) : '',
+      reason: item.reason || 'manual',
+      expiresAt: toDatetimeLocal(item.expiresAt)
+    };
+  }
+
+  async function saveBlocklistEntry() {
+    const payload: BlocklistMutation = {
+      keyType: blockEditor.keyType,
+      key: blockEditor.key.trim(),
+      externalUrl: blockEditor.externalUrl.trim(),
+      releaseTitle: blockEditor.releaseTitle.trim(),
+      indexerName: blockEditor.indexerName.trim(),
+      sizeMb: blockEditor.sizeMb,
+      postedDate: blockEditor.postedDate.trim(),
+      reason: blockEditor.reason.trim() || 'manual',
+      expiresAt: blockEditor.expiresAt ? new Date(blockEditor.expiresAt).toISOString() : undefined
+    };
+    working = true;
+    try {
+      if (blockEditor.id) {
+        await api.updateBlocklist(blockEditor.id, payload);
+        toastSuccess('Runtime blocklist entry updated');
+      } else {
+        await api.createManualBlocklist(payload);
+        toastSuccess('Runtime blocklist entry created');
+      }
+      resetBlockEditor();
+      blPage = 1;
+      await loadBlocklist();
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : String(e));
+    } finally {
+      working = false;
+    }
+  }
+
+  function blocklistKeyLabel(item: BlocklistItem) {
+    switch (item.keyType) {
+      case 'external_url': return 'URL';
+      case 'release_signature': return 'Signature';
+      default: return 'Key';
+    }
+  }
+
+  function blocklistContext(item: BlocklistItem) {
+    const parts: string[] = [];
+    if (item.releaseTitle) parts.push(item.releaseTitle);
+    if (item.indexerName) parts.push(item.indexerName);
+    if (item.sizeBytes) parts.push(bytes(item.sizeBytes));
+    return parts.join(' • ');
   }
 
   async function runMaintenance(task: 'orphaned-content' | 'broken-media-symlinks' | 'orphaned-completed-symlinks') {
@@ -588,6 +830,8 @@
     void loadTaskSchedules();
     void loadCustomFormats();
     void loadBlockRules();
+    void loadIndexerPolicies();
+    void loadSubtitleProfiles();
     const unsub = subscribeEvents(() => { if (!working) void loadAll(); });
     const timer = window.setInterval(() => void loadAll(), 30000);
     const taskTimer = window.setInterval(() => void loadTaskSchedules(), 30000);
@@ -602,27 +846,8 @@
   $: integrationEntries = status ? Object.entries(status.integrations).filter(([n]) => n !== 'subtitleProviders') : [];
   $: subtitleProviderEntries = status ? Object.entries(status.integrations.subtitleProviders) : [];
 
-  $: filteredBlocklist = (() => {
-    const filtered = (blocklist ?? []).filter((b) => {
-      const matchReason = blockReasonFilter === 'all' || b.reason === blockReasonFilter;
-      const matchQ = !blockQuery || `${b.key} ${b.reason}`.toLowerCase().includes(blockQuery.toLowerCase());
-      return matchReason && matchQ;
-    });
-    const dir = blockSortDir === 'asc' ? 1 : -1;
-    filtered.sort((a, b) => {
-      if (blockSortCol === 'reason') return dir * a.reason.localeCompare(b.reason);
-      if (blockSortCol === 'key') return dir * a.key.localeCompare(b.key);
-      const ea = a.expiresAt ?? '';
-      const eb = b.expiresAt ?? '';
-      return dir * ea.localeCompare(eb);
-    });
-    return filtered;
-  })();
-
-  $: blocklistStats = {
-    total: (blocklist ?? []).length,
-    byReason: (blocklist ?? []).reduce<Record<string, number>>((acc, b) => { acc[b.reason] = (acc[b.reason] ?? 0) + 1; return acc; }, {})
-  };
+  $: if (activeTab === 'rules' && !blLoading && blStats === null) { void loadBlocklist(); }
+  $: filteredBlocklist = blocklist;
 
   $: configuredCount = integrationEntries.filter(([, v]) => v.configured).length;
   $: enabledProviders = (draft?.usenet.providers ?? []).filter((p) => p.enabled).length;
@@ -1018,6 +1243,64 @@
         </div>
       {/if}
 
+      <Panel title="Per-Indexer Policies" subtitle="Assign a static score modifier to releases from a specific indexer. Positive boosts, negative penalises.">
+        <div class="cf-layout">
+          <div class="cf-list">
+            <div class="cf-list-header">
+              <span>Policies</span>
+              <Button kind="ghost" on:click={() => { editingPolicy = { indexerName: '', scoreModifier: 0, enabled: true, note: '' }; }}>
+                <Plus size={14} /> Add
+              </Button>
+            </div>
+            {#if indexerPolicies.length === 0}
+              <div class="cf-empty">No per-indexer policies yet.</div>
+            {/if}
+            {#each indexerPolicies as p (p.id)}
+              <button class="cf-item" class:cf-active={editingPolicy?.id === p.id} on:click={() => { editingPolicy = { ...p }; }}>
+                <span class="cf-item-name">{p.indexerName}</span>
+                <div style="display:flex;align-items:center;gap:4px;flex-shrink:0">
+                  <span class="cf-item-score" class:cf-pos={p.scoreModifier > 0} class:cf-neg={p.scoreModifier < 0}>{p.scoreModifier > 0 ? '+' : ''}{p.scoreModifier}</span>
+                  {#if !p.enabled}<span class="cf-disabled-badge">off</span>{/if}
+                </div>
+              </button>
+            {/each}
+          </div>
+          <div class="cf-editor">
+            {#if editingPolicy}
+              <div class="field">
+                <label class="field-label" for="ip-name">Indexer Name <span class="field-hint">(exact match — case-sensitive)</span></label>
+                <input id="ip-name" type="text" bind:value={editingPolicy.indexerName} placeholder="e.g. NZBFinder" disabled={!!editingPolicy.id} />
+              </div>
+              <div class="field">
+                <label class="field-label" for="ip-score">Score Modifier</label>
+                <input id="ip-score" type="number" bind:value={editingPolicy.scoreModifier} placeholder="e.g. 50 or -100" />
+              </div>
+              <div class="field">
+                <label class="field-label" for="ip-note">Note <span class="field-hint">(optional)</span></label>
+                <input id="ip-note" type="text" bind:value={editingPolicy.note} placeholder="Why this modifier exists" />
+              </div>
+              <label class="flag-row">
+                <input type="checkbox" bind:checked={editingPolicy.enabled} />
+                <div><strong>Enabled</strong><span>Apply this modifier when scoring releases</span></div>
+              </label>
+              <div class="editor-actions" style="margin-top:16px">
+                {#if editingPolicy.id}
+                  <Button kind="danger" on:click={() => editingPolicy?.id && deleteIndexerPolicy(editingPolicy.id)}>
+                    <Trash2 size={15} /> Delete
+                  </Button>
+                {/if}
+                <Button kind="ghost" on:click={() => { editingPolicy = null; }}>Cancel</Button>
+                <Button kind="primary" on:click={saveIndexerPolicy} disabled={ipSaving}>
+                  <Save size={15} /> {ipSaving ? 'Saving…' : 'Save'}
+                </Button>
+              </div>
+            {:else}
+              <div class="cf-empty">Select a policy to edit, or add a new one.</div>
+            {/if}
+          </div>
+        </div>
+      </Panel>
+
     <!-- QUEUE -->
     {:else if activeTab === 'queue'}
       {#if draft}
@@ -1175,38 +1458,123 @@
 
     <!-- RULES -->
     {:else if activeTab === 'rules'}
-      <Panel title="Blocklist" subtitle="Durable release blocks from manual, archive or metadata rejects.">
-        {#if blocklist.length > 0}
-          <!-- Reason summary row -->
-          <div class="bl-reasons">
-            {#each Object.entries(blocklistStats.byReason).sort(([,a],[,b]) => b - a) as [reason, count]}
-              <div class="bl-reason-chip reason-chip-{reason.split('_')[0]}" class:active={blockReasonFilter === reason}>
-                <button class="bl-reason-chip-btn" on:click={() => { blockReasonFilter = blockReasonFilter === reason ? 'all' : reason; }}>
-                  <span class="reason-badge reason-{reason.split('_')[0]}">{reason}</span>
-                  <span class="bl-reason-count">{count}</span>
-                </button>
-                <button class="clear-btn bl-reason-clear" on:click={() => clearBlocklistByReason(reason)} disabled={working} title="Clear all {reason}">
-                  <X size={11} />
-                </button>
-              </div>
+      <Panel title="Runtime Blocklist" subtitle="Operational blocks created from failed fetches, archive rejects, missing articles, and manual runtime clears. Separate from Release Filtering rules and Custom Formats scoring.">
+        <div class="bl-editor">
+          <div class="bl-editor-head">
+            <div>
+              <strong>{blockEditor.id ? `Edit Entry #${blockEditor.id}` : 'Add Manual Entry'}</strong>
+              <p>Use a structured URL/signature entry or paste a raw runtime key directly.</p>
+            </div>
+            {#if blockEditor.id}
+              <Button kind="ghost" on:click={resetBlockEditor} disabled={working}>
+                <X size={14} />
+                Cancel Edit
+              </Button>
+            {/if}
+          </div>
+          <div class="form-grid form-grid--3col">
+            <label class="form-field">
+              <span>Entry Type</span>
+              <select bind:value={blockEditor.keyType} disabled={!!blockEditor.id}>
+                <option value="external_url">External URL</option>
+                <option value="release_signature">Release Signature</option>
+                <option value="raw">Raw Key</option>
+              </select>
+            </label>
+            <label class="form-field">
+              <span>Reason</span>
+              <input type="text" bind:value={blockEditor.reason} placeholder="manual" />
+            </label>
+            <label class="form-field">
+              <span>Expires At</span>
+              <input type="datetime-local" bind:value={blockEditor.expiresAt} />
+            </label>
+          </div>
+          {#if blockEditor.keyType === 'external_url'}
+            <div class="form-grid">
+              <label class="form-field">
+                <span>External URL</span>
+                <input type="url" bind:value={blockEditor.externalUrl} placeholder="https://indexer.example/download/..." />
+              </label>
+            </div>
+          {:else if blockEditor.keyType === 'release_signature'}
+            <div class="form-grid form-grid--3col">
+              <label class="form-field">
+                <span>Release Title</span>
+                <input type="text" bind:value={blockEditor.releaseTitle} placeholder="Dune.2021.2160p..." />
+              </label>
+              <label class="form-field">
+                <span>Indexer Name</span>
+                <input type="text" bind:value={blockEditor.indexerName} placeholder="NZB Finder" />
+              </label>
+              <label class="form-field">
+                <span>Size (MB bucket)</span>
+                <input type="number" min="0" bind:value={blockEditor.sizeMb} placeholder="7000" />
+              </label>
+            </div>
+            <div class="form-grid">
+              <label class="form-field">
+                <span>Posted Date</span>
+                <input type="date" bind:value={blockEditor.postedDate} />
+              </label>
+            </div>
+          {:else}
+            <div class="form-grid">
+              <label class="form-field">
+                <span>Raw Key</span>
+                <input type="text" bind:value={blockEditor.key} placeholder="external_url:https://... or release_signature:..." />
+              </label>
+            </div>
+          {/if}
+          <div class="bl-editor-actions">
+            <Button kind="primary" on:click={saveBlocklistEntry} disabled={working}>
+              <Save size={14} />
+              {blockEditor.id ? 'Update Entry' : 'Create Entry'}
+            </Button>
+          </div>
+        </div>
+
+        <!-- Stats chips -->
+        {#if blStats}
+          <div class="bl-stats-row">
+            <div class="bl-stat-chip">
+              <span class="bl-stat-num">{blStats.active}</span>
+              <span class="bl-stat-lbl">active</span>
+            </div>
+            <div class="bl-stat-chip warn">
+              <span class="bl-stat-num">{blStats.expired}</span>
+              <span class="bl-stat-lbl">expired</span>
+            </div>
+            {#each Object.entries(blStats.byReason).sort(([,a],[,b]) => b - a) as [reason, count]}
+              <button class="bl-reason-chip" class:active={blockReasonFilter === reason} on:click={() => { blockReasonFilter = blockReasonFilter === reason ? 'all' : reason; blPage = 1; void loadBlocklist(); }}>
+                <span class="reason-badge reason-{reason.split('_')[0]}">{reason}</span>
+                <span class="bl-reason-count">{count}</span>
+              </button>
             {/each}
           </div>
         {/if}
 
+        <!-- Toolbar -->
         <div class="bl-toolbar">
           <div class="bl-search">
             <Search size={14} />
-            <input bind:value={blockQuery} placeholder="Search by key or reason…" />
+            <input bind:value={blockQuery} placeholder="Search key or reason…"
+              on:input={() => { blPage = 1; void loadBlocklist(); }} />
           </div>
           {#if blockReasonFilter !== 'all'}
-            <button class="bl-filter-active" on:click={() => blockReasonFilter = 'all'}>
+            <button class="bl-filter-active" on:click={() => { blockReasonFilter = 'all'; blPage = 1; void loadBlocklist(); }}>
               {blockReasonFilter} <X size={11} />
             </button>
           {/if}
-          <div class="bl-stats mono">
-            {filteredBlocklist.length} / {blocklist.length} entries
+          <div class="bl-stats-text mono">
+            {blTotal} entr{blTotal === 1 ? 'y' : 'ies'}
           </div>
-          {#if blocklist.length > 0}
+          <select class="bl-page-size" bind:value={blPageSize} on:change={() => { blPage = 1; void loadBlocklist(); }}>
+            <option value={25}>25 / page</option>
+            <option value={50}>50 / page</option>
+            <option value={100}>100 / page</option>
+          </select>
+          {#if blTotal > 0}
             <Button kind="ghost" on:click={clearAllBlocklist} disabled={loading || working}>
               <X size={14} />
               Clear all
@@ -1214,18 +1582,25 @@
           {/if}
         </div>
 
-        {#if filteredBlocklist.length > 0}
+        <!-- Table -->
+        {#if blLoading}
+          <div class="empty">Loading…</div>
+        {:else if filteredBlocklist.length > 0}
           <div class="bl-table-wrap">
             <table class="bl-table">
               <thead>
                 <tr>
-                  <th class="sortable" on:click={() => { if (blockSortCol === 'reason') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'reason'; blockSortDir = 'asc'; } }}>
+                  <th class="sortable" on:click={() => { if (blockSortCol === 'reason') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'reason'; blockSortDir = 'asc'; } void loadBlocklist(); }}>
                     Reason {blockSortCol === 'reason' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
                   </th>
-                  <th class="sortable" on:click={() => { if (blockSortCol === 'key') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'key'; blockSortDir = 'asc'; } }}>
-                    Key / URL {blockSortCol === 'key' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
+                  <th class="sortable" on:click={() => { if (blockSortCol === 'key') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'key'; blockSortDir = 'asc'; } void loadBlocklist(); }}>
+                    Runtime Key {blockSortCol === 'key' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
                   </th>
-                  <th class="sortable" on:click={() => { if (blockSortCol === 'expires') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'expires'; blockSortDir = 'asc'; } }}>
+                  <th>Matched Release</th>
+                  <th class="sortable" on:click={() => { if (blockSortCol === 'createdAt') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'createdAt'; blockSortDir = 'desc'; } void loadBlocklist(); }}>
+                    Added {blockSortCol === 'createdAt' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
+                  </th>
+                  <th class="sortable" on:click={() => { if (blockSortCol === 'expires') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'expires'; blockSortDir = 'asc'; } void loadBlocklist(); }}>
                     Expires {blockSortCol === 'expires' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
                   </th>
                   <th></th>
@@ -1234,23 +1609,59 @@
               <tbody>
                 {#each filteredBlocklist as item (item.id)}
                   <tr>
-                    <td><span class="reason-badge reason-{item.reason.split('_')[0]}">{item.reason}</span></td>
-                    <td class="bl-key mono">{item.key}</td>
-                    <td class="muted mono">{item.expiresAt ? new Date(item.expiresAt).toLocaleDateString() : '—'}</td>
+                    <td>
+                      <span class="reason-badge reason-{item.reason.split('_')[0]}">{item.reason}</span>
+                    </td>
+                    <td class="bl-key-cell">
+                      <div class="bl-key-top">
+                        <span class="reason-badge neutral">{blocklistKeyLabel(item)}</span>
+                        <button class="icon-btn" type="button" on:click={() => copyBlocklistKey(item.key)} title="Copy runtime key">
+                          <Copy size={13} />
+                        </button>
+                      </div>
+                      <div class="bl-key mono">{item.key}</div>
+                    </td>
+                    <td class="bl-context-cell">
+                      {#if blocklistContext(item)}
+                        <div class="bl-context-title">{item.releaseTitle || 'Matched release'}</div>
+                        <div class="muted mono">{blocklistContext(item)}</div>
+                        {#if item.libraryItemId || item.selectedReleaseId}
+                          <div class="muted mono">
+                            {#if item.libraryItemId}library #{item.libraryItemId}{/if}
+                            {#if item.libraryItemId && item.selectedReleaseId} • {/if}
+                            {#if item.selectedReleaseId}selected #{item.selectedReleaseId}{/if}
+                          </div>
+                        {/if}
+                      {:else}
+                        <div class="muted">No linked release metadata available.</div>
+                      {/if}
+                    </td>
+                    <td class="muted mono">{item.createdAt ? new Date(item.createdAt).toLocaleDateString('en-GB') : '—'}</td>
+                    <td class="muted mono">{item.expiresAt ? new Date(item.expiresAt).toLocaleDateString('en-GB') : 'Never'}</td>
                     <td class="bl-action">
-                      <button class="clear-btn" on:click={() => clearBlocklist(item.id)} disabled={working} title="Clear this entry">
+                      <div class="bl-row-actions">
+                        <button class="icon-btn" type="button" on:click={() => clearBlocklistByReason(item.reason)} disabled={working} title="Clear all with this reason">
+                          <Trash2 size={13} />
+                        </button>
+                        <button class="icon-btn" type="button" on:click={() => startEditBlocklist(item)} disabled={working} title="Edit entry">
+                          <Pencil size={13} />
+                        </button>
+                        <button class="clear-btn" on:click={() => clearBlocklist(item.id)} disabled={working} title="Clear this entry">
                         <X size={13} />
-                      </button>
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 {/each}
               </tbody>
             </table>
           </div>
-        {:else if blocklist.length > 0}
-          <div class="empty">No entries match the current filter.</div>
+          <!-- Pagination -->
+          <div class="bl-pagination">
+            <Pagination page={blPage} totalPages={blTotalPages} on:change={(e) => { blPage = e.detail; void loadBlocklist(); }} />
+          </div>
         {:else}
-          <div class="empty">No active blocklist entries.</div>
+          <div class="empty">{blStats?.active === 0 ? 'No active blocklist entries.' : 'No entries match the current filter.'}</div>
         {/if}
       </Panel>
 
@@ -1329,30 +1740,30 @@
         {@const movieDefs = qualityDefs.filter(d => d.mediaType === 'movie')}
         {@const episodeDefs = qualityDefs.filter(d => d.mediaType === 'episode')}
         <div class="qdef-shell">
-          <Panel title="Movie Quality Definitions" subtitle="Per-tier size limits applied when ranking movie releases. Set 0 for no limit.">
+          <Panel title="Movie Quality Definitions" subtitle="Per-tier size limits (MB/min) applied when ranking movie releases. Requires runtime metadata. Set 0 for no limit.">
             <table class="qdef-table">
-              <thead><tr><th>Quality</th><th>Min (MB)</th><th>Max (MB)</th><th></th></tr></thead>
+              <thead><tr><th>Quality</th><th>Min (MB/min)</th><th>Max (MB/min)</th><th></th></tr></thead>
               <tbody>
                 {#each movieDefs as d (d.id)}
                   <tr>
                     <td class="qdef-title">{d.title}</td>
-                    <td><input type="number" min="0" class="qdef-input" bind:value={d.minSizeMb} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></td>
-                    <td><input type="number" min="0" class="qdef-input" bind:value={d.maxSizeMb} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></td>
+                    <td><input type="number" min="0" class="qdef-input" bind:value={d.minMbPerMinute} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></td>
+                    <td><input type="number" min="0" class="qdef-input" bind:value={d.maxMbPerMinute} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></td>
                     <td><button class="qdef-save-btn" disabled={!qualityDefsDirty.has(d.id) || qualityDefsSaving.has(d.id)} on:click={() => saveQualityDef(d)} type="button">{qualityDefsSaving.has(d.id) ? '…' : 'Save'}</button></td>
                   </tr>
                 {/each}
               </tbody>
             </table>
           </Panel>
-          <Panel title="TV / Episode Quality Definitions" subtitle="Per-tier size limits applied when ranking TV episode releases. Set 0 for no limit.">
+          <Panel title="TV / Episode Quality Definitions" subtitle="Per-tier size limits (MB/min) applied when ranking TV episode releases. Set 0 for no limit.">
             <table class="qdef-table">
-              <thead><tr><th>Quality</th><th>Min (MB)</th><th>Max (MB)</th><th></th></tr></thead>
+              <thead><tr><th>Quality</th><th>Min (MB/min)</th><th>Max (MB/min)</th><th></th></tr></thead>
               <tbody>
                 {#each episodeDefs as d (d.id)}
                   <tr>
                     <td class="qdef-title">{d.title}</td>
-                    <td><input type="number" min="0" class="qdef-input" bind:value={d.minSizeMb} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></td>
-                    <td><input type="number" min="0" class="qdef-input" bind:value={d.maxSizeMb} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></td>
+                    <td><input type="number" min="0" class="qdef-input" bind:value={d.minMbPerMinute} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></td>
+                    <td><input type="number" min="0" class="qdef-input" bind:value={d.maxMbPerMinute} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></td>
                     <td><button class="qdef-save-btn" disabled={!qualityDefsDirty.has(d.id) || qualityDefsSaving.has(d.id)} on:click={() => saveQualityDef(d)} type="button">{qualityDefsSaving.has(d.id) ? '…' : 'Save'}</button></td>
                   </tr>
                 {/each}
@@ -1556,13 +1967,27 @@
 
               <div class="divider"></div>
 
+              <div class="field">
+                <div class="field-label">Upgrade Threshold</div>
+                <div class="size-row">
+                  <label>
+                    <span>Minimum CF Upgrade</span>
+                    <input type="number" min="0" bind:value={selectedProfile.minimumUpgradeCustomFormatScore} class="size-input" placeholder="0 = no minimum" />
+                  </label>
+                </div>
+                <p class="field-hint" style="margin-top:4px">When upgrades are enabled, the candidate must improve the custom-format subtotal by at least this amount over the current release.</p>
+              </div>
+
+              <div class="divider"></div>
+
               <!-- Size limits -->
               <div class="field">
                 <div class="field-label">Size Limits</div>
                 <div class="size-row">
-                  <label><span>Min (MB)</span><input type="number" min="0" bind:value={selectedProfile.minSizeMb} class="size-input" placeholder="0 = no limit" /></label>
-                  <label><span>Max (MB)</span><input type="number" min="0" bind:value={selectedProfile.maxSizeMb} class="size-input" placeholder="0 = no limit" /></label>
+                  <label><span>Min (MB/min)</span><input type="number" min="0" bind:value={selectedProfile.minMbPerMinute} class="size-input" placeholder="0 = no limit" /></label>
+                  <label><span>Max (MB/min)</span><input type="number" min="0" bind:value={selectedProfile.maxMbPerMinute} class="size-input" placeholder="0 = no limit" /></label>
                 </div>
+                <p class="field-hint" style="margin-top:4px">Applied per runtime minute. If runtime metadata is missing, size limits are skipped instead of hard-rejecting the release.</p>
               </div>
 
               <div class="divider"></div>
@@ -1602,13 +2027,33 @@
     <!-- CUSTOM FORMATS -->
     {:else if activeTab === 'formats'}
       <Panel title="Custom Formats" subtitle="User-defined scoring rules applied to release titles. Positive scores boost, negative scores penalise.">
+        {#if cfImportOpen}
+          <div class="cf-import-box">
+            <div class="cf-import-header">
+              <strong>Import Custom Formats</strong>
+              <span class="field-hint">Paste a JSON array of custom format objects. Fields: name, pattern, score, enabled.</span>
+            </div>
+            <textarea class="cf-import-textarea" bind:value={cfImportJson} rows={8} placeholder={`[{"name":"BluRay","pattern":"(?i)bluray","score":50,"enabled":true}]`}></textarea>
+            <div class="editor-actions" style="margin-top:10px">
+              <Button kind="ghost" on:click={() => { cfImportOpen = false; cfImportJson = ''; }}>Cancel</Button>
+              <Button kind="primary" on:click={importCustomFormats} disabled={cfImporting || !cfImportJson.trim()}>
+                {cfImporting ? 'Importing…' : 'Import'}
+              </Button>
+            </div>
+          </div>
+        {/if}
         <div class="cf-layout">
           <div class="cf-list">
             <div class="cf-list-header">
               <span>Formats</span>
-              <Button kind="ghost" on:click={() => { editingFormat = blankFormat(); }}>
-                <Plus size={14} /> New
-              </Button>
+              <div style="display:flex;gap:6px">
+                <Button kind="ghost" on:click={() => { cfImportOpen = !cfImportOpen; cfImportJson = ''; }}>
+                  Import
+                </Button>
+                <Button kind="ghost" on:click={() => { editingFormat = blankFormat(); }}>
+                  <Plus size={14} /> New
+                </Button>
+              </div>
             </div>
             {#if customFormats.length === 0}
               <div class="cf-empty">No custom formats yet.</div>
@@ -1616,8 +2061,11 @@
             {#each customFormats as f (f.id)}
               <button class="cf-item" class:cf-active={editingFormat?.id === f.id} on:click={() => { editingFormat = { ...f }; }}>
                 <span class="cf-item-name">{f.name}</span>
-                <span class="cf-item-score" class:cf-pos={f.score > 0} class:cf-neg={f.score < 0}>{f.score > 0 ? '+' : ''}{f.score}</span>
-                {#if !f.enabled}<span class="cf-disabled-badge">off</span>{/if}
+                <div style="display:flex;align-items:center;gap:4px;flex-shrink:0">
+                  {#if f.source && f.source !== 'custom'}<span class="rf-badge rf-badge-src">{f.source}</span>{/if}
+                  <span class="cf-item-score" class:cf-pos={f.score > 0} class:cf-neg={f.score < 0}>{f.score > 0 ? '+' : ''}{f.score}</span>
+                  {#if !f.enabled}<span class="cf-disabled-badge">off</span>{/if}
+                </div>
               </button>
             {/each}
           </div>
@@ -1796,6 +2244,73 @@
                 </div>
               {/if}
             </div>
+          </div>
+        </div>
+      </Panel>
+
+    <!-- SUBTITLE PROFILES -->
+    {:else if activeTab === 'subtitle-profiles'}
+      <Panel title="Subtitle Profiles" subtitle="Named language preference sets for subtitle acquisition. Assign a profile per library item to override the global language settings.">
+        <div class="cf-layout">
+          <div class="cf-list">
+            <div class="cf-list-header">
+              <span>Profiles</span>
+              <Button kind="ghost" on:click={() => { editingSubtitleProfile = { name: '', languages: [], preferHearingImpaired: false, requireExactLanguage: false, isDefault: false }; }}>
+                <Plus size={14} /> New
+              </Button>
+            </div>
+            {#if subtitleProfiles.length === 0}
+              <div class="cf-empty">No subtitle profiles yet.</div>
+            {/if}
+            {#each subtitleProfiles as p (p.id)}
+              <button class="cf-item" class:cf-active={editingSubtitleProfile?.id === p.id} on:click={() => { editingSubtitleProfile = { ...p }; }}>
+                <span class="cf-item-name">{p.name}</span>
+                <div style="display:flex;align-items:center;gap:4px;flex-shrink:0">
+                  {#if p.isDefault}<span class="rf-badge rf-badge-src">default</span>{/if}
+                  {#if p.languages.length > 0}<span class="cf-disabled-badge">{p.languages.slice(0,2).join(', ')}{p.languages.length > 2 ? '…' : ''}</span>{/if}
+                </div>
+              </button>
+            {/each}
+          </div>
+          <div class="cf-editor">
+            {#if editingSubtitleProfile}
+              <div class="field">
+                <label class="field-label" for="sp-name">Profile Name</label>
+                <input id="sp-name" type="text" bind:value={editingSubtitleProfile.name} placeholder="e.g. Dutch Preferred" />
+              </div>
+              <div class="field">
+                <label class="field-label" for="sp-languages">Languages <span class="field-hint">(comma-separated ISO codes, e.g. nl, en)</span></label>
+                <input id="sp-languages" type="text"
+                  value={editingSubtitleProfile.languages.join(', ')}
+                  on:input={(e) => { editingSubtitleProfile = { ...editingSubtitleProfile!, languages: (e.currentTarget as HTMLInputElement).value.split(',').map(l => l.trim()).filter(Boolean) }; }}
+                  placeholder="nl, en" />
+              </div>
+              <label class="flag-row">
+                <input type="checkbox" bind:checked={editingSubtitleProfile.preferHearingImpaired} />
+                <div><strong>Prefer Hearing Impaired</strong><span>Boost scores for SDH/HI subtitles</span></div>
+              </label>
+              <label class="flag-row">
+                <input type="checkbox" bind:checked={editingSubtitleProfile.requireExactLanguage} />
+                <div><strong>Require Exact Language</strong><span>Skip subtitles in a different language</span></div>
+              </label>
+              <label class="flag-row">
+                <input type="checkbox" bind:checked={editingSubtitleProfile.isDefault} />
+                <div><strong>Set as Default</strong><span>Use this profile when no per-item profile is assigned</span></div>
+              </label>
+              <div class="editor-actions" style="margin-top:16px">
+                {#if editingSubtitleProfile.id}
+                  <Button kind="danger" on:click={() => editingSubtitleProfile?.id && deleteSubtitleProfile(editingSubtitleProfile.id)}>
+                    <Trash2 size={15} /> Delete
+                  </Button>
+                {/if}
+                <Button kind="ghost" on:click={() => { editingSubtitleProfile = null; }}>Cancel</Button>
+                <Button kind="primary" on:click={saveSubtitleProfile} disabled={spSaving}>
+                  <Save size={15} /> {spSaving ? 'Saving…' : 'Save'}
+                </Button>
+              </div>
+            {:else}
+              <div class="cf-empty">Select a profile to edit, or create a new one.</div>
+            {/if}
           </div>
         </div>
       </Panel>
@@ -2377,55 +2892,102 @@
   .int-info span   { display: block; margin-top: 3px; color: hsl(var(--muted-foreground)); font-size: 12px; overflow-wrap: anywhere; }
 
   /* blocklist */
-  .bl-reasons {
+  .bl-editor {
+    display: grid;
+    gap: 12px;
+    margin-bottom: 18px;
+    padding: 14px;
+    border-radius: 16px;
+    border: 1px solid hsl(0 0% 100% / 0.06);
+    background: hsl(0 0% 100% / 0.03);
+  }
+
+  .bl-editor-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: flex-start;
+  }
+
+  .bl-editor-head p {
+    margin: 4px 0 0;
+    color: hsl(var(--muted-foreground));
+    font-size: 12px;
+  }
+
+  .bl-editor-actions {
+    display: flex;
+    justify-content: flex-end;
+  }
+
+  .bl-stats-row {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
-    margin-bottom: 16px;
+    margin-bottom: 14px;
+    align-items: center;
   }
+
+  .bl-stat-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 10px;
+    border: 1px solid hsl(0 0% 100% / 0.08);
+    background: hsl(0 0% 100% / 0.04);
+    font-size: 12px;
+  }
+
+  .bl-stat-chip.warn .bl-stat-num { color: hsl(47 100% 77%); }
+  .bl-stat-num { font-weight: 700; }
+  .bl-stat-lbl { color: hsl(var(--muted-foreground)); }
 
   .bl-reason-chip {
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: 6px;
     border-radius: 12px;
     border: 1px solid hsl(0 0% 100% / 0.08);
     background: hsl(0 0% 100% / 0.04);
-    padding: 2px 4px 2px 2px;
+    padding: 4px 8px;
+    cursor: pointer;
+    font-size: 12px;
     transition: border-color 0.15s, background 0.15s;
   }
+
+  .bl-reason-chip:hover { background: hsl(0 0% 100% / 0.08); }
 
   .bl-reason-chip.active {
     border-color: hsl(var(--primary) / 0.5);
     background: hsl(var(--primary) / 0.08);
   }
 
-  .bl-reason-chip-btn {
+  .bl-reason-count {
+    font-weight: 700;
+    color: hsl(var(--foreground));
+  }
+
+  .bl-pagination {
     display: flex;
     align-items: center;
     gap: 6px;
-    background: none;
-    border: none;
-    cursor: pointer;
-    padding: 4px 6px;
-    border-radius: 8px;
+    justify-content: center;
+    padding: 14px 0 4px;
   }
 
-  .bl-reason-chip-btn:hover { background: hsl(0 0% 100% / 0.06); }
-
-  .bl-reason-count {
-    font-size: 12px;
-    font-weight: 700;
+  .bl-page-size {
+    height: 32px;
+    padding: 0 8px;
+    border: 1px solid hsl(0 0% 100% / 0.08);
+    border-radius: 10px;
+    background: hsl(0 0% 100% / 0.04);
     color: hsl(var(--foreground));
-    min-width: 16px;
-    text-align: right;
+    font-size: 12px;
+    cursor: pointer;
   }
 
-  .bl-reason-clear {
-    width: 22px !important;
-    height: 22px !important;
-    border-radius: 6px !important;
-  }
+  .bl-stats-text { color: hsl(var(--muted-foreground)); font-size: 12px; white-space: nowrap; }
 
   .bl-filter-active {
     display: flex;
@@ -2486,7 +3048,6 @@
     cursor: pointer;
   }
 
-  .bl-stats { color: hsl(var(--muted-foreground)); font-size: 12px; white-space: nowrap; }
 
   .bl-table-wrap {
     overflow-x: auto;
@@ -2518,8 +3079,20 @@
 
   .bl-table tr:last-child td { border-bottom: none; }
 
+  .bl-key-cell, .bl-context-cell { min-width: 220px; }
+  .bl-key-top, .bl-row-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .bl-key-top { justify-content: space-between; margin-bottom: 6px; }
   .bl-key { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: hsl(var(--muted-foreground)); font-size: 11px; }
-  .bl-action { width: 40px; text-align: right; }
+  .bl-context-title {
+    font-size: 13px;
+    font-weight: 600;
+    margin-bottom: 3px;
+  }
+  .bl-action { width: 84px; text-align: right; }
 
   .clear-btn {
     display: inline-grid;
@@ -2533,6 +3106,12 @@
     cursor: pointer;
   }
   .clear-btn:hover { background: hsl(0 72% 51% / 0.15); color: hsl(0 96% 82%); border-color: hsl(0 72% 51% / 0.3); }
+
+  .reason-badge.neutral {
+    border: 1px solid hsl(0 0% 100% / 0.08);
+    background: hsl(0 0% 100% / 0.04);
+    color: hsl(var(--muted-foreground));
+  }
 
   .reason-badge {
     display: inline-block;
@@ -2918,6 +3497,9 @@
   .cf-disabled-badge { font-size: 10px; background: hsl(0 0% 100% / 0.08); border-radius: 4px; padding: 1px 5px; color: hsl(var(--muted-foreground)); }
   .cf-editor { display: grid; gap: 14px; }
   .cf-empty { padding: 24px; color: hsl(var(--muted-foreground)); font-size: 13px; text-align: center; }
+  .cf-import-box { display: grid; gap: 10px; padding: 14px 16px; border-radius: 14px; border: 1px solid hsl(var(--primary) / 0.3); background: hsl(var(--primary) / 0.05); margin-bottom: 16px; }
+  .cf-import-header { display: grid; gap: 4px; }
+  .cf-import-textarea { width: 100%; min-height: 140px; border-radius: 10px; border: 1px solid hsl(0 0% 100% / 0.1); background: hsl(0 0% 100% / 0.04); color: inherit; font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 10px; resize: vertical; }
   @media (max-width: 600px) {
     .cf-layout { grid-template-columns: 1fr; }
   }

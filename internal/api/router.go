@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"path"
 	"strconv"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,18 +21,17 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/hjongedijk/drakkar/internal/auth"
 	"github.com/hjongedijk/drakkar/internal/cache"
-	"github.com/hjongedijk/drakkar/internal/frontend"
 	"github.com/hjongedijk/drakkar/internal/catalog"
 	"github.com/hjongedijk/drakkar/internal/config"
 	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/ranking"
+	"github.com/hjongedijk/drakkar/internal/frontend"
+	"github.com/hjongedijk/drakkar/internal/jellyfin"
 	"github.com/hjongedijk/drakkar/internal/library"
 	"github.com/hjongedijk/drakkar/internal/maintenance"
 	"github.com/hjongedijk/drakkar/internal/metrics"
 	"github.com/hjongedijk/drakkar/internal/nzb"
-	"github.com/hjongedijk/drakkar/internal/policy"
-	"github.com/hjongedijk/drakkar/internal/jellyfin"
 	"github.com/hjongedijk/drakkar/internal/plex"
+	"github.com/hjongedijk/drakkar/internal/policy"
 	"github.com/hjongedijk/drakkar/internal/probe"
 	"github.com/hjongedijk/drakkar/internal/seerr"
 	"github.com/hjongedijk/drakkar/internal/stream"
@@ -55,6 +56,7 @@ type StreamsProvider interface {
 type HealthRepository interface {
 	HealthSummary(ctx context.Context) (database.HealthSummary, error)
 	ListHealthEntries(ctx context.Context) ([]database.HealthEntry, error)
+	ListConsistencyIssues(ctx context.Context) ([]database.ConsistencyIssue, error)
 	RecordHealthCheck(ctx context.Context, publicationID int64, ok bool) error
 }
 
@@ -66,15 +68,25 @@ type ProfilesRepository interface {
 	UpdateQualityDefinition(ctx context.Context, d database.QualityDefinition) (database.QualityDefinition, error)
 	GetLibraryItemQualityProfile(ctx context.Context, libraryItemID int64) (*database.QualityProfile, error)
 	SetLibraryItemQualityProfile(ctx context.Context, libraryItemID int64, profileID *int64) error
+	SetMediaRequestQualityProfile(ctx context.Context, requestID int64, profileID *int64) (int64, error)
 	GetGrabHistory(ctx context.Context, libraryItemID int64) ([]database.GrabHistoryEntry, error)
 	ListCustomFormats(ctx context.Context) ([]database.CustomFormat, error)
 	UpdateCustomFormat(ctx context.Context, f database.CustomFormat) (database.CustomFormat, error)
 	DeleteCustomFormat(ctx context.Context, id int64) error
 	UpsertCustomFormat(ctx context.Context, f database.CustomFormat) (database.CustomFormat, error)
+	UpsertCustomFormatByName(ctx context.Context, f database.CustomFormat) (database.CustomFormat, error)
 	ListReleaseBlockRules(ctx context.Context) ([]database.ReleaseBlockRule, error)
 	UpsertReleaseBlockRule(ctx context.Context, r database.ReleaseBlockRule) (database.ReleaseBlockRule, error)
 	UpdateReleaseBlockRule(ctx context.Context, r database.ReleaseBlockRule) (database.ReleaseBlockRule, error)
 	DeleteReleaseBlockRule(ctx context.Context, id int64) error
+	ListIndexerPolicies(ctx context.Context) ([]database.IndexerPolicy, error)
+	UpsertIndexerPolicy(ctx context.Context, p database.IndexerPolicy) (database.IndexerPolicy, error)
+	UpdateIndexerPolicy(ctx context.Context, p database.IndexerPolicy) (database.IndexerPolicy, error)
+	DeleteIndexerPolicy(ctx context.Context, id int64) error
+	ListSubtitleProfiles(ctx context.Context) ([]database.SubtitleProfile, error)
+	CreateSubtitleProfile(ctx context.Context, p database.SubtitleProfile) (database.SubtitleProfile, error)
+	UpdateSubtitleProfile(ctx context.Context, p database.SubtitleProfile) (database.SubtitleProfile, error)
+	DeleteSubtitleProfile(ctx context.Context, id int64) error
 	SetTVShowMonitoringMode(ctx context.Context, tvShowID int64, mode string) error
 	ListSabQueueItems(ctx context.Context, category string, start, limit int) ([]database.SabQueueItem, int, error)
 	ListSabHistoryItems(ctx context.Context, category string, start, limit int) ([]database.SabHistoryItem, int, error)
@@ -104,7 +116,11 @@ type WorkflowService interface {
 	ListRequests(ctx context.Context) ([]database.MediaRequestSummary, error)
 	SyncRequests(ctx context.Context) (workflow.SyncResult, error)
 	CreateSeerrRequest(ctx context.Context, mediaType string, tmdbID int64) (workflow.SyncResult, error)
+	CreateSeerrSeasonRequest(ctx context.Context, tmdbID int64, seasons []int) (workflow.SyncResult, error)
 	SearchPendingLibrary(ctx context.Context) (workflow.BulkSearchResult, error)
+	WorkQueueStatus(ctx context.Context) (workflow.WorkQueueStatus, error)
+	PauseWorkQueue(ctx context.Context) (workflow.WorkQueueStatus, error)
+	ResumeWorkQueue(ctx context.Context) (workflow.WorkQueueStatus, error)
 	RetryFailedQueue(ctx context.Context) (workflow.BulkQueueRetryResult, error)
 	ClearFailedQueue(ctx context.Context) (int, error)
 	SearchLibrary(ctx context.Context, libraryItemID int64) (workflow.SearchResult, error)
@@ -114,8 +130,12 @@ type WorkflowService interface {
 	RestoreRejectedReleases(ctx context.Context, libraryItemID int64) (database.RejectedReleaseRestoreResult, error)
 	SkipRelease(ctx context.Context, releaseCandidateID int64) (workflow.ReleaseActionResult, error)
 	RetryQueueItem(ctx context.Context, queueItemID int64) (workflow.QueueRetryResult, error)
+	ManageQueueItem(ctx context.Context, queueItemID int64, action string) (workflow.QueueManageResult, error)
+	ManageQueueItems(ctx context.Context, queueItemIDs []int64, action string) (workflow.BulkQueueRetryResult, error)
+	ManageFailedQueue(ctx context.Context, action string) (workflow.BulkQueueRetryResult, error)
 	BackfillMetadata(ctx context.Context) (workflow.BackfillMetadataResult, error)
 	FillMissingEpisodes(ctx context.Context) (workflow.FillMissingEpisodesResult, error)
+	SearchUpgrades(ctx context.Context) (workflow.UpgradeSearchResult, error)
 	ManualSearch(ctx context.Context, query string) ([]workflow.ManualSearchItem, error)
 	ImportNZBFromPush(ctx context.Context, content []byte, filename, mediaType string) (string, error)
 	ResetLibraryItem(ctx context.Context, libraryItemID int64) error
@@ -130,6 +150,7 @@ type MaintenanceService interface {
 	RemoveOrphanedContent(ctx context.Context) (maintenance.Result, error)
 	RemoveBrokenMediaSymlinks(ctx context.Context) (maintenance.Result, error)
 	RemoveOrphanedCompletedSymlinks(ctx context.Context) (maintenance.Result, error)
+	DeepNZBHealthCheck(ctx context.Context) (maintenance.Result, error)
 }
 
 type CacheService interface {
@@ -147,6 +168,10 @@ type SubtitleService interface {
 
 type BlocklistService interface {
 	List(ctx context.Context) ([]database.BlocklistItemSummary, error)
+	ListPaged(ctx context.Context, f database.BlocklistFilter) (database.BlocklistPage, error)
+	Stats(ctx context.Context) (database.BlocklistStats, error)
+	Create(ctx context.Context, item database.BlocklistMutation) (database.BlocklistItemSummary, error)
+	Update(ctx context.Context, id int64, item database.BlocklistMutation) (database.BlocklistItemSummary, error)
 	Clear(ctx context.Context, id int64) error
 	ClearAll(ctx context.Context) (database.BlocklistClearResult, error)
 	ClearByReason(ctx context.Context, reason string) (database.BlocklistClearResult, error)
@@ -235,7 +260,7 @@ func (b *EventBroker) Publish(event map[string]any) {
 	}
 }
 
-func Router(status StatusService, queue QueueService, workflow WorkflowService, publication PublicationService, maintenance MaintenanceService, cacheSvc CacheService, subtitleSvc SubtitleService, blocklistSvc BlocklistService, probeSvc IntegrationProbeService, catalogSvc CatalogService, broker *EventBroker, healthRepo HealthRepository, streamsProvider StreamsProvider, profilesRepo ProfilesRepository, taskSchedules TaskScheduleProvider, policySvc PolicyService, plexClient *plex.Client, jellyfinClient *jellyfin.Client, settingsSvc SettingsService, userRepo UserRepository, metricsProvider ...MetricsProvider) chi.Router {
+func Router(status StatusService, queue QueueService, workflowSvc WorkflowService, publication PublicationService, maintenance MaintenanceService, cacheSvc CacheService, subtitleSvc SubtitleService, blocklistSvc BlocklistService, probeSvc IntegrationProbeService, catalogSvc CatalogService, broker *EventBroker, healthRepo HealthRepository, streamsProvider StreamsProvider, profilesRepo ProfilesRepository, taskSchedules TaskScheduleProvider, policySvc PolicyService, plexClient *plex.Client, jellyfinClient *jellyfin.Client, settingsSvc SettingsService, userRepo UserRepository, metricsProvider ...MetricsProvider) chi.Router {
 	r := chi.NewRouter()
 	r.Use(corsMiddleware)
 	r.Use(authMiddlewareFor(userRepo))
@@ -251,9 +276,9 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 	}
 
 	// SABnzbd-compatible API endpoint — allows Radarr/Sonarr to use Drakkar as a download client.
-	if workflow != nil {
+	if workflowSvc != nil {
 		sabH := &sabHandler{
-			importFn: workflow.ImportNZBFromPush,
+			importFn: workflowSvc.ImportNZBFromPush,
 			repo:     profilesRepo,
 			fuseMountPath: func() string {
 				mp := status.Status().FuseMountPath
@@ -265,6 +290,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		}
 		r.HandleFunc("/sabnzbd/api", sabH.ServeHTTP)
 		r.HandleFunc("/api/sabnzbd/api", sabH.ServeHTTP)
+		r.HandleFunc("/dav/api", sabH.ServeHTTP)
 	}
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -291,7 +317,41 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
-		respondJSON(w, http.StatusOK, map[string]any{"items": items})
+		workQueue := workflow.WorkQueueStatus{}
+		if workflowSvc != nil {
+			workQueue, err = workflowSvc.WorkQueueStatus(r.Context())
+			if err != nil {
+				respondError(w, http.StatusBadGateway, err)
+				return
+			}
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"items": items, "workQueue": workQueue})
+	})
+	r.Post("/api/queue/pause", func(w http.ResponseWriter, r *http.Request) {
+		if workflowSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
+			return
+		}
+		result, err := workflowSvc.PauseWorkQueue(r.Context())
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		publishMutation("queue.pause", map[string]any{"paused": result.Paused, "depth": result.Depth})
+		respondJSON(w, http.StatusAccepted, result)
+	})
+	r.Post("/api/queue/resume", func(w http.ResponseWriter, r *http.Request) {
+		if workflowSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
+			return
+		}
+		result, err := workflowSvc.ResumeWorkQueue(r.Context())
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		publishMutation("queue.resume", map[string]any{"paused": result.Paused, "depth": result.Depth})
+		respondJSON(w, http.StatusAccepted, result)
 	})
 	r.Get("/api/dashboard/home", func(w http.ResponseWriter, r *http.Request) {
 		if catalogSvc == nil {
@@ -376,7 +436,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusOK, result)
 	})
 	r.Post("/api/queue/{id}/retry", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
@@ -385,7 +445,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
-		result, err := workflow.RetryQueueItem(r.Context(), id)
+		result, err := workflowSvc.RetryQueueItem(r.Context(), id)
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -394,11 +454,11 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusAccepted, result)
 	})
 	r.Post("/api/queue/retry-failed", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		result, err := workflow.RetryFailedQueue(r.Context())
+		result, err := workflowSvc.RetryFailedQueue(r.Context())
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -406,8 +466,78 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		publishMutation("queue.retry_failed", map[string]any{"processed": result.Processed, "retried": result.Retried, "failed": result.Failed})
 		respondJSON(w, http.StatusAccepted, result)
 	})
+	r.Post("/api/queue/{id}/action", func(w http.ResponseWriter, r *http.Request) {
+		if workflowSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
+			return
+		}
+		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		var body struct {
+			Action string `json:"action"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		result, err := workflowSvc.ManageQueueItem(r.Context(), id, body.Action)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		publishMutation("queue.action", map[string]any{"queueItemId": id, "action": result.Action})
+		respondJSON(w, http.StatusAccepted, result)
+	})
+	r.Post("/api/queue/bulk-action", func(w http.ResponseWriter, r *http.Request) {
+		if workflowSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
+			return
+		}
+		var body struct {
+			QueueItemIDs []int64 `json:"queueItemIds"`
+			Action       string  `json:"action"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		if len(body.QueueItemIDs) == 0 {
+			respondError(w, http.StatusBadRequest, errors.New("queueItemIds required"))
+			return
+		}
+		result, err := workflowSvc.ManageQueueItems(r.Context(), body.QueueItemIDs, body.Action)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		publishMutation("queue.bulk_action", map[string]any{"queueItemIds": body.QueueItemIDs, "action": body.Action, "processed": result.Processed, "retried": result.Retried, "failed": result.Failed})
+		respondJSON(w, http.StatusAccepted, result)
+	})
+	r.Post("/api/queue/failed/action", func(w http.ResponseWriter, r *http.Request) {
+		if workflowSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
+			return
+		}
+		var body struct {
+			Action string `json:"action"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		result, err := workflowSvc.ManageFailedQueue(r.Context(), body.Action)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		publishMutation("queue.failed_action", map[string]any{"action": body.Action, "processed": result.Processed, "retried": result.Retried, "failed": result.Failed})
+		respondJSON(w, http.StatusAccepted, result)
+	})
 	r.Post("/api/queue/clear-failed", func(w http.ResponseWriter, r *http.Request) {
-		n, err := workflow.ClearFailedQueue(r.Context())
+		n, err := workflowSvc.ClearFailedQueue(r.Context())
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, err)
 			return
@@ -496,16 +626,45 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusOK, map[string]any{"status": "cancelled", "nzbDocumentId": id})
 	})
 	r.Get("/api/requests", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondJSON(w, http.StatusOK, map[string]any{"requests": []any{}})
 			return
 		}
-		items, err := workflow.ListRequests(r.Context())
+		items, err := workflowSvc.ListRequests(r.Context())
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"requests": items})
+	})
+	r.Put("/api/requests/{id}/profile", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
+			return
+		}
+		requestID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		var body struct {
+			ProfileID *int64 `json:"profileId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		libraryItemID, err := profilesRepo.SetMediaRequestQualityProfile(r.Context(), requestID, body.ProfileID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				respondError(w, http.StatusNotFound, errors.New("request is not linked to a library item"))
+				return
+			}
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		publishMutation("request.profile", map[string]any{"requestId": requestID, "libraryItemId": libraryItemID, "profileId": body.ProfileID})
+		respondJSON(w, http.StatusOK, map[string]any{"requestId": requestID, "libraryItemId": libraryItemID, "profileId": body.ProfileID})
 	})
 	r.Get("/api/library", func(w http.ResponseWriter, r *http.Request) {
 		if catalogSvc != nil {
@@ -541,6 +700,19 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		}
 		respondJSON(w, http.StatusOK, item)
 	})
+	r.Post("/api/library/search-upgrades", func(w http.ResponseWriter, r *http.Request) {
+		if workflowSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
+			return
+		}
+		result, err := workflowSvc.SearchUpgrades(r.Context())
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		publishMutation("library.search_upgrades", map[string]any{"checked": result.Checked, "upgraded": result.Upgraded, "failed": result.Failed})
+		respondJSON(w, http.StatusAccepted, result)
+	})
 	r.Get("/api/library/missing", func(w http.ResponseWriter, r *http.Request) {
 		items, err := queue.ListLibraryItems(r.Context())
 		if err != nil {
@@ -554,6 +726,34 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			}
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"items": missing})
+	})
+	r.Post("/api/library/{id}/replacements", func(w http.ResponseWriter, r *http.Request) {
+		if workflowSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
+			return
+		}
+		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		search, err := workflowSvc.SearchLibrary(r.Context(), libraryItemID)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		items, err := queue.ListReleaseSummaries(r.Context(), libraryItemID)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		publishMutation("library.replacements", map[string]any{"libraryItemId": libraryItemID, "candidateCount": len(items), "selectedReleaseId": search.SelectedReleaseID})
+		respondJSON(w, http.StatusAccepted, map[string]any{
+			"libraryItemId":     libraryItemID,
+			"candidateCount":    len(items),
+			"selectedReleaseId": search.SelectedReleaseID,
+			"items":             items,
+		})
 	})
 	r.Get("/api/releases/{libraryItemId}", func(w http.ResponseWriter, r *http.Request) {
 		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "libraryItemId"), 10, 64)
@@ -681,15 +881,78 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 	})
 	r.Get("/api/blocklist", func(w http.ResponseWriter, r *http.Request) {
 		if blocklistSvc == nil {
-			respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
+			respondJSON(w, http.StatusOK, database.BlocklistPage{Items: []database.BlocklistItemSummary{}, Page: 1, PageSize: 50, Total: 0, TotalPages: 1})
 			return
 		}
-		items, err := blocklistSvc.List(r.Context())
+		q := r.URL.Query()
+		page, _ := strconv.Atoi(q.Get("page"))
+		pageSize, _ := strconv.Atoi(q.Get("pageSize"))
+		result, err := blocklistSvc.ListPaged(r.Context(), database.BlocklistFilter{
+			Q:        q.Get("q"),
+			Reason:   q.Get("reason"),
+			Page:     page,
+			PageSize: pageSize,
+			Sort:     q.Get("sort"),
+			Dir:      q.Get("dir"),
+		})
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
-		respondJSON(w, http.StatusOK, map[string]any{"items": items})
+		respondJSON(w, http.StatusOK, result)
+	})
+	r.Get("/api/blocklist/stats", func(w http.ResponseWriter, r *http.Request) {
+		if blocklistSvc == nil {
+			respondJSON(w, http.StatusOK, database.BlocklistStats{ByReason: map[string]int{}})
+			return
+		}
+		stats, err := blocklistSvc.Stats(r.Context())
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, stats)
+	})
+	r.Post("/api/blocklist/manual", func(w http.ResponseWriter, r *http.Request) {
+		if blocklistSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("blocklist unavailable"))
+			return
+		}
+		item, err := parseManualBlocklistMutation(r)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		created, err := blocklistSvc.Create(r.Context(), item)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		publishMutation("blocklist.create", map[string]any{"blocklistItemId": created.ID, "reason": created.Reason})
+		respondJSON(w, http.StatusCreated, created)
+	})
+	r.Put("/api/blocklist/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if blocklistSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("blocklist unavailable"))
+			return
+		}
+		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		item, err := parseManualBlocklistMutation(r)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		updated, err := blocklistSvc.Update(r.Context(), id, item)
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		publishMutation("blocklist.update", map[string]any{"blocklistItemId": updated.ID, "reason": updated.Reason})
+		respondJSON(w, http.StatusOK, updated)
 	})
 	r.Delete("/api/blocklist/{id}", func(w http.ResponseWriter, r *http.Request) {
 		if blocklistSvc == nil {
@@ -745,13 +1008,13 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		if !payload.IsActionable() {
 			return
 		}
-		if workflow == nil {
+		if workflowSvc == nil {
 			return
 		}
 		// Trigger a sync in the background so this request returns fast.
 		go func() {
 			bgCtx := context.Background()
-			result, err := workflow.SyncRequests(bgCtx)
+			result, err := workflowSvc.SyncRequests(bgCtx)
 			if err != nil {
 				return
 			}
@@ -763,12 +1026,12 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			// Items created from webhook are pushed to the work queue with
 			// high priority (10) so they jump ahead of normal monitoring items.
 			if result.Created > 0 {
-				if wq, ok := workflow.(interface {
+				if wq, ok := workflowSvc.(interface {
 					PushPendingToQueue(priority int)
 				}); ok {
 					wq.PushPendingToQueue(10)
 				} else {
-					workflow.SearchPendingLibrary(bgCtx) //nolint:errcheck
+					workflowSvc.SearchPendingLibrary(bgCtx) //nolint:errcheck
 				}
 			}
 		}()
@@ -784,11 +1047,11 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusOK, map[string]any{"items": sessions})
 	})
 	r.Post("/api/requests/sync", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		result, err := workflow.SyncRequests(r.Context())
+		result, err := workflowSvc.SyncRequests(r.Context())
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -797,19 +1060,28 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusAccepted, result)
 	})
 	r.Post("/api/discover/request", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
 		var body struct {
 			MediaType string `json:"mediaType"`
 			TmdbID    int64  `json:"tmdbId"`
+			Seasons   []int  `json:"seasons"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TmdbID == 0 {
 			respondError(w, http.StatusBadRequest, errors.New("tmdbId and mediaType required"))
 			return
 		}
-		result, err := workflow.CreateSeerrRequest(r.Context(), body.MediaType, body.TmdbID)
+		var (
+			result workflow.SyncResult
+			err    error
+		)
+		if body.MediaType == "tv" && len(body.Seasons) > 0 {
+			result, err = workflowSvc.CreateSeerrSeasonRequest(r.Context(), body.TmdbID, body.Seasons)
+		} else {
+			result, err = workflowSvc.CreateSeerrRequest(r.Context(), body.MediaType, body.TmdbID)
+		}
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -818,11 +1090,11 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusAccepted, result)
 	})
 	r.Post("/api/library/search-pending", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		result, err := workflow.SearchPendingLibrary(r.Context())
+		result, err := workflowSvc.SearchPendingLibrary(r.Context())
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -831,7 +1103,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusAccepted, result)
 	})
 	r.Post("/api/library/{id}/search", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
@@ -840,7 +1112,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
-		result, err := workflow.SearchLibrary(r.Context(), id)
+		result, err := workflowSvc.SearchLibrary(r.Context(), id)
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -849,7 +1121,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusAccepted, result)
 	})
 	r.Post("/api/library/{id}/reset", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
@@ -858,7 +1130,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
-		if err := workflow.ResetLibraryItem(r.Context(), id); err != nil {
+		if err := workflowSvc.ResetLibraryItem(r.Context(), id); err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
 		}
@@ -866,7 +1138,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusOK, map[string]any{"libraryItemId": id})
 	})
 	r.Post("/api/releases/{id}/select", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
@@ -875,7 +1147,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
-		result, err := workflow.SelectRelease(r.Context(), id)
+		result, err := workflowSvc.SelectRelease(r.Context(), id)
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -884,7 +1156,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusAccepted, result)
 	})
 	r.Post("/api/releases/{id}/reject", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
@@ -899,7 +1171,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		if r.Body != nil {
 			_ = json.NewDecoder(r.Body).Decode(&payload)
 		}
-		result, err := workflow.RejectRelease(r.Context(), id, payload.Reason)
+		result, err := workflowSvc.RejectRelease(r.Context(), id, payload.Reason)
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -908,7 +1180,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusAccepted, result)
 	})
 	r.Post("/api/releases/{id}/restore", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
@@ -917,7 +1189,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
-		result, err := workflow.RestoreRelease(r.Context(), id)
+		result, err := workflowSvc.RestoreRelease(r.Context(), id)
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -926,7 +1198,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusAccepted, result)
 	})
 	r.Post("/api/releases/{id}/skip", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
@@ -935,7 +1207,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
-		result, err := workflow.SkipRelease(r.Context(), id)
+		result, err := workflowSvc.SkipRelease(r.Context(), id)
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -961,7 +1233,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusAccepted, map[string]any{"status": "republished", "libraryItemId": id})
 	})
 	r.Post("/api/library/{id}/restore-rejected", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
@@ -970,7 +1242,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
-		result, err := workflow.RestoreRejectedReleases(r.Context(), id)
+		result, err := workflowSvc.RestoreRejectedReleases(r.Context(), id)
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -992,11 +1264,11 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusAccepted, result)
 	})
 	r.Post("/api/library/backfill-metadata", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		result, err := workflow.BackfillMetadata(r.Context())
+		result, err := workflowSvc.BackfillMetadata(r.Context())
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -1004,11 +1276,11 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusAccepted, result)
 	})
 	r.Post("/api/library/fill-missing-episodes", func(w http.ResponseWriter, r *http.Request) {
-		if workflow == nil {
+		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		result, err := workflow.FillMissingEpisodes(r.Context())
+		result, err := workflowSvc.FillMissingEpisodes(r.Context())
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -1067,6 +1339,19 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		publishMutation("maintenance.orphaned_completed_symlinks", map[string]any{"deletedFiles": result.DeletedFiles, "deletedRows": result.DeletedRows})
 		respondJSON(w, http.StatusAccepted, result)
 	})
+	r.Post("/api/maintenance/nzb-health-check", func(w http.ResponseWriter, r *http.Request) {
+		if maintenance == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("maintenance unavailable"))
+			return
+		}
+		result, err := maintenance.DeepNZBHealthCheck(r.Context())
+		if err != nil {
+			respondError(w, http.StatusBadGateway, err)
+			return
+		}
+		publishMutation("maintenance.nzb_health_check", map[string]any{"scannedRows": result.ScannedRows, "resetItems": result.ResetItems})
+		respondJSON(w, http.StatusAccepted, result)
+	})
 	r.Get("/api/events", broker.ServeHTTP)
 	r.Get("/api/health/summary", func(w http.ResponseWriter, r *http.Request) {
 		if healthRepo == nil {
@@ -1116,6 +1401,21 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		}
 		publishMutation("health.check", map[string]any{"checked": checked, "healthy": healthy})
 		respondJSON(w, http.StatusOK, map[string]any{"checked": checked, "healthy": healthy})
+	})
+	r.Get("/api/health/consistency", func(w http.ResponseWriter, r *http.Request) {
+		if healthRepo == nil {
+			respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
+			return
+		}
+		issues, err := healthRepo.ListConsistencyIssues(r.Context())
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if issues == nil {
+			issues = []database.ConsistencyIssue{}
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"items": issues})
 	})
 	r.Get("/api/metrics", func(w http.ResponseWriter, r *http.Request) {
 		var snap metrics.Snapshot
@@ -1329,7 +1629,7 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
 			return
 		}
-		candidates, err := workflow.ManualSearch(r.Context(), q)
+		candidates, err := workflowSvc.ManualSearch(r.Context(), q)
 		if err != nil {
 			respondError(w, http.StatusBadGateway, err)
 			return
@@ -1416,10 +1716,10 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			return
 		}
 		type VFSEntry struct {
-			Name    string `json:"name"`
-			Path    string `json:"path"`
-			IsDir   bool   `json:"isDir"`
-			Size    int64  `json:"size"`
+			Name  string `json:"name"`
+			Path  string `json:"path"`
+			IsDir bool   `json:"isDir"`
+			Size  int64  `json:"size"`
 		}
 		result := make([]VFSEntry, 0, len(entries))
 		for _, e := range entries {
@@ -1539,182 +1839,8 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 		respondJSON(w, http.StatusOK, map[string]any{"items": entries})
 	})
 
-	// ── Custom formats ───────────────────────────────────────────────────────────
-	r.Get("/api/custom-formats", func(w http.ResponseWriter, r *http.Request) {
-		if profilesRepo == nil {
-			respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
-			return
-		}
-		items, err := profilesRepo.ListCustomFormats(r.Context())
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if items == nil {
-			items = []database.CustomFormat{}
-		}
-		respondJSON(w, http.StatusOK, map[string]any{"items": items})
-	})
-	r.Post("/api/custom-formats", func(w http.ResponseWriter, r *http.Request) {
-		if profilesRepo == nil {
-			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
-			return
-		}
-		var f database.CustomFormat
-		if err := json.NewDecoder(r.Body).Decode(&f); err != nil {
-			respondError(w, http.StatusBadRequest, err)
-			return
-		}
-		saved, err := profilesRepo.UpsertCustomFormat(r.Context(), f)
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		respondJSON(w, http.StatusOK, saved)
-	})
-	r.Put("/api/custom-formats/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if profilesRepo == nil {
-			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
-			return
-		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
-			return
-		}
-		var f database.CustomFormat
-		if err := json.NewDecoder(r.Body).Decode(&f); err != nil {
-			respondError(w, http.StatusBadRequest, err)
-			return
-		}
-		f.ID = id
-		updated, err := profilesRepo.UpdateCustomFormat(r.Context(), f)
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		respondJSON(w, http.StatusOK, updated)
-	})
-	r.Delete("/api/custom-formats/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if profilesRepo == nil {
-			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
-			return
-		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
-			return
-		}
-		if err := profilesRepo.DeleteCustomFormat(r.Context(), id); err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		respondJSON(w, http.StatusOK, map[string]any{"deleted": id})
-	})
-
-	// ── Release block rules ──────────────────────────────────────────────────────
-	r.Get("/api/release-block-rules", func(w http.ResponseWriter, r *http.Request) {
-		if profilesRepo == nil {
-			respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
-			return
-		}
-		items, err := profilesRepo.ListReleaseBlockRules(r.Context())
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if items == nil {
-			items = []database.ReleaseBlockRule{}
-		}
-		respondJSON(w, http.StatusOK, map[string]any{"items": items})
-	})
-	r.Post("/api/release-block-rules", func(w http.ResponseWriter, r *http.Request) {
-		if profilesRepo == nil {
-			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
-			return
-		}
-		var rule database.ReleaseBlockRule
-		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
-			respondError(w, http.StatusBadRequest, err)
-			return
-		}
-		saved, err := profilesRepo.UpsertReleaseBlockRule(r.Context(), rule)
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		respondJSON(w, http.StatusOK, saved)
-	})
-	r.Put("/api/release-block-rules/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if profilesRepo == nil {
-			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
-			return
-		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
-			return
-		}
-		var rule database.ReleaseBlockRule
-		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
-			respondError(w, http.StatusBadRequest, err)
-			return
-		}
-		rule.ID = id
-		updated, err := profilesRepo.UpdateReleaseBlockRule(r.Context(), rule)
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		respondJSON(w, http.StatusOK, updated)
-	})
-	r.Delete("/api/release-block-rules/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if profilesRepo == nil {
-			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
-			return
-		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
-			return
-		}
-		if err := profilesRepo.DeleteReleaseBlockRule(r.Context(), id); err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		respondJSON(w, http.StatusOK, map[string]any{"deleted": id})
-	})
-	r.Post("/api/release-block-rules/test", func(w http.ResponseWriter, r *http.Request) {
-		if profilesRepo == nil {
-			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
-			return
-		}
-		var req struct {
-			Title     string `json:"title"`
-			MediaType string `json:"mediaType"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			respondError(w, http.StatusBadRequest, err)
-			return
-		}
-		dbRules, err := profilesRepo.ListReleaseBlockRules(r.Context())
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		rules := make([]ranking.BlockRule, len(dbRules))
-		for i, rr := range dbRules {
-			rules[i] = ranking.BlockRule{
-				ID: rr.ID, Type: rr.Type, Pattern: rr.Pattern,
-				MediaType: rr.MediaType, Action: rr.Action,
-				ScorePenalty: rr.ScorePenalty, Enabled: rr.Enabled,
-				Source: rr.Source, Note: rr.Note,
-			}
-		}
-		result := ranking.TestBlockRules(rules, req.Title, req.MediaType)
-		respondJSON(w, http.StatusOK, result)
-	})
-
+	// ── Custom formats, release block rules, indexer policies, subtitle profiles ──
+	registerProfileRoutes(r, profilesRepo)
 	// ── TV show monitoring mode ──────────────────────────────────────────────────
 	r.Put("/api/tv-shows/{id}/monitoring", func(w http.ResponseWriter, r *http.Request) {
 		if profilesRepo == nil {
@@ -1758,12 +1884,17 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 
 // authMiddlewareFor builds the auth middleware using the user repo.
 // Public prefixes (setup, login/logout, webhooks, sabnzbd) pass through unauthenticated.
+// When repo is nil (e.g. in tests) all requests pass through unauthenticated.
 func authMiddlewareFor(repo UserRepository) func(http.Handler) http.Handler {
+	if repo == nil {
+		return func(next http.Handler) http.Handler { return next }
+	}
 	exempt := []string{
 		"/api/setup/",
 		"/api/auth/login",
 		"/api/auth/logout",
 		"/api/webhooks/",
+		"/dav/api",
 		"/api/sabnzbd/",
 		"/sabnzbd/",
 	}
@@ -2033,4 +2164,99 @@ func uploadSubtitleRequest(r *http.Request, subtitles SubtitleService, libraryIt
 		fileName = "subtitle.srt"
 	}
 	return subtitles.UploadSubtitle(r.Context(), libraryItemID, language, fileName, r.Body)
+}
+
+func parseManualBlocklistMutation(r *http.Request) (database.BlocklistMutation, error) {
+	var body struct {
+		Key          string     `json:"key"`
+		KeyType      string     `json:"keyType"`
+		ExternalURL  string     `json:"externalUrl"`
+		ReleaseTitle string     `json:"releaseTitle"`
+		IndexerName  string     `json:"indexerName"`
+		SizeMB       int64      `json:"sizeMb"`
+		PostedDate   string     `json:"postedDate"`
+		Reason       string     `json:"reason"`
+		ExpiresAt    *time.Time `json:"expiresAt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		return database.BlocklistMutation{}, err
+	}
+	key, err := manualBlocklistKey(body.KeyType, body.Key, body.ExternalURL, body.ReleaseTitle, body.IndexerName, body.SizeMB, body.PostedDate)
+	if err != nil {
+		return database.BlocklistMutation{}, err
+	}
+	return database.BlocklistMutation{
+		Key:       key,
+		Reason:    strings.TrimSpace(body.Reason),
+		ExpiresAt: body.ExpiresAt,
+	}, nil
+}
+
+func manualBlocklistKey(keyType, rawKey, externalURL, releaseTitle, indexerName string, sizeMB int64, postedDate string) (string, error) {
+	switch strings.TrimSpace(keyType) {
+	case "", "raw":
+		key := strings.TrimSpace(rawKey)
+		if key == "" {
+			return "", errors.New("key is required")
+		}
+		return key, nil
+	case "external_url":
+		if strings.TrimSpace(externalURL) == "" {
+			return "", errors.New("externalUrl is required")
+		}
+		return "external_url:" + strings.TrimSpace(externalURL), nil
+	case "release_signature":
+		titleKey := normalizeBlocklistTitle(strings.TrimSpace(releaseTitle))
+		if titleKey == "" {
+			return "", errors.New("releaseTitle is required")
+		}
+		indexerKey := normalizeBlocklistTitle(strings.TrimSpace(indexerName))
+		sizeBucket := "0"
+		if sizeMB > 0 {
+			sizeBucket = strconv.FormatInt(sizeMB, 10)
+		}
+		dateBucket := "none"
+		if strings.TrimSpace(postedDate) != "" {
+			value, err := time.Parse("2006-01-02", strings.TrimSpace(postedDate))
+			if err != nil {
+				return "", fmt.Errorf("invalid postedDate: %w", err)
+			}
+			dateBucket = value.UTC().Format("2006-01-02")
+		}
+		return "release_signature:" + strings.Join([]string{titleKey, indexerKey, sizeBucket, dateBucket}, "|"), nil
+	default:
+		return "", fmt.Errorf("unsupported keyType %q", keyType)
+	}
+}
+
+func normalizeBlocklistTitle(value string) string {
+	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ", "{", " ", "}", " ")
+	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(strings.TrimSpace(value)))), " ")
+}
+
+func validateReleaseBlockRule(r database.ReleaseBlockRule) error {
+	validTypes := map[string]bool{"release_group": true, "title_pattern": true, "regex": true, "missing_release_group": true}
+	if !validTypes[r.Type] {
+		return fmt.Errorf("type must be one of: release_group, title_pattern, regex, missing_release_group")
+	}
+	validMediaTypes := map[string]bool{"movie": true, "tv": true, "both": true}
+	if !validMediaTypes[r.MediaType] {
+		return fmt.Errorf("mediaType must be one of: movie, tv, both")
+	}
+	validActions := map[string]bool{"block": true, "penalty": true}
+	if !validActions[r.Action] {
+		return fmt.Errorf("action must be one of: block, penalty")
+	}
+	if r.ScorePenalty < 0 {
+		return fmt.Errorf("scorePenalty must be >= 0")
+	}
+	if r.Type != "missing_release_group" && strings.TrimSpace(r.Pattern) == "" {
+		return fmt.Errorf("pattern is required for type %q", r.Type)
+	}
+	if r.Type == "regex" {
+		if _, err := regexp.Compile(r.Pattern); err != nil {
+			return fmt.Errorf("invalid regex pattern: %w", err)
+		}
+	}
+	return nil
 }
