@@ -73,6 +73,7 @@ type Repository interface {
 	ListShowsWithMissingEpisodes(ctx context.Context) ([]database.ShowWithMissingEpisodes, error)
 	EnsureEpisodeLibraryItem(ctx context.Context, tvShowID int64, showTitle string, seasonNum, episodeNum int, episodeTitle, airDate string) (created bool, err error)
 	ListCustomFormats(ctx context.Context) ([]database.CustomFormat, error)
+	ListReleaseBlockRules(ctx context.Context) ([]database.ReleaseBlockRule, error)
 	CreateImportedNZB(ctx context.Context, imported database.ImportedNZB) (database.QueueSnapshot, error)
 	ListSabQueueItems(ctx context.Context, category string, start, limit int) ([]database.SabQueueItem, int, error)
 	ListSabHistoryItems(ctx context.Context, category string, start, limit int) ([]database.SabHistoryItem, int, error)
@@ -1920,6 +1921,7 @@ func (s *Service) profilePreferencesForItem(ctx context.Context, libraryItemID i
 				MinimumAgeHours:  p.MinimumAgeHours,
 				CutoffResolution: p.CutoffResolution,
 				CustomFormats:    s.loadCustomFormats(ctx),
+				BlockRules:       s.loadBlockRules(ctx),
 			}
 		}
 	}
@@ -1981,6 +1983,7 @@ func (s *Service) defaultProfilePreferences(ctx context.Context, mediaType strin
 		MinimumAgeHours:  profile.MinimumAgeHours,
 		CutoffResolution: profile.CutoffResolution,
 		CustomFormats:    s.loadCustomFormats(ctx),
+		BlockRules:       s.loadBlockRules(ctx),
 	}
 
 	s.profileCacheMu.Lock()
@@ -2048,6 +2051,33 @@ func (s *Service) loadCustomFormats(ctx context.Context) []ranking.CustomFormat 
 			Pattern: f.Pattern,
 			Score:   f.Score,
 			Enabled: f.Enabled,
+		}
+	}
+	return out
+}
+
+// loadBlockRules fetches release block rules from the DB and converts them to
+// ranking.BlockRule values. Returns nil on error (silently degrades).
+func (s *Service) loadBlockRules(ctx context.Context) []ranking.BlockRule {
+	if s == nil || s.repo == nil {
+		return nil
+	}
+	dbRules, err := s.repo.ListReleaseBlockRules(ctx)
+	if err != nil || len(dbRules) == 0 {
+		return nil
+	}
+	out := make([]ranking.BlockRule, len(dbRules))
+	for i, r := range dbRules {
+		out[i] = ranking.BlockRule{
+			ID:           r.ID,
+			Type:         r.Type,
+			Pattern:      r.Pattern,
+			MediaType:    r.MediaType,
+			Action:       r.Action,
+			ScorePenalty: r.ScorePenalty,
+			Enabled:      r.Enabled,
+			Source:       r.Source,
+			Note:         r.Note,
 		}
 	}
 	return out
@@ -2363,6 +2393,7 @@ func (s *Service) ManualSearch(ctx context.Context, query string) ([]ManualSearc
 		}
 		result := ranking.ScoreWithPreferences(candidate, ranking.Requirements{}, ranking.Preferences{
 			CustomFormats: s.loadCustomFormats(ctx),
+			BlockRules:    s.loadBlockRules(ctx),
 		})
 		out = append(out, ManualSearchItem{
 			Title:      r.Title,

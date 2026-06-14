@@ -26,7 +26,9 @@ import type {
   FullSettings,
   GrabHistoryEntry,
   CustomFormat,
-  User
+  User,
+  ReleaseBlockRule,
+  BlockTestResult
 } from '$lib/types';
 
 function baseURL() {
@@ -224,6 +226,16 @@ export const api = {
   // Grab history
   grabHistory: (libraryItemID: number) =>
     request<{ items: GrabHistoryEntry[] }>(`/api/library/${libraryItemID}/grab-history`),
+  // Release block rules
+  listReleaseBlockRules: () => request<{ items: ReleaseBlockRule[] }>('/api/release-block-rules'),
+  createReleaseBlockRule: (r: ReleaseBlockRule) =>
+    request<ReleaseBlockRule>('/api/release-block-rules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(r) }),
+  updateReleaseBlockRule: (r: ReleaseBlockRule) =>
+    request<ReleaseBlockRule>(`/api/release-block-rules/${r.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(r) }),
+  deleteReleaseBlockRule: (id: number) =>
+    request<{ deleted: number }>(`/api/release-block-rules/${id}`, { method: 'DELETE' }),
+  testReleaseBlockRule: (title: string, mediaType: string) =>
+    request<BlockTestResult>('/api/release-block-rules/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title, mediaType }) }),
   // Custom formats
   listCustomFormats: () => request<{ items: CustomFormat[] }>('/api/custom-formats'),
   createCustomFormat: (f: CustomFormat) =>

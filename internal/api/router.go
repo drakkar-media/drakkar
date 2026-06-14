@@ -23,6 +23,7 @@ import (
 	"github.com/hjongedijk/drakkar/internal/catalog"
 	"github.com/hjongedijk/drakkar/internal/config"
 	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/hjongedijk/drakkar/internal/ranking"
 	"github.com/hjongedijk/drakkar/internal/library"
 	"github.com/hjongedijk/drakkar/internal/maintenance"
 	"github.com/hjongedijk/drakkar/internal/metrics"
@@ -70,6 +71,10 @@ type ProfilesRepository interface {
 	UpdateCustomFormat(ctx context.Context, f database.CustomFormat) (database.CustomFormat, error)
 	DeleteCustomFormat(ctx context.Context, id int64) error
 	UpsertCustomFormat(ctx context.Context, f database.CustomFormat) (database.CustomFormat, error)
+	ListReleaseBlockRules(ctx context.Context) ([]database.ReleaseBlockRule, error)
+	UpsertReleaseBlockRule(ctx context.Context, r database.ReleaseBlockRule) (database.ReleaseBlockRule, error)
+	UpdateReleaseBlockRule(ctx context.Context, r database.ReleaseBlockRule) (database.ReleaseBlockRule, error)
+	DeleteReleaseBlockRule(ctx context.Context, id int64) error
 	SetTVShowMonitoringMode(ctx context.Context, tvShowID int64, mode string) error
 	ListSabQueueItems(ctx context.Context, category string, start, limit int) ([]database.SabQueueItem, int, error)
 	ListSabHistoryItems(ctx context.Context, category string, start, limit int) ([]database.SabHistoryItem, int, error)
@@ -1605,6 +1610,109 @@ func Router(status StatusService, queue QueueService, workflow WorkflowService, 
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"deleted": id})
+	})
+
+	// ── Release block rules ──────────────────────────────────────────────────────
+	r.Get("/api/release-block-rules", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
+			return
+		}
+		items, err := profilesRepo.ListReleaseBlockRules(r.Context())
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if items == nil {
+			items = []database.ReleaseBlockRule{}
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"items": items})
+	})
+	r.Post("/api/release-block-rules", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
+			return
+		}
+		var rule database.ReleaseBlockRule
+		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		saved, err := profilesRepo.UpsertReleaseBlockRule(r.Context(), rule)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, saved)
+	})
+	r.Put("/api/release-block-rules/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
+			return
+		}
+		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		var rule database.ReleaseBlockRule
+		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		rule.ID = id
+		updated, err := profilesRepo.UpdateReleaseBlockRule(r.Context(), rule)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, updated)
+	})
+	r.Delete("/api/release-block-rules/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
+			return
+		}
+		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := profilesRepo.DeleteReleaseBlockRule(r.Context(), id); err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"deleted": id})
+	})
+	r.Post("/api/release-block-rules/test", func(w http.ResponseWriter, r *http.Request) {
+		if profilesRepo == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
+			return
+		}
+		var req struct {
+			Title     string `json:"title"`
+			MediaType string `json:"mediaType"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		dbRules, err := profilesRepo.ListReleaseBlockRules(r.Context())
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		rules := make([]ranking.BlockRule, len(dbRules))
+		for i, rr := range dbRules {
+			rules[i] = ranking.BlockRule{
+				ID: rr.ID, Type: rr.Type, Pattern: rr.Pattern,
+				MediaType: rr.MediaType, Action: rr.Action,
+				ScorePenalty: rr.ScorePenalty, Enabled: rr.Enabled,
+				Source: rr.Source, Note: rr.Note,
+			}
+		}
+		result := ranking.TestBlockRules(rules, req.Title, req.MediaType)
+		respondJSON(w, http.StatusOK, result)
 	})
 
 	// ── TV show monitoring mode ──────────────────────────────────────────────────

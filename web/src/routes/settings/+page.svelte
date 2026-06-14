@@ -21,6 +21,7 @@
   import CheckCircle2 from '@lucide/svelte/icons/check-circle-2';
   import AlertTriangle from '@lucide/svelte/icons/alert-triangle';
   import Star from '@lucide/svelte/icons/star';
+  import Ban from '@lucide/svelte/icons/ban';
   import ChevronUp from '@lucide/svelte/icons/chevron-up';
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
   import Trash2 from '@lucide/svelte/icons/trash-2';
@@ -35,9 +36,9 @@
   import { api, subscribeEvents } from '$lib/api';
   import { bytes, dateTime } from '$lib/format';
   import { toastError, toastSuccess } from '$lib/toast';
-  import type { BlocklistItem, CustomFormat, FullSettings, IntegrationProbeReport, MaintenanceResult, PolicySettings, QualityDefinition, QualityProfile, Status, TaskSchedule, UsenetProvider } from '$lib/types';
+  import type { BlocklistItem, BlockTestResult, CustomFormat, FullSettings, IntegrationProbeReport, MaintenanceResult, PolicySettings, QualityDefinition, QualityProfile, ReleaseBlockRule, Status, TaskSchedule, UsenetProvider } from '$lib/types';
 
-  type SettingsTab = 'integrations' | 'providers' | 'indexers' | 'queue' | 'library' | 'rules' | 'quality' | 'formats' | 'notifications' | 'logs' | 'tasks' | 'media-players' | 'system';
+  type SettingsTab = 'integrations' | 'providers' | 'indexers' | 'queue' | 'library' | 'rules' | 'quality' | 'formats' | 'filtering' | 'notifications' | 'logs' | 'tasks' | 'media-players' | 'system';
 
   const tabs: { id: SettingsTab; label: string; short: string; icon: typeof PlugZap }[] = [
     { id: 'integrations',  label: 'Integrations',  short: 'Apps',     icon: PlugZap },
@@ -47,8 +48,9 @@
     { id: 'library',       label: 'Library',       short: 'Names',    icon: Library },
     { id: 'rules',         label: 'Rules',         short: 'Rules',    icon: ShieldAlert },
     { id: 'quality',       label: 'Quality',       short: 'Quality',  icon: SlidersHorizontal },
-    { id: 'formats',       label: 'Custom Formats', short: 'Formats', icon: Star },
-    { id: 'notifications', label: 'Notifications', short: 'Notify',  icon: Webhook },
+    { id: 'formats',       label: 'Custom Formats',    short: 'Formats',   icon: Star },
+    { id: 'filtering',     label: 'Release Filtering', short: 'Filtering', icon: Ban },
+    { id: 'notifications', label: 'Notifications',     short: 'Notify',    icon: Webhook },
     { id: 'logs',          label: 'Logs',          short: 'Logs',     icon: ScrollText },
     { id: 'tasks',         label: 'Tasks',         short: 'Tasks',    icon: ClipboardList },
     { id: 'media-players', label: 'Media Players', short: 'Players',  icon: Tv },
@@ -199,6 +201,70 @@
       customFormats = res.items ?? [];
     } catch { /* ignore */ }
   }
+
+  // ── Release block rules ──────────────────────────────────────────────────
+  let blockRules: ReleaseBlockRule[] = [];
+  let bfSaving = false;
+  let editingRule: ReleaseBlockRule | null = null;
+  let testTitle = '';
+  let testMediaType: 'movie' | 'tv' | 'both' = 'both';
+  let testResult: BlockTestResult | null = null;
+  let testRunning = false;
+
+  function blankRule(): ReleaseBlockRule {
+    return { type: 'release_group', pattern: '', mediaType: 'both', action: 'block', scorePenalty: 0, enabled: true, source: 'custom', note: '' };
+  }
+
+  async function loadBlockRules() {
+    try {
+      const res = await api.listReleaseBlockRules();
+      blockRules = res.items ?? [];
+    } catch { /* ignore */ }
+  }
+
+  async function saveBlockRule() {
+    if (!editingRule) return;
+    bfSaving = true;
+    try {
+      let saved: ReleaseBlockRule;
+      if (editingRule.id) {
+        saved = await api.updateReleaseBlockRule(editingRule);
+        blockRules = blockRules.map(r => r.id === saved.id ? saved : r);
+      } else {
+        saved = await api.createReleaseBlockRule(editingRule);
+        blockRules = [...blockRules, saved];
+      }
+      editingRule = null;
+      toastSuccess('Saved');
+    } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
+    finally { bfSaving = false; }
+  }
+
+  async function deleteBlockRule(id: number) {
+    try {
+      await api.deleteReleaseBlockRule(id);
+      blockRules = blockRules.filter(r => r.id !== id);
+      editingRule = null;
+      toastSuccess('Deleted');
+    } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
+  }
+
+  async function runBlockTest() {
+    if (!testTitle.trim()) return;
+    testRunning = true;
+    testResult = null;
+    try {
+      testResult = await api.testReleaseBlockRule(testTitle.trim(), testMediaType);
+    } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
+    finally { testRunning = false; }
+  }
+
+  $: blockRuleGroups = {
+    release_group: blockRules.filter(r => r.type === 'release_group'),
+    title_pattern: blockRules.filter(r => r.type === 'title_pattern'),
+    regex: blockRules.filter(r => r.type === 'regex'),
+    missing_release_group: blockRules.filter(r => r.type === 'missing_release_group'),
+  };
 
   async function saveFormat() {
     if (!editingFormat) return;
@@ -521,6 +587,7 @@
     void loadAll();
     void loadTaskSchedules();
     void loadCustomFormats();
+    void loadBlockRules();
     const unsub = subscribeEvents(() => { if (!working) void loadAll(); });
     const timer = window.setInterval(() => void loadAll(), 30000);
     const taskTimer = window.setInterval(() => void loadTaskSchedules(), 30000);
@@ -1586,6 +1653,149 @@
             {:else}
               <div class="cf-empty">Select a format to edit, or create a new one.</div>
             {/if}
+          </div>
+        </div>
+      </Panel>
+
+    <!-- RELEASE FILTERING -->
+    {:else if activeTab === 'filtering'}
+      <Panel title="Release Filtering" subtitle="Block or penalise known low-quality releases by group, title pattern, or regex. Default rules are from TRaSH Guides LQ lists.">
+        <div class="rf-layout">
+          <!-- Rule list -->
+          <div class="rf-list">
+            <div class="rf-list-header">
+              <span>Rules ({blockRules.filter(r => r.enabled).length}/{blockRules.length} enabled)</span>
+              <Button kind="ghost" on:click={() => { editingRule = blankRule(); }}>
+                <Plus size={14} /> Add
+              </Button>
+            </div>
+
+            {#each [['release_group','Release Groups'], ['title_pattern','Title Patterns'], ['regex','Regex'], ['missing_release_group','Missing Group']] as [typeKey, typeLabel] (typeKey)}
+              {@const group = blockRules.filter(r => r.type === typeKey)}
+              {#if group.length > 0}
+                <div class="rf-type-header">{typeLabel} <span class="rf-count">{group.filter(r => r.enabled).length}/{group.length}</span></div>
+                {#each group as rule (rule.id)}
+                  <button class="rf-item" class:rf-active={editingRule?.id === rule.id} class:rf-disabled={!rule.enabled}
+                    on:click={() => { editingRule = { ...rule }; testResult = null; }}>
+                    <span class="rf-pattern">{rule.pattern || '(any)'}</span>
+                    <span class="rf-badges">
+                      {#if rule.mediaType !== 'both'}<span class="rf-badge rf-badge-mt">{rule.mediaType}</span>{/if}
+                      <span class="rf-badge" class:rf-badge-block={rule.action === 'block'} class:rf-badge-penalty={rule.action === 'penalty'}>
+                        {rule.action === 'block' ? 'block' : `-${rule.scorePenalty}`}
+                      </span>
+                      {#if rule.source !== 'custom'}<span class="rf-badge rf-badge-src">{rule.source}</span>{/if}
+                      {#if !rule.enabled}<span class="rf-badge rf-badge-off">off</span>{/if}
+                    </span>
+                  </button>
+                {/each}
+              {/if}
+            {/each}
+
+            {#if blockRules.length === 0}
+              <div class="cf-empty">No rules yet.</div>
+            {/if}
+          </div>
+
+          <!-- Editor + test tool -->
+          <div class="rf-editor">
+            {#if editingRule}
+              <div class="field">
+                <label class="field-label" for="rf-type">Type</label>
+                <select id="rf-type" bind:value={editingRule.type} disabled={editingRule.id !== undefined && editingRule.source !== 'custom'}>
+                  <option value="release_group">Release Group</option>
+                  <option value="title_pattern">Title Pattern</option>
+                  <option value="regex">Regex</option>
+                  <option value="missing_release_group">Missing Release Group</option>
+                </select>
+              </div>
+              {#if editingRule.type !== 'missing_release_group'}
+                <div class="field">
+                  <label class="field-label" for="rf-pattern">Pattern
+                    {#if editingRule.type === 'regex'}<span class="field-hint">(regex, case-insensitive)</span>{/if}
+                    {#if editingRule.type === 'title_pattern'}<span class="field-hint">(substring match, dots normalised)</span>{/if}
+                    {#if editingRule.type === 'release_group'}<span class="field-hint">(parsed group after last "-")</span>{/if}
+                  </label>
+                  <input id="rf-pattern" type="text" bind:value={editingRule.pattern}
+                    placeholder={editingRule.type === 'release_group' ? 'e.g. GalaxyRG' : editingRule.type === 'title_pattern' ? 'e.g. AI Upscale' : '(?i)upscal(e|ed)'}
+                    disabled={editingRule.id !== undefined && editingRule.source !== 'custom'} />
+                </div>
+              {/if}
+              <div class="field">
+                <label class="field-label" for="rf-mediatype">Media type</label>
+                <select id="rf-mediatype" bind:value={editingRule.mediaType} disabled={editingRule.id !== undefined && editingRule.source !== 'custom'}>
+                  <option value="both">Both</option>
+                  <option value="movie">Movie only</option>
+                  <option value="tv">TV only</option>
+                </select>
+              </div>
+              <div class="field">
+                <label class="field-label" for="rf-action">Action</label>
+                <select id="rf-action" bind:value={editingRule.action} disabled={editingRule.id !== undefined && editingRule.source !== 'custom'}>
+                  <option value="block">Block (reject release)</option>
+                  <option value="penalty">Penalty (reduce score)</option>
+                </select>
+              </div>
+              {#if editingRule.action === 'penalty'}
+                <div class="field">
+                  <label class="field-label" for="rf-penalty">Score penalty <span class="field-hint">(positive = points subtracted)</span></label>
+                  <input id="rf-penalty" type="number" bind:value={editingRule.scorePenalty} min="0"
+                    disabled={editingRule.id !== undefined && editingRule.source !== 'custom'} />
+                </div>
+              {/if}
+              <div class="field">
+                <label class="field-label" for="rf-note">Note <span class="field-hint">(optional)</span></label>
+                <input id="rf-note" type="text" bind:value={editingRule.note} placeholder="Why this rule exists" />
+              </div>
+              <label class="flag-row">
+                <input type="checkbox" bind:checked={editingRule.enabled} />
+                <div><strong>Enabled</strong><span>Apply this rule when scoring releases</span></div>
+              </label>
+              <div class="editor-actions" style="margin-top:16px">
+                {#if editingRule.id && editingRule.source === 'custom'}
+                  <Button kind="danger" on:click={() => editingRule?.id && deleteBlockRule(editingRule.id)}>
+                    <Trash2 size={15} /> Delete
+                  </Button>
+                {/if}
+                <Button kind="ghost" on:click={() => { editingRule = null; testResult = null; }}>Cancel</Button>
+                <Button kind="primary" on:click={saveBlockRule} disabled={bfSaving}>
+                  <Save size={15} /> {bfSaving ? 'Saving…' : 'Save'}
+                </Button>
+              </div>
+              {#if editingRule.source !== 'custom'}
+                <p class="rf-readonly-note">Default and TRaSH rules: only <strong>enabled</strong> and <strong>note</strong> can be changed. To customise, add a new custom rule.</p>
+              {/if}
+            {:else}
+              <div class="cf-empty">Select a rule to edit, or add a new custom rule.</div>
+            {/if}
+
+            <!-- Test tool -->
+            <div class="rf-test-panel">
+              <div class="rf-test-header">Test a release title</div>
+              <div class="rf-test-row">
+                <input type="text" bind:value={testTitle} placeholder="Movie.Title.2025.1080p.WEB-DL-GalaxyRG"
+                  style="flex:1" on:keydown={(e) => e.key === 'Enter' && runBlockTest()} />
+                <select bind:value={testMediaType} style="width:100px">
+                  <option value="both">Both</option>
+                  <option value="movie">Movie</option>
+                  <option value="tv">TV</option>
+                </select>
+                <Button kind="secondary" on:click={runBlockTest} disabled={testRunning || !testTitle.trim()}>
+                  {testRunning ? '…' : 'Test'}
+                </Button>
+              </div>
+              {#if testResult}
+                <div class="rf-test-result" class:rf-test-blocked={testResult.blocked} class:rf-test-allowed={testResult.allowed && testResult.scorePenalty === 0}>
+                  <strong>{testResult.blocked ? '🚫 Blocked' : testResult.scorePenalty > 0 ? `⚠ Penalty −${testResult.scorePenalty}` : '✓ Allowed'}</strong>
+                  {#if testResult.matchedRules.length > 0}
+                    <ul class="rf-test-matches">
+                      {#each testResult.matchedRules as m}
+                        <li><span class="rf-badge rf-badge-src">{m.type}</span> {m.reason}</li>
+                      {/each}
+                    </ul>
+                  {/if}
+                </div>
+              {/if}
+            </div>
           </div>
         </div>
       </Panel>
@@ -2710,5 +2920,36 @@
   .cf-empty { padding: 24px; color: hsl(var(--muted-foreground)); font-size: 13px; text-align: center; }
   @media (max-width: 600px) {
     .cf-layout { grid-template-columns: 1fr; }
+  }
+
+  /* ── Release Filtering ─────────────────────────────────────────────────── */
+  .rf-layout { display: grid; grid-template-columns: 240px 1fr; gap: 16px; }
+  .rf-list { display: grid; gap: 3px; align-content: start; max-height: 600px; overflow-y: auto; }
+  .rf-list-header { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 600; color: hsl(var(--muted-foreground)); padding: 0 4px 6px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .rf-type-header { font-size: 11px; font-weight: 600; color: hsl(var(--muted-foreground)); padding: 10px 4px 3px; text-transform: uppercase; letter-spacing: 0.06em; display: flex; align-items: center; gap: 6px; }
+  .rf-count { font-size: 10px; background: hsl(0 0% 100% / 0.08); border-radius: 4px; padding: 1px 5px; }
+  .rf-item { display: flex; align-items: center; justify-content: space-between; gap: 4px; padding: 6px 10px; border-radius: 9px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.03); cursor: pointer; text-align: left; transition: background 0.1s; }
+  .rf-item:hover, .rf-item.rf-active { background: hsl(var(--primary) / 0.12); border-color: hsl(var(--primary) / 0.3); }
+  .rf-item.rf-disabled { opacity: 0.45; }
+  .rf-pattern { font-size: 12px; font-family: 'JetBrains Mono', monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .rf-badges { display: flex; gap: 3px; flex-shrink: 0; }
+  .rf-badge { font-size: 10px; border-radius: 4px; padding: 1px 5px; white-space: nowrap; }
+  .rf-badge-block { background: hsl(0 70% 50% / 0.2); color: hsl(0 70% 65%); }
+  .rf-badge-penalty { background: hsl(43 90% 50% / 0.2); color: hsl(43 90% 65%); }
+  .rf-badge-src { background: hsl(0 0% 100% / 0.08); color: hsl(var(--muted-foreground)); }
+  .rf-badge-mt { background: hsl(217 80% 60% / 0.2); color: hsl(217 80% 72%); }
+  .rf-badge-off { background: hsl(0 0% 100% / 0.06); color: hsl(var(--muted-foreground)); }
+  .rf-editor { display: grid; gap: 14px; align-content: start; }
+  .rf-readonly-note { font-size: 12px; color: hsl(var(--muted-foreground)); background: hsl(0 0% 100% / 0.03); border: 1px solid hsl(0 0% 100% / 0.06); border-radius: 10px; padding: 10px 12px; margin: 0; }
+  .rf-test-panel { margin-top: 24px; padding: 14px; border: 1px solid hsl(0 0% 100% / 0.06); border-radius: 14px; background: hsl(0 0% 100% / 0.02); display: grid; gap: 10px; }
+  .rf-test-header { font-size: 12px; font-weight: 600; color: hsl(var(--muted-foreground)); text-transform: uppercase; letter-spacing: 0.06em; }
+  .rf-test-row { display: flex; gap: 8px; align-items: center; }
+  .rf-test-result { padding: 10px 12px; border-radius: 10px; border: 1px solid hsl(0 0% 100% / 0.08); background: hsl(0 0% 100% / 0.03); font-size: 13px; }
+  .rf-test-result.rf-test-blocked { background: hsl(0 70% 50% / 0.1); border-color: hsl(0 70% 50% / 0.3); color: hsl(0 70% 65%); }
+  .rf-test-result.rf-test-allowed { background: hsl(140 60% 40% / 0.1); border-color: hsl(140 60% 40% / 0.3); color: hsl(140 60% 60%); }
+  .rf-test-matches { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 4px; list-style: disc; }
+  .rf-test-matches li { font-size: 12px; color: inherit; }
+  @media (max-width: 700px) {
+    .rf-layout { grid-template-columns: 1fr; }
   }
 </style>

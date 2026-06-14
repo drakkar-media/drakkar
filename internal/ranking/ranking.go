@@ -120,6 +120,19 @@ type CustomFormat struct {
 	Enabled bool
 }
 
+// BlockRule is a release filter rule loaded from the release_block_rules table.
+type BlockRule struct {
+	ID           int64
+	Type         string // "release_group" | "title_pattern" | "regex" | "missing_release_group"
+	Pattern      string
+	MediaType    string // "movie" | "tv" | "both"
+	Action       string // "block" | "penalty"
+	ScorePenalty int    // only used when Action == "penalty"
+	Enabled      bool
+	Source       string
+	Note         string
+}
+
 type Preferences struct {
 	Resolutions     []string
 	Sources         []string
@@ -144,6 +157,8 @@ type Preferences struct {
 	CutoffResolution string
 	// CustomFormats: user-defined scoring rules applied on top of base score.
 	CustomFormats []CustomFormat
+	// BlockRules: release filter rules. Block action rejects; penalty action subtracts score.
+	BlockRules []BlockRule
 }
 
 type Result struct {
@@ -327,7 +342,146 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 		}
 	}
 
+	// ── Release block rules ───────────────────────────────────────────────────
+	if len(prefs.BlockRules) > 0 {
+		effectiveMediaType := required.MediaType
+		if effectiveMediaType == "episode" {
+			effectiveMediaType = "tv"
+		}
+		titleLower := strings.ToLower(candidate.Title)
+		// Prefer the pre-parsed ReleaseGroup field; fall back to parsing the title.
+		releaseGroup := candidate.ReleaseGroup
+		if releaseGroup == "" {
+			releaseGroup = ParseReleaseGroup(candidate.Title)
+		}
+		releaseGroupLower := strings.ToLower(releaseGroup)
+
+		for _, rule := range prefs.BlockRules {
+			if !rule.Enabled {
+				continue
+			}
+			if rule.MediaType != "both" && rule.MediaType != effectiveMediaType {
+				continue
+			}
+			if !matchBlockRule(rule, titleLower, releaseGroupLower) {
+				continue
+			}
+			if rule.Action == "block" {
+				return Result{Rejected: true, RejectReason: "blocklist:" + rule.Type + ":" + rule.Pattern}
+			}
+			score -= rule.ScorePenalty
+		}
+	}
+
 	return Result{Score: score}
+}
+
+// ParseReleaseGroup extracts the release group from a release title using scene convention:
+// the group is the text after the last "-" separator, excluding file extensions.
+// Returns an empty string when no group can be parsed.
+func ParseReleaseGroup(title string) string {
+	name := title
+	// Strip common media/archive extensions.
+	for _, ext := range []string{".nzb", ".mkv", ".mp4", ".avi", ".ts", ".m2ts"} {
+		if strings.HasSuffix(strings.ToLower(name), ext) {
+			name = name[:len(name)-len(ext)]
+			break
+		}
+	}
+	idx := strings.LastIndex(name, "-")
+	if idx < 0 || idx == len(name)-1 {
+		return ""
+	}
+	group := name[idx+1:]
+	// Groups never contain spaces or dots in standard scene naming.
+	if strings.ContainsAny(group, " \t\n.") {
+		return ""
+	}
+	return group
+}
+
+// matchBlockRule returns true when the given rule matches the (already lower-cased) title/group.
+func matchBlockRule(rule BlockRule, titleLower, releaseGroupLower string) bool {
+	switch rule.Type {
+	case "release_group":
+		patternLower := strings.ToLower(rule.Pattern)
+		if releaseGroupLower != "" {
+			return releaseGroupLower == patternLower
+		}
+		// Fallback: search whole title when group cannot be parsed.
+		return strings.Contains(titleLower, patternLower)
+	case "title_pattern":
+		patternLower := strings.ToLower(rule.Pattern)
+		// Also check with dots normalised to spaces to match scene notation
+		// (e.g. pattern "AI Upscale" matches title "...ai.upscale-GROUP").
+		normalised := strings.ReplaceAll(titleLower, ".", " ")
+		return strings.Contains(titleLower, patternLower) || strings.Contains(normalised, patternLower)
+	case "regex":
+		if re, err := regexp.Compile("(?i)" + rule.Pattern); err == nil {
+			return re.MatchString(titleLower)
+		}
+	case "missing_release_group":
+		return releaseGroupLower == ""
+	}
+	return false
+}
+
+// BlockTestMatch is one matched rule in a TestBlockRules result.
+type BlockTestMatch struct {
+	RuleID  int64  `json:"ruleId"`
+	Type    string `json:"type"`
+	Pattern string `json:"pattern"`
+	Action  string `json:"action"`
+	Reason  string `json:"reason"`
+}
+
+// BlockTestResult is returned by TestBlockRules for debugging/API use.
+type BlockTestResult struct {
+	Allowed      bool             `json:"allowed"`
+	Blocked      bool             `json:"blocked"`
+	ScorePenalty int              `json:"scorePenalty"`
+	MatchedRules []BlockTestMatch `json:"matchedRules"`
+}
+
+// TestBlockRules evaluates a release title against a set of rules and returns
+// a detailed filter result. Used by the /api/release-block-rules/test endpoint.
+func TestBlockRules(rules []BlockRule, title, mediaType string) BlockTestResult {
+	titleLower := strings.ToLower(title)
+	releaseGroup := ParseReleaseGroup(title)
+	releaseGroupLower := strings.ToLower(releaseGroup)
+
+	effectiveMediaType := mediaType
+	if effectiveMediaType == "episode" {
+		effectiveMediaType = "tv"
+	}
+
+	var result BlockTestResult
+	for _, rule := range rules {
+		if !rule.Enabled {
+			continue
+		}
+		if rule.MediaType != "both" && rule.MediaType != effectiveMediaType {
+			continue
+		}
+		if !matchBlockRule(rule, titleLower, releaseGroupLower) {
+			continue
+		}
+		match := BlockTestMatch{
+			RuleID:  rule.ID,
+			Type:    rule.Type,
+			Pattern: rule.Pattern,
+			Action:  rule.Action,
+			Reason:  fmt.Sprintf("%s matched %q", rule.Type, rule.Pattern),
+		}
+		result.MatchedRules = append(result.MatchedRules, match)
+		if rule.Action == "block" {
+			result.Blocked = true
+		} else {
+			result.ScorePenalty += rule.ScorePenalty
+		}
+	}
+	result.Allowed = !result.Blocked
+	return result
 }
 
 // ── Source scoring (field + title parsing) ───────────────────────────────────

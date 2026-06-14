@@ -40,6 +40,35 @@ export type CustomFormat = {
   enabled: boolean;
 };
 
+export type ReleaseBlockRule = {
+  id?: number;
+  type: 'release_group' | 'title_pattern' | 'regex' | 'missing_release_group';
+  pattern: string;
+  mediaType: 'movie' | 'tv' | 'both';
+  action: 'block' | 'penalty';
+  scorePenalty: number;
+  enabled: boolean;
+  source: 'default' | 'trash' | 'custom';
+  note: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type BlockTestMatch = {
+  ruleId: number;
+  type: string;
+  pattern: string;
+  action: string;
+  reason: string;
+};
+
+export type BlockTestResult = {
+  allowed: boolean;
+  blocked: boolean;
+  scorePenalty: number;
+  matchedRules: BlockTestMatch[];
+};
+
 export type QualityDefinition = {
   id: number;
   mediaType: string;

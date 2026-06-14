@@ -299,6 +299,35 @@ type CustomFormat struct {
 	Enabled   bool   `json:"enabled"`
 }
 
+type ReleaseBlockRule struct {
+	ID           int64     `json:"id"`
+	Type         string    `json:"type"`
+	Pattern      string    `json:"pattern"`
+	MediaType    string    `json:"mediaType"`
+	Action       string    `json:"action"`
+	ScorePenalty int       `json:"scorePenalty"`
+	Enabled      bool      `json:"enabled"`
+	Source       string    `json:"source"`
+	Note         string    `json:"note"`
+	CreatedAt    time.Time `json:"createdAt"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
+type BlockFilterMatch struct {
+	RuleID  int64  `json:"ruleId"`
+	Type    string `json:"type"`
+	Pattern string `json:"pattern"`
+	Action  string `json:"action"`
+	Reason  string `json:"reason"`
+}
+
+type BlockFilterResult struct {
+	Allowed      bool               `json:"allowed"`
+	Blocked      bool               `json:"blocked"`
+	ScorePenalty int                `json:"scorePenalty"`
+	MatchedRules []BlockFilterMatch `json:"matchedRules"`
+}
+
 type CandidateHistory struct {
 	ExternalURL       string
 	FailureCount      int
