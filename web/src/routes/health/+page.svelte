@@ -251,7 +251,6 @@
   table {
     width: 100%;
     border-collapse: collapse;
-    min-width: 720px;
   }
 
   th,

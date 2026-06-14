@@ -6,7 +6,6 @@
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import SearchCheck from '@lucide/svelte/icons/search-check';
   import Play from '@lucide/svelte/icons/play';
-  import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
   import PosterCard from '$lib/components/PosterCard.svelte';
   import { itemStatus, STATUS_ORDER } from '$lib/itemStatus';
   import MetricCard from '$lib/components/MetricCard.svelte';
@@ -61,15 +60,6 @@
     finally { working = false; }
   }
 
-  async function retryFailed() {
-    working = true;
-    try {
-      const r = await api.retryFailedQueue();
-      toastSuccess(`Retried ${r.retried}`);
-      await loadLibrary();
-    } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
-    finally { working = false; }
-  }
 
   onMount(() => {
     void loadLibrary();
@@ -135,7 +125,6 @@
   $: availableCount   = items.filter(i => i.available && (i.missingCount ?? 0) === 0).length;
   $: partialCount     = items.filter(i => i.available && (i.missingCount ?? 0) > 0).length;
   $: activeCount      = items.filter(i => activeStates.includes(i.queueState)).length;
-  $: failedCount      = items.filter(i => i.queueState === 'failed').length;
   $: missingCount     = items.filter(i => !i.available && !activeStates.includes(i.queueState) && i.queueState !== 'failed').length;
 
   $: visibleSorted = visibleItems.slice().sort((a, b) => {
@@ -167,11 +156,6 @@
         title={!hydraReady ? 'NZBHydra2 not configured' : ''}>
         <Play size={14} /> Search Pending
       </Button>
-      {#if failedCount > 0}
-        <Button kind="danger" on:click={retryFailed} disabled={loading || working}>
-          <RotateCcw size={14} /> Retry Failed ({failedCount})
-        </Button>
-      {/if}
     </div>
   </div>
 

@@ -251,6 +251,9 @@
     display: flex; flex-direction: column; justify-content: flex-end;
     height: 100%; max-width: 680px; padding: 32px 36px 32px 72px;
   }
+  @media (max-width: 600px) {
+    .hero-content { padding: 16px; }
+  }
 
   .hero-tags { display: flex; gap: 8px; margin-bottom: 12px; }
 

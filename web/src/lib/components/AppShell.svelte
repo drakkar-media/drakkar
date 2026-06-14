@@ -293,6 +293,9 @@
   }
 
   .main { max-width: 1760px; padding: 8px 16px 100px; margin: 0 auto; }
+  @media (max-width: 600px) {
+    .main { padding-bottom: 80px; }
+  }
 
   /* ── Mobile overlay / drawer ─────────────────── */
   .mobile-overlay {

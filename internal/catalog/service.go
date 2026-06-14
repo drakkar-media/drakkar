@@ -844,9 +844,13 @@ func (s *Service) buildTVSeasons(ctx context.Context, detail LibraryDetail) ([]S
 			status := "missing"
 			title := episode.Name
 			var libID *int64
-			if row, ok := available[episodeKey(seasonNumber, episode.EpisodeNumber)]; ok && row.Available {
-				status = "available"
-				item.AvailableCount++
+			if row, ok := available[episodeKey(seasonNumber, episode.EpisodeNumber)]; ok {
+				if row.Available {
+					status = "available"
+					item.AvailableCount++
+				} else {
+					item.MissingCount++
+				}
 				if strings.TrimSpace(row.Title) != "" {
 					title = row.Title
 				}
@@ -988,11 +992,17 @@ func fallbackTVSeasonsFromRows(rows []showEpisodeRow) []SeasonDetail {
 		if title == "" {
 			title = fmt.Sprintf("Episode %02d", row.EpisodeNumber)
 		}
+		var libID *int64
+		if row.LibraryItemID > 0 {
+			id := row.LibraryItemID
+			libID = &id
+		}
 		season.Episodes = append(season.Episodes, EpisodeDetail{
 			SeasonNumber:  row.SeasonNumber,
 			EpisodeNumber: row.EpisodeNumber,
 			Title:         title,
 			Status:        status,
+			LibraryItemID: libID,
 		})
 		season.EpisodeCount++
 	}
