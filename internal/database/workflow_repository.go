@@ -715,8 +715,12 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLib
 	return out, rows.Err()
 }
 
-func (db *DB) ListFailedQueueRetryTargets(ctx context.Context) ([]FailedQueueRetryTarget, error) {
-	rows, err := db.SQL.QueryContext(ctx, `
+// ListFailedQueueRetryTargets returns failed items eligible for retry.
+// limit caps the result set (0 = unlimited). The scheduled retry pass uses a
+// small limit so each run completes within the timer interval; user-triggered
+// bulk actions pass 0 to process all items.
+func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]FailedQueueRetryTarget, error) {
+	query := `
 		select
 			q.id,
 			q.library_item_id,
@@ -735,8 +739,13 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context) ([]FailedQueueRet
 		    q.state = $1
 		    or (q.state = $2 and q.selected_release_id is not null)
 		  )
-		order by q.updated_at asc, q.id asc`, QueueFailed, QueueRequested,
-	)
+		order by q.updated_at asc, q.id asc`
+	args := []any{QueueFailed, QueueRequested}
+	if limit > 0 {
+		query += ` LIMIT $3`
+		args = append(args, limit)
+	}
+	rows, err := db.SQL.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

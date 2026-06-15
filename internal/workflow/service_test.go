@@ -130,7 +130,7 @@ func (r *repoStub) LookupCandidateHistory(ctx context.Context, libraryItemID int
 func (r *repoStub) ListPendingLibrarySearchTargets(ctx context.Context) ([]database.PendingLibrarySearchTarget, error) {
 	return r.pending, nil
 }
-func (r *repoStub) ListFailedQueueRetryTargets(ctx context.Context) ([]database.FailedQueueRetryTarget, error) {
+func (r *repoStub) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]database.FailedQueueRetryTarget, error) {
 	return r.failedQueues, nil
 }
 func (r *repoStub) GetQueueRetryTarget(ctx context.Context, queueItemID int64) (database.QueueRetryTarget, error) {

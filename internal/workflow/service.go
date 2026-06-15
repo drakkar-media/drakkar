@@ -46,7 +46,7 @@ type Repository interface {
 	GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (database.LibrarySearchInput, error)
 	LookupCandidateHistory(ctx context.Context, libraryItemID int64) (map[string]database.CandidateHistory, error)
 	ListPendingLibrarySearchTargets(ctx context.Context) ([]database.PendingLibrarySearchTarget, error)
-	ListFailedQueueRetryTargets(ctx context.Context) ([]database.FailedQueueRetryTarget, error)
+	ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]database.FailedQueueRetryTarget, error)
 	ListUpgradableLibraryItems(ctx context.Context) ([]int64, error)
 	ClearFailedQueueItems(ctx context.Context) (int, error)
 	GetQueueRetryTarget(ctx context.Context, queueItemID int64) (database.QueueRetryTarget, error)
@@ -601,7 +601,10 @@ func (s *Service) ClearFailedQueue(ctx context.Context) (int, error) {
 }
 
 func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, error) {
-	targets, err := s.repo.ListFailedQueueRetryTargets(ctx)
+	// Cap at 100 items so the scheduled pass completes within the 15-minute
+	// timer interval (~8s per item × 100 = ~14 min). Remaining items are
+	// picked up by subsequent scheduled runs.
+	targets, err := s.repo.ListFailedQueueRetryTargets(ctx, 100)
 	if err != nil {
 		return BulkQueueRetryResult{}, err
 	}
@@ -1928,7 +1931,7 @@ func (s *Service) ManageQueueItem(ctx context.Context, queueItemID int64, action
 }
 
 func (s *Service) ManageFailedQueue(ctx context.Context, action string) (BulkQueueRetryResult, error) {
-	targets, err := s.repo.ListFailedQueueRetryTargets(ctx)
+	targets, err := s.repo.ListFailedQueueRetryTargets(ctx, 0)
 	if err != nil {
 		return BulkQueueRetryResult{}, err
 	}
@@ -1974,7 +1977,7 @@ func (s *Service) ManageQueueItems(ctx context.Context, queueItemIDs []int64, ac
 }
 
 func (s *Service) AutoManageFailedQueue(ctx context.Context) (BulkQueueRetryResult, error) {
-	targets, err := s.repo.ListFailedQueueRetryTargets(ctx)
+	targets, err := s.repo.ListFailedQueueRetryTargets(ctx, 0)
 	if err != nil {
 		return BulkQueueRetryResult{}, err
 	}
