@@ -22,12 +22,13 @@ type Service struct {
 }
 
 type Result struct {
-	TaskName     string `json:"taskName"`
-	DeletedFiles int    `json:"deletedFiles"`
-	DeletedRows  int    `json:"deletedRows"`
-	ScannedFiles int    `json:"scannedFiles"`
-	ScannedRows  int    `json:"scannedRows"`
-	ResetItems   int    `json:"resetItems"`
+	TaskName      string `json:"taskName"`
+	DeletedFiles  int    `json:"deletedFiles"`
+	DeletedRows   int    `json:"deletedRows"`
+	ScannedFiles  int    `json:"scannedFiles"`
+	ScannedRows   int    `json:"scannedRows"`
+	ResetItems    int    `json:"resetItems"`
+	RepairedItems int    `json:"repairedItems"`
 }
 
 func NewService(repo Repository, runtime config.Runtime) *Service {

@@ -14,6 +14,10 @@ type NamedArticleSource struct {
 	Source ArticleSource
 }
 
+type StatSource interface {
+	Stat(ctx context.Context, messageID string) error
+}
+
 type FallbackSource struct {
 	sources []NamedArticleSource
 	retries int
@@ -60,11 +64,39 @@ func (s *FallbackSource) BodyPriority(ctx context.Context, messageID string, pri
 	return nil, errors.Join(failures...)
 }
 
+func (s *FallbackSource) Stat(ctx context.Context, messageID string) error {
+	if s == nil || len(s.sources) == 0 {
+		return errors.New("fallback source unavailable")
+	}
+	var failures []error
+	for attempt := 0; attempt <= s.retries; attempt++ {
+		for _, source := range s.sources {
+			err := fetchArticleStat(ctx, source.Source, messageID)
+			if err == nil {
+				return nil
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			failures = append(failures, fmt.Errorf("%s attempt %d: %w", sourceName(source), attempt+1, err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
 func fetchArticleBody(ctx context.Context, source ArticleSource, messageID string, priority stream.FetchPriority) ([]byte, error) {
 	if prioritySource, ok := source.(PriorityArticleSource); ok {
 		return prioritySource.BodyPriority(ctx, messageID, priority)
 	}
 	return source.Body(ctx, messageID)
+}
+
+func fetchArticleStat(ctx context.Context, source ArticleSource, messageID string) error {
+	if statSource, ok := source.(StatSource); ok {
+		return statSource.Stat(ctx, messageID)
+	}
+	_, err := source.Body(ctx, messageID)
+	return err
 }
 
 func sourceName(source NamedArticleSource) string {

@@ -2,20 +2,21 @@ package app
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/hjongedijk/drakkar/internal/library"
 	"github.com/hjongedijk/drakkar/internal/maintenance"
 	"github.com/hjongedijk/drakkar/internal/workflow"
 	"github.com/rs/zerolog"
 )
 
 type maintenanceOpsService struct {
-	base        *maintenance.Service
-	db          *database.DB
-	workflowSvc *workflow.Service
-	logger      zerolog.Logger
+	base           *maintenance.Service
+	db             *database.DB
+	workflowSvc    *workflow.Service
+	publicationSvc *library.Publisher
+	logger         zerolog.Logger
 }
 
 func (s *maintenanceOpsService) RemoveBrokenMediaSymlinks(ctx context.Context) (maintenance.Result, error) {
@@ -31,34 +32,53 @@ func (s *maintenanceOpsService) RemoveOrphanedContent(ctx context.Context) (main
 }
 
 func (s *maintenanceOpsService) DeepNZBHealthCheck(ctx context.Context) (maintenance.Result, error) {
-	return runNZBHealthCheck(ctx, s.db, s.workflowSvc, s.logger)
+	return runNZBHealthCheck(ctx, s.db, s.workflowSvc, s.publicationSvc, s.logger)
 }
 
-// runNZBHealthCheck scans all available library items and resets any whose
-// first/last NNTP segments are no longer retrievable or whose only published
-// file is a sample clip.
-func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, logger zerolog.Logger) (maintenance.Result, error) {
+// runNZBHealthCheck first repairs bad symlinks by re-publishing them, then
+// performs a heavier decoded-segment validation on available items and resets
+// broken releases for re-queue. Sample-only publications are also reset.
+func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, publicationSvc *library.Publisher, logger zerolog.Logger) (maintenance.Result, error) {
 	result := maintenance.Result{TaskName: "nzb-health-check"}
-	sizer, ok := db.SegmentFetcher.(database.SegmentSizer)
-	if !ok || sizer == nil {
-		return result, nil
+
+	if publicationSvc != nil {
+		entries, err := db.ListHealthEntries(ctx)
+		if err == nil {
+			repairedSeen := make(map[int64]struct{})
+			for _, entry := range entries {
+				if ctx.Err() != nil {
+					break
+				}
+				if database.CheckSymlinkHealth(entry.LibraryPath, entry.TargetPath) {
+					continue
+				}
+				logger.Warn().
+					Int64("libraryItemId", entry.LibraryItemID).
+					Str("libraryPath", entry.LibraryPath).
+					Msg("health check: broken symlink publication — re-publishing item")
+				if err := publicationSvc.RepublishLibraryItem(ctx, entry.LibraryItemID); err != nil {
+					logger.Error().Err(err).Int64("libraryItemId", entry.LibraryItemID).Msg("health check: republish failed")
+					continue
+				}
+				if _, exists := repairedSeen[entry.LibraryItemID]; !exists {
+					repairedSeen[entry.LibraryItemID] = struct{}{}
+					result.RepairedItems++
+				}
+			}
+		}
 	}
 
 	type candidate struct {
 		libraryItemID int64
+		nzbDocumentID int64
 		title         string
-		firstMsgID    string
-		lastMsgID     string
 	}
 
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT DISTINCT ON (qi.library_item_id)
 		    qi.library_item_id,
-		    li.title,
-		    (SELECT ns.message_id FROM nzb_files nf JOIN nzb_segments ns ON ns.nzb_file_id=nf.id
-		     WHERE nf.nzb_document_id=nd.id ORDER BY nf.id ASC, ns.segment_number ASC LIMIT 1),
-		    (SELECT ns.message_id FROM nzb_files nf JOIN nzb_segments ns ON ns.nzb_file_id=nf.id
-		     WHERE nf.nzb_document_id=nd.id ORDER BY nf.id ASC, ns.segment_number DESC LIMIT 1)
+		    nd.id,
+		    li.title
 		FROM queue_items qi
 		JOIN library_items li ON li.id = qi.library_item_id
 		JOIN selected_releases sr ON sr.id = qi.selected_release_id
@@ -74,10 +94,10 @@ func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workfl
 	var candidates []candidate
 	for rows.Next() {
 		var c candidate
-		if err := rows.Scan(&c.libraryItemID, &c.title, &c.firstMsgID, &c.lastMsgID); err != nil {
+		if err := rows.Scan(&c.libraryItemID, &c.nzbDocumentID, &c.title); err != nil {
 			continue
 		}
-		if c.firstMsgID != "" {
+		if c.nzbDocumentID > 0 {
 			candidates = append(candidates, c)
 		}
 	}
@@ -90,24 +110,17 @@ func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workfl
 		if ctx.Err() != nil {
 			break
 		}
-		isMissing := func(msgID string) bool {
-			checkCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-			_, err := sizer.DecodedSize(checkCtx, msgID)
-			cancel()
-			if err == nil {
-				return false
-			}
-			msg := err.Error()
-			return strings.Contains(msg, "not found") || strings.Contains(msg, "430")
-		}
-		broken := isMissing(c.firstMsgID) || (c.lastMsgID != c.firstMsgID && isMissing(c.lastMsgID))
-		if !broken {
+		checkCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		err := db.StrictCheckFirstSegments(checkCtx, c.nzbDocumentID)
+		cancel()
+		if err == nil {
 			continue
 		}
 		logger.Warn().
 			Int64("libraryItemId", c.libraryItemID).
 			Str("title", c.title).
-			Msg("health check: segment missing — resetting item for re-queue")
+			Err(err).
+			Msg("health check: strict NZB validation failed — resetting item for re-queue")
 		if resetErr := workflowSvc.ResetLibraryItem(ctx, c.libraryItemID); resetErr != nil {
 			logger.Error().Err(resetErr).Int64("libraryItemId", c.libraryItemID).Msg("health check: reset failed")
 		} else if _, exists := resetSeen[c.libraryItemID]; !exists {

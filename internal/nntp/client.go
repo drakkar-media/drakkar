@@ -47,6 +47,15 @@ func (c *ArticleClient) Body(ctx context.Context, messageID string) ([]byte, err
 	return session.Body(ctx, messageID)
 }
 
+func (c *ArticleClient) Stat(ctx context.Context, messageID string) error {
+	session, err := c.NewSession(ctx)
+	if err != nil {
+		return err
+	}
+	defer session.Close()
+	return session.Stat(ctx, messageID)
+}
+
 func (c *ArticleClient) NewSession(ctx context.Context) (BodySession, error) {
 	conn, err := c.dial(ctx)
 	if err != nil {

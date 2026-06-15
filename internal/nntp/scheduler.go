@@ -12,9 +12,9 @@ var ErrSchedulerQueueFull = errors.New("nntp scheduler queue full")
 // ScheduledSource dispatches NNTP article fetches using a three-tier priority
 // queue that mirrors nzbdav's PrioritizedSemaphore behaviour:
 //
-//   high   (priority ≥ Interactive=100) — direct player reads
-//   medium (priority ≥ ReadAhead=80)   — speculative prefetch
-//   low    (priority < 80)             — background calibration / checks
+//	high   (priority ≥ Interactive=100) — direct player reads
+//	medium (priority ≥ ReadAhead=80)   — speculative prefetch
+//	low    (priority < 80)             — background calibration / checks
 //
 // Workers always drain `high` before `medium`, `medium` before `low`, so
 // interactive reads are never delayed by background work.  No hard cap is
@@ -32,6 +32,7 @@ type fetchRequest struct {
 	ctx       context.Context
 	messageID string
 	priority  stream.FetchPriority
+	op        fetchOperation
 	resultCh  chan fetchResult
 }
 
@@ -39,6 +40,13 @@ type fetchResult struct {
 	body []byte
 	err  error
 }
+
+type fetchOperation uint8
+
+const (
+	fetchOperationBody fetchOperation = iota
+	fetchOperationStat
+)
 
 func NewScheduledSource(source ArticleSource, workers int, queueSize int) *ScheduledSource {
 	if workers <= 0 {
@@ -81,6 +89,7 @@ func (s *ScheduledSource) BodyPriority(ctx context.Context, messageID string, pr
 		ctx:       ctx,
 		messageID: messageID,
 		priority:  priority,
+		op:        fetchOperationBody,
 		resultCh:  make(chan fetchResult, 1),
 	}
 	queue := s.queue(priority)
@@ -94,6 +103,33 @@ func (s *ScheduledSource) BodyPriority(ctx context.Context, messageID string, pr
 		return result.body, result.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+}
+
+func (s *ScheduledSource) Stat(ctx context.Context, messageID string) error {
+	if s == nil || s.source == nil {
+		return errors.New("scheduled source unavailable")
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	req := fetchRequest{
+		ctx:       ctx,
+		messageID: messageID,
+		priority:  stream.PriorityBackground,
+		op:        fetchOperationStat,
+		resultCh:  make(chan fetchResult, 1),
+	}
+	select {
+	case s.low <- req:
+	default:
+		return ErrSchedulerQueueFull
+	}
+	select {
+	case result := <-req.resultCh:
+		return result.err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -121,7 +157,16 @@ func (s *ScheduledSource) worker() {
 			}
 			continue
 		}
-		body, err := fetchArticleBody(req.ctx, s.source, req.messageID, req.priority)
+		var (
+			body []byte
+			err  error
+		)
+		switch req.op {
+		case fetchOperationStat:
+			err = fetchArticleStat(req.ctx, s.source, req.messageID)
+		default:
+			body, err = fetchArticleBody(req.ctx, s.source, req.messageID, req.priority)
+		}
 		select {
 		case req.resultCh <- fetchResult{body: body, err: err}:
 		case <-req.ctx.Done():

@@ -121,3 +121,23 @@ func (s *DiskCachedDecodedSource) storePartInfo(messageID string, info yenc.Part
 	defer s.infoMu.Unlock()
 	s.partInfo[messageID] = info
 }
+
+func (s *DiskCachedDecodedSource) Stat(ctx context.Context, messageID string) error {
+	if s == nil || s.source == nil {
+		return errors.New("disk cached source unavailable")
+	}
+	if body, ok, err := s.cache.Get(messageID); err == nil && ok {
+		metrics.M.CacheHits.Add(1)
+		if _, hasInfo := s.lookupPartInfo(messageID); !hasInfo {
+			_, _, _ = s.fillPartInfoFromRaw(ctx, messageID, stream.PriorityBackground, body)
+		}
+		return nil
+	} else if err != nil {
+		return err
+	}
+	if statSource, ok := s.source.(StatSource); ok {
+		return statSource.Stat(ctx, messageID)
+	}
+	_, _, err := s.DecodedBodyInfoPriority(ctx, messageID, stream.PriorityBackground)
+	return err
+}

@@ -92,3 +92,17 @@ func (s *CachedDecodedSource) DecodedBodyInfoPriority(ctx context.Context, messa
 	}
 	return body, yenc.PartInfo{}, nil
 }
+
+func (s *CachedDecodedSource) Stat(ctx context.Context, messageID string) error {
+	if s == nil || s.source == nil {
+		return errors.New("decoded source unavailable")
+	}
+	if _, ok := s.cache.Get(messageID); ok {
+		return nil
+	}
+	if statSource, ok := s.source.(StatSource); ok {
+		return statSource.Stat(ctx, messageID)
+	}
+	_, err := s.DecodedBodyPriority(ctx, messageID, stream.PriorityBackground)
+	return err
+}

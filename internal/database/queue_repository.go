@@ -652,6 +652,14 @@ func (db *DB) SetImportedNZBIndexed(ctx context.Context, queueItemID int64) erro
 	return err
 }
 
+func (db *DB) MarkQueueItemPublishing(ctx context.Context, queueItemID int64) error {
+	_, err := db.SQL.ExecContext(ctx, `
+		update queue_items
+		set state = $2, updated_at = now()
+		where id = $1`, queueItemID, QueuePublishing)
+	return err
+}
+
 func (db *DB) CancelNZBDocument(ctx context.Context, nzbDocumentID int64) error {
 	result, err := db.SQL.ExecContext(ctx, `
 		update queue_items

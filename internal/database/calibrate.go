@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 )
 
 // SegmentSizer can return the actual decoded byte size of an NNTP article.
@@ -11,15 +12,13 @@ type SegmentSizer interface {
 	DecodedSize(ctx context.Context, messageID string) (int64, error)
 }
 
-// PreflightCheckFirstSegments verifies that the first AND last segment of every
-// NZB file in the given document is reachable on NNTP. Unlike CalibrateNZBOffsets
-// (which silently skips missing segments), this returns an error immediately so
-// the workqueue can reject the release and fall back to the next candidate.
-func (db *DB) PreflightCheckFirstSegments(ctx context.Context, nzbDocumentID int64) error {
-	sizer, ok := db.SegmentFetcher.(SegmentSizer)
-	if !ok || sizer == nil {
-		return nil // NNTP fetcher not available; skip preflight
-	}
+type SegmentChecker interface {
+	Exists(ctx context.Context, messageID string) error
+}
+
+type segmentPair struct{ first, last string }
+
+func (db *DB) loadNZBFirstLastSegmentPairs(ctx context.Context, nzbDocumentID int64) ([]segmentPair, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT
 		    (SELECT ns.message_id FROM nzb_segments ns WHERE ns.nzb_file_id = nf.id ORDER BY ns.segment_number ASC  LIMIT 1),
@@ -27,28 +26,96 @@ func (db *DB) PreflightCheckFirstSegments(ctx context.Context, nzbDocumentID int
 		FROM nzb_files nf
 		WHERE nf.nzb_document_id = $1`, nzbDocumentID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rows.Close()
-	type segPair struct{ first, last string }
-	var pairs []segPair
+	var pairs []segmentPair
 	for rows.Next() {
-		var p segPair
+		var p segmentPair
 		if err := rows.Scan(&p.first, &p.last); err != nil {
-			return err
+			return nil, err
 		}
 		pairs = append(pairs, p)
 	}
-	if err := rows.Err(); err != nil {
+	return pairs, rows.Err()
+}
+
+// PreflightCheckFirstSegments verifies that the first AND last segment of every
+// NZB file in the given document is reachable on NNTP. Unlike CalibrateNZBOffsets
+// (which silently skips missing segments), this returns an error immediately so
+// the workqueue can reject the release and fall back to the next candidate.
+func (db *DB) PreflightCheckFirstSegments(ctx context.Context, nzbDocumentID int64) error {
+	checker, ok := db.SegmentFetcher.(SegmentChecker)
+	if !ok || checker == nil {
+		return nil // NNTP fetcher not available; skip preflight
+	}
+	pairs, err := db.loadNZBFirstLastSegmentPairs(ctx, nzbDocumentID)
+	if err != nil {
+		return err
+	}
+	if len(pairs) == 0 {
+		return nil
+	}
+	checkCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	const maxConcurrentChecks = 8
+	sem := make(chan struct{}, maxConcurrentChecks)
+	var (
+		wg       sync.WaitGroup
+		errOnce  sync.Once
+		firstErr error
+	)
+	for _, pair := range pairs {
+		pair := pair
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-checkCtx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			if err := checker.Exists(checkCtx, pair.first); err != nil {
+				errOnce.Do(func() {
+					firstErr = fmt.Errorf("preflight: first segment %s unavailable: %w", pair.first, err)
+					cancel()
+				})
+				return
+			}
+			if pair.last != pair.first {
+				if err := checker.Exists(checkCtx, pair.last); err != nil {
+					errOnce.Do(func() {
+						firstErr = fmt.Errorf("preflight: last segment %s unavailable: %w", pair.last, err)
+						cancel()
+					})
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return firstErr
+}
+
+// StrictCheckFirstSegments uses the older heavier validation strategy:
+// download enough decoded article data to measure first/last segment sizes for
+// every file, failing as soon as any required segment is unavailable.
+func (db *DB) StrictCheckFirstSegments(ctx context.Context, nzbDocumentID int64) error {
+	sizer, ok := db.SegmentFetcher.(SegmentSizer)
+	if !ok || sizer == nil {
+		return nil
+	}
+	pairs, err := db.loadNZBFirstLastSegmentPairs(ctx, nzbDocumentID)
+	if err != nil {
 		return err
 	}
 	for _, p := range pairs {
 		if _, err := sizer.DecodedSize(ctx, p.first); err != nil {
-			return fmt.Errorf("preflight: first segment %s unavailable: %w", p.first, err)
+			return fmt.Errorf("strict health: first segment %s unavailable: %w", p.first, err)
 		}
 		if p.last != p.first {
 			if _, err := sizer.DecodedSize(ctx, p.last); err != nil {
-				return fmt.Errorf("preflight: last segment %s unavailable: %w", p.last, err)
+				return fmt.Errorf("strict health: last segment %s unavailable: %w", p.last, err)
 			}
 		}
 	}
@@ -111,10 +178,10 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 	defer rows.Close()
 
 	type fileInfo struct {
-		id          int64
-		firstMsgID  string
+		id           int64
+		firstMsgID   string
 		estFirstSize int64
-		lastMsgID   string
+		lastMsgID    string
 		estLastSize  int64
 	}
 	var files []fileInfo

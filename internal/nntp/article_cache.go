@@ -45,6 +45,17 @@ func (s *CachedFallbackSource) BodyPriority(ctx context.Context, messageID strin
 	return body, err
 }
 
+func (s *CachedFallbackSource) Stat(ctx context.Context, messageID string) error {
+	if s.isMissing(messageID) {
+		return errArticleNotFound(messageID)
+	}
+	err := s.inner.Stat(ctx, messageID)
+	if err != nil && isNotFoundError(err) {
+		s.markMissing(messageID)
+	}
+	return err
+}
+
 func (s *CachedFallbackSource) isMissing(messageID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

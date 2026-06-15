@@ -1144,6 +1144,12 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 		return result, nil, err
 	}
 	item.State = database.QueuePreflight
+	if s.preflightChecker != nil {
+		if err := s.preflightChecker(ctx, item); err != nil {
+			result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), 0)
+			return result, nil, err
+		}
+	}
 	return nil, &pendingPublish{current: current, item: item}, nil
 }
 
@@ -1157,6 +1163,16 @@ func (s *Service) publishImportedRelease(ctx context.Context, p pendingPublish) 
 	updated, err := s.repo.GetSelectedReleaseSummary(ctx, p.current.SelectedReleaseID)
 	if err == nil && updated.VirtualFileCount == 0 && strings.TrimSpace(updated.ArchiveRejects) != "" {
 		return s.promoteNextAfterFailure(ctx, p.current, updated.ArchiveRejects)
+	}
+	if p.item.QueueItemID > 0 {
+		if publisher, ok := s.repo.(interface {
+			MarkQueueItemPublishing(context.Context, int64) error
+		}); ok {
+			if err := publisher.MarkQueueItemPublishing(ctx, p.item.QueueItemID); err != nil {
+				return s.promoteNextAfterFailure(ctx, p.current, err.Error())
+			}
+			p.item.State = database.QueuePublishing
+		}
 	}
 	if s.postImportHook != nil {
 		if err := s.postImportHook(ctx, p.item); err != nil {
@@ -2499,6 +2515,17 @@ func (s *Service) ImportNZBFromPush(ctx context.Context, content []byte, filenam
 				s.logger.Error().Err(promoteErr).Msg("sabnzbd: promoteNextAfterFailure failed (no files)")
 			}
 			return
+		}
+		if publisher, ok := s.repo.(interface {
+			MarkQueueItemPublishing(context.Context, int64) error
+		}); ok {
+			if err := publisher.MarkQueueItemPublishing(bgCtx, item.QueueItemID); err != nil {
+				if _, promoteErr := s.promoteNextAfterFailure(bgCtx, current, err.Error()); promoteErr != nil {
+					s.logger.Error().Err(promoteErr).Msg("sabnzbd: promoteNextAfterFailure failed (publishing state)")
+				}
+				return
+			}
+			item.State = database.QueuePublishing
 		}
 		if s.postImportHook != nil {
 			if err := s.postImportHook(bgCtx, item); err != nil {

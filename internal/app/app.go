@@ -295,10 +295,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	}
 	publicationSvc := library.NewPublisher(db, rt)
 	maintenanceSvc := &maintenanceOpsService{
-		base:        maintenance.NewService(db, rt),
-		db:          db,
-		workflowSvc: workflowSvc,
-		logger:      logger,
+		base:           maintenance.NewService(db, rt),
+		db:             db,
+		workflowSvc:    workflowSvc,
+		publicationSvc: publicationSvc,
+		logger:         logger,
 	}
 	cacheSvc := cache.NewService(cache.NewFileCache(rt.BlockCachePath, rt.DiskCacheLimitBytes))
 	catalogSvc := catalog.NewService(db, tmdb.NewClient(cfg.Metadata))

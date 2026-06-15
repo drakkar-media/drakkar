@@ -32,3 +32,20 @@ func (s *LimitedSource) Body(ctx context.Context, messageID string) ([]byte, err
 	defer func() { <-s.sem }()
 	return s.source.Body(ctx, messageID)
 }
+
+func (s *LimitedSource) Stat(ctx context.Context, messageID string) error {
+	if s == nil || s.source == nil {
+		return errors.New("limited source unavailable")
+	}
+	select {
+	case s.sem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-s.sem }()
+	if statSource, ok := s.source.(StatSource); ok {
+		return statSource.Stat(ctx, messageID)
+	}
+	_, err := s.source.Body(ctx, messageID)
+	return err
+}

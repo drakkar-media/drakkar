@@ -55,6 +55,21 @@ func (f *SegmentFetcher) DecodedSize(ctx context.Context, messageID string) (int
 	return int64(len(decoded)), nil
 }
 
+// Exists verifies that the article exists without forcing a full decoded-body
+// download when the underlying source supports NNTP STAT.
+func (f *SegmentFetcher) Exists(ctx context.Context, messageID string) error {
+	if f == nil || f.source == nil {
+		return errors.New("nntp source unavailable")
+	}
+	if statSource, ok := f.source.(interface {
+		Stat(context.Context, string) error
+	}); ok {
+		return statSource.Stat(ctx, messageID)
+	}
+	_, err := f.DecodedSize(ctx, messageID)
+	return err
+}
+
 func (f *SegmentFetcher) FetchRange(ctx context.Context, segment stream.SegmentRange) ([]byte, error) {
 	return f.FetchRangePriority(ctx, segment, stream.PriorityInteractive)
 }
