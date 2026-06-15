@@ -608,7 +608,6 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 	if err != nil {
 		return BulkQueueRetryResult{}, err
 	}
-	s.logger.Info().Int("targets", len(targets)).Msg("retry: loaded targets")
 
 	// Load user-configured policy (same source as AutoManageFailedQueue).
 	settings := policy.DefaultSettings()
@@ -628,13 +627,6 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 		// should be retried via RetryQueueItem (NZB re-fetch) rather than
 		// discarding the release and doing a fresh NZBHydra2 search.
 		userAction := policy.ActionForReason(settings, target.FailureReason)
-		s.logger.Debug().
-			Int64("queueItemId", target.QueueItemID).
-			Str("failureReason", target.FailureReason).
-			Bool("hasSelectedRelease", target.HasSelectedRelease).
-			Int("candidateFailureCount", target.CandidateFailureCount).
-			Str("userAction", string(userAction)).
-			Msg("retry: processing target")
 		if userAction != policy.QueueActionDoNothing &&
 			!(userAction == policy.QueueActionSearchAgain && target.HasSelectedRelease && target.CandidateFailureCount == 0) {
 			switch userAction {
@@ -691,7 +683,6 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 			// ActionSearchAgain, ActionRetryLater → standard retry flow.
 		}
 
-		s.logger.Info().Int64("queueItemId", target.QueueItemID).Msg("retry: calling RetryQueueItem")
 		if _, err := s.RetryQueueItem(ctx, target.QueueItemID); err != nil {
 			s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: RetryQueueItem failed")
 			result.Failed++
