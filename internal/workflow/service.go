@@ -132,6 +132,21 @@ type Service struct {
 	// NZB may go through preflight + publish at a time to avoid exhausting the
 	// NNTP connection pool.
 	importSem chan struct{}
+
+	// searchInflight deduplicates concurrent SearchLibrary calls for the same
+	// library item ID (O-05). Keyed by int64 library item ID.
+	searchInflight sync.Map
+
+	// TTL caches for policy data, guarded by profileCacheMu (O-04).
+	// These are loaded from the DB at most once per 5 minutes.
+	customFormatsCache   []ranking.CustomFormat
+	customFormatsCacheAt time.Time
+	blockRulesCache      []ranking.BlockRule
+	blockRulesCacheAt    time.Time
+	indexerPolicyCache   map[string]int
+	indexerPolicyCacheAt time.Time
+	tierSizeCache        map[string]map[string][2]int
+	tierSizeCacheAt      map[string]time.Time
 }
 
 type WorkQueueStatus struct {
@@ -602,10 +617,10 @@ func (s *Service) ClearFailedQueue(ctx context.Context) (int, error) {
 }
 
 func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, error) {
-	// Cap at 100 items so the scheduled pass completes within the 15-minute
-	// timer interval (~8s per item × 100 = ~14 min). Remaining items are
-	// picked up by subsequent scheduled runs.
-	targets, err := s.repo.ListFailedQueueRetryTargets(ctx, 100)
+	// Fetch up to 500 items: restart-interrupted items (stale_worker, interrupted_by_restart)
+	// don't call Hydra and are much faster to process. Hydra calls are capped at 100
+	// per run so we don't flood the indexer while still clearing restart backlogs quickly.
+	targets, err := s.repo.ListFailedQueueRetryTargets(ctx, 500)
 	if err != nil {
 		return BulkQueueRetryResult{}, err
 	}
@@ -618,6 +633,9 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 		}
 	}
 	ttl := settings.BlocklistTTLDays
+
+	const maxHydraCalls = 100
+	hydraCallCount := 0
 
 	result := BulkQueueRetryResult{Processed: len(targets)}
 	for _, target := range targets {
@@ -632,6 +650,9 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 			!(target.HasSelectedRelease && target.CandidateFailureCount == 0) {
 			switch userAction {
 			case policy.QueueActionRemoveBlocklistAndSearch, policy.QueueActionRemoveAndBlocklist:
+				if hydraCallCount >= maxHydraCalls && userAction == policy.QueueActionRemoveBlocklistAndSearch {
+					continue // skip Hydra-dependent items when cap is reached
+				}
 				if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, ttl); err != nil {
 					s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: blocklist failed")
 				}
@@ -641,6 +662,7 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 					continue
 				}
 				if userAction == policy.QueueActionRemoveBlocklistAndSearch {
+					hydraCallCount++
 					if _, err := s.SearchLibrary(ctx, target.LibraryItemID); err == nil {
 						result.Retried++
 					} else {
@@ -649,6 +671,10 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 					}
 				}
 			case policy.QueueActionSearchAgain:
+				if hydraCallCount >= maxHydraCalls {
+					continue
+				}
+				hydraCallCount++
 				if _, err := s.SearchLibrary(ctx, target.LibraryItemID); err == nil {
 					result.Retried++
 				} else {
@@ -666,6 +692,10 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 		action := policy.DecideFromReason(target.FailureReason)
 		switch action {
 		case policy.ActionBlocklistAndSearch:
+			if hydraCallCount >= maxHydraCalls {
+				continue
+			}
+			hydraCallCount++
 			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, ttl); err != nil {
 				s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("bulk retry: blocklist failed")
 			}
@@ -700,6 +730,12 @@ func isDeadlock(err error) bool {
 }
 
 func (s *Service) SearchLibrary(ctx context.Context, libraryItemID int64) (SearchResult, error) {
+	// O-05: skip if another goroutine is already searching this item.
+	if _, loaded := s.searchInflight.LoadOrStore(libraryItemID, struct{}{}); loaded {
+		return SearchResult{LibraryItemID: libraryItemID}, nil
+	}
+	defer s.searchInflight.Delete(libraryItemID)
+
 	const maxDeadlockRetries = 3
 	for attempt := 0; attempt < maxDeadlockRetries; attempt++ {
 		result, err := s.searchLibraryOnceWithMode(ctx, libraryItemID, false)
@@ -927,13 +963,37 @@ func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearc
 }
 
 // buildSeasonPackRequests produces Hydra queries for a full season (no episode number).
+// Mirrors buildSearchRequests: Tier 1 is ID-based (no title), Tier 2 is title-only (no IDs).
 func buildSeasonPackRequests(input database.LibrarySearchInput) []hydra.SearchRequest {
 	show := input.ShowTitle
 	if show == "" {
 		show = input.Title
 	}
 	var requests []hydra.SearchRequest
-	add := func(q string) {
+
+	seen := func(req hydra.SearchRequest) bool {
+		for _, ex := range requests {
+			if sameSearchRequest(ex, req) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Tier 1: ID-based request (no query string) — consistent with buildSearchRequests.
+	if input.ShowTMDBID > 0 || input.ShowTVDBID > 0 || input.ShowIMDbID != "" {
+		req := hydra.SearchRequest{
+			MediaType:    input.MediaType,
+			TMDBID:       input.ShowTMDBID,
+			IMDbID:       input.ShowIMDbID,
+			TVDBID:       input.ShowTVDBID,
+			SeasonNumber: input.SeasonNumber,
+		}
+		requests = append(requests, req)
+	}
+
+	// Tier 2: title-based fallbacks (no IDs) — EpisodeNumber 0 = season pack.
+	addTitle := func(q string) {
 		q = strings.TrimSpace(q)
 		if q == "" {
 			return
@@ -941,29 +1001,19 @@ func buildSeasonPackRequests(input database.LibrarySearchInput) []hydra.SearchRe
 		req := hydra.SearchRequest{
 			MediaType:    input.MediaType,
 			Query:        q,
-			IMDbID:       input.ShowIMDbID,
-			TVDBID:       input.ShowTVDBID,
 			SeasonNumber: input.SeasonNumber,
-			// EpisodeNumber intentionally 0 = season pack
 		}
-		if strings.EqualFold(q, req.IMDbID) {
-			req.Query = ""
+		if !seen(req) {
+			requests = append(requests, req)
 		}
-		for _, ex := range requests {
-			if sameSearchRequest(ex, req) {
-				return
-			}
-		}
-		requests = append(requests, req)
 	}
-	add(input.ShowIMDbID)
 	if input.SeasonNumber > 0 {
-		add(fmt.Sprintf("%s S%02d", show, input.SeasonNumber))
+		addTitle(fmt.Sprintf("%s S%02d", show, input.SeasonNumber))
 		if input.ShowYear > 0 {
-			add(fmt.Sprintf("%s %d S%02d", show, input.ShowYear, input.SeasonNumber))
+			addTitle(fmt.Sprintf("%s %d S%02d", show, input.ShowYear, input.SeasonNumber))
 		}
 	}
-	add(show)
+	addTitle(show)
 	return requests
 }
 
@@ -1405,11 +1455,13 @@ func shouldContinueSearch(candidates []database.SearchCandidateRecord, input dat
 			continue
 		}
 		if shouldKeepSearchingPastCandidate(candidate, input) {
-			return true
+			continue // season pack — keep scanning for a specific-episode candidate
 		}
-		return candidate.FailureCount > 0
+		if candidate.FailureCount == 0 {
+			return false // untried, non-season-pack candidate exists
+		}
 	}
-	return true
+	return true // all non-rejected candidates are season packs or have failures
 }
 
 func shouldKeepSearchingPastCandidate(candidate database.SearchCandidateRecord, input database.LibrarySearchInput) bool {
@@ -2202,8 +2254,19 @@ func (s *Service) defaultProfilePreferences(ctx context.Context, mediaType strin
 }
 
 // loadTierSizeLimits returns a map from resolution → [minMB, maxMB] built from
-// the quality_definitions table. Returns nil on error (silently degrades).
+// the quality_definitions table. Results are cached for 5 minutes (O-04).
 func (s *Service) loadTierSizeLimits(ctx context.Context, mediaType string) map[string][2]int {
+	const cacheTTL = 5 * time.Minute
+	s.profileCacheMu.Lock()
+	if s.tierSizeCache != nil {
+		if at, ok := s.tierSizeCacheAt[mediaType]; ok && time.Since(at) < cacheTTL {
+			cached := s.tierSizeCache[mediaType]
+			s.profileCacheMu.Unlock()
+			return cached
+		}
+	}
+	s.profileCacheMu.Unlock()
+
 	defs, err := s.repo.ListQualityDefinitions(ctx)
 	if err != nil || len(defs) == 0 {
 		return nil
@@ -2236,18 +2299,39 @@ func (s *Service) loadTierSizeLimits(ctx context.Context, mediaType string) map[
 		}
 		out[res] = existing
 	}
-	if len(out) == 0 {
-		return nil
+	var result map[string][2]int
+	if len(out) > 0 {
+		result = out
 	}
-	return out
+
+	s.profileCacheMu.Lock()
+	if s.tierSizeCache == nil {
+		s.tierSizeCache = make(map[string]map[string][2]int)
+		s.tierSizeCacheAt = make(map[string]time.Time)
+	}
+	s.tierSizeCache[mediaType] = result
+	s.tierSizeCacheAt[mediaType] = time.Now()
+	s.profileCacheMu.Unlock()
+
+	return result
 }
 
 // loadCustomFormats fetches custom formats from the DB and converts them to
-// ranking.CustomFormat values. Returns nil on error (silently degrades).
+// ranking.CustomFormat values. Results are cached for 5 minutes (O-04).
 func (s *Service) loadCustomFormats(ctx context.Context) []ranking.CustomFormat {
 	if s == nil || s.repo == nil {
 		return nil
 	}
+	const cacheTTL = 5 * time.Minute
+	s.profileCacheMu.Lock()
+	if s.customFormatsCache != nil && time.Since(s.customFormatsCacheAt) < cacheTTL {
+		out := make([]ranking.CustomFormat, len(s.customFormatsCache))
+		copy(out, s.customFormatsCache)
+		s.profileCacheMu.Unlock()
+		return out
+	}
+	s.profileCacheMu.Unlock()
+
 	dbFormats, err := s.repo.ListCustomFormats(ctx)
 	if err != nil || len(dbFormats) == 0 {
 		return nil
@@ -2262,15 +2346,33 @@ func (s *Service) loadCustomFormats(ctx context.Context) []ranking.CustomFormat 
 			Source:  f.Source,
 		}
 	}
+
+	cached := make([]ranking.CustomFormat, len(out))
+	copy(cached, out)
+	s.profileCacheMu.Lock()
+	s.customFormatsCache = cached
+	s.customFormatsCacheAt = time.Now()
+	s.profileCacheMu.Unlock()
+
 	return out
 }
 
 // loadBlockRules fetches release block rules from the DB and converts them to
-// ranking.BlockRule values. Returns nil on error (silently degrades).
+// ranking.BlockRule values. Results are cached for 5 minutes (O-04).
 func (s *Service) loadBlockRules(ctx context.Context) []ranking.BlockRule {
 	if s == nil || s.repo == nil {
 		return nil
 	}
+	const cacheTTL = 5 * time.Minute
+	s.profileCacheMu.Lock()
+	if s.blockRulesCache != nil && time.Since(s.blockRulesCacheAt) < cacheTTL {
+		out := make([]ranking.BlockRule, len(s.blockRulesCache))
+		copy(out, s.blockRulesCache)
+		s.profileCacheMu.Unlock()
+		return out
+	}
+	s.profileCacheMu.Unlock()
+
 	dbRules, err := s.repo.ListReleaseBlockRules(ctx)
 	if err != nil || len(dbRules) == 0 {
 		return nil
@@ -2289,19 +2391,49 @@ func (s *Service) loadBlockRules(ctx context.Context) []ranking.BlockRule {
 			Note:         r.Note,
 		}
 	}
+
+	cached := make([]ranking.BlockRule, len(out))
+	copy(cached, out)
+	s.profileCacheMu.Lock()
+	s.blockRulesCache = cached
+	s.blockRulesCacheAt = time.Now()
+	s.profileCacheMu.Unlock()
+
 	return out
 }
 
 // loadIndexerPolicyMap fetches the enabled indexer policy score modifiers.
-// Returns nil map on error (silently degrades — no per-indexer adjustment applied).
+// Results are cached for 5 minutes (O-04). Returns nil on error.
 func (s *Service) loadIndexerPolicyMap(ctx context.Context) map[string]int {
 	if s == nil || s.repo == nil {
 		return nil
 	}
+	const cacheTTL = 5 * time.Minute
+	s.profileCacheMu.Lock()
+	if s.indexerPolicyCache != nil && time.Since(s.indexerPolicyCacheAt) < cacheTTL {
+		out := make(map[string]int, len(s.indexerPolicyCache))
+		for k, v := range s.indexerPolicyCache {
+			out[k] = v
+		}
+		s.profileCacheMu.Unlock()
+		return out
+	}
+	s.profileCacheMu.Unlock()
+
 	m, err := s.repo.LoadIndexerPolicyMap(ctx)
 	if err != nil {
 		return nil
 	}
+
+	cached := make(map[string]int, len(m))
+	for k, v := range m {
+		cached[k] = v
+	}
+	s.profileCacheMu.Lock()
+	s.indexerPolicyCache = cached
+	s.indexerPolicyCacheAt = time.Now()
+	s.profileCacheMu.Unlock()
+
 	return m
 }
 

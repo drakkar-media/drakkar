@@ -6,9 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+)
+
+// blocklistCache is a short-lived in-process cache for loadBlocklistMap (O-10).
+// The blocklist is read on every search but rarely changes; a 30-second TTL
+// avoids full table scans per candidate batch while keeping data fresh.
+var (
+	blocklistCacheMu  sync.Mutex
+	blocklistCached   map[string]string
+	blocklistCachedAt time.Time
 )
 
 // preDeleteVFRBySelectedRelease removes virtual_file_ranges rows that would be
@@ -1843,6 +1853,18 @@ func normalizeReleaseTitle(value string) string {
 }
 
 func loadBlocklistMap(ctx context.Context, tx *sql.Tx) (map[string]string, error) {
+	const cacheTTL = 30 * time.Second
+	blocklistCacheMu.Lock()
+	if blocklistCached != nil && time.Since(blocklistCachedAt) < cacheTTL {
+		out := make(map[string]string, len(blocklistCached))
+		for k, v := range blocklistCached {
+			out[k] = v
+		}
+		blocklistCacheMu.Unlock()
+		return out, nil
+	}
+	blocklistCacheMu.Unlock()
+
 	rows, err := tx.QueryContext(ctx, `
 		select key, reason
 		from blocklist_items
@@ -1860,7 +1882,20 @@ func loadBlocklistMap(ctx context.Context, tx *sql.Tx) (map[string]string, error
 		}
 		out[key] = reason
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	cached := make(map[string]string, len(out))
+	for k, v := range out {
+		cached[k] = v
+	}
+	blocklistCacheMu.Lock()
+	blocklistCached = cached
+	blocklistCachedAt = time.Now()
+	blocklistCacheMu.Unlock()
+
+	return out, nil
 }
 
 func (db *DB) BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int64, reason string, ttlDays int) error {

@@ -271,7 +271,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		if item.NZBDocumentID == nil {
 			return nil
 		}
-		return db.PreflightCheckFirstSegments(ctx, *item.NZBDocumentID)
+		// Use a context independent of the BullMQ job ctx so that the 30s lock
+		// expiry doesn't cancel an in-progress NNTP preflight (O-09 workaround).
+		preflightCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		return db.PreflightCheckFirstSegments(preflightCtx, *item.NZBDocumentID)
 	})
 	wq, err := workflow.NewWorkQueue(3, valkey, wqWorkerClient)
 	if err != nil {

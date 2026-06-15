@@ -140,7 +140,12 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 		join ids on ids.id = q.id
 		join library_items l on l.id = q.library_item_id
 		left join selected_releases sr on sr.id = q.selected_release_id
-		left join nzb_documents n on n.selected_release_id = sr.id
+		left join lateral (
+			select id, file_name
+			from nzb_documents
+			where selected_release_id = sr.id
+			order by id desc limit 1
+		) n on sr.id is not null
 		order by
 			case q.state
 				when 'fetching_nzb' then 0

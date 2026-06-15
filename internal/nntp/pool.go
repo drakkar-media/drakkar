@@ -208,7 +208,7 @@ func (p *PooledSource) discard(session BodySession) {
 func (p *PooledSource) Stats() (active, idle int) {
 	p.mu.Lock()
 	active = p.open
-	p.mu.Unlock()
 	idle = len(p.idle)
+	p.mu.Unlock()
 	return
 }
