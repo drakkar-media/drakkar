@@ -622,12 +622,13 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 	for _, target := range targets {
 		result.ProcessedQueues = append(result.ProcessedQueues, target.QueueItemID)
 
-		// User-configured policy takes precedence over the hardcoded matrix.
-		// AutoManageFailedQueue runs before this function and resets handled
-		// items to 'requested', so they won't appear here — but handle the
-		// fallback explicitly for failure reasons not yet covered by Auto.
+		// User-configured policy takes precedence over the hardcoded matrix,
+		// EXCEPT for items that already have a valid selected release: those
+		// should be retried via RetryQueueItem (NZB re-fetch) rather than
+		// discarding the release and doing a fresh NZBHydra2 search.
 		userAction := policy.ActionForReason(settings, target.FailureReason)
-		if userAction != policy.QueueActionDoNothing {
+		if userAction != policy.QueueActionDoNothing &&
+			!(userAction == policy.QueueActionSearchAgain && target.HasSelectedRelease && target.CandidateFailureCount == 0) {
 			switch userAction {
 			case policy.QueueActionRemoveBlocklistAndSearch, policy.QueueActionRemoveAndBlocklist:
 				if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, ttl); err != nil {
@@ -1993,6 +1994,13 @@ func (s *Service) AutoManageFailedQueue(ctx context.Context) (BulkQueueRetryResu
 		action := policy.ActionForReason(settings, target.FailureReason)
 		switch action {
 		case policy.QueueActionSearchAgain:
+			// Items with a valid existing release (failure_count=0) should be
+			// retried by RetryFailedQueue via RetryQueueItem, not searched again.
+			// Searching again would discard a perfectly good selected release and
+			// add an unnecessary 12-second NZBHydra2 round-trip per item.
+			if target.HasSelectedRelease && target.CandidateFailureCount == 0 {
+				continue
+			}
 			if _, err := s.SearchLibrary(ctx, target.LibraryItemID); err != nil {
 				result.Failed++
 				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)

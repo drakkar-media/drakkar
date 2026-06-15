@@ -1341,8 +1341,8 @@ func TestRestoreRejectedReleases(t *testing.T) {
 func TestRetryFailedQueue(t *testing.T) {
 	repo := &repoStub{
 		failedQueues: []database.FailedQueueRetryTarget{
-			{QueueItemID: 55, LibraryItemID: 42, FailureReason: "interrupted_by_restart"},
-			{QueueItemID: 56, LibraryItemID: 43, FailureReason: "interrupted_by_restart"},
+			{QueueItemID: 55, LibraryItemID: 42, FailureReason: "interrupted_by_restart", HasSelectedRelease: true, CandidateFailureCount: 0},
+			{QueueItemID: 56, LibraryItemID: 43, FailureReason: "interrupted_by_restart", HasSelectedRelease: true, CandidateFailureCount: 0},
 		},
 		retryTarget: database.QueueRetryTarget{
 			QueueItemID:       55,

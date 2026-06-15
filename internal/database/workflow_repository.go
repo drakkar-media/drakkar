@@ -731,9 +731,12 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]Fai
 				when q.state = $2 and q.selected_release_id is not null
 					then 'interrupted_by_restart'
 				else coalesce(q.failure_reason, '')
-			end as failure_reason
+			end as failure_reason,
+			q.selected_release_id is not null as has_selected_release,
+			coalesce(rc.failure_count, 0) as candidate_failure_count
 		from queue_items q
 		join library_items li on li.id = q.library_item_id
+		left join release_candidates rc on rc.id = q.selected_release_id
 		where li.available = false
 		  and (
 		    q.state = $1
@@ -754,7 +757,8 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]Fai
 	var out []FailedQueueRetryTarget
 	for rows.Next() {
 		var item FailedQueueRetryTarget
-		if err := rows.Scan(&item.QueueItemID, &item.LibraryItemID, &item.FailureReason); err != nil {
+		if err := rows.Scan(&item.QueueItemID, &item.LibraryItemID, &item.FailureReason,
+			&item.HasSelectedRelease, &item.CandidateFailureCount); err != nil {
 			return nil, err
 		}
 		out = append(out, item)

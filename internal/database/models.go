@@ -471,9 +471,11 @@ type PendingLibrarySearchTarget struct {
 }
 
 type FailedQueueRetryTarget struct {
-	QueueItemID   int64  `json:"queueItemId"`
-	LibraryItemID int64  `json:"libraryItemId"`
-	FailureReason string `json:"failureReason"`
+	QueueItemID          int64  `json:"queueItemId"`
+	LibraryItemID        int64  `json:"libraryItemId"`
+	FailureReason        string `json:"failureReason"`
+	HasSelectedRelease   bool   `json:"hasSelectedRelease"`
+	CandidateFailureCount int   `json:"candidateFailureCount"`
 }
 
 type PendingRepublishTarget struct {
