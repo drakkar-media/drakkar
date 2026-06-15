@@ -176,9 +176,9 @@ func (db *DB) GetDefaultQualityProfile(ctx context.Context) (QualityProfile, err
 
 func (db *DB) GetLibraryItemQualityProfile(ctx context.Context, libraryItemID int64) (*QualityProfile, error) {
 	row := db.SQL.QueryRowContext(ctx,
-		`SELECT`+profileSelectCols+`FROM quality_profiles qp
-		 JOIN library_items li ON li.quality_profile_id = qp.id
-		 WHERE li.id = $1`, libraryItemID)
+		`SELECT`+profileSelectCols+`FROM quality_profiles
+		 WHERE id = (SELECT quality_profile_id FROM library_items WHERE id = $1)`,
+		libraryItemID)
 	p, err := scanProfile(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

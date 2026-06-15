@@ -2419,7 +2419,7 @@ func (f HTTPNZBFetcher) Fetch(ctx context.Context, rawURL string) (string, []byt
 
 	client := f.Client
 	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
+		client = &http.Client{Timeout: 60 * time.Second}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
