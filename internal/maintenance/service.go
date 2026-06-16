@@ -29,6 +29,7 @@ type Result struct {
 	ScannedRows   int    `json:"scannedRows"`
 	ResetItems    int    `json:"resetItems"`
 	RepairedItems int    `json:"repairedItems"`
+	DegradedItems int    `json:"degradedItems"`
 }
 
 func NewService(repo Repository, runtime config.Runtime) *Service {

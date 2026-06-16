@@ -116,7 +116,6 @@ func DefaultSettings() Settings {
 		},
 		IgnoredPatterns: []string{
 			"*.nfo",
-			"*.par2",
 			"*.sfv",
 			"*sample.mkv",
 			"*.iso",

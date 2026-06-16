@@ -758,7 +758,7 @@ func filterImportedByPatterns(imported ImportedNZB, patterns []string) ImportedN
 		filtered.SegmentCount += len(file.Segments)
 	}
 	// Re-detect archives from the filtered file list — clearing then rebuilding
-	// ensures that files removed by the ignore patterns (e.g. .nfo, .par2) don't
+	// ensures that files removed by the ignore patterns (e.g. .nfo) don't
 	// leave orphaned volume references in the archive groups.
 	filtered.Archives = DetectImportedArchives(filtered.Files)
 	return filtered

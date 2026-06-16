@@ -4,8 +4,13 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/bodgit/sevenzip"
 	"github.com/hjongedijk/drakkar/internal/stream"
 )
 
@@ -193,6 +198,86 @@ func TestHasCompleteArchiveMapping(t *testing.T) {
 	}
 }
 
+func TestInspect7zEntriesStoredCopy(t *testing.T) {
+	raw := loadSevenZipFixture(t, "t0.7z")
+	files := []ImportedNZBFile{{
+		FileName:      "Movie.7z",
+		FileSizeBytes: int64(len(raw)),
+		Segments: []ImportedNZBSegment{{
+			MessageID:          "<one@test>",
+			DecodedStartOffset: 0,
+			DecodedEndOffset:   int64(len(raw)),
+		}},
+	}}
+	fileByName := map[string]ImportedNZBFile{"Movie.7z": files[0]}
+	readerAt, volumeSizes, totalSize, err := buildImportedArchiveReader(context.Background(), []ImportedArchiveVolume{{Path: "Movie.7z", VolumeIndex: 0}}, fileByName, fetcherStub{data: raw})
+	if err != nil {
+		t.Fatalf("buildImportedArchiveReader: %v", err)
+	}
+	reader, err := sevenzip.NewReader(readerAt, totalSize)
+	if err != nil {
+		t.Fatalf("sevenzip.NewReader: %v", err)
+	}
+	entries, err := inspect7zEntries(reader, volumeSizes)
+	if err != nil {
+		t.Fatalf("inspect7zEntries: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected two entries, got %+v", entries)
+	}
+	if entries[0].CompressionMethod != "copy" || entries[1].CompressionMethod != "copy" {
+		t.Fatalf("unexpected methods %+v", entries)
+	}
+	if entries[0].PackedSizeBytes != entries[0].SizeBytes || len(entries[0].Ranges) != 1 {
+		t.Fatalf("unexpected first entry %+v", entries[0])
+	}
+	if entries[0].Ranges[0].EntryOffset != 0 || entries[0].Ranges[0].ArchiveOffset < 0 {
+		t.Fatalf("unexpected first range %+v", entries[0].Ranges[0])
+	}
+}
+
+func TestInspect7zEntriesRejectsCompressedArchive(t *testing.T) {
+	raw := loadSevenZipFixture(t, "lzma.7z")
+	files := []ImportedNZBFile{{
+		FileName:      "Movie.7z",
+		FileSizeBytes: int64(len(raw)),
+		Segments: []ImportedNZBSegment{{
+			MessageID:          "<one@test>",
+			DecodedStartOffset: 0,
+			DecodedEndOffset:   int64(len(raw)),
+		}},
+	}}
+	fileByName := map[string]ImportedNZBFile{"Movie.7z": files[0]}
+	readerAt, volumeSizes, totalSize, err := buildImportedArchiveReader(context.Background(), []ImportedArchiveVolume{{Path: "Movie.7z", VolumeIndex: 0}}, fileByName, fetcherStub{data: raw})
+	if err != nil {
+		t.Fatalf("buildImportedArchiveReader: %v", err)
+	}
+	reader, err := sevenzip.NewReader(readerAt, totalSize)
+	if err != nil {
+		t.Fatalf("sevenzip.NewReader: %v", err)
+	}
+	_, err = inspect7zEntries(reader, volumeSizes)
+	if !errors.Is(err, errArchiveCompressionUnsupported) {
+		t.Fatalf("expected compression rejection, got %v", err)
+	}
+}
+
+func TestSplitArchiveRangeAcrossVolumes(t *testing.T) {
+	ranges, err := splitArchiveRange(map[int]int64{
+		0: 100,
+		1: 150,
+	}, 80, 120)
+	if err != nil {
+		t.Fatalf("splitArchiveRange: %v", err)
+	}
+	if len(ranges) != 2 {
+		t.Fatalf("unexpected ranges %+v", ranges)
+	}
+	if ranges[0].LengthBytes != 20 || ranges[1].EntryOffset != 20 || ranges[1].LengthBytes != 100 {
+		t.Fatalf("unexpected cross-volume mapping %+v", ranges)
+	}
+}
+
 func buildRAR4(solid bool, encrypted bool, method byte, name string, payloadSize uint32) []byte {
 	raw := append([]byte{}, []byte("Rar!\x1a\x07\x00")...)
 	mainFlags := uint16(0x0100)
@@ -225,5 +310,19 @@ func rarBlock(headType byte, flags uint16, body []byte) []byte {
 	binary.LittleEndian.PutUint16(raw[3:5], flags)
 	binary.LittleEndian.PutUint16(raw[5:7], uint16(len(raw)))
 	copy(raw[7:], body)
+	return raw
+}
+
+func loadSevenZipFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	out, err := exec.Command("go", "env", "GOMODCACHE").Output()
+	if err != nil {
+		t.Fatalf("go env GOMODCACHE: %v", err)
+	}
+	root := strings.TrimSpace(string(out))
+	raw, err := os.ReadFile(filepath.Join(root, "github.com", "bodgit", "sevenzip@v1.5.1", "testdata", name))
+	if err != nil {
+		t.Fatalf("read 7z fixture %s: %v", name, err)
+	}
 	return raw
 }

@@ -192,9 +192,18 @@ func (db *DB) ListSelectedReleasesForPublication(ctx context.Context) ([]int64, 
 		select distinct vf.selected_release_id
 		from virtual_files vf
 		join queue_items q on q.selected_release_id = vf.selected_release_id
-		where q.state in ($1, $2, $3, $4)
+		join selected_releases sr on sr.id = vf.selected_release_id
+		where q.state in ($1, $2, $3)
+		   or (
+		        q.state in ($4, $5)
+		        and not exists (
+		            select 1
+		            from symlink_publications sp
+		            where sp.library_item_id = sr.library_item_id
+		        )
+		   )
 		order by vf.selected_release_id asc`,
-		QueuePreflight, QueuePublishing, QueueAvailable, QueueIndexing,
+		QueuePreflight, QueuePublishing, QueueIndexing, QueueAvailable, QueueDegraded,
 	)
 	if err != nil {
 		return nil, err

@@ -16,6 +16,19 @@ type HealthEntry struct {
 	HealthOK      *bool      `json:"healthOk"`
 }
 
+type DeepHealthCandidate struct {
+	PublicationID int64
+	LibraryItemID int64
+	LibraryPath   string
+	TargetPath    string
+	CreatedAt     time.Time
+	LastCheckedAt *time.Time
+	HealthOK      *bool
+	NZBDocumentID int64
+	Title         string
+	HasPAR2       bool
+}
+
 type HealthSummary struct {
 	Total             int `json:"total"`
 	Checked           int `json:"checked"`
@@ -119,6 +132,107 @@ func (db *DB) RecordHealthCheck(ctx context.Context, publicationID int64, ok boo
 		update symlink_publications
 		set last_checked_at = now(), health_ok = $2
 		where id = $1`, publicationID, ok)
+	return err
+}
+
+func (db *DB) RecordHealthStatus(ctx context.Context, publicationID int64, ok bool) error {
+	_, err := db.SQL.ExecContext(ctx, `
+		update symlink_publications
+		set health_ok = $2
+		where id = $1`, publicationID, ok)
+	return err
+}
+
+func (db *DB) ListDeepHealthCandidates(ctx context.Context, limit int) ([]DeepHealthCandidate, error) {
+	query := `
+		SELECT DISTINCT ON (sp.library_item_id)
+		    sp.id AS publication_id,
+		    sp.library_item_id,
+		    sp.library_path,
+		    sp.target_path,
+		    sp.created_at,
+		    sp.last_checked_at,
+		    sp.health_ok,
+		    nd.id,
+		    li.title,
+		    EXISTS (
+		        SELECT 1
+		        FROM nzb_files nf
+		        WHERE nf.nzb_document_id = nd.id
+		          AND lower(nf.subject) LIKE '%.par2%'
+		    ) AS has_par2
+		FROM symlink_publications sp
+		JOIN library_items li ON li.id = sp.library_item_id
+		JOIN queue_items qi ON qi.library_item_id = sp.library_item_id
+		JOIN selected_releases sr ON sr.id = qi.selected_release_id
+		JOIN nzb_documents nd ON nd.selected_release_id = sr.id
+		WHERE li.available = true
+		  AND qi.state IN ('available', 'degraded')
+		ORDER BY sp.library_item_id ASC, qi.id DESC`
+	if limit > 0 {
+		query = `
+			SELECT *
+			FROM (` + query + `) candidates
+			ORDER BY last_checked_at ASC NULLS FIRST, created_at ASC, publication_id ASC
+			LIMIT $1`
+		rows, err := db.SQL.QueryContext(ctx, query, limit)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return scanDeepHealthCandidates(rows)
+	}
+	rows, err := db.SQL.QueryContext(ctx, `
+		SELECT *
+		FROM (`+query+`) candidates
+		ORDER BY last_checked_at ASC NULLS FIRST, created_at ASC, publication_id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanDeepHealthCandidates(rows)
+}
+
+type deepHealthScanner interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+}
+
+func scanDeepHealthCandidates(rows deepHealthScanner) ([]DeepHealthCandidate, error) {
+	var out []DeepHealthCandidate
+	for rows.Next() {
+		var item DeepHealthCandidate
+		if err := rows.Scan(
+			&item.PublicationID,
+			&item.LibraryItemID,
+			&item.LibraryPath,
+			&item.TargetPath,
+			&item.CreatedAt,
+			&item.LastCheckedAt,
+			&item.HealthOK,
+			&item.NZBDocumentID,
+			&item.Title,
+			&item.HasPAR2,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) MarkLibraryItemDegraded(ctx context.Context, libraryItemID int64, reason string) error {
+	_, err := db.SQL.ExecContext(ctx, `
+		UPDATE queue_items
+		SET state = $2, failure_reason = $3, updated_at = now()
+		WHERE id = (
+		    SELECT id
+		    FROM queue_items
+		    WHERE library_item_id = $1
+		    ORDER BY id DESC
+		    LIMIT 1
+		)`, libraryItemID, QueueDegraded, reason)
 	return err
 }
 

@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -21,6 +23,7 @@ type segmentPair struct{ first, last string }
 func (db *DB) loadNZBFirstLastSegmentPairs(ctx context.Context, nzbDocumentID int64) ([]segmentPair, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT
+		    nf.subject,
 		    (SELECT ns.message_id FROM nzb_segments ns WHERE ns.nzb_file_id = nf.id ORDER BY ns.segment_number ASC  LIMIT 1),
 		    (SELECT ns.message_id FROM nzb_segments ns WHERE ns.nzb_file_id = nf.id ORDER BY ns.segment_number DESC LIMIT 1)
 		FROM nzb_files nf
@@ -31,13 +34,49 @@ func (db *DB) loadNZBFirstLastSegmentPairs(ctx context.Context, nzbDocumentID in
 	defer rows.Close()
 	var pairs []segmentPair
 	for rows.Next() {
+		var subject string
 		var p segmentPair
-		if err := rows.Scan(&p.first, &p.last); err != nil {
+		if err := rows.Scan(&subject, &p.first, &p.last); err != nil {
 			return nil, err
+		}
+		if !shouldValidateNZBSubject(subject) {
+			continue
 		}
 		pairs = append(pairs, p)
 	}
 	return pairs, rows.Err()
+}
+
+func shouldValidateNZBSubject(subject string) bool {
+	name := parseNZBSubjectFilename(subject)
+	if name == "" {
+		name = subject
+	}
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(name)))
+	if base == "" {
+		return false
+	}
+	switch ext := strings.ToLower(filepath.Ext(base)); ext {
+	case ".par2", ".sfv", ".nfo", ".jpg", ".jpeg", ".png":
+		return false
+	}
+	if isSampleFilename(base) {
+		return false
+	}
+	return true
+}
+
+func parseNZBSubjectFilename(subject string) string {
+	start := strings.Index(subject, "\"")
+	end := strings.LastIndex(subject, "\"")
+	if start >= 0 && end > start {
+		return subject[start+1 : end]
+	}
+	fields := strings.Fields(subject)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.Trim(fields[0], "\"")
 }
 
 // PreflightCheckFirstSegments verifies that the first AND last segment of every

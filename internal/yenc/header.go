@@ -2,6 +2,7 @@ package yenc
 
 import (
 	"bytes"
+	"encoding/hex"
 	"strconv"
 )
 
@@ -83,4 +84,16 @@ func parseKeyValue(line []byte, key string) (string, bool) {
 		end++
 	}
 	return string(line[start:end]), true
+}
+
+func parseHexUint32(line []byte, key string) (uint32, bool) {
+	value, ok := parseKeyValue(line, key)
+	if !ok || len(value) != 8 {
+		return 0, false
+	}
+	raw, err := hex.DecodeString(value)
+	if err != nil || len(raw) != 4 {
+		return 0, false
+	}
+	return uint32(raw[0])<<24 | uint32(raw[1])<<16 | uint32(raw[2])<<8 | uint32(raw[3]), true
 }

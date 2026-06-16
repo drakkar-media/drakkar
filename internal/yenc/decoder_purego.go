@@ -1,14 +1,16 @@
+//go:build !rapidyenc || !cgo
+
 package yenc
 
 import (
 	"bytes"
 	"errors"
-	"strings"
 )
 
 var (
 	ErrMissingBegin = errors.New("yenc begin header missing")
 	ErrMissingEnd   = errors.New("yenc end footer missing")
+	ErrCRCMismatch  = errors.New("yenc crc mismatch")
 )
 
 func DecodeArticle(body []byte) ([]byte, error) {
@@ -52,18 +54,10 @@ func DecodeArticle(body []byte) ([]byte, error) {
 			out = append(out, b-42)
 		}
 	}
-	return out, nil
-}
-
-func splitLines(body []byte) [][]byte {
-	normalized := strings.ReplaceAll(string(body), "\r\n", "\n")
-	normalized = strings.ReplaceAll(normalized, "\r", "\n")
-	raw := strings.Split(normalized, "\n")
-	out := make([][]byte, 0, len(raw))
-	for _, line := range raw {
-		out = append(out, []byte(line))
+	if err := verifyExpectedCRC(body, out); err != nil {
+		return nil, err
 	}
-	return out
+	return out, nil
 }
 
 func unstuffDotLine(line []byte) []byte {

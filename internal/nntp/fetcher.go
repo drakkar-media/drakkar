@@ -33,22 +33,22 @@ func NewSegmentFetcher(source DecodedArticleSource) *SegmentFetcher {
 	return &SegmentFetcher{source: source}
 }
 
+// DecodedArticle fetches and returns the full decoded article body.
+func (f *SegmentFetcher) DecodedArticle(ctx context.Context, messageID string) ([]byte, error) {
+	if f == nil || f.source == nil {
+		return nil, errors.New("nntp source unavailable")
+	}
+	if ps, ok := f.source.(PriorityDecodedArticleSource); ok {
+		return ps.DecodedBodyPriority(ctx, messageID, stream.PriorityBackground)
+	}
+	return f.source.DecodedBody(ctx, messageID)
+}
+
 // DecodedSize fetches the full decoded article and returns its byte length.
 // This is used during calibration to determine the actual decoded size of a
 // segment rather than relying on estimates from the NZB bytes attribute.
 func (f *SegmentFetcher) DecodedSize(ctx context.Context, messageID string) (int64, error) {
-	if f == nil || f.source == nil {
-		return 0, errors.New("nntp source unavailable")
-	}
-	var (
-		decoded []byte
-		err     error
-	)
-	if ps, ok := f.source.(PriorityDecodedArticleSource); ok {
-		decoded, err = ps.DecodedBodyPriority(ctx, messageID, stream.PriorityBackground)
-	} else {
-		decoded, err = f.source.DecodedBody(ctx, messageID)
-	}
+	decoded, err := f.DecodedArticle(ctx, messageID)
 	if err != nil {
 		return 0, err
 	}
