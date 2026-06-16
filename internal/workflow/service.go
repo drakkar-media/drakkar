@@ -1652,9 +1652,10 @@ func (s *Service) promoteNextAfterFailureDepth(ctx context.Context, current data
 	// Use a fresh context for DB cleanup if the caller's context was already
 	// canceled — prevents the item from remaining stuck in a transitional state.
 	dbCtx := cleanupCtx(ctx)
-	if depth >= 2 {
-		// Depth limit: fail the current item so it doesn't stay stuck in preflight.
-		// The next scheduler cycle will pick it up with a fresh search.
+	if depth >= 25 {
+		// Depth limit: we've tried 26 candidates inline. Fail+promote one more so
+		// the item lands in QueueSelected for the next dispatch cycle rather than
+		// holding this BullMQ job open indefinitely.
 		if _, depthErr := s.repo.FailSelectedReleaseAndPromoteNext(dbCtx, current.SelectedReleaseID, reason); depthErr != nil {
 			s.logger.Error().Err(depthErr).Int64("selectedReleaseId", current.SelectedReleaseID).Msg("workqueue: depth-limit fail failed")
 		}
