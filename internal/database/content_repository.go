@@ -2,10 +2,57 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 
 	"github.com/hjongedijk/drakkar/internal/stream"
 )
+
+// computeSpans builds the SegmentSpan slice for a virtual file on-the-fly from
+// the inline segment data stored in nzb_files. segmentByteOffset is the byte
+// offset within the NZB file's decoded content where this virtual file starts
+// (0 for direct_nzb, = archive_offset for stored_rar). entrySize is the size of
+// the virtual file in bytes.
+func computeSpans(messageIDs []string, decodedSegmentSize, lastDecodedSize, segmentByteOffset, entrySize int64) []stream.SegmentSpan {
+	if len(messageIDs) == 0 || decodedSegmentSize <= 0 {
+		return nil
+	}
+	entryEnd := segmentByteOffset + entrySize
+	firstSegIdx := segmentByteOffset / decodedSegmentSize
+	var spans []stream.SegmentSpan
+	vfPos := int64(0)
+	for i := firstSegIdx; i < int64(len(messageIDs)); i++ {
+		segStart := i * decodedSegmentSize
+		segSize := decodedSegmentSize
+		if i == int64(len(messageIDs))-1 && lastDecodedSize > 0 {
+			segSize = lastDecodedSize
+		}
+		segEnd := segStart + segSize
+		if segStart >= entryEnd {
+			break
+		}
+		dataStart := segmentByteOffset
+		if segStart > dataStart {
+			dataStart = segStart
+		}
+		dataEnd := entryEnd
+		if segEnd < dataEnd {
+			dataEnd = segEnd
+		}
+		byteInSeg := dataStart - segStart
+		chunkLen := dataEnd - dataStart
+		spans = append(spans, stream.SegmentSpan{
+			SegmentID:        i, // segment index used as cache key in ReadAheadManager
+			MessageID:        messageIDs[i],
+			Start:            vfPos,
+			End:              vfPos + chunkLen,
+			DecodedStart:     segStart,
+			SegmentByteStart: byteInSeg,
+		})
+		vfPos += chunkLen
+	}
+	return spans
+}
 
 func (db *DB) ListContentMountEntriesForRelease(ctx context.Context, selectedReleaseID int64) ([]ContentMountEntry, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
@@ -80,9 +127,9 @@ func (db *DB) OpenVirtualMediaFile(ctx context.Context, virtualFileID int64) (st
 		spans := make([]stream.SegmentSpan, len(entry.spans))
 		copy(spans, entry.spans)
 		if entry.readerKind == "stored_rar" {
-			return stream.NewStoredRarReader(entry.name, spanFileSize(spans), spans, fetcher, db.ReadAhead), nil
+			return stream.NewStoredRarReader(entry.name, entry.size, spans, fetcher, db.ReadAhead), nil
 		}
-		return stream.NewDirectNzbReader(entry.name, spanFileSize(spans), spans, fetcher, db.ReadAhead), nil
+		return stream.NewDirectNzbReader(entry.name, entry.size, spans, fetcher, db.ReadAhead), nil
 	default:
 		return nil, errors.New("virtual media reader not implemented: " + entry.readerKind)
 	}
@@ -90,8 +137,8 @@ func (db *DB) OpenVirtualMediaFile(ctx context.Context, virtualFileID int64) (st
 
 // loadVFCache returns the cached virtual-file metadata, querying the DB on
 // the first call for each virtualFileID and serving from memory thereafter.
-// Spans are immutable in the DB after the NZB is imported, so the cache
-// never needs invalidation.
+// Spans are recomputed from inline nzb_files data, so calibration must call
+// InvalidateVFCacheForNZBFile to flush stale entries after updating sizes.
 func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, error) {
 	db.vfCacheMu.RLock()
 	if entry, ok := db.vfCache[virtualFileID]; ok {
@@ -101,48 +148,46 @@ func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, 
 	db.vfCacheMu.RUnlock()
 
 	var entry cachedVF
+	var nzbFileID sql.NullInt64
+	var segByteOffset, decodedSegSize, lastDecSize int64
+	var messageIDsRaw *string // scan as nullable string then parse
+
 	err := db.SQL.QueryRowContext(ctx, `
-		select file_name, reader_kind, inline_bytes
-		from virtual_files
-		where id = $1`, virtualFileID,
-	).Scan(&entry.name, &entry.readerKind, &entry.inlineData)
+		SELECT vf.file_name, vf.reader_kind, vf.inline_bytes, vf.size_bytes,
+		       vf.nzb_file_id, vf.segment_byte_offset,
+		       COALESCE(nf.message_ids::text, '{}'),
+		       COALESCE(nf.decoded_segment_size, 0),
+		       COALESCE(nf.last_decoded_size, 0)
+		FROM virtual_files vf
+		LEFT JOIN nzb_files nf ON nf.id = vf.nzb_file_id
+		WHERE vf.id = $1`, virtualFileID,
+	).Scan(&entry.name, &entry.readerKind, &entry.inlineData, &entry.size,
+		&nzbFileID, &segByteOffset, &messageIDsRaw, &decodedSegSize, &lastDecSize)
 	if err != nil {
 		return nil, err
 	}
+
 	if entry.readerKind == "direct_nzb" || entry.readerKind == "stored_rar" {
-		// For stored_rar we need decoded_start_offset and segment_byte_start to
-		// translate VF byte positions into decoded-segment byte positions at read
-		// time. For direct_nzb these fields are zero (their default) because VF
-		// positions equal decoded positions.
-		rows, err := db.SQL.QueryContext(ctx, `
-			select ns.id, ns.message_id, vfr.range_start, vfr.range_end,
-			       ns.decoded_start_offset, vfr.segment_byte_start
-			from virtual_file_ranges vfr
-			join nzb_segments ns on ns.id = vfr.nzb_segment_id
-			where vfr.virtual_file_id = $1
-			order by vfr.range_start asc`, virtualFileID,
-		)
-		if err != nil {
-			return nil, err
+		var msgIDs []string
+		if messageIDsRaw != nil {
+			msgIDs = parsePostgresArray(*messageIDsRaw)
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var span stream.SegmentSpan
-			if err := rows.Scan(&span.SegmentID, &span.MessageID, &span.Start, &span.End,
-				&span.DecodedStart, &span.SegmentByteStart); err != nil {
-				return nil, err
-			}
-			entry.spans = append(entry.spans, span)
-		}
-		if err := rows.Err(); err != nil {
-			return nil, err
-		}
+		entry.spans = computeSpans(msgIDs, decodedSegSize, lastDecSize, segByteOffset, entry.size)
 	}
 
 	db.vfCacheMu.Lock()
 	db.vfCache[virtualFileID] = &entry
 	db.vfCacheMu.Unlock()
 	return &entry, nil
+}
+
+// InvalidateVFCacheForNZBFile clears all cached virtual-file entries so that
+// the next open picks up corrected decoded_segment_size / last_decoded_size
+// values written by calibration. Simplest correct approach: clear everything.
+func (db *DB) InvalidateVFCacheForNZBFile(_ int64) {
+	db.vfCacheMu.Lock()
+	db.vfCache = make(map[int64]*cachedVF)
+	db.vfCacheMu.Unlock()
 }
 
 type unavailableSegmentFetcher struct{}

@@ -13,97 +13,10 @@ import (
 	"github.com/hjongedijk/drakkar/internal/stream"
 )
 
-// bulkInsertSegments inserts all segments for one NZB file in a single query
-// (one round-trip instead of N). Returns the inserted IDs in segment order.
-// maxSegmentBatch is the max segments per INSERT to stay under PostgreSQL's
-// 65535-parameter limit (6 params per segment: 65535/6 = 10922, rounded down).
-const maxSegmentBatch = 10000
-
-// vfRange is a single virtual_file_ranges row ready for bulk insert.
-type vfRange struct {
-	segmentID        int64
-	rangeStart       int64
-	rangeEnd         int64
-	segmentByteStart int64
-}
-
-// bulkInsertVFRanges inserts virtual_file_ranges rows in batches (5 params per
-// row → max 13107 rows per query). This replaces the previous one-INSERT-per-
-// segment loop that caused measurable latency for large NZBs.
-func bulkInsertVFRanges(ctx context.Context, tx *sql.Tx, virtualFileID int64, ranges []vfRange) error {
-	const batchSize = 13000 // 5 params × 13000 = 65000 < 65535 limit
-	for start := 0; start < len(ranges); start += batchSize {
-		end := start + batchSize
-		if end > len(ranges) {
-			end = len(ranges)
-		}
-		batch := ranges[start:end]
-		var sb strings.Builder
-		sb.WriteString(`INSERT INTO virtual_file_ranges (virtual_file_id, nzb_segment_id, range_start, range_end, segment_byte_start) VALUES `)
-		args := make([]any, 0, len(batch)*5)
-		for i, r := range batch {
-			if i > 0 {
-				sb.WriteByte(',')
-			}
-			base := i * 5
-			fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d)", base+1, base+2, base+3, base+4, base+5)
-			args = append(args, virtualFileID, r.segmentID, r.rangeStart, r.rangeEnd, r.segmentByteStart)
-		}
-		if _, err := tx.ExecContext(ctx, sb.String(), args...); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func bulkInsertSegments(ctx context.Context, tx *sql.Tx, nzbFileID int64, segments []ImportedNZBSegment) ([]int64, error) {
-	if len(segments) == 0 {
-		return nil, nil
-	}
-	ids := make([]int64, 0, len(segments))
-	for start := 0; start < len(segments); start += maxSegmentBatch {
-		end := start + maxSegmentBatch
-		if end > len(segments) {
-			end = len(segments)
-		}
-		batch := segments[start:end]
-		sb := strings.Builder{}
-		sb.WriteString(`insert into nzb_segments (nzb_file_id, segment_number, message_id, encoded_size_bytes, decoded_start_offset, decoded_end_offset, availability_status) values `)
-		args := make([]interface{}, 0, len(batch)*6)
-		for i, seg := range batch {
-			if i > 0 {
-				sb.WriteByte(',')
-			}
-			base := i * 6
-			fmt.Fprintf(&sb, "($%d,$%d,$%d,$%d,$%d,$%d,'unknown')", base+1, base+2, base+3, base+4, base+5, base+6)
-			args = append(args, nzbFileID, seg.Number, seg.MessageID, seg.EncodedSizeBytes, seg.DecodedStartOffset, seg.DecodedEndOffset)
-		}
-		sb.WriteString(` returning id`)
-		rows, err := tx.QueryContext(ctx, sb.String(), args...)
-		if err != nil {
-			return nil, err
-		}
-		for rows.Next() {
-			var id int64
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			ids = append(ids, id)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		rows.Close()
-	}
-	return ids, nil
-}
-
 type importedFileSegments struct {
-	fileName string
-	spans    []stream.SegmentSpan
-	ids      []int64
+	fileName  string
+	nzbFileID int64
+	spans     []stream.SegmentSpan // computed from inline data for resolveArchiveEntryRanges
 }
 
 func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
@@ -133,7 +46,7 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 			n.id,
 			coalesce(n.file_name, ''),
 			coalesce((select count(*) from nzb_files nf where nf.nzb_document_id = n.id), 0),
-			coalesce((select count(*) from nzb_segments ns join nzb_files nf on nf.id = ns.nzb_file_id where nf.nzb_document_id = n.id), 0),
+			coalesce((select sum(array_length(nf.message_ids, 1)) from nzb_files nf where nf.nzb_document_id = n.id), 0),
 			q.created_at,
 			q.updated_at
 		from queue_items q
@@ -278,43 +191,39 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 		if file.PostedUnix > 0 {
 			postedAt = time.Unix(file.PostedUnix, 0).UTC()
 		}
+		msgIDs := make([]string, len(file.Segments))
+		for i, s := range file.Segments {
+			msgIDs[i] = s.MessageID
+		}
+		decSegSize, lastDecSize := segmentSizes(file.Segments)
 		var nzbFileID int64
 		if err = tx.QueryRowContext(ctx, `
-			insert into nzb_files (nzb_document_id, subject, poster, posted_at, file_size_bytes)
-			values ($1, $2, $3, $4, $5)
+			insert into nzb_files (nzb_document_id, subject, poster, posted_at, file_size_bytes, message_ids, decoded_segment_size, last_decoded_size)
+			values ($1, $2, $3, $4, $5, $6, $7, $8)
 			returning id`,
 			nzbDocumentID, file.Subject, file.Poster, postedAt, file.FileSizeBytes,
+			pgTextArray(msgIDs), decSegSize, lastDecSize,
 		).Scan(&nzbFileID); err != nil {
 			return QueueSnapshot{}, err
 		}
 
-		var segmentIDs []int64
-		if segmentIDs, err = bulkInsertSegments(ctx, tx, nzbFileID, file.Segments); err != nil {
-			return QueueSnapshot{}, err
-		}
+		spans := computeSpans(msgIDs, decSegSize, lastDecSize, 0, file.FileSizeBytes)
 		fileSegments[file.FileName] = importedFileSegments{
-			fileName: file.FileName,
-			ids:      segmentIDs,
-			spans:    importedSegmentSpans(file.Segments, segmentIDs),
+			fileName:  file.FileName,
+			nzbFileID: nzbFileID,
+			spans:     spans,
 		}
 
 		if isPlayableMedia(file.FileName) {
 			virtualPath := "releases/" + fmt.Sprintf("%d", selectedReleaseID) + "/" + file.FileName
-			var virtualFileID int64
 			if err = tx.QueryRowContext(ctx, `
 				insert into virtual_files (
-					selected_release_id, path, file_name, size_bytes, reader_kind
-				) values ($1, $2, $3, $4, 'direct_nzb')
+					selected_release_id, path, file_name, size_bytes, reader_kind,
+					nzb_file_id, segment_byte_offset
+				) values ($1, $2, $3, $4, 'direct_nzb', $5, 0)
 				returning id`,
-				selectedReleaseID, virtualPath, file.FileName, file.FileSizeBytes,
-			).Scan(&virtualFileID); err != nil {
-				return QueueSnapshot{}, err
-			}
-			vfrs := make([]vfRange, len(file.Segments))
-			for i, seg := range file.Segments {
-				vfrs[i] = vfRange{segmentID: segmentIDs[i], rangeStart: seg.DecodedStartOffset, rangeEnd: seg.DecodedEndOffset}
-			}
-			if err = bulkInsertVFRanges(ctx, tx, virtualFileID, vfrs); err != nil {
+				selectedReleaseID, virtualPath, file.FileName, file.FileSizeBytes, nzbFileID,
+			).Scan(new(int64)); err != nil {
 				return QueueSnapshot{}, err
 			}
 		}
@@ -351,8 +260,6 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID int64, imported ImportedNZB) (QueueSnapshot, error) {
 	imported = db.applyImportPolicies(ctx, imported)
 	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher)
-	// Cap at 60s: deleting old nzb_segments cascades through nzb_files/virtual_file_ranges
-	// and can block for many minutes when calibration holds read locks on those rows.
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	tx, err := db.SQL.BeginTx(ctx, nil)
@@ -376,9 +283,6 @@ func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID in
 		return QueueSnapshot{}, err
 	}
 
-	if err = preDeleteVFRBySelectedRelease(ctx, tx, selectedReleaseID); err != nil {
-		return QueueSnapshot{}, err
-	}
 	if _, err = tx.ExecContext(ctx, `
 		delete from nzb_documents
 		where selected_release_id = $1`, selectedReleaseID); err != nil {
@@ -409,41 +313,37 @@ func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID in
 		if file.PostedUnix > 0 {
 			postedAt = time.Unix(file.PostedUnix, 0).UTC()
 		}
+		msgIDs := make([]string, len(file.Segments))
+		for i, s := range file.Segments {
+			msgIDs[i] = s.MessageID
+		}
+		decSegSize, lastDecSize := segmentSizes(file.Segments)
 		var nzbFileID int64
 		if err = tx.QueryRowContext(ctx, `
-			insert into nzb_files (nzb_document_id, subject, poster, posted_at, file_size_bytes)
-			values ($1, $2, $3, $4, $5)
+			insert into nzb_files (nzb_document_id, subject, poster, posted_at, file_size_bytes, message_ids, decoded_segment_size, last_decoded_size)
+			values ($1, $2, $3, $4, $5, $6, $7, $8)
 			returning id`,
 			nzbDocumentID, file.Subject, file.Poster, postedAt, file.FileSizeBytes,
+			pgTextArray(msgIDs), decSegSize, lastDecSize,
 		).Scan(&nzbFileID); err != nil {
 			return QueueSnapshot{}, err
 		}
-		var segmentIDs []int64
-		if segmentIDs, err = bulkInsertSegments(ctx, tx, nzbFileID, file.Segments); err != nil {
-			return QueueSnapshot{}, err
-		}
+		spans := computeSpans(msgIDs, decSegSize, lastDecSize, 0, file.FileSizeBytes)
 		fileSegments[file.FileName] = importedFileSegments{
-			fileName: file.FileName,
-			ids:      segmentIDs,
-			spans:    importedSegmentSpans(file.Segments, segmentIDs),
+			fileName:  file.FileName,
+			nzbFileID: nzbFileID,
+			spans:     spans,
 		}
 		if isPlayableMedia(file.FileName) {
 			virtualPath := "releases/" + fmt.Sprintf("%d", selectedReleaseID) + "/" + file.FileName
-			var virtualFileID int64
 			if err = tx.QueryRowContext(ctx, `
 				insert into virtual_files (
-					selected_release_id, path, file_name, size_bytes, reader_kind
-				) values ($1, $2, $3, $4, 'direct_nzb')
+					selected_release_id, path, file_name, size_bytes, reader_kind,
+					nzb_file_id, segment_byte_offset
+				) values ($1, $2, $3, $4, 'direct_nzb', $5, 0)
 				returning id`,
-				selectedReleaseID, virtualPath, file.FileName, file.FileSizeBytes,
-			).Scan(&virtualFileID); err != nil {
-				return QueueSnapshot{}, err
-			}
-			vfrs := make([]vfRange, len(file.Segments))
-			for i, seg := range file.Segments {
-				vfrs[i] = vfRange{segmentID: segmentIDs[i], rangeStart: seg.DecodedStartOffset, rangeEnd: seg.DecodedEndOffset}
-			}
-			if err = bulkInsertVFRanges(ctx, tx, virtualFileID, vfrs); err != nil {
+				selectedReleaseID, virtualPath, file.FileName, file.FileSizeBytes, nzbFileID,
+			).Scan(new(int64)); err != nil {
 				return QueueSnapshot{}, err
 			}
 		}
@@ -557,17 +457,11 @@ func insertImportedArchives(ctx context.Context, tx *sql.Tx, selectedReleaseID i
 }
 
 func insertArchiveVirtualFile(ctx context.Context, tx *sql.Tx, selectedReleaseID int64, entry ImportedArchiveEntry, volumePaths map[int]string, fileSegments map[string]importedFileSegments) (int64, error) {
-	virtualPath := "releases/" + fmt.Sprintf("%d", selectedReleaseID) + "/" + entry.Path
-	var virtualFileID int64
-	if err := tx.QueryRowContext(ctx, `
-		insert into virtual_files (
-			selected_release_id, path, file_name, size_bytes, reader_kind
-		) values ($1, $2, $3, $4, 'stored_rar')
-		returning id`,
-		selectedReleaseID, virtualPath, entry.Path, entry.SizeBytes,
-	).Scan(&virtualFileID); err != nil {
-		return 0, err
-	}
+	// For stored_rar entries that span multiple volumes, only the first range's
+	// NZB file and archive offset are stored — multi-volume RAR is not supported
+	// for streaming, so we use the first volume's source as the reference.
+	var nzbFileID int64
+	archiveByteOffset := entry.ArchiveOffset // byte offset in the NZB file decoded content
 	for _, item := range entry.Ranges {
 		volumePath, ok := volumePaths[item.VolumeIndex]
 		if !ok {
@@ -577,63 +471,41 @@ func insertArchiveVirtualFile(ctx context.Context, tx *sql.Tx, selectedReleaseID
 		if !ok {
 			continue
 		}
-		ranges, err := resolveArchiveEntryRanges(source, item)
-		if err != nil {
-			return 0, err
-		}
-		vfrs := make([]vfRange, len(ranges))
-		for i, r := range ranges {
-			vfrs[i] = vfRange{segmentID: r.SegmentID, rangeStart: r.RangeStart, rangeEnd: r.RangeEnd, segmentByteStart: r.SegmentByteStart}
-		}
-		if err = bulkInsertVFRanges(ctx, tx, virtualFileID, vfrs); err != nil {
-			return 0, err
-		}
+		nzbFileID = source.nzbFileID
+		archiveByteOffset = item.ArchiveOffset
+		break
+	}
+
+	virtualPath := "releases/" + fmt.Sprintf("%d", selectedReleaseID) + "/" + entry.Path
+	var virtualFileID int64
+	if err := tx.QueryRowContext(ctx, `
+		insert into virtual_files (
+			selected_release_id, path, file_name, size_bytes, reader_kind,
+			nzb_file_id, segment_byte_offset
+		) values ($1, $2, $3, $4, 'stored_rar', $5, $6)
+		returning id`,
+		selectedReleaseID, virtualPath, entry.Path, entry.SizeBytes,
+		nzbFileID, archiveByteOffset,
+	).Scan(&virtualFileID); err != nil {
+		return 0, err
 	}
 	return virtualFileID, nil
 }
 
-type resolvedArchiveRange struct {
-	SegmentID        int64
-	RangeStart       int64
-	RangeEnd         int64
-	SegmentByteStart int64
+func resolveArchiveEntryRanges(source importedFileSegments, item ImportedArchiveRange) ([]stream.SegmentRange, error) {
+	return stream.ResolveRange(source.spans, item.ArchiveOffset, item.LengthBytes)
 }
 
-func resolveArchiveEntryRanges(source importedFileSegments, item ImportedArchiveRange) ([]resolvedArchiveRange, error) {
-	parts, err := stream.ResolveRange(source.spans, item.ArchiveOffset, item.LengthBytes)
-	if err != nil {
-		return nil, err
+// segmentSizes returns (decodedSegmentSize, lastDecodedSize) from the imported segments.
+// decodedSegmentSize is the size of the first (uniform) segment; lastDecodedSize is the
+// size of the final segment (which may differ).
+func segmentSizes(segments []ImportedNZBSegment) (int64, int64) {
+	if len(segments) == 0 {
+		return 0, 0
 	}
-	out := make([]resolvedArchiveRange, 0, len(parts))
-	for _, part := range parts {
-		start := item.EntryOffset + (part.RangeStart - item.ArchiveOffset)
-		end := start + (part.RangeEnd - part.RangeStart)
-		// part.RangeStart is an archive byte position; part.SegmentStart is the
-		// decoded_start_offset of the segment (also an archive byte position for
-		// source spans). Their difference is the byte offset within the decoded
-		// segment at which this span's content begins.
-		segByteStart := part.RangeStart - part.SegmentStart
-		out = append(out, resolvedArchiveRange{
-			SegmentID:        part.SegmentID,
-			RangeStart:       start,
-			RangeEnd:         end,
-			SegmentByteStart: segByteStart,
-		})
-	}
-	return out, nil
-}
-
-func importedSegmentSpans(segments []ImportedNZBSegment, segmentIDs []int64) []stream.SegmentSpan {
-	out := make([]stream.SegmentSpan, 0, len(segments))
-	for i, segment := range segments {
-		out = append(out, stream.SegmentSpan{
-			SegmentID: segmentIDs[i],
-			MessageID: segment.MessageID,
-			Start:     segment.DecodedStartOffset,
-			End:       segment.DecodedEndOffset,
-		})
-	}
-	return out
+	first := segments[0].DecodedEndOffset - segments[0].DecodedStartOffset
+	last := segments[len(segments)-1].DecodedEndOffset - segments[len(segments)-1].DecodedStartOffset
+	return first, last
 }
 
 func (db *DB) MarkSelectedReleaseFetching(ctx context.Context, selectedReleaseID int64) error {
@@ -897,10 +769,9 @@ func (db *DB) ListSabHistoryItems(ctx context.Context, category string, start, l
 		SELECT li.id, li.title, li.media_type, q.state, q.failure_reason,
 		       COALESCE(q.selected_release_id, 0),
 		       COALESCE((
-		           SELECT SUM(ns.encoded_size_bytes)
+		           SELECT SUM(nf.file_size_bytes)
 		           FROM nzb_documents nd
 		           JOIN nzb_files nf ON nf.nzb_document_id = nd.id
-		           JOIN nzb_segments ns ON ns.nzb_file_id = nf.id
 		           WHERE nd.selected_release_id = q.selected_release_id
 		       ), 0)
 		FROM library_items li

@@ -24,10 +24,11 @@ func (db *DB) loadNZBFirstLastSegmentPairs(ctx context.Context, nzbDocumentID in
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT
 		    nf.subject,
-		    (SELECT ns.message_id FROM nzb_segments ns WHERE ns.nzb_file_id = nf.id ORDER BY ns.segment_number ASC  LIMIT 1),
-		    (SELECT ns.message_id FROM nzb_segments ns WHERE ns.nzb_file_id = nf.id ORDER BY ns.segment_number DESC LIMIT 1)
+		    nf.message_ids[1],
+		    nf.message_ids[array_length(nf.message_ids, 1)]
 		FROM nzb_files nf
-		WHERE nf.nzb_document_id = $1`, nzbDocumentID)
+		WHERE nf.nzb_document_id = $1
+		  AND array_length(nf.message_ids, 1) > 0`, nzbDocumentID)
 	if err != nil {
 		return nil, err
 	}
@@ -204,13 +205,14 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT nf.id,
-		       (SELECT ns.message_id FROM nzb_segments ns WHERE ns.nzb_file_id = nf.id ORDER BY ns.segment_number ASC  LIMIT 1),
-		       (SELECT ns.decoded_end_offset - ns.decoded_start_offset FROM nzb_segments ns WHERE ns.nzb_file_id = nf.id ORDER BY ns.segment_number ASC  LIMIT 1),
-		       (SELECT ns.message_id FROM nzb_segments ns WHERE ns.nzb_file_id = nf.id ORDER BY ns.segment_number DESC LIMIT 1),
-		       (SELECT ns.decoded_end_offset - ns.decoded_start_offset FROM nzb_segments ns WHERE ns.nzb_file_id = nf.id ORDER BY ns.segment_number DESC LIMIT 1)
+		       nf.message_ids[1],
+		       nf.decoded_segment_size,
+		       nf.message_ids[array_length(nf.message_ids, 1)],
+		       nf.last_decoded_size
 		FROM nzb_files nf
 		WHERE nf.nzb_document_id = $1
-		  AND nf.calibrated_at IS NULL`, nzbDocumentID)
+		  AND nf.calibrated_at IS NULL
+		  AND array_length(nf.message_ids, 1) > 0`, nzbDocumentID)
 	if err != nil {
 		return err
 	}
@@ -273,7 +275,11 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 	return nil
 }
 
-// rescaleFileSegments rewrites decoded byte offsets for all segments of a file.
+// rescaleFileSegments updates decoded segment sizes for a file inline in nzb_files
+// and recomputes virtual_files.size_bytes for any direct_nzb virtual file backed
+// by this nzb_file.  The old nzb_segments / virtual_file_ranges tables were
+// removed by migration 000041; all segment data now lives in nzb_files.
+//
 // actualFirstSize is the measured decoded size of segment 1 (applied uniformly
 // to all non-last segments). actualLastSize is the measured decoded size of the
 // final segment — using the real value avoids the file-size overestimation that
@@ -286,67 +292,34 @@ func (db *DB) rescaleFileSegments(ctx context.Context, nzbFileID, actualFirstSiz
 	}
 	defer tx.Rollback()
 
-	// Rewrite nzb_segments: all non-last segments get uniform actualFirstSize
-	// boundaries; the last segment uses its own measured actualLastSize.
-	_, err = tx.ExecContext(ctx, `
-		WITH numbered AS (
-		    SELECT id, segment_number,
-		           ROW_NUMBER() OVER (ORDER BY segment_number) - 1 AS idx,
-		           COUNT(*) OVER () AS total
-		    FROM nzb_segments
-		    WHERE nzb_file_id = $1
-		)
-		UPDATE nzb_segments ns SET
-		    decoded_start_offset = n.idx * $2,
-		    decoded_end_offset   = CASE
-		        WHEN n.idx = n.total - 1 THEN n.idx * $2 + $3
-		        ELSE (n.idx + 1) * $2
-		    END
-		FROM numbered n
-		WHERE ns.id = n.id`,
-		nzbFileID, actualFirstSize, actualLastSize)
-	if err != nil {
+	// Update the inline segment sizes stored in nzb_files.
+	var segmentCount int64
+	if err = tx.QueryRowContext(ctx, `
+		UPDATE nzb_files
+		SET decoded_segment_size = $2,
+		    last_decoded_size     = $3
+		WHERE id = $1
+		RETURNING array_length(message_ids, 1)`,
+		nzbFileID, actualFirstSize, actualLastSize,
+	).Scan(&segmentCount); err != nil {
 		return err
 	}
 
-	// Rewrite virtual_file_ranges with the same uniform boundaries.
-	_, err = tx.ExecContext(ctx, `
-		WITH numbered AS (
-		    SELECT ns.id as seg_id,
-		           ROW_NUMBER() OVER (PARTITION BY ns.nzb_file_id ORDER BY ns.segment_number) - 1 AS idx,
-		           COUNT(*) OVER (PARTITION BY ns.nzb_file_id) AS total
-		    FROM nzb_segments ns
-		    WHERE ns.nzb_file_id = $1
-		)
-		UPDATE virtual_file_ranges vfr SET
-		    range_start = n.idx * $2,
-		    range_end   = CASE
-		        WHEN n.idx = n.total - 1 THEN n.idx * $2 + $3
-		        ELSE (n.idx + 1) * $2
-		    END
-		FROM numbered n
-		WHERE vfr.nzb_segment_id = n.seg_id`,
-		nzbFileID, actualFirstSize, actualLastSize)
-	if err != nil {
-		return err
-	}
-
-	// Sync virtual_files.size_bytes to the corrected max range_end.
-	_, err = tx.ExecContext(ctx, `
-		UPDATE virtual_files vf SET
-		    size_bytes = (
-		        SELECT COALESCE(MAX(vfr.range_end), 0)
-		        FROM virtual_file_ranges vfr
-		        WHERE vfr.virtual_file_id = vf.id
-		    )
-		WHERE id IN (
-		    SELECT DISTINCT vfr.virtual_file_id
-		    FROM virtual_file_ranges vfr
-		    JOIN nzb_segments ns ON ns.id = vfr.nzb_segment_id
-		    WHERE ns.nzb_file_id = $1
-		)`, nzbFileID)
-	if err != nil {
-		return err
+	// Recompute virtual_files.size_bytes for direct_nzb entries backed by this
+	// nzb_file.  The total decoded size is:
+	//   (segmentCount - 1) * actualFirstSize + actualLastSize
+	// This exactly mirrors what computeSpans produces.
+	if segmentCount > 0 {
+		totalSize := (segmentCount-1)*actualFirstSize + actualLastSize
+		if _, err = tx.ExecContext(ctx, `
+			UPDATE virtual_files
+			SET size_bytes = $2
+			WHERE nzb_file_id = $1
+			  AND reader_kind = 'direct_nzb'`,
+			nzbFileID, totalSize,
+		); err != nil {
+			return err
+		}
 	}
 
 	// Mark this file as calibrated so future startup passes can skip it.
@@ -354,5 +327,11 @@ func (db *DB) rescaleFileSegments(ctx context.Context, nzbFileID, actualFirstSiz
 		return err
 	}
 
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+
+	// Flush the in-memory VF cache so the next open picks up the new sizes.
+	db.InvalidateVFCacheForNZBFile(nzbFileID)
+	return nil
 }
