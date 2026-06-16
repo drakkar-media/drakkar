@@ -272,6 +272,9 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)
 	}
 	workflowSvc := workflow.NewService(db, seerrClient, hydraClient)
+	if checker, ok := db.SegmentFetcher.(database.SegmentChecker); ok {
+		workflowSvc.SetEarlyChecker(checker.Exists)
+	}
 	workflowSvc.SetPreflightChecker(func(ctx context.Context, item database.QueueSnapshot) error {
 		if item.NZBDocumentID == nil {
 			return nil

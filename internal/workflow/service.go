@@ -111,6 +111,10 @@ type Service struct {
 	fetcher          NZBFetcher
 	postImportHook   func(context.Context, database.QueueSnapshot) error
 	preflightChecker func(context.Context, database.QueueSnapshot) error
+	// earlyChecker is called with a single message ID immediately after NZB parsing,
+	// before archive inspection and DB import. A non-nil error rejects the candidate
+	// fast, avoiding expensive segment downloads for expired releases.
+	earlyChecker func(context.Context, string) error
 	queuePolicy      QueuePolicyProvider
 	indexerLimits    IndexerLimits
 	logger           zerolog.Logger
@@ -254,6 +258,10 @@ func (s *Service) SetPostImportHook(fn func(context.Context, database.QueueSnaps
 
 func (s *Service) SetPreflightChecker(fn func(context.Context, database.QueueSnapshot) error) {
 	s.preflightChecker = fn
+}
+
+func (s *Service) SetEarlyChecker(fn func(context.Context, string) error) {
+	s.earlyChecker = fn
 }
 
 func (s *Service) SetQueuePolicyProvider(provider QueuePolicyProvider) {
@@ -1221,7 +1229,32 @@ func (s *Service) fetchAndImportSelectedReleaseDepth(ctx context.Context, select
 	if err != nil {
 		return s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
 	}
+	// Quick NNTP STAT check before the expensive archive inspection + DB import.
+	// Pick the first segment of the largest NZB file (proxy for the main content file).
+	if s.earlyChecker != nil {
+		if msgID := largestFileFirstSegment(imported.Files); msgID != "" {
+			if err := s.earlyChecker(ctx, msgID); err != nil {
+				return s.promoteNextAfterFailureDepth(ctx, current, fmt.Sprintf("early preflight: %s", err), depth)
+			}
+		}
+	}
 	return s.importSelectedRelease(ctx, current, imported, depth)
+}
+
+// largestFileFirstSegment returns the first segment message ID of the largest
+// file in the NZB, skipping files with no segments. Used as a cheap proxy for
+// the main content file when doing an early NNTP STAT check.
+func largestFileFirstSegment(files []database.ImportedNZBFile) string {
+	var best database.ImportedNZBFile
+	for _, f := range files {
+		if len(f.Segments) > 0 && f.FileSizeBytes > best.FileSizeBytes {
+			best = f
+		}
+	}
+	if len(best.Segments) == 0 {
+		return ""
+	}
+	return best.Segments[0].MessageID
 }
 
 // dedupeSearchResults collapses results that are the same release posted to
