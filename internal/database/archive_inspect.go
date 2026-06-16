@@ -40,23 +40,32 @@ func inspectImportedArchives(ctx context.Context, archives []ImportedArchive, fi
 	for _, file := range files {
 		fileByName[file.FileName] = file
 	}
-	// Read par2 index files for authoritative filenames and sizes — metadata
-	// only, no disk write, mirroring nzbdav's FetchFirstSegmentsStep approach.
+	// Fetch all par2 index files in parallel, then update fileByName.
 	enrichFileByNameFromPar2(ctx, files, fileByName, fetcher)
-	out := make([]ImportedArchive, 0, len(archives))
-	for _, item := range archives {
-		inspected := item
-		// Bound each archive inspection so a slow/stalled NNTP connection
-		// can't block import indefinitely. 15s is generous for 256KB.
-		inspectCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		err := inspectArchive(inspectCtx, &inspected, fileByName, fetcher)
-		cancel()
-		if err != nil {
-			inspected.Status = "rejected"
-			inspected.RejectReason = err.Error()
-		}
-		out = append(out, inspected)
+	// Inspect archives in parallel (fileByName is read-only from here).
+	out := make([]ImportedArchive, len(archives))
+	const maxParallelInspections = 4
+	sem := make(chan struct{}, maxParallelInspections)
+	var wg sync.WaitGroup
+	for i, item := range archives {
+		i, item := i, item
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			inspected := item
+			inspectCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			err := inspectArchive(inspectCtx, &inspected, fileByName, fetcher)
+			cancel()
+			if err != nil {
+				inspected.Status = "rejected"
+				inspected.RejectReason = err.Error()
+			}
+			out[i] = inspected
+		}()
 	}
+	wg.Wait()
 	return out
 }
 
@@ -284,24 +293,41 @@ func isPar2IndexFile(name string) bool {
 	return !strings.Contains(stem, ".vol")
 }
 
-// enrichFileByNameFromPar2 fetches each par2 index file found in files, parses
-// its FileDesc packets in-memory (no disk write), and updates fileByName with
-// the authoritative FileLength for any filename that already exists in the map.
+// enrichFileByNameFromPar2 fetches all par2 index files found in files in
+// parallel, parses their FileDesc packets in-memory (no disk write), and
+// updates fileByName with the authoritative FileLength for known filenames.
 // For obfuscated NZBs where no exact name matches, a size-based alias is added
 // so archive inspection can locate volumes under their real names.
 func enrichFileByNameFromPar2(ctx context.Context, files []ImportedNZBFile, fileByName map[string]ImportedNZBFile, fetcher stream.SegmentFetcher) {
+	var par2Files []ImportedNZBFile
 	for _, file := range files {
-		if !isPar2IndexFile(file.FileName) {
-			continue
+		if isPar2IndexFile(file.FileName) {
+			par2Files = append(par2Files, file)
 		}
-		// 512 KB covers all FileDesc packets in any realistic release.
-		readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		data, err := readImportedFilePrefix(readCtx, file, 512*1024, fetcher)
-		cancel()
-		if err != nil {
-			continue
-		}
-		descs := par2.ParseFileDescs(data)
+	}
+	if len(par2Files) == 0 {
+		return
+	}
+	// Fetch all par2 index files concurrently (typically 1-3 per release).
+	allDescs := make([][]par2.FileDesc, len(par2Files))
+	var wg sync.WaitGroup
+	for i, file := range par2Files {
+		i, file := i, file
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// 512 KB covers all FileDesc packets in any realistic release.
+			readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			data, err := readImportedFilePrefix(readCtx, file, 512*1024, fetcher)
+			cancel()
+			if err != nil {
+				return
+			}
+			allDescs[i] = par2.ParseFileDescs(data)
+		}()
+	}
+	wg.Wait()
+	for _, descs := range allDescs {
 		for _, d := range descs {
 			if d.FileName == "" {
 				continue

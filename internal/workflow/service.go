@@ -232,7 +232,7 @@ func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service 
 		seerr:     seerr,
 		hydra:     hydra,
 		fetcher:   HTTPNZBFetcher{},
-		importSem: make(chan struct{}, 1), // 1 concurrent import/preflight/publish (nzbdav parity)
+		importSem: make(chan struct{}, 2), // 2 concurrent NZB fetch+index+preflight
 	}
 }
 
