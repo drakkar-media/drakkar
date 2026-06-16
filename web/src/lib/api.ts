@@ -55,7 +55,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(text || `${response.status} ${response.statusText}`);
+    let message = text || `${response.status} ${response.statusText}`;
+    try {
+      const json = JSON.parse(text);
+      if (typeof json?.error === 'string') message = json.error;
+    } catch { /* not JSON — use raw text */ }
+    throw new Error(message);
   }
   return (await response.json()) as T;
 }

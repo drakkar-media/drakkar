@@ -314,7 +314,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		report, err := probeSvc.Probe(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusAccepted, report)
@@ -329,7 +329,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		if workflowSvc != nil {
 			workQueue, err = workflowSvc.WorkQueueStatus(r.Context())
 			if err != nil {
-				respondError(w, http.StatusBadGateway, err)
+				respondError(w, http.StatusInternalServerError, err)
 				return
 			}
 		}
@@ -342,7 +342,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.PauseWorkQueue(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("queue.pause", map[string]any{"paused": result.Paused, "depth": result.Depth})
@@ -355,7 +355,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.ResumeWorkQueue(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("queue.resume", map[string]any{"paused": result.Paused, "depth": result.Depth})
@@ -402,7 +402,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := catalogSvc.DiscoverSearch(r.Context(), query)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusOK, result)
@@ -416,7 +416,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		page, _ := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("page")))
 		result, err := catalogSvc.DiscoverList(r.Context(), mediaType, page)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusOK, result)
@@ -438,7 +438,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			IMDbID:    strings.TrimSpace(r.URL.Query().Get("imdbId")),
 		})
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusOK, result)
@@ -455,7 +455,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.RetryQueueItem(r.Context(), id)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("queue.retry", map[string]any{"queueItemId": id, "action": result.Action})
@@ -468,7 +468,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.RetryFailedQueue(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("queue.retry_failed", map[string]any{"processed": result.Processed, "retried": result.Retried, "failed": result.Failed})
@@ -493,7 +493,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.ManageQueueItem(r.Context(), id, body.Action)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("queue.action", map[string]any{"queueItemId": id, "action": result.Action})
@@ -518,7 +518,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.ManageQueueItems(r.Context(), body.QueueItemIDs, body.Action)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("queue.bulk_action", map[string]any{"queueItemIds": body.QueueItemIDs, "action": body.Action, "processed": result.Processed, "retried": result.Retried, "failed": result.Failed})
@@ -538,7 +538,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.ManageFailedQueue(r.Context(), body.Action)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("queue.failed_action", map[string]any{"action": body.Action, "processed": result.Processed, "retried": result.Retried, "failed": result.Failed})
@@ -597,12 +597,12 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		req.Header.Set("User-Agent", "Drakkar/1.0")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, fmt.Errorf("fetch url: %w", err))
+			respondError(w, http.StatusInternalServerError, fmt.Errorf("fetch url: %w", err))
 			return
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= 400 {
-			respondError(w, http.StatusBadGateway, fmt.Errorf("remote returned HTTP %d", resp.StatusCode))
+			respondError(w, http.StatusInternalServerError, fmt.Errorf("remote returned HTTP %d", resp.StatusCode))
 			return
 		}
 		fileName := path.Base(body.URL)
@@ -881,7 +881,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := subtitleSvc.DownloadCandidate(r.Context(), id)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("subtitle.download", map[string]any{"libraryItemId": result.LibraryItemID, "language": result.Language, "provider": result.Provider})
@@ -950,7 +950,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		created, err := blocklistSvc.Create(r.Context(), item)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("blocklist.create", map[string]any{"blocklistItemId": created.ID, "reason": created.Reason})
@@ -973,7 +973,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		updated, err := blocklistSvc.Update(r.Context(), id, item)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("blocklist.update", map[string]any{"blocklistItemId": updated.ID, "reason": updated.Reason})
@@ -1004,7 +1004,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		if reason := r.URL.Query().Get("reason"); reason != "" {
 			result, err := blocklistSvc.ClearByReason(r.Context(), reason)
 			if err != nil {
-				respondError(w, http.StatusBadGateway, err)
+				respondError(w, http.StatusInternalServerError, err)
 				return
 			}
 			publishMutation("blocklist.clear_reason", map[string]any{"reason": reason, "cleared": result.Cleared})
@@ -1013,7 +1013,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := blocklistSvc.ClearAll(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("blocklist.clear_all", map[string]any{"cleared": result.Cleared})
@@ -1079,7 +1079,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.SyncRequests(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("requests.sync", map[string]any{"seen": result.Seen, "created": result.Created})
@@ -1109,7 +1109,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			result, err = workflowSvc.CreateSeerrRequest(r.Context(), body.MediaType, body.TmdbID)
 		}
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("requests.sync", map[string]any{"seen": result.Seen, "created": result.Created})
@@ -1161,7 +1161,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		if err := workflowSvc.ResetLibraryItem(r.Context(), id); err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("library.reset", map[string]any{"libraryItemId": id})
@@ -1179,7 +1179,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.SelectRelease(r.Context(), id)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("release.select", map[string]any{"releaseCandidateId": id, "selectedReleaseId": result.SelectedReleaseID})
@@ -1203,7 +1203,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.RejectRelease(r.Context(), id, payload.Reason)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("release.reject", map[string]any{"releaseCandidateId": id, "selectedReleaseId": result.SelectedReleaseID})
@@ -1221,7 +1221,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.RestoreRelease(r.Context(), id)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("release.restore", map[string]any{"releaseCandidateId": id})
@@ -1239,7 +1239,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.SkipRelease(r.Context(), id)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("release.skip", map[string]any{"releaseCandidateId": id, "selectedReleaseId": result.SelectedReleaseID})
@@ -1256,7 +1256,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		if err := publication.RepublishLibraryItem(r.Context(), id); err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("library.republish", map[string]any{"libraryItemId": id})
@@ -1274,7 +1274,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.RestoreRejectedReleases(r.Context(), id)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("library.restore_rejected", map[string]any{"libraryItemId": id, "restored": result.Restored})
@@ -1317,7 +1317,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.BackfillMetadata(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusAccepted, result)
@@ -1329,7 +1329,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.FillMissingEpisodes(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusAccepted, result)
@@ -1341,7 +1341,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := cacheSvc.Prune(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("cache.prune", map[string]any{"deletedFiles": result.DeletedFiles, "deletedBytes": result.DeletedBytes})
@@ -1354,7 +1354,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := maintenance.RemoveOrphanedContent(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("maintenance.orphaned_content", map[string]any{"deletedFiles": result.DeletedFiles, "deletedRows": result.DeletedRows})
@@ -1367,7 +1367,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := maintenance.RemoveBrokenMediaSymlinks(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("maintenance.broken_media_symlinks", map[string]any{"deletedFiles": result.DeletedFiles, "deletedRows": result.DeletedRows})
@@ -1380,7 +1380,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := maintenance.RemoveOrphanedCompletedSymlinks(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("maintenance.orphaned_completed_symlinks", map[string]any{"deletedFiles": result.DeletedFiles, "deletedRows": result.DeletedRows})
@@ -1393,7 +1393,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := maintenance.DeepNZBHealthCheck(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		publishMutation("maintenance.nzb_health_check", map[string]any{"scannedRows": result.ScannedRows, "resetItems": result.ResetItems})
@@ -1678,7 +1678,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		candidates, err := workflowSvc.ManualSearch(r.Context(), q)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"items": candidates})
@@ -1689,7 +1689,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		month := r.URL.Query().Get("month") // "YYYY-MM", defaults to current
 		entries, err := catalogSvc.ReleaseCalendar(r.Context(), month)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"entries": entries})
@@ -1801,7 +1801,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		if err := plexClient.RefreshSection(r.Context(), ""); err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"status": "refreshed"})
@@ -1813,7 +1813,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		libs, err := plexClient.Libraries(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"libraries": libs})
@@ -1822,7 +1822,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 	r.Post("/api/plex/oauth/start", func(w http.ResponseWriter, r *http.Request) {
 		pin, err := plex.StartOAuth(r.Context())
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusOK, pin)
@@ -1837,7 +1837,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := plex.PollOAuth(r.Context(), body.PinID)
 		if err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusOK, result)
@@ -1858,7 +1858,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		if err := jellyfinClient.RefreshLibraries(r.Context()); err != nil {
-			respondError(w, http.StatusBadGateway, err)
+			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"status": "refreshed"})
