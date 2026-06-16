@@ -18,12 +18,13 @@ import (
 
 // cachedVF holds the immutable data for a virtual file so that repeated
 // OpenVirtualMediaFile calls (e.g. each rclone range request) don't re-query
-// the DB for the same 9000+ segment-span rows.
+// the DB for the same segment data.
 type cachedVF struct {
 	name       string
 	readerKind string
 	inlineData []byte
-	spans      []stream.SegmentSpan // canonical DB spans — callers receive a copy
+	size       int64             // virtual file size in bytes
+	spans      []stream.SegmentSpan // canonical spans — callers receive a copy
 }
 
 type DB struct {

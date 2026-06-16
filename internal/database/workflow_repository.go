@@ -21,54 +21,17 @@ var (
 	blocklistCachedAt time.Time
 )
 
-// preDeleteVFRBySelectedRelease removes virtual_file_ranges rows that would be
-// cascade-deleted when a selected_release row is deleted, doing it as a single
-// bulk DELETE instead of one-per-segment. For large NZBs (100k+ segments) the
-// cascade does 100k individual index scans; this query does two.
-func preDeleteVFRBySelectedRelease(ctx context.Context, tx *sql.Tx, selectedReleaseID int64) error {
-	if _, err := tx.ExecContext(ctx, `
-		delete from virtual_file_ranges
-		where nzb_segment_id in (
-			select ns.id from nzb_segments ns
-			join nzb_files nf on nf.id = ns.nzb_file_id
-			join nzb_documents nd on nd.id = nf.nzb_document_id
-			where nd.selected_release_id = $1
-		)`, selectedReleaseID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `
-		delete from virtual_file_ranges
-		where virtual_file_id in (
-			select id from virtual_files where selected_release_id = $1
-		)`, selectedReleaseID); err != nil {
-		return err
-	}
+// preDeleteVFRBySelectedRelease was a bulk pre-delete of virtual_file_ranges rows
+// before cascading selected_release deletes. The virtual_file_ranges table was
+// removed by migration 000041 (segment data is now inline in nzb_files), so this
+// function is now a no-op kept for call-site compatibility.
+func preDeleteVFRBySelectedRelease(_ context.Context, _ *sql.Tx, _ int64) error {
 	return nil
 }
 
-// preDeleteVFRByLibraryItem does the same bulk pre-delete for all selected
-// releases belonging to a library item.
-func preDeleteVFRByLibraryItem(ctx context.Context, tx *sql.Tx, libraryItemID int64) error {
-	if _, err := tx.ExecContext(ctx, `
-		delete from virtual_file_ranges
-		where nzb_segment_id in (
-			select ns.id from nzb_segments ns
-			join nzb_files nf on nf.id = ns.nzb_file_id
-			join nzb_documents nd on nd.id = nf.nzb_document_id
-			join selected_releases sr on sr.id = nd.selected_release_id
-			where sr.library_item_id = $1
-		)`, libraryItemID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `
-		delete from virtual_file_ranges
-		where virtual_file_id in (
-			select id from virtual_files where selected_release_id in (
-				select id from selected_releases where library_item_id = $1
-			)
-		)`, libraryItemID); err != nil {
-		return err
-	}
+// preDeleteVFRByLibraryItem was a bulk pre-delete of virtual_file_ranges rows.
+// The virtual_file_ranges table was removed by migration 000041; no-op.
+func preDeleteVFRByLibraryItem(_ context.Context, _ *sql.Tx, _ int64) error {
 	return nil
 }
 
@@ -1384,29 +1347,6 @@ func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int
 			}
 		}
 	}
-	// Pre-delete VFR for the selected_release being removed by this promote.
-	if _, err = tx.ExecContext(ctx, `
-		delete from virtual_file_ranges
-		where nzb_segment_id in (
-			select ns.id from nzb_segments ns
-			join nzb_files nf on nf.id = ns.nzb_file_id
-			join nzb_documents nd on nd.id = nf.nzb_document_id
-			join selected_releases sr on sr.id = nd.selected_release_id
-			where sr.release_candidate_id = $1
-		)`, releaseCandidateID,
-	); err != nil {
-		return nil, err
-	}
-	if _, err = tx.ExecContext(ctx, `
-		delete from virtual_file_ranges
-		where virtual_file_id in (
-			select id from virtual_files where selected_release_id in (
-				select id from selected_releases where release_candidate_id = $1
-			)
-		)`, releaseCandidateID,
-	); err != nil {
-		return nil, err
-	}
 	if _, err = tx.ExecContext(ctx, `
 		delete from selected_releases
 		where release_candidate_id = $1`, releaseCandidateID,
@@ -1617,9 +1557,9 @@ func (db *DB) SkipReleaseCandidate(ctx context.Context, releaseCandidateID int64
 }
 
 func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedReleaseID int64, reason string) (*ReleaseSummary, error) {
-	// Cap at 90s: cascade-deleting nzb_segments/virtual_file_ranges for a large
-	// release (100k+ segments) takes ~22s with proper indexes. 90s gives headroom
-	// for the largest NZBs without hanging indefinitely on lock contention.
+	// Cap at 90s: deleting nzb_documents and their cascaded nzb_files rows for
+	// a large release can take significant time. 90s gives headroom without
+	// hanging indefinitely on lock contention.
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 	tx, err := db.SQL.BeginTx(ctx, nil)
