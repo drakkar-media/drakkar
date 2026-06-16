@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/hjongedijk/drakkar/internal/database"
@@ -35,99 +36,110 @@ func (s *maintenanceOpsService) DeepNZBHealthCheck(ctx context.Context) (mainten
 	return runNZBHealthCheck(ctx, s.db, s.workflowSvc, s.publicationSvc, s.logger)
 }
 
-// runNZBHealthCheck first repairs bad symlinks by re-publishing them, then
-// performs a heavier decoded-segment validation on available items and resets
-// broken releases for re-queue. Sample-only publications are also reset.
-func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, publicationSvc *library.Publisher, logger zerolog.Logger) (maintenance.Result, error) {
+func nextDeepHealthCheckDelay(createdAt time.Time) time.Duration {
+	age := time.Since(createdAt)
+	if age < time.Hour {
+		return time.Hour
+	}
+	if age > 30*24*time.Hour {
+		return 30 * 24 * time.Hour
+	}
+	return age
+}
+
+func shouldRunDeepHealthCheck(now time.Time, item database.DeepHealthCandidate) bool {
+	if item.LastCheckedAt == nil || item.HealthOK == nil {
+		return true
+	}
+	if !*item.HealthOK {
+		return true
+	}
+	return now.Sub(*item.LastCheckedAt) >= nextDeepHealthCheckDelay(item.CreatedAt)
+}
+
+func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, publicationSvc *library.Publisher, logger zerolog.Logger, limit int, force bool) (maintenance.Result, error) {
 	result := maintenance.Result{TaskName: "nzb-health-check"}
-
-	if publicationSvc != nil {
-		entries, err := db.ListHealthEntries(ctx)
-		if err == nil {
-			repairedSeen := make(map[int64]struct{})
-			for _, entry := range entries {
-				if ctx.Err() != nil {
-					break
-				}
-				if database.CheckSymlinkHealth(entry.LibraryPath, entry.TargetPath) {
-					continue
-				}
-				logger.Warn().
-					Int64("libraryItemId", entry.LibraryItemID).
-					Str("libraryPath", entry.LibraryPath).
-					Msg("health check: broken symlink publication — re-publishing item")
-				if err := publicationSvc.RepublishLibraryItem(ctx, entry.LibraryItemID); err != nil {
-					logger.Error().Err(err).Int64("libraryItemId", entry.LibraryItemID).Msg("health check: republish failed")
-					continue
-				}
-				if _, exists := repairedSeen[entry.LibraryItemID]; !exists {
-					repairedSeen[entry.LibraryItemID] = struct{}{}
-					result.RepairedItems++
-				}
-			}
-		}
-	}
-
-	type candidate struct {
-		libraryItemID int64
-		nzbDocumentID int64
-		title         string
-	}
-
-	rows, err := db.SQL.QueryContext(ctx, `
-		SELECT DISTINCT ON (qi.library_item_id)
-		    qi.library_item_id,
-		    nd.id,
-		    li.title
-		FROM queue_items qi
-		JOIN library_items li ON li.id = qi.library_item_id
-		JOIN selected_releases sr ON sr.id = qi.selected_release_id
-		JOIN nzb_documents nd ON nd.selected_release_id = sr.id
-		WHERE qi.state = 'available' AND li.available = true
-		ORDER BY qi.library_item_id ASC, qi.id DESC`)
+	candidates, err := db.ListDeepHealthCandidates(ctx, limit)
 	if err != nil {
 		logger.Error().Err(err).Msg("health check: query failed")
 		return result, err
 	}
-	defer rows.Close()
-
-	var candidates []candidate
-	for rows.Next() {
-		var c candidate
-		if err := rows.Scan(&c.libraryItemID, &c.nzbDocumentID, &c.title); err != nil {
-			continue
-		}
-		if c.nzbDocumentID > 0 {
-			candidates = append(candidates, c)
-		}
-	}
-	_ = rows.Err()
-
-	result.ScannedRows = len(candidates)
-	logger.Info().Int("count", len(candidates)).Msg("health check: scanning available library items")
+	now := time.Now()
+	logger.Info().Int("count", len(candidates)).Bool("force", force).Msg("health check: scanning deep-check candidates")
 	resetSeen := make(map[int64]struct{})
+	repairedSeen := make(map[int64]struct{})
 	for _, c := range candidates {
 		if ctx.Err() != nil {
 			break
 		}
+		result.ScannedRows++
+		symlinkOK := database.CheckSymlinkHealth(c.LibraryPath, c.TargetPath)
+		_ = db.RecordHealthStatus(ctx, c.PublicationID, symlinkOK)
+		if !symlinkOK {
+			if publicationSvc != nil {
+				logger.Warn().
+					Int64("libraryItemId", c.LibraryItemID).
+					Str("libraryPath", c.LibraryPath).
+					Msg("health check: broken symlink publication — re-publishing item")
+				if err := publicationSvc.RepublishLibraryItem(ctx, c.LibraryItemID); err != nil {
+					logger.Error().Err(err).Int64("libraryItemId", c.LibraryItemID).Msg("health check: republish failed")
+				} else {
+					symlinkOK = database.CheckSymlinkHealth(c.LibraryPath, c.TargetPath)
+					_ = db.RecordHealthStatus(ctx, c.PublicationID, symlinkOK)
+					if symlinkOK {
+						if _, exists := repairedSeen[c.LibraryItemID]; !exists {
+							repairedSeen[c.LibraryItemID] = struct{}{}
+							result.RepairedItems++
+						}
+					}
+				}
+			}
+			if !symlinkOK && !force {
+				continue
+			}
+		}
+		if !strings.Contains(c.TargetPath, "/content/") {
+			_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
+			continue
+		}
+		if !force && !shouldRunDeepHealthCheck(now, c) {
+			continue
+		}
+		if c.NZBDocumentID <= 0 {
+			continue
+		}
 		checkCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		err := db.StrictCheckFirstSegments(checkCtx, c.nzbDocumentID)
+		err := db.StrictCheckFirstSegments(checkCtx, c.NZBDocumentID)
 		cancel()
 		if err == nil {
+			_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
 			continue
 		}
 		logger.Warn().
-			Int64("libraryItemId", c.libraryItemID).
-			Str("title", c.title).
+			Int64("libraryItemId", c.LibraryItemID).
+			Str("title", c.Title).
 			Err(err).
 			Msg("health check: strict NZB validation failed — resetting item for re-queue")
-		if resetErr := workflowSvc.ResetLibraryItem(ctx, c.libraryItemID); resetErr != nil {
-			logger.Error().Err(resetErr).Int64("libraryItemId", c.libraryItemID).Msg("health check: reset failed")
-		} else if _, exists := resetSeen[c.libraryItemID]; !exists {
-			resetSeen[c.libraryItemID] = struct{}{}
+		_ = db.RecordHealthCheck(ctx, c.PublicationID, false)
+		if resetErr := workflowSvc.ResetLibraryItem(ctx, c.LibraryItemID); resetErr != nil {
+			logger.Error().Err(resetErr).Int64("libraryItemId", c.LibraryItemID).Msg("health check: reset failed")
+		} else if _, exists := resetSeen[c.LibraryItemID]; !exists {
+			resetSeen[c.LibraryItemID] = struct{}{}
 			result.ResetItems++
 		}
 	}
+	return result, nil
+}
+
+// runNZBHealthCheck repairs bad symlinks by re-publishing them, performs decoded-
+// segment validation on available items, resets broken releases for re-queue,
+// and resets sample-only publications.
+func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, publicationSvc *library.Publisher, logger zerolog.Logger) (maintenance.Result, error) {
+	result, err := runNZBHealthCheckBatch(ctx, db, workflowSvc, publicationSvc, logger, 0, true)
+	if err != nil {
+		return result, err
+	}
+	resetSeen := make(map[int64]struct{})
 
 	sampleRows, err := db.SQL.QueryContext(ctx, `
 		SELECT DISTINCT qi.library_item_id, li.title

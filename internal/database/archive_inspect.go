@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hjongedijk/drakkar/internal/par2"
 	"github.com/hjongedijk/drakkar/internal/stream"
 )
 
@@ -39,6 +40,9 @@ func inspectImportedArchives(ctx context.Context, archives []ImportedArchive, fi
 	for _, file := range files {
 		fileByName[file.FileName] = file
 	}
+	// Read par2 index files for authoritative filenames and sizes — metadata
+	// only, no disk write, mirroring nzbdav's FetchFirstSegmentsStep approach.
+	enrichFileByNameFromPar2(ctx, files, fileByName, fetcher)
 	out := make([]ImportedArchive, 0, len(archives))
 	for _, item := range archives {
 		inspected := item
@@ -60,15 +64,23 @@ func inspectArchive(ctx context.Context, archive *ImportedArchive, fileByName ma
 	if archive == nil {
 		return nil
 	}
-	if archive.Kind != "rar" {
-		return errArchiveHeadersInvalid
-	}
 	if !hasContiguousVolumes(archive.Volumes) {
 		return errArchiveHeadersInvalid
 	}
 	if len(archive.Volumes) == 0 {
 		return errArchiveHeadersInvalid
 	}
+	switch archive.Kind {
+	case "rar":
+		return inspectRARArchive(ctx, archive, fileByName, fetcher)
+	case "7z":
+		return inspect7zArchive(ctx, archive, fileByName, fetcher)
+	default:
+		return errArchiveHeadersInvalid
+	}
+}
+
+func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName map[string]ImportedNZBFile, fetcher stream.SegmentFetcher) error {
 	first, ok := fileByName[archive.Volumes[0].Path]
 	if !ok {
 		return errArchiveHeadersInvalid
@@ -259,6 +271,71 @@ func rar4FindDataStart(raw []byte) (int64, error) {
 		offset = next
 	}
 	return 0, errArchiveHeadersInvalid
+}
+
+// isPar2IndexFile returns true for the primary .par2 index file.
+// .vol*.par2 recovery files contain no FileDesc packets and are excluded.
+func isPar2IndexFile(name string) bool {
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(name)))
+	if !strings.HasSuffix(base, ".par2") {
+		return false
+	}
+	stem := base[:len(base)-5]
+	return !strings.Contains(stem, ".vol")
+}
+
+// enrichFileByNameFromPar2 fetches each par2 index file found in files, parses
+// its FileDesc packets in-memory (no disk write), and updates fileByName with
+// the authoritative FileLength for any filename that already exists in the map.
+// For obfuscated NZBs where no exact name matches, a size-based alias is added
+// so archive inspection can locate volumes under their real names.
+func enrichFileByNameFromPar2(ctx context.Context, files []ImportedNZBFile, fileByName map[string]ImportedNZBFile, fetcher stream.SegmentFetcher) {
+	for _, file := range files {
+		if !isPar2IndexFile(file.FileName) {
+			continue
+		}
+		// 512 KB covers all FileDesc packets in any realistic release.
+		readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		data, err := readImportedFilePrefix(readCtx, file, 512*1024, fetcher)
+		cancel()
+		if err != nil {
+			continue
+		}
+		descs := par2.ParseFileDescs(data)
+		for _, d := range descs {
+			if d.FileName == "" {
+				continue
+			}
+			if entry, ok := fileByName[d.FileName]; ok {
+				// Exact name match: use par2 FileLength as authoritative size.
+				entry.FileSizeBytes = int64(d.FileLength)
+				fileByName[d.FileName] = entry
+				continue
+			}
+			// Size-based alias for obfuscated NZBs: find the NZB file whose
+			// estimated size is within 5% of the par2 FileLength and hasn't
+			// already been aliased, then expose it under the real filename.
+			if d.FileLength == 0 {
+				continue
+			}
+			fl := int64(d.FileLength)
+			for _, f := range files {
+				if _, exists := fileByName[d.FileName]; exists {
+					break
+				}
+				diff := f.FileSizeBytes - fl
+				if diff < 0 {
+					diff = -diff
+				}
+				if diff*20 <= fl { // within 5%
+					aliased := f
+					aliased.FileName = d.FileName
+					aliased.FileSizeBytes = fl
+					fileByName[d.FileName] = aliased
+				}
+			}
+		}
+	}
 }
 
 func readImportedFilePrefix(ctx context.Context, file ImportedNZBFile, limit int64, fetcher stream.SegmentFetcher) ([]byte, error) {

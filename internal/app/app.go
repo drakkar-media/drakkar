@@ -62,6 +62,11 @@ const (
 	taskResetOrphaned          = "reset_orphaned_available"
 )
 
+const (
+	backgroundHealthCheckInterval = 15 * time.Minute
+	backgroundDeepHealthBatchSize = 48
+)
+
 type runtimeStatus struct {
 	status api.Status
 }
@@ -117,7 +122,7 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 		{ID: taskRetryFailedQueue, Label: "Retry Failed Queue", Group: "Indexing", Interval: "15m", Automated: true, LastRunState: "idle"},
 		{ID: taskRepublishPending, Label: "Republish Pending", Group: "Publishing", Interval: "30m", Automated: true, LastRunState: "idle"},
 		{ID: taskResetOrphaned, Label: "Reset Orphaned Available Items", Group: "Publishing", Interval: "Manual", Automated: false, LastRunState: "idle"},
-		{ID: taskHealthCheck, Label: "Run Health Check", Group: "Maintenance", Interval: "60m", Automated: true, LastRunState: "idle"},
+		{ID: taskHealthCheck, Label: "Run Health Check", Group: "Maintenance", Interval: "15m", Automated: true, LastRunState: "idle"},
 		{ID: taskNZBHealthCheck, Label: "Deep NZB Article Check", Group: "Maintenance", Interval: "168h", Automated: false, LastRunState: "idle"},
 		{ID: taskCachePrune, Label: "Prune Block Cache", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskOrphanedContent, Label: "Remove Orphaned Content", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
@@ -585,15 +590,34 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		var checked, healthy int
 		for _, e := range entries {
 			isOK := database.CheckSymlinkHealth(e.LibraryPath, e.TargetPath)
-			_ = db.RecordHealthCheck(ctx, e.ID, isOK)
+			_ = db.RecordHealthStatus(ctx, e.ID, isOK)
 			checked++
 			if isOK {
 				healthy++
 			}
 		}
+		deepResult, err := runNZBHealthCheckBatch(ctx, db, workflowSvc, publicationSvc, logger, backgroundDeepHealthBatchSize, false)
+		if err != nil {
+			logger.Error().Err(err).Msg("monitoring: background deep health check error")
+		}
 		_ = db.TouchMaintenanceCursor(ctx, taskHealthCheck, time.Now().UTC().Format(time.RFC3339))
-		broker.Publish(map[string]any{"kind": "health.check_background", "checked": checked, "healthy": healthy})
-		logger.Info().Int("checked", checked).Int("healthy", healthy).Msg("monitoring: health check complete")
+		broker.Publish(map[string]any{
+			"kind":          "health.check_background",
+			"checked":       checked,
+			"healthy":       healthy,
+			"deepChecked":   deepResult.ScannedRows,
+			"repairedItems": deepResult.RepairedItems,
+			"degradedItems": deepResult.DegradedItems,
+			"resetItems":    deepResult.ResetItems,
+		})
+		logger.Info().
+			Int("checked", checked).
+			Int("healthy", healthy).
+			Int("deepChecked", deepResult.ScannedRows).
+			Int("repaired", deepResult.RepairedItems).
+			Int("degraded", deepResult.DegradedItems).
+			Int("reset", deepResult.ResetItems).
+			Msg("monitoring: health check complete")
 	}
 
 	runCachePrune := func() {
@@ -655,7 +679,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	startRecurring("stale-queue-reset", 5*time.Minute, true, runStaleReset)
 	startRecurring(taskRetryFailedQueue, 15*time.Minute, true, runRetryPass) // was 30m
 	startRecurring(taskRepublishPending, 30*time.Minute, true, runRepublishPass)
-	startRecurring(taskHealthCheck, 60*time.Minute, true, runHealthCheck)
+	startRecurring(taskHealthCheck, backgroundHealthCheckInterval, true, runHealthCheck)
 	startRecurring(taskNZBHealthCheck, 168*time.Hour, false, func() {
 		if _, err := maintenanceSvc.DeepNZBHealthCheck(ctx); err != nil {
 			logger.Error().Err(err).Msg("deep nzb health check failed")
@@ -707,12 +731,6 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			logger.Error().Err(err).Msg("calibrate nzb offsets failed")
 		}
 	}()
-	go func() {
-		if _, err := maintenanceSvc.DeepNZBHealthCheck(ctx); err != nil {
-			logger.Error().Err(err).Msg("startup deep nzb health check failed")
-		}
-	}()
-
 	select {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
