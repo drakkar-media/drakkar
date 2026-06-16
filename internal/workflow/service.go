@@ -1142,6 +1142,14 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 		result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), 0)
 		return result, nil, err
 	}
+	if s.earlyChecker != nil {
+		if msgID := largestFileFirstSegment(imported.Files); msgID != "" {
+			if err := s.earlyChecker(ctx, msgID); err != nil {
+				result, err := s.promoteNextAfterFailureDepth(ctx, current, fmt.Sprintf("early preflight: %s", err), 0)
+				return result, nil, err
+			}
+		}
+	}
 	item, err := s.repo.ImportSelectedReleaseNZB(ctx, current.SelectedReleaseID, imported)
 	if err != nil {
 		result, err := s.promoteNextAfterFailure(ctx, current, err.Error())
