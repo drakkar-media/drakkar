@@ -495,7 +495,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// Active download states (fetching_nzb, indexing, publishing) time out after
 	// 45 minutes — large episodes can take 20-40 minutes to fetch and import.
 	runStaleReset := func() {
-		n, err := db.ResetStaleQueueItems(ctx, 10*time.Minute, 45*time.Minute)
+		n, err := db.ResetStaleQueueItems(ctx, 10*time.Minute, 45*time.Minute, 20*time.Minute)
 		if err != nil {
 			logger.Error().Err(err).Msg("monitoring: stale reset error")
 			return

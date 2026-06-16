@@ -696,11 +696,14 @@ func (db *DB) ResetStuckQueueItems(ctx context.Context) (int, error) {
 
 // ResetStaleQueueItems resets items stuck in transitional states.
 // Active download states (fetching_nzb, indexing, publishing) use downloadStaleAfter
-// because large files can take tens of minutes; idle transitions use staleAfter.
-func (db *DB) ResetStaleQueueItems(ctx context.Context, staleAfter, downloadStaleAfter time.Duration) (int, error) {
+// because large files can take tens of minutes. The selected state uses
+// selectedStaleAfter (20 min) because BullMQ workers may be busy. Idle
+// search transitions (preflight, searching, ranking) use staleAfter (10 min).
+func (db *DB) ResetStaleQueueItems(ctx context.Context, staleAfter, downloadStaleAfter, selectedStaleAfter time.Duration) (int, error) {
 	now := time.Now()
 	idleCutoff := now.Add(-staleAfter)
 	downloadCutoff := now.Add(-downloadStaleAfter)
+	selectedCutoff := now.Add(-selectedStaleAfter)
 	result, err := db.SQL.ExecContext(ctx, `
 		UPDATE queue_items SET
 			state = $1,
@@ -708,14 +711,17 @@ func (db *DB) ResetStaleQueueItems(ctx context.Context, staleAfter, downloadStal
 			updated_at = now()
 		WHERE (
 			(state IN ($2, $3, $4) AND updated_at < $7)
-			OR (state IN ($5, $6, $8, $9) AND updated_at < $10)
+			OR (state IN ($5, $6, $8) AND updated_at < $10)
+			OR (state = $9 AND updated_at < $11)
 		)`,
 		QueueFailed,
-		QueueFetchingNZB, QueueIndexing, QueuePublishing, // slow: download cutoff
-		QueuePreflight, QueueSearching,                   // fast: idle cutoff
+		QueueFetchingNZB, QueueIndexing, QueuePublishing, // slow: download cutoff ($7)
+		QueuePreflight, QueueSearching,                   // fast: idle cutoff ($10)
 		downloadCutoff,
-		QueueRanking, QueueSelected, // fast: idle cutoff
+		QueueRanking,    // fast: idle cutoff ($10)
+		QueueSelected,   // medium: selected cutoff ($11)
 		idleCutoff,
+		selectedCutoff,
 	)
 	if err != nil {
 		return 0, err

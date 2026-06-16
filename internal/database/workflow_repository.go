@@ -2175,8 +2175,14 @@ func (db *DB) EnsureEpisodeLibraryItem(ctx context.Context, tvShowID int64, show
 		VALUES ('episode', $1, $2)
 		ON CONFLICT (episode_id) WHERE episode_id IS NOT NULL DO NOTHING
 		RETURNING id`, episodeID, title).Scan(&libItemID)
-	if err != nil || libItemID == 0 {
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil // concurrent insert won the race; item already tracked
+		}
 		return false, err
+	}
+	if libItemID == 0 {
+		return false, nil
 	}
 
 	// Queue it for search.

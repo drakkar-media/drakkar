@@ -1268,33 +1268,35 @@ func largestFileFirstSegment(files []database.ImportedNZBFile) string {
 // titles match and their sizes are within 5% of each other. Within each group
 // the entry with the highest IndexerScore wins; Grabs breaks ties.
 func dedupeSearchResults(results []hydra.SearchResult) []hydra.SearchResult {
-	type bucket struct {
-		normTitle string
-		size      int64
-		best      hydra.SearchResult
+	type sizeBucket struct {
+		size int64
+		best hydra.SearchResult
 	}
-	buckets := make([]bucket, 0, len(results))
+	// Map by normalized title → slice of per-size buckets.
+	// O(1) outer lookup; inner slice is tiny in practice (1-2 entries per title).
+	seen := make(map[string][]sizeBucket, len(results))
 	for _, r := range results {
 		nt := normReleaseTitle(r.Title)
-		found := false
-		for i := range buckets {
-			if buckets[i].normTitle != nt || !sizesClose(r.SizeBytes, buckets[i].size) {
-				continue
+		matched := false
+		for i := range seen[nt] {
+			if sizesClose(r.SizeBytes, seen[nt][i].size) {
+				if r.IndexerScore > seen[nt][i].best.IndexerScore ||
+					(r.IndexerScore == seen[nt][i].best.IndexerScore && r.Grabs > seen[nt][i].best.Grabs) {
+					seen[nt][i].best = r
+				}
+				matched = true
+				break
 			}
-			if r.IndexerScore > buckets[i].best.IndexerScore ||
-				(r.IndexerScore == buckets[i].best.IndexerScore && r.Grabs > buckets[i].best.Grabs) {
-				buckets[i].best = r
-			}
-			found = true
-			break
 		}
-		if !found {
-			buckets = append(buckets, bucket{normTitle: nt, size: r.SizeBytes, best: r})
+		if !matched {
+			seen[nt] = append(seen[nt], sizeBucket{size: r.SizeBytes, best: r})
 		}
 	}
-	out := make([]hydra.SearchResult, 0, len(buckets))
-	for _, b := range buckets {
-		out = append(out, b.best)
+	out := make([]hydra.SearchResult, 0, len(results))
+	for _, buckets := range seen {
+		for _, b := range buckets {
+			out = append(out, b.best)
+		}
 	}
 	return out
 }

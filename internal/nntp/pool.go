@@ -141,8 +141,40 @@ func (p *PooledSource) acquire(ctx context.Context) (BodySession, error) {
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	// Drain stale idle sessions, take first fresh one.
 	for {
+		// Drain stale idle sessions, take first fresh one.
+		for {
+			select {
+			case s := <-p.idle:
+				if time.Since(s.idleSince) > idleTimeout {
+					_ = s.session.Close()
+					p.mu.Lock()
+					p.open--
+					p.mu.Unlock()
+					continue
+				}
+				return s.session, nil
+			default:
+				goto noIdle
+			}
+		}
+	noIdle:
+		p.mu.Lock()
+		if p.open < p.maxOpen {
+			p.open++
+			p.mu.Unlock()
+			session, err := p.factory(ctx)
+			if err != nil {
+				p.mu.Lock()
+				p.open--
+				p.mu.Unlock()
+				return nil, err
+			}
+			return session, nil
+		}
+		p.mu.Unlock()
+
+		// All connections in use — wait for one to be returned.
 		select {
 		case s := <-p.idle:
 			if time.Since(s.idleSince) > idleTimeout {
@@ -150,42 +182,13 @@ func (p *PooledSource) acquire(ctx context.Context) (BodySession, error) {
 				p.mu.Lock()
 				p.open--
 				p.mu.Unlock()
-				continue
+				// loop back: open slot freed, retry immediately
+			} else {
+				return s.session, nil
 			}
-			return s.session, nil
-		default:
-			goto noIdle
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-	}
-noIdle:
-	p.mu.Lock()
-	if p.open < p.maxOpen {
-		p.open++
-		p.mu.Unlock()
-		session, err := p.factory(ctx)
-		if err != nil {
-			p.mu.Lock()
-			p.open--
-			p.mu.Unlock()
-			return nil, err
-		}
-		return session, nil
-	}
-	p.mu.Unlock()
-
-	// All connections in use — wait.
-	select {
-	case s := <-p.idle:
-		if time.Since(s.idleSince) > idleTimeout {
-			_ = s.session.Close()
-			p.mu.Lock()
-			p.open--
-			p.mu.Unlock()
-			return p.acquire(ctx) // retry with decremented open count
-		}
-		return s.session, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
 	}
 }
 
