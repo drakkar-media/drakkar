@@ -576,7 +576,9 @@
       draft = cloneSettings(fs);
       // Apply frontend defaults for fields that may be absent from older settings.json
       if (draft && !draft.indexer) {
-        draft.indexer = { tvRssSyncIntervalMinutes: 15, movieRssSyncIntervalMinutes: 30, minimumAgeMinutes: 0, retentionDays: 0, maximumSizeMB: 0, searchDelayMs: 0 };
+        draft.indexer = { tvRssSyncIntervalMinutes: 15, movieRssSyncIntervalMinutes: 30, minimumAgeMinutes: 0, retentionDays: 0, maximumSizeMB: 0, searchDelayMs: 0, backgroundSearchWorkers: 12 };
+      } else if (draft?.indexer && !draft.indexer.backgroundSearchWorkers) {
+        draft.indexer.backgroundSearchWorkers = 12;
       }
       if (draft && !draft.jellyfin) {
         draft.jellyfin = { url: '', apiKey: '' };
@@ -1208,32 +1210,37 @@
             <label class="form-field">
               <span>TV RSS Sync Interval (minutes)</span>
               <input type="number" min="15" max="120" bind:value={draft.indexer.tvRssSyncIntervalMinutes} />
-              <small class="field-hint">How often to poll for new TV/episode releases. Minimum 15 min (Sonarr default). Requires restart.</small>
+              <small class="field-hint">How often to poll for new TV/episode releases. Minimum 15 min (Sonarr default). Applies immediately.</small>
             </label>
             <label class="form-field">
               <span>Movie RSS Sync Interval (minutes)</span>
               <input type="number" min="30" max="120" bind:value={draft.indexer.movieRssSyncIntervalMinutes} />
-              <small class="field-hint">How often to poll for new movie releases. Minimum 30 min (Radarr default). Requires restart.</small>
+              <small class="field-hint">How often to poll for new movie releases. Minimum 30 min (Radarr default). Applies immediately.</small>
             </label>
             <label class="form-field">
               <span>Minimum Age (minutes)</span>
               <input type="number" min="0" bind:value={draft.indexer.minimumAgeMinutes} />
-              <small class="field-hint">Don't grab a release posted less than this many minutes ago. Gives Usenet time to propagate. Sonarr/Radarr default: 0.</small>
+              <small class="field-hint">Don't grab a release posted less than this many minutes ago. Gives Usenet time to propagate. Sonarr/Radarr default: 0. Applies immediately.</small>
             </label>
             <label class="form-field">
               <span>Retention (days)</span>
               <input type="number" min="0" bind:value={draft.indexer.retentionDays} />
-              <small class="field-hint">Skip releases older than this. Set to match your Usenet provider's retention. 0 = unlimited.</small>
+              <small class="field-hint">Skip releases older than this. Set to match your Usenet provider's retention. 0 = unlimited. Applies immediately.</small>
             </label>
             <label class="form-field">
               <span>Maximum Size (MB)</span>
               <input type="number" min="0" bind:value={draft.indexer.maximumSizeMB} />
-              <small class="field-hint">Reject releases larger than this. 0 = no limit. Sonarr/Radarr default: 0.</small>
+              <small class="field-hint">Reject releases larger than this. 0 = no limit. Sonarr/Radarr default: 0. Applies immediately.</small>
             </label>
             <label class="form-field">
               <span>Search Delay (ms)</span>
               <input type="number" min="0" bind:value={draft.indexer.searchDelayMs} />
-              <small class="field-hint">Minimum delay between consecutive NZBHydra2 API calls. 0 = no throttle (Sonarr/Radarr behaviour — NZBHydra2 handles per-indexer rate limiting). Requires restart.</small>
+              <small class="field-hint">Minimum delay between consecutive NZBHydra2 API calls. 0 = no throttle (Sonarr/Radarr behaviour — NZBHydra2 handles per-indexer rate limiting). Applies immediately.</small>
+            </label>
+            <label class="form-field">
+              <span>Background Search Workers</span>
+              <input type="number" min="1" bind:value={draft.indexer.backgroundSearchWorkers} />
+              <small class="field-hint">Concurrent BullMQ workers used for missing-item and backlog searches. Higher values drain big queues faster but increase Hydra/indexer load. Applies immediately.</small>
             </label>
           </div>
         </Panel>

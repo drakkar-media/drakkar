@@ -46,12 +46,17 @@ type Repository interface {
 	GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (database.LibrarySearchInput, error)
 	LookupCandidateHistory(ctx context.Context, libraryItemID int64) (map[string]database.CandidateHistory, error)
 	ListPendingLibrarySearchTargets(ctx context.Context) ([]database.PendingLibrarySearchTarget, error)
+	CountActiveSearchBacklog(ctx context.Context) (int, error)
+	CountSelectedQueueBacklog(ctx context.Context) (int, error)
+	GetShowWithMissingEpisodes(ctx context.Context, tvShowID int64) (*database.ShowWithMissingEpisodes, error)
+	ListPendingTVShowLibraryItemIDs(ctx context.Context, tvShowID int64) ([]int64, error)
 	ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]database.FailedQueueRetryTarget, error)
 	ListUpgradableLibraryItems(ctx context.Context) ([]int64, error)
 	ClearFailedQueueItems(ctx context.Context) (int, error)
 	GetQueueRetryTarget(ctx context.Context, queueItemID int64) (database.QueueRetryTarget, error)
 	BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int64, reason string, ttlDays int) error
 	ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) error
+	RequeueSelectedRelease(ctx context.Context, queueItemID int64) error
 	ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord) (*int64, error)
 	MarkLibrarySearchFailed(ctx context.Context, libraryItemID int64, reason string) error
 	GetSelectedReleaseSummary(ctx context.Context, selectedReleaseID int64) (database.ReleaseSummary, error)
@@ -114,10 +119,10 @@ type Service struct {
 	// earlyChecker is called with a single message ID immediately after NZB parsing,
 	// before archive inspection and DB import. A non-nil error rejects the candidate
 	// fast, avoiding expensive segment downloads for expired releases.
-	earlyChecker func(context.Context, string) error
-	queuePolicy      QueuePolicyProvider
-	indexerLimits    IndexerLimits
-	logger           zerolog.Logger
+	earlyChecker  func(context.Context, string) error
+	queuePolicy   QueuePolicyProvider
+	indexerLimits IndexerLimits
+	logger        zerolog.Logger
 	// WorkQueue accepts individual library item IDs for immediate dispatch.
 	// Push items here from webhooks or sync to bypass the 30-min tick.
 	WorkQueue WorkQueuer
@@ -230,6 +235,12 @@ type QueueManageResult struct {
 
 const pendingQueueBatchSize = 200 // process up to 200 items per scheduler tick (was 50)
 
+const (
+	defaultInlineFallbackDepth = 12
+	busyInlineFallbackDepth    = 1
+	busyQueueDepthThreshold    = 150
+)
+
 func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service {
 	return &Service{
 		repo:      repo,
@@ -258,6 +269,16 @@ func (s *Service) SetPostImportHook(fn func(context.Context, database.QueueSnaps
 
 func (s *Service) SetPreflightChecker(fn func(context.Context, database.QueueSnapshot) error) {
 	s.preflightChecker = fn
+}
+
+func (s *Service) SetImportConcurrency(workers int) {
+	if s == nil {
+		return
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	s.importSem = make(chan struct{}, workers)
 }
 
 func (s *Service) SetEarlyChecker(fn func(context.Context, string) error) {
@@ -339,7 +360,7 @@ func (s *Service) CreateSeerrRequest(ctx context.Context, mediaType string, tmdb
 	if err := s.seerr.CreateRequest(ctx, mediaType, tmdbID); err != nil {
 		return SyncResult{}, err
 	}
-	return s.SyncRequests(ctx)
+	return s.syncRequestsWithRetry(ctx)
 }
 
 func (s *Service) CreateSeerrSeasonRequest(ctx context.Context, tmdbID int64, seasons []int) (SyncResult, error) {
@@ -352,7 +373,7 @@ func (s *Service) CreateSeerrSeasonRequest(ctx context.Context, tmdbID int64, se
 	if err := s.seerr.CreateTVSeasonRequest(ctx, tmdbID, seasons); err != nil {
 		return SyncResult{}, err
 	}
-	return s.SyncRequests(ctx)
+	return s.syncRequestsWithRetry(ctx)
 }
 
 func (s *Service) enrichMovieRequest(ctx context.Context, libraryItemID, tmdbID int64) error {
@@ -483,6 +504,10 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 	if err != nil {
 		return BulkSearchResult{}, err
 	}
+	selectedBacklog := 0
+	if s.WorkQueue != nil && s.repo != nil {
+		selectedBacklog, _ = s.repo.CountSelectedQueueBacklog(ctx)
+	}
 	result := BulkSearchResult{Processed: len(targets)}
 	for _, target := range targets {
 		result.ProcessedItems = append(result.ProcessedItems, target.LibraryItemID)
@@ -490,11 +515,17 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 		// rather than searching sequentially. Limit one bulk dispatch batch so
 		// a giant import does not hammer Hydra all at once.
 		if s.WorkQueue != nil {
+			if selectedBacklog > 0 && !target.Selected {
+				continue
+			}
+			priority := 0
+			if target.Selected {
+				priority = 1
+			}
 			// Push ALL pending items to WorkQueue — no artificial cap.
-			// WorkQueue workers process at the natural Hydra throttle rate (500ms).
-			// Matches Radarr's "Search All Missing" which queries all missing items
-			// in parallel without a hard batch limit.
-			s.WorkQueue.Push(ctx, target.LibraryItemID, 0)
+			// Workers drain at configured Hydra delay / worker concurrency.
+			// Matches Radarr's "Search All Missing" bulk-dispatch behaviour.
+			s.WorkQueue.Push(ctx, target.LibraryItemID, priority)
 			result.Searched++
 			continue
 		}
@@ -510,6 +541,25 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 		}
 	}
 	return result, nil
+}
+
+// ProcessLibraryItem handles a queue-dispatched library item.
+// If the item already has a selected release, resume fetch/import for that
+// release instead of performing a brand-new search.
+func (s *Service) ProcessLibraryItem(ctx context.Context, libraryItemID int64) error {
+	if s == nil {
+		return nil
+	}
+	current, err := s.repo.GetLatestSelectedReleaseSummaryByLibraryItem(ctx, libraryItemID)
+	if err != nil {
+		return err
+	}
+	if current != nil && current.SelectedReleaseID != 0 {
+		_, err := s.fetchAndImportSelectedRelease(ctx, current.SelectedReleaseID)
+		return err
+	}
+	_, err = s.SearchLibrary(ctx, libraryItemID)
+	return err
 }
 
 func (s *Service) WorkQueueStatus(ctx context.Context) (WorkQueueStatus, error) {
@@ -716,6 +766,19 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 			continue
 		default:
 			// ActionSearchAgain, ActionRetryLater → standard retry flow.
+		}
+
+		isRestartInterruption := strings.Contains(strings.ToLower(target.FailureReason), "interrupted_by_restart") ||
+			strings.Contains(strings.ToLower(target.FailureReason), "stale_worker")
+		if isRestartInterruption && target.HasSelectedRelease && target.CandidateFailureCount == 0 {
+			if err := s.repo.RequeueSelectedRelease(ctx, target.QueueItemID); err != nil {
+				s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: RequeueSelectedRelease failed")
+				result.Failed++
+				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+				continue
+			}
+			result.Retried++
+			continue
 		}
 
 		if _, err := s.RetryQueueItem(ctx, target.QueueItemID); err != nil {
@@ -1034,6 +1097,32 @@ func (s *Service) searchHydraWithRetry(ctx context.Context, request hydra.Search
 	return s.hydra.Search(ctx, request)
 }
 
+func (s *Service) syncRequestsWithRetry(ctx context.Context) (SyncResult, error) {
+	backoff := []time.Duration{0, 1 * time.Second, 2 * time.Second}
+	var lastResult SyncResult
+	var lastErr error
+	for _, delay := range backoff {
+		if delay > 0 {
+			select {
+			case <-ctx.Done():
+				return SyncResult{}, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		lastResult, lastErr = s.SyncRequests(ctx)
+		if lastErr == nil {
+			return lastResult, nil
+		}
+		if !isRetryableSeerrSyncFailure(lastErr) {
+			return SyncResult{}, lastErr
+		}
+	}
+	if lastErr != nil {
+		return SyncResult{}, lastErr
+	}
+	return lastResult, nil
+}
+
 func classifySearchFailureReason(err error) string {
 	if err == nil {
 		return "search_error"
@@ -1061,10 +1150,19 @@ func classifySearchFailureReason(err error) string {
 		strings.Contains(message, "status 502"),
 		strings.Contains(message, "status 503"),
 		strings.Contains(message, "status 504"),
+		strings.Contains(message, "status 520"),
+		strings.Contains(message, "status 521"),
+		strings.Contains(message, "status 522"),
+		strings.Contains(message, "status 523"),
+		strings.Contains(message, "cloudflare unavailable"),
 		strings.Contains(message, "connection refused"),
 		strings.Contains(message, "no such host"),
 		strings.Contains(message, "server misbehaving"):
 		return "search_unavailable"
+	case strings.Contains(message, "status 524"),
+		strings.Contains(message, "cloudflare timeout"),
+		strings.Contains(message, "gateway timeout"):
+		return "search_timeout"
 	default:
 		return "search_error"
 	}
@@ -1073,6 +1171,37 @@ func classifySearchFailureReason(err error) string {
 func isRetryableSearchFailure(err error) bool {
 	switch classifySearchFailureReason(err) {
 	case "search_timeout", "search_unavailable":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRetryableSeerrSyncFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	message := strings.ToLower(strings.TrimSpace(err.Error()))
+	switch {
+	case strings.Contains(message, "timeout"),
+		strings.Contains(message, "deadline exceeded"),
+		strings.Contains(message, "status 500"),
+		strings.Contains(message, "status 502"),
+		strings.Contains(message, "status 503"),
+		strings.Contains(message, "status 504"),
+		strings.Contains(message, "status 520"),
+		strings.Contains(message, "status 521"),
+		strings.Contains(message, "status 522"),
+		strings.Contains(message, "status 523"),
+		strings.Contains(message, "status 524"),
+		strings.Contains(message, "cloudflare"),
+		strings.Contains(message, "bad gateway"),
+		strings.Contains(message, "gateway timeout"),
+		strings.Contains(message, "connection refused"),
+		strings.Contains(message, "no such host"):
 		return true
 	default:
 		return false
@@ -1638,10 +1767,29 @@ func cleanupCtx(ctx context.Context) context.Context {
 	return context.Background()
 }
 
+func (s *Service) maxInlineFallbackDepth(ctx context.Context) int {
+	if s == nil {
+		return defaultInlineFallbackDepth
+	}
+	if s.repo != nil {
+		if backlog, err := s.repo.CountActiveSearchBacklog(ctx); err == nil && backlog >= busyQueueDepthThreshold {
+			return busyInlineFallbackDepth
+		}
+	}
+	if s.WorkQueue == nil {
+		return defaultInlineFallbackDepth
+	}
+	if s.WorkQueue.Depth(ctx) >= busyQueueDepthThreshold {
+		return busyInlineFallbackDepth
+	}
+	return defaultInlineFallbackDepth
+}
+
 // promoteNextAfterFailureDepth adds a depth counter to prevent infinite recursive
 // promotion chains (e.g. all candidates fail with 403 from the indexer).
 // Radarr/Sonarr never recurse here — they let the scheduler re-try later.
-// We cap at 5 hops so we can try a few alternatives without stack-overflowing.
+// Under heavy backlog, cap inline churn aggressively so one bad episode does
+// not monopolize workers for minutes while hundreds of other items wait.
 func (s *Service) promoteNextAfterFailureDepth(ctx context.Context, current database.ReleaseSummary, reason string, depth int) (*int64, error) {
 	s.logger.Warn().
 		Int64("libraryItemId", current.LibraryItemID).
@@ -1652,10 +1800,9 @@ func (s *Service) promoteNextAfterFailureDepth(ctx context.Context, current data
 	// Use a fresh context for DB cleanup if the caller's context was already
 	// canceled — prevents the item from remaining stuck in a transitional state.
 	dbCtx := cleanupCtx(ctx)
-	if depth >= 25 {
-		// Depth limit: we've tried 26 candidates inline. Fail+promote one more so
-		// the item lands in QueueSelected for the next dispatch cycle rather than
-		// holding this BullMQ job open indefinitely.
+	if depth >= s.maxInlineFallbackDepth(ctx) {
+		// Stop inline candidate churn and leave the next candidate selected for a
+		// later queue pass. This keeps throughput fair when backlog is large.
 		if _, depthErr := s.repo.FailSelectedReleaseAndPromoteNext(dbCtx, current.SelectedReleaseID, reason); depthErr != nil {
 			s.logger.Error().Err(depthErr).Int64("selectedReleaseId", current.SelectedReleaseID).Msg("workqueue: depth-limit fail failed")
 		}
@@ -2739,6 +2886,17 @@ type FillMissingEpisodesResult struct {
 	ItemsCreated   int `json:"itemsCreated"`
 }
 
+type PrioritizeTVShowResult struct {
+	TVShowID      int64 `json:"tvShowId"`
+	EpisodesFound int   `json:"episodesFound"`
+	ItemsCreated  int   `json:"itemsCreated"`
+	Queued        int   `json:"queued"`
+}
+
+type missingEpisodeBatchEnsurer interface {
+	EnsureEpisodeLibraryItemsBatch(ctx context.Context, tvShowID int64, showTitle string, episodes []database.MissingEpisodeBatchInput) ([]int64, error)
+}
+
 // FillMissingEpisodes queries TMDB for the episode list of every TV show that
 // has missing episodes, then creates library_item + queue_item rows for each
 // episode not yet in the local database. Those new items enter the normal
@@ -2774,17 +2932,126 @@ func (s *Service) FillMissingEpisodes(ctx context.Context) (FillMissingEpisodesR
 			if err != nil {
 				continue
 			}
+
+			batch := make([]database.MissingEpisodeBatchInput, 0, len(season.Episodes))
 			for _, ep := range season.Episodes {
 				if ep.EpisodeNumber <= 0 {
 					continue
 				}
 				result.EpisodesFound++
-				created, err := s.repo.EnsureEpisodeLibraryItem(ctx, show.TVShowID, show.ShowTitle, seasonNum, ep.EpisodeNumber, ep.Name, ep.AirDate)
+				batch = append(batch, database.MissingEpisodeBatchInput{
+					SeasonNumber:  seasonNum,
+					EpisodeNumber: ep.EpisodeNumber,
+					Title:         ep.Name,
+					AirDate:       ep.AirDate,
+				})
+			}
+			if len(batch) == 0 {
+				continue
+			}
+
+			if batchRepo, ok := s.repo.(missingEpisodeBatchEnsurer); ok {
+				createdIDs, err := batchRepo.EnsureEpisodeLibraryItemsBatch(ctx, show.TVShowID, show.ShowTitle, batch)
+				if err != nil {
+					continue
+				}
+				result.ItemsCreated += len(createdIDs)
+				if s.WorkQueue != nil {
+					for _, libraryItemID := range createdIDs {
+						s.WorkQueue.Push(ctx, libraryItemID, 0)
+					}
+				}
+				continue
+			}
+
+			for _, ep := range batch {
+				created, err := s.repo.EnsureEpisodeLibraryItem(ctx, show.TVShowID, show.ShowTitle, ep.SeasonNumber, ep.EpisodeNumber, ep.Title, ep.AirDate)
 				if err != nil || !created {
 					continue
 				}
 				result.ItemsCreated++
 			}
+		}
+	}
+	return result, nil
+}
+
+func (s *Service) PrioritizeTVShowMissing(ctx context.Context, tvShowID int64) (PrioritizeTVShowResult, error) {
+	if s == nil || s.repo == nil || s.tmdb == nil || !s.tmdb.Enabled() || tvShowID <= 0 {
+		return PrioritizeTVShowResult{}, nil
+	}
+	show, err := s.repo.GetShowWithMissingEpisodes(ctx, tvShowID)
+	if err != nil {
+		return PrioritizeTVShowResult{}, err
+	}
+	if show == nil || show.TMDBID <= 0 {
+		return PrioritizeTVShowResult{TVShowID: tvShowID}, nil
+	}
+
+	result := PrioritizeTVShowResult{TVShowID: tvShowID}
+	seasonNums, err := s.tmdb.TVSeasonNumbers(ctx, show.TMDBID)
+	if err != nil {
+		return result, err
+	}
+	queuedSet := make(map[int64]struct{})
+	for _, seasonNum := range seasonNums {
+		season, err := s.tmdb.TVSeason(ctx, show.TMDBID, seasonNum)
+		if err != nil {
+			continue
+		}
+		batch := make([]database.MissingEpisodeBatchInput, 0, len(season.Episodes))
+		for _, ep := range season.Episodes {
+			if ep.EpisodeNumber <= 0 {
+				continue
+			}
+			result.EpisodesFound++
+			batch = append(batch, database.MissingEpisodeBatchInput{
+				SeasonNumber:  seasonNum,
+				EpisodeNumber: ep.EpisodeNumber,
+				Title:         ep.Name,
+				AirDate:       ep.AirDate,
+			})
+		}
+		if len(batch) == 0 {
+			continue
+		}
+		if batchRepo, ok := s.repo.(missingEpisodeBatchEnsurer); ok {
+			createdIDs, err := batchRepo.EnsureEpisodeLibraryItemsBatch(ctx, show.TVShowID, show.ShowTitle, batch)
+			if err != nil {
+				continue
+			}
+			result.ItemsCreated += len(createdIDs)
+			for _, id := range createdIDs {
+				queuedSet[id] = struct{}{}
+			}
+			continue
+		}
+		for _, ep := range batch {
+			created, err := s.repo.EnsureEpisodeLibraryItem(ctx, show.TVShowID, show.ShowTitle, ep.SeasonNumber, ep.EpisodeNumber, ep.Title, ep.AirDate)
+			if err != nil || !created {
+				continue
+			}
+			result.ItemsCreated++
+		}
+	}
+
+	pendingIDs, err := s.repo.ListPendingTVShowLibraryItemIDs(ctx, tvShowID)
+	if err != nil {
+		return result, err
+	}
+	for _, id := range pendingIDs {
+		queuedSet[id] = struct{}{}
+	}
+	if s.WorkQueue != nil {
+		for id := range queuedSet {
+			s.WorkQueue.Push(ctx, id, 10)
+			result.Queued++
+		}
+		return result, nil
+	}
+	for id := range queuedSet {
+		if _, err := s.SearchLibrary(ctx, id); err == nil {
+			result.Queued++
 		}
 	}
 	return result, nil
@@ -2809,7 +3076,7 @@ func (s *Service) ManualSearch(ctx context.Context, query string) ([]ManualSearc
 	if s == nil || s.hydra == nil || query == "" {
 		return nil, nil
 	}
-	results, err := s.hydra.Search(ctx, hydra.SearchRequest{
+	results, err := s.searchHydraWithRetry(ctx, hydra.SearchRequest{
 		Query:     query,
 		MediaType: "search",
 	})

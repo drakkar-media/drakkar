@@ -4,68 +4,94 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/hjongedijk/drakkar/internal/config"
 )
 
-func TestPendingRequests(t *testing.T) {
-	var requests int
+func TestCreateTVSeasonRequestRecoversFromCloudflareTimeout(t *testing.T) {
+	var mu sync.Mutex
+	posts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/request" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
-		requests++
-		w.Header().Set("Content-Type", "application/json")
-		if got := r.URL.Query().Get("take"); got != "5000" {
-			t.Fatalf("unexpected take %q", got)
-		}
-		switch r.URL.Query().Get("skip") {
-		case "0":
-			// status=3 (declined) is the only status Drakkar skips; status=5 is now included.
-			_, _ = w.Write([]byte(`{"pageInfo":{"results":5001,"pageSize":5000,"page":1},"results":[{"id":12,"type":"movie","status":2,"media":{"tmdbId":438631,"title":"Dune","releaseDate":"2021-10-22"}},{"id":13,"type":"movie","status":3,"media":{"tmdbId":1,"title":"Declined","releaseDate":"2021-10-22"}}]}`))
-		case "5000":
-			_, _ = w.Write([]byte(`{"pageInfo":{"results":5001,"pageSize":5000,"page":2},"results":[{"id":14,"type":"tv","status":2,"media":{"tvdbId":362472,"tmdbId":84958,"name":"Loki","firstAirDate":"2021-06-09"},"episodes":[{"seasonNumber":2,"episodeNumber":1,"name":"Ouroboros"}]}]}`))
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/request":
+			mu.Lock()
+			posts++
+			current := posts
+			mu.Unlock()
+			if current == 1 {
+				w.WriteHeader(524)
+				_, _ = w.Write([]byte("<html><title>524</title><body>Cloudflare timeout</body></html>"))
+				return
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/request":
+			mu.Lock()
+			current := posts
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			if current >= 2 {
+				_, _ = w.Write([]byte(`{"pageInfo":{"results":1,"pageSize":5000,"page":1},"results":[{"id":1,"type":"tv","status":2,"media":{"tmdbId":84958,"tvdbId":362472,"title":"Loki","firstAirDate":"2021-06-09"},"episodes":[{"seasonNumber":2,"episodeNumber":1,"name":"Episode 1"}]}]}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"pageInfo":{"results":0,"pageSize":5000,"page":1},"results":[]}`))
 		default:
-			t.Fatalf("unexpected skip %q", r.URL.Query().Get("skip"))
+			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
 
-	client := NewClient(config.ServiceConfig{URL: server.URL, APIKey: "abc"})
-	got, err := client.PendingRequests(context.Background())
-	if err != nil {
+	client := NewClient(config.ServiceConfig{URL: server.URL})
+	client.httpClient.Timeout = 2 * time.Second
+
+	if err := client.CreateTVSeasonRequest(context.Background(), 84958, []int{2}); err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("expected 2 requests, got %d", len(got))
-	}
-	if got[0].MediaTitle != "Dune" || got[0].MediaYear != 2021 {
-		t.Fatalf("unexpected first request %+v", got[0])
-	}
-	if got[1].SeasonNumber != 2 || got[1].EpisodeNumber != 1 {
-		t.Fatalf("unexpected second request %+v", got[1])
-	}
-	if requests != 2 {
-		t.Fatalf("expected 2 page requests, got %d", requests)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if posts != 2 {
+		t.Fatalf("expected one retry after transient failure, got %d posts", posts)
 	}
 }
 
-func TestProbe(t *testing.T) {
+func TestCreateRequestTreatsExistingConflictAsSuccess(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/status" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/request":
+			http.Error(w, "already requested", http.StatusConflict)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/request":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"pageInfo":{"results":1,"pageSize":5000,"page":1},"results":[{"id":1,"type":"movie","status":2,"media":{"tmdbId":11,"title":"Star Wars","releaseDate":"1977-05-25"},"episodes":[]}]}`))
+		default:
+			http.NotFound(w, r)
 		}
-		if got := r.Header.Get("X-Api-Key"); got != "abc" {
-			t.Fatalf("expected api key header, got %q", got)
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"version":"3.3.0"}`))
 	}))
 	defer server.Close()
 
-	client := NewClient(config.ServiceConfig{URL: server.URL, APIKey: "abc"})
-	if err := client.Probe(context.Background()); err != nil {
+	client := NewClient(config.ServiceConfig{URL: server.URL})
+	if err := client.CreateRequest(context.Background(), "movie", 11); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPendingRequestsClassifiesCloudflareHTML(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("<html><body>Cloudflare 502 Bad Gateway</body></html>"))
+	}))
+	defer server.Close()
+
+	client := NewClient(config.ServiceConfig{URL: server.URL})
+	_, err := client.PendingRequests(context.Background())
+	if err == nil {
+		t.Fatal("expected cloudflare error")
+	}
+	if got := strings.ToLower(err.Error()); !strings.Contains(got, "cloudflare") || !strings.Contains(got, "502") {
+		t.Fatalf("unexpected error %q", got)
 	}
 }

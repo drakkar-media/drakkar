@@ -89,6 +89,11 @@ type IndexerConfig struct {
 	// SearchDelayMs: minimum milliseconds between consecutive NZBHydra2 search
 	// requests. 0 means no delay (Sonarr/Radarr behaviour). Default: 0.
 	SearchDelayMs int `json:"searchDelayMs"`
+
+	// BackgroundSearchWorkers: BullMQ worker concurrency for missing-item search
+	// jobs. Higher values improve backlog throughput when Hydra throttling is low.
+	// Default: 12.
+	BackgroundSearchWorkers int `json:"backgroundSearchWorkers"`
 }
 
 func DefaultIndexerConfig() IndexerConfig {
@@ -99,6 +104,7 @@ func DefaultIndexerConfig() IndexerConfig {
 		RetentionDays:               0,
 		MaximumSizeMB:               0,
 		SearchDelayMs:               0,
+		BackgroundSearchWorkers:     12,
 	}
 }
 
@@ -295,6 +301,9 @@ func applyDefaults(cfg *Settings) {
 	}
 	if cfg.Indexer.MovieRssSyncIntervalMinutes == 0 {
 		cfg.Indexer.MovieRssSyncIntervalMinutes = DefaultIndexerConfig().MovieRssSyncIntervalMinutes
+	}
+	if cfg.Indexer.BackgroundSearchWorkers <= 0 {
+		cfg.Indexer.BackgroundSearchWorkers = DefaultIndexerConfig().BackgroundSearchWorkers
 	}
 	if len(cfg.Subtitles.Languages) == 0 {
 		cfg.Subtitles.Languages = []string{"en"}

@@ -17,9 +17,9 @@ import (
 )
 
 // defaultSearchInterval is the minimum gap between consecutive Hydra API calls.
-// This serialises concurrent BullMQ worker goroutines through a single queue,
-// preventing simultaneous episode searches from flooding indexers.
-var defaultSearchInterval = 2 * time.Second
+// 0 matches Sonarr/Radarr behaviour: do not add client-side throttling unless
+// explicitly configured by the user.
+var defaultSearchInterval time.Duration
 
 var ErrRateLimited = errors.New("nzbhydra2 rate limited")
 
@@ -30,8 +30,8 @@ const (
 
 var (
 	// Matches Radarr's default categories (2000–2060 full set).
-	movieCategories = []string{"2000", "2010", "2020", "2030", "2040", "2045", "2050", "2060"}
-	tvCategories    = []string{"5030", "5040", "5045", "5080"}
+	movieCategories  = []string{"2000", "2010", "2020", "2030", "2040", "2045", "2050", "2060"}
+	tvCategories     = []string{"5030", "5040", "5045", "5080"}
 	rateLimitBackoff = []time.Duration{
 		15 * time.Minute,
 		30 * time.Minute,
@@ -83,7 +83,7 @@ type SearchRequest struct {
 	MediaType     string
 	Query         string
 	IMDbID        string
-	TMDBID        int64  // tmdbid= parameter (Radarr/Sonarr first-tier ID search)
+	TMDBID        int64 // tmdbid= parameter (Radarr/Sonarr first-tier ID search)
 	TVDBID        int64
 	SeasonNumber  int
 	EpisodeNumber int
@@ -298,16 +298,19 @@ func (c *Client) doSearchRequest(ctx context.Context, u *url.URL) ([]SearchResul
 		return nil, err
 	}
 	defer resp.Body.Close()
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return nil, readErr
+	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		c.startCooldown()
 		return nil, fmt.Errorf("%w: nzbhydra2 search status %d", ErrRateLimited, resp.StatusCode)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("nzbhydra2 search status %d", resp.StatusCode)
+		return nil, classifyHydraHTTPError(resp.StatusCode, body)
 	}
 	c.recordSuccess()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
+	if err := detectHydraResponseError(resp.StatusCode, body); err != nil {
 		return nil, err
 	}
 	trimmed := strings.TrimSpace(string(body))
@@ -554,4 +557,62 @@ func parsePublished(epoch int64, values ...string) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+func classifyHydraHTTPError(statusCode int, body []byte) error {
+	snippet := summarizeHTTPBody(body)
+	switch statusCode {
+	case 520, 521, 522, 523:
+		if snippet != "" {
+			return fmt.Errorf("nzbhydra2 cloudflare unavailable status %d: %s", statusCode, snippet)
+		}
+		return fmt.Errorf("nzbhydra2 cloudflare unavailable status %d", statusCode)
+	case 524:
+		if snippet != "" {
+			return fmt.Errorf("nzbhydra2 cloudflare timeout status %d: %s", statusCode, snippet)
+		}
+		return fmt.Errorf("nzbhydra2 cloudflare timeout status %d", statusCode)
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		if snippet != "" {
+			return fmt.Errorf("nzbhydra2 search status %d: %s", statusCode, snippet)
+		}
+	}
+	if snippet != "" {
+		return fmt.Errorf("nzbhydra2 search status %d: %s", statusCode, snippet)
+	}
+	return fmt.Errorf("nzbhydra2 search status %d", statusCode)
+}
+
+func detectHydraResponseError(statusCode int, body []byte) error {
+	text := strings.ToLower(strings.TrimSpace(string(body)))
+	switch {
+	case strings.Contains(text, "cloudflare") && strings.Contains(text, "524"):
+		return fmt.Errorf("nzbhydra2 cloudflare timeout status %d", statusCode)
+	case strings.Contains(text, "cloudflare") && strings.Contains(text, "522"):
+		return fmt.Errorf("nzbhydra2 cloudflare unavailable status %d", statusCode)
+	case strings.Contains(text, "cloudflare") && strings.Contains(text, "timed out"):
+		return fmt.Errorf("nzbhydra2 cloudflare timeout status %d", statusCode)
+	case strings.Contains(text, "<html") && strings.Contains(text, "cloudflare"):
+		return fmt.Errorf("nzbhydra2 cloudflare unavailable status %d", statusCode)
+	case strings.Contains(text, "<html") && strings.Contains(text, "bad gateway"):
+		return fmt.Errorf("nzbhydra2 search status %d: bad gateway", statusCode)
+	case strings.Contains(text, "<html") && strings.Contains(text, "gateway timeout"):
+		return fmt.Errorf("nzbhydra2 search status %d: gateway timeout", statusCode)
+	default:
+		return nil
+	}
+}
+
+func summarizeHTTPBody(body []byte) string {
+	text := strings.TrimSpace(string(body))
+	if text == "" {
+		return ""
+	}
+	text = strings.ReplaceAll(text, "\n", " ")
+	text = strings.ReplaceAll(text, "\r", " ")
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > 160 {
+		text = text[:160]
+	}
+	return text
 }

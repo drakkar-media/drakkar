@@ -195,6 +195,13 @@ export type BulkSearchResult = {
   failedItems?: number[];
 };
 
+export type PrioritizeTVShowResult = {
+  tvShowId: number;
+  episodesFound: number;
+  itemsCreated: number;
+  queued: number;
+};
+
 export type BulkRepublishResult = {
   processed: number;
   republished: number;
@@ -506,6 +513,7 @@ export type FullSettings = {
     retentionDays: number;
     maximumSizeMB: number;
     searchDelayMs: number;
+    backgroundSearchWorkers: number;
   };
   notifications: {
     discordWebhookUrl: string;

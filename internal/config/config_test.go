@@ -66,3 +66,26 @@ func TestValidatePathsRejectsNestedLibrary(t *testing.T) {
 		t.Fatalf("expected fuse separation error, got %v", err)
 	}
 }
+
+func TestLoadAppliesIndexerWorkerDefault(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(path, []byte(`{
+  "database":{"host":"postgres","port":5432,"name":"drakkar","username":"drakkar","password":"secret"},
+  "valkey":{"host":"valkey","port":6379,"password":""},
+  "nzbhydra2":{"url":"http://nzbhydra2:5076","apiKey":""},
+  "seerr":{"url":"http://seerr:5055","apiKey":""},
+  "usenet":{"providers":[{"name":"primary","host":"news","port":563,"tls":true,"username":"","password":"","maxConnections":20,"enabled":true}]},
+  "metadata":{"tmdb":{"apiKey":""},"tvdb":{"apiKey":""}},
+  "subtitles":{"enabled":true,"languages":["en"],"providers":{"subdl":{"enabled":true,"apiKey":""}}},
+  "indexer":{"searchDelayMs":0}
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Indexer.BackgroundSearchWorkers != 12 {
+		t.Fatalf("expected default backgroundSearchWorkers=12, got %d", cfg.Indexer.BackgroundSearchWorkers)
+	}
+}

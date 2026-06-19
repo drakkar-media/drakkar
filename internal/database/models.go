@@ -468,6 +468,7 @@ type QueueRetryTarget struct {
 
 type PendingLibrarySearchTarget struct {
 	LibraryItemID int64 `json:"libraryItemId"`
+	Selected      bool  `json:"selected"`
 }
 
 type FailedQueueRetryTarget struct {

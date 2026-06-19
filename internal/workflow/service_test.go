@@ -16,34 +16,37 @@ import (
 )
 
 type repoStub struct {
-	requests       []database.MediaRequestSummary
-	searchInput    database.LibrarySearchInput
-	history        map[string]database.CandidateHistory
-	defaultProfile database.QualityProfile
-	itemProfile    *database.QualityProfile
-	conflict       string
-	searchApplied  []database.SearchCandidateRecord
-	searchFailed   []string
-	pending        []database.PendingLibrarySearchTarget
-	failedQueues   []database.FailedQueueRetryTarget
-	upgradable     []int64
-	movieCalls     int
-	tvCalls        int
-	fetching       int64
-	imported       database.ImportedNZB
-	indexed        int64
-	selected       database.ReleaseSummary
-	selectedByID   map[int64]database.ReleaseSummary
-	promoted       *database.ReleaseSummary
-	alternative    *database.ReleaseSummary
-	next           *database.ReleaseSummary
-	failed         []string
-	rejected       []string
-	retryTarget    database.QueueRetryTarget
-	skipped        []int64
-	stored         database.StoredNZBDocument
-	restoredGroup  []int64
-	movieMeta      struct {
+	requests        []database.MediaRequestSummary
+	searchInput     database.LibrarySearchInput
+	history         map[string]database.CandidateHistory
+	defaultProfile  database.QualityProfile
+	itemProfile     *database.QualityProfile
+	conflict        string
+	searchApplied   []database.SearchCandidateRecord
+	searchFailed    []string
+	pending         []database.PendingLibrarySearchTarget
+	backlog         int
+	selectedBacklog int
+	failedQueues    []database.FailedQueueRetryTarget
+	upgradable      []int64
+	movieCalls      int
+	tvCalls         int
+	fetching        int64
+	imported        database.ImportedNZB
+	indexed         int64
+	selected        database.ReleaseSummary
+	selectedByID    map[int64]database.ReleaseSummary
+	promoted        *database.ReleaseSummary
+	alternative     *database.ReleaseSummary
+	next            *database.ReleaseSummary
+	failed          []string
+	rejected        []string
+	retryTarget     database.QueueRetryTarget
+	skipped         []int64
+	requeued        []int64
+	stored          database.StoredNZBDocument
+	restoredGroup   []int64
+	movieMeta       struct {
 		libraryItemID int64
 		tmdbID        int64
 		title         string
@@ -58,6 +61,9 @@ type repoStub struct {
 		imdbID        string
 		episodeTitle  string
 	}
+	missingShows        []database.ShowWithMissingEpisodes
+	batchCreatedIDs     []int64
+	batchCreatedBatches int
 }
 
 func (r *repoStub) ListMediaRequests(ctx context.Context) ([]database.MediaRequestSummary, error) {
@@ -130,6 +136,24 @@ func (r *repoStub) LookupCandidateHistory(ctx context.Context, libraryItemID int
 func (r *repoStub) ListPendingLibrarySearchTargets(ctx context.Context) ([]database.PendingLibrarySearchTarget, error) {
 	return r.pending, nil
 }
+func (r *repoStub) CountActiveSearchBacklog(ctx context.Context) (int, error) {
+	return r.backlog, nil
+}
+func (r *repoStub) CountSelectedQueueBacklog(ctx context.Context) (int, error) {
+	return r.selectedBacklog, nil
+}
+func (r *repoStub) GetShowWithMissingEpisodes(_ context.Context, tvShowID int64) (*database.ShowWithMissingEpisodes, error) {
+	for _, show := range r.missingShows {
+		if show.TVShowID == tvShowID {
+			item := show
+			return &item, nil
+		}
+	}
+	return nil, nil
+}
+func (r *repoStub) ListPendingTVShowLibraryItemIDs(_ context.Context, _ int64) ([]int64, error) {
+	return append([]int64(nil), r.batchCreatedIDs...), nil
+}
 func (r *repoStub) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]database.FailedQueueRetryTarget, error) {
 	return r.failedQueues, nil
 }
@@ -142,6 +166,10 @@ func (r *repoStub) BlocklistQueueSelectedRelease(ctx context.Context, queueItemI
 }
 func (r *repoStub) ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) error {
 	r.skipped = append(r.skipped, queueItemID)
+	return nil
+}
+func (r *repoStub) RequeueSelectedRelease(ctx context.Context, queueItemID int64) error {
+	r.requeued = append(r.requeued, queueItemID)
 	return nil
 }
 func (r *repoStub) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord) (*int64, error) {
@@ -298,10 +326,18 @@ func (r *repoStub) ListMetadataBackfillTargets(_ context.Context) ([]database.Me
 	return nil, nil
 }
 func (r *repoStub) ListShowsWithMissingEpisodes(_ context.Context) ([]database.ShowWithMissingEpisodes, error) {
-	return nil, nil
+	return r.missingShows, nil
 }
 func (r *repoStub) EnsureEpisodeLibraryItem(_ context.Context, _ int64, _ string, _, _ int, _, _ string) (bool, error) {
 	return false, nil
+}
+func (r *repoStub) EnsureEpisodeLibraryItemsBatch(_ context.Context, _ int64, _ string, episodes []database.MissingEpisodeBatchInput) ([]int64, error) {
+	r.batchCreatedBatches++
+	if len(r.batchCreatedIDs) == 0 {
+		return nil, nil
+	}
+	out := append([]int64(nil), r.batchCreatedIDs...)
+	return out, nil
 }
 func (r *repoStub) ListCustomFormats(_ context.Context) ([]database.CustomFormat, error) {
 	return nil, nil
@@ -468,6 +504,27 @@ type tvdbStub struct{}
 func (tvdbStub) Enabled() bool { return true }
 func (tvdbStub) SeriesDetails(ctx context.Context, tvdbID int64) (tvdb.SeriesDetails, error) {
 	return tvdb.SeriesDetails{Name: "The Bear", Year: 2022, IMDbID: "tt14452776"}, nil
+}
+
+type tmdbFillMissingStub struct{}
+
+func (tmdbFillMissingStub) Enabled() bool { return true }
+func (tmdbFillMissingStub) MovieDetails(context.Context, int64) (tmdb.MovieDetails, error) {
+	return tmdb.MovieDetails{}, nil
+}
+func (tmdbFillMissingStub) TVDetails(context.Context, int64) (tmdb.TVDetails, error) {
+	return tmdb.TVDetails{}, nil
+}
+func (tmdbFillMissingStub) TVSeasonNumbers(_ context.Context, _ int64) ([]int, error) {
+	return []int{1}, nil
+}
+func (tmdbFillMissingStub) TVSeason(_ context.Context, _ int64, seasonNumber int) (tmdb.TVSeason, error) {
+	return tmdb.TVSeason{
+		Episodes: []tmdb.TVEpisode{
+			{EpisodeNumber: 1, Name: "Pilot", AirDate: "2024-01-01"},
+			{EpisodeNumber: 2, Name: "Second", AirDate: "2024-01-08"},
+		},
+	}, nil
 }
 
 func TestSyncRequests(t *testing.T) {
@@ -1096,11 +1153,13 @@ func TestSearchLibraryClassifiesTimeoutFailure(t *testing.T) {
 
 func TestClassifySearchFailureReason(t *testing.T) {
 	cases := map[string]string{
-		"nzbhydra2 search status 401":  "search_auth_error",
-		"nzbhydra2 search status 429":  "search_rate_limited",
-		"nzbhydra2 search status 503":  "search_unavailable",
-		"dial tcp: connection refused": "search_unavailable",
-		"something else":               "search_error",
+		"nzbhydra2 search status 401":                 "search_auth_error",
+		"nzbhydra2 search status 429":                 "search_rate_limited",
+		"nzbhydra2 search status 503":                 "search_unavailable",
+		"nzbhydra2 cloudflare unavailable status 522": "search_unavailable",
+		"nzbhydra2 cloudflare timeout status 524":     "search_timeout",
+		"dial tcp: connection refused":                "search_unavailable",
+		"something else":                              "search_error",
 	}
 	for input, expected := range cases {
 		if got := classifySearchFailureReason(errors.New(input)); got != expected {
@@ -1176,6 +1235,56 @@ func TestSearchLibraryDoesNotRetryAuthFailure(t *testing.T) {
 	}
 }
 
+func TestManualSearchRetriesTransientHydraFailure(t *testing.T) {
+	var queries []string
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{
+		seqByQuery: map[string][]hydraReply{
+			"dune": {
+				{err: errors.New("nzbhydra2 cloudflare timeout status 524")},
+				{results: []hydra.SearchResult{
+					{Title: "Dune.2021.1080p.WEB-DL.x265-GRP", Link: "http://example/good", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+				}},
+			},
+		},
+		queries: &queries,
+	})
+
+	items, err := service.ManualSearch(context.Background(), "dune")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected one result, got %+v", items)
+	}
+	if len(queries) != 2 || queries[0] != "dune" || queries[1] != "dune" {
+		t.Fatalf("expected one retry of same query, got %+v", queries)
+	}
+}
+
+func TestMaxInlineFallbackDepthUsesBusyQueueLimit(t *testing.T) {
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
+	queue := newWorkQueueStub()
+	for i := 0; i < busyQueueDepthThreshold; i++ {
+		queue.Push(context.Background(), int64(i+1), 0)
+	}
+	service.WorkQueue = queue
+	if got := service.maxInlineFallbackDepth(context.Background()); got != busyInlineFallbackDepth {
+		t.Fatalf("expected busy inline depth %d, got %d", busyInlineFallbackDepth, got)
+	}
+}
+
+func TestMaxInlineFallbackDepthUsesDefaultWhenQueueSmall(t *testing.T) {
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
+	queue := newWorkQueueStub()
+	for i := 0; i < 10; i++ {
+		queue.Push(context.Background(), int64(i+1), 0)
+	}
+	service.WorkQueue = queue
+	if got := service.maxInlineFallbackDepth(context.Background()); got != defaultInlineFallbackDepth {
+		t.Fatalf("expected default inline depth %d, got %d", defaultInlineFallbackDepth, got)
+	}
+}
+
 func TestSearchPendingLibrary(t *testing.T) {
 	repo := &repoStub{
 		pending: []database.PendingLibrarySearchTarget{
@@ -1211,6 +1320,28 @@ func TestSearchPendingLibrary(t *testing.T) {
 	}
 }
 
+func TestProcessLibraryItemResumesSelectedRelease(t *testing.T) {
+	repo := &repoStub{
+		selected: database.ReleaseSummary{
+			SelectedReleaseID: 303,
+			LibraryItemID:     42,
+			ExternalURL:       "http://example/retry.nzb",
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	service.fetcher = fetcherStub{
+		fileName: "retry.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Retry (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+	}
+
+	if err := service.ProcessLibraryItem(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if repo.fetching != 303 {
+		t.Fatalf("expected selected release fetch to resume, got fetching=%d", repo.fetching)
+	}
+}
+
 func TestSearchPendingLibraryQueuesAllItems(t *testing.T) {
 	const total = pendingQueueBatchSize + 10
 	pending := make([]database.PendingLibrarySearchTarget, 0, total)
@@ -1231,6 +1362,30 @@ func TestSearchPendingLibraryQueuesAllItems(t *testing.T) {
 	}
 	if depth := service.WorkQueue.Depth(context.Background()); depth != total {
 		t.Fatalf("expected workqueue depth=%d got %d", total, depth)
+	}
+}
+
+func TestSearchPendingLibraryQueuesOnlySelectedWhenSelectedBacklogExists(t *testing.T) {
+	repo := &repoStub{
+		selectedBacklog: 2,
+		pending: []database.PendingLibrarySearchTarget{
+			{LibraryItemID: 1, Selected: true},
+			{LibraryItemID: 2, Selected: false},
+			{LibraryItemID: 3, Selected: true},
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	service.WorkQueue = newWorkQueueStub()
+
+	result, err := service.SearchPendingLibrary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Processed != 3 || result.Searched != 2 {
+		t.Fatalf("unexpected bulk result %+v", result)
+	}
+	if depth := service.WorkQueue.Depth(context.Background()); depth != 2 {
+		t.Fatalf("expected only selected items queued, got depth %d", depth)
 	}
 }
 
@@ -1327,24 +1482,10 @@ func TestRetryFailedQueue(t *testing.T) {
 	repo := &repoStub{
 		failedQueues: []database.FailedQueueRetryTarget{
 			{QueueItemID: 55, LibraryItemID: 42, FailureReason: "interrupted_by_restart", HasSelectedRelease: true, CandidateFailureCount: 0},
-			{QueueItemID: 56, LibraryItemID: 43, FailureReason: "interrupted_by_restart", HasSelectedRelease: true, CandidateFailureCount: 0},
-		},
-		retryTarget: database.QueueRetryTarget{
-			QueueItemID:       55,
-			LibraryItemID:     42,
-			SelectedReleaseID: func() *int64 { v := int64(303); return &v }(),
-		},
-		selected: database.ReleaseSummary{
-			SelectedReleaseID: 303,
-			LibraryItemID:     42,
-			ExternalURL:       "http://example/retry.nzb",
+			{QueueItemID: 56, LibraryItemID: 43, FailureReason: "stale_worker", HasSelectedRelease: true, CandidateFailureCount: 0},
 		},
 	}
 	service := NewService(repo, seerrStub{}, hydraStub{})
-	service.fetcher = fetcherStub{
-		fileName: "retry.nzb",
-		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Retry (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
-	}
 
 	result, err := service.RetryFailedQueue(context.Background())
 	if err != nil {
@@ -1355,6 +1496,9 @@ func TestRetryFailedQueue(t *testing.T) {
 	}
 	if len(result.ProcessedQueues) != 2 || result.ProcessedQueues[0] != 55 || result.ProcessedQueues[1] != 56 {
 		t.Fatalf("unexpected processed queues %+v", result.ProcessedQueues)
+	}
+	if len(repo.requeued) != 2 || repo.requeued[0] != 55 || repo.requeued[1] != 56 {
+		t.Fatalf("unexpected requeued items %+v", repo.requeued)
 	}
 }
 
@@ -1842,6 +1986,34 @@ func TestSearchUpgradesRequiresMinimumCustomFormatScoreIncrement(t *testing.T) {
 	}
 	if !repo.searchApplied[0].Rejected || repo.searchApplied[0].RejectReason != "upgrade_custom_format_score" {
 		t.Fatalf("expected upgrade_custom_format_score reject, got %+v", repo.searchApplied[0])
+	}
+}
+
+func TestFillMissingEpisodesBatchesAndQueuesNewItems(t *testing.T) {
+	repo := &repoStub{
+		missingShows: []database.ShowWithMissingEpisodes{{
+			TVShowID:  77,
+			TMDBID:    1234,
+			ShowTitle: "Loki",
+		}},
+		batchCreatedIDs: []int64{501, 502},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	service.SetTMDBClient(tmdbFillMissingStub{})
+	service.WorkQueue = newWorkQueueStub()
+
+	result, err := service.FillMissingEpisodes(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ShowsProcessed != 1 || result.EpisodesFound != 2 || result.ItemsCreated != 2 {
+		t.Fatalf("unexpected result %+v", result)
+	}
+	if repo.batchCreatedBatches != 1 {
+		t.Fatalf("expected one batch insert, got %d", repo.batchCreatedBatches)
+	}
+	if depth := service.WorkQueue.Depth(context.Background()); depth != 2 {
+		t.Fatalf("expected two queued items, got %d", depth)
 	}
 }
 

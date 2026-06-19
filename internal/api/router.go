@@ -136,6 +136,7 @@ type WorkflowService interface {
 	ManageFailedQueue(ctx context.Context, action string) (workflow.BulkQueueRetryResult, error)
 	BackfillMetadata(ctx context.Context) (workflow.BackfillMetadataResult, error)
 	FillMissingEpisodes(ctx context.Context) (workflow.FillMissingEpisodesResult, error)
+	PrioritizeTVShowMissing(ctx context.Context, tvShowID int64) (workflow.PrioritizeTVShowResult, error)
 	SearchUpgrades(ctx context.Context) (workflow.UpgradeSearchResult, error)
 	ManualSearch(ctx context.Context, query string) ([]workflow.ManualSearchItem, error)
 	ImportNZBFromPush(ctx context.Context, content []byte, filename, mediaType string) (string, error)
@@ -1149,6 +1150,24 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			publishMutation("library.search", map[string]any{"libraryItemId": id, "candidateCount": result.CandidateCount, "selectedReleaseId": result.SelectedReleaseID})
 		}()
 		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
+	})
+	r.Post("/api/tv-shows/{id}/prioritize-missing", func(w http.ResponseWriter, r *http.Request) {
+		if workflowSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
+			return
+		}
+		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		result, err := workflowSvc.PrioritizeTVShowMissing(r.Context(), id)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		publishMutation("tv.prioritize_missing", map[string]any{"tvShowId": id, "queued": result.Queued, "itemsCreated": result.ItemsCreated})
+		respondJSON(w, http.StatusAccepted, result)
 	})
 	r.Post("/api/library/{id}/reset", func(w http.ResponseWriter, r *http.Request) {
 		if workflowSvc == nil {

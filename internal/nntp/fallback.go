@@ -34,6 +34,12 @@ func NewFallbackSource(sources []NamedArticleSource, retries int) *FallbackSourc
 	if retries < 0 {
 		retries = 0
 	}
+	// With a single provider, retrying the same missing article immediately just
+	// burns another full round-trip and halves throughput under heavy backlog.
+	// Keep multi-provider fallback retries, but avoid duplicate misses on solo setups.
+	if len(filtered) <= 1 {
+		retries = 0
+	}
 	return &FallbackSource{
 		sources: filtered,
 		retries: retries,

@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"regexp"
 	"strconv"
 	"strings"
@@ -24,12 +25,12 @@ func ParseEpisodeFromFilename(name string) (season, episode int) {
 
 // SeasonPackEpisodeMatch pairs a virtual file path with a library item.
 type SeasonPackEpisodeMatch struct {
-	VirtualFileID  int64
+	VirtualFileID   int64
 	VirtualFilePath string
-	FileName       string
-	LibraryItemID  int64
-	SeasonNumber   int
-	EpisodeNumber  int
+	FileName        string
+	LibraryItemID   int64
+	SeasonNumber    int
+	EpisodeNumber   int
 }
 
 // FindSeasonPackMatches looks up library items matching the episode numbers
@@ -37,13 +38,7 @@ type SeasonPackEpisodeMatch struct {
 // It returns one match per (season, episode) pair, preferring library items
 // for the same TV show as the triggering library item.
 func (db *DB) FindSeasonPackMatches(ctx context.Context, selectedReleaseID, triggeringLibraryItemID int64) ([]SeasonPackEpisodeMatch, error) {
-	// Get the TV show ID for the triggering library item.
-	var tvShowID int64
-	err := db.SQL.QueryRowContext(ctx, `
-		SELECT coalesce(e.tv_show_id, 0)
-		FROM library_items li
-		LEFT JOIN episodes e ON e.id = li.episode_id
-		WHERE li.id = $1`, triggeringLibraryItemID).Scan(&tvShowID)
+	tvShowID, _, err := db.resolveSeasonPackShow(ctx, triggeringLibraryItemID)
 	if err != nil || tvShowID == 0 {
 		return nil, nil
 	}
@@ -96,7 +91,6 @@ func (db *DB) FindSeasonPackMatches(ctx context.Context, selectedReleaseID, trig
 			WHERE e.tv_show_id = $1
 			  AND e.season_number = $2
 			  AND e.episode_number = $3
-			  AND li.available = false
 			LIMIT 1`, tvShowID, season, episode).Scan(&libraryItemID)
 		if err != nil {
 			continue // no matching un-fulfilled library item
@@ -120,14 +114,7 @@ func (db *DB) FindSeasonPackMatches(ctx context.Context, selectedReleaseID, trig
 // finds, and marks them available. This turns one whole-show library item into
 // many per-episode items so the library reflects actual episode availability.
 func (db *DB) CreateSeasonPackEpisodeItems(ctx context.Context, selectedReleaseID, triggeringLibraryItemID int64) error {
-	// Resolve the TV show for the triggering item.
-	var tvShowID int64
-	var showTitle string
-	err := db.SQL.QueryRowContext(ctx, `
-		SELECT coalesce(e.tv_show_id, 0), li.title
-		FROM library_items li
-		LEFT JOIN episodes e ON e.id = li.episode_id
-		WHERE li.id = $1`, triggeringLibraryItemID).Scan(&tvShowID, &showTitle)
+	tvShowID, showTitle, err := db.resolveSeasonPackShow(ctx, triggeringLibraryItemID)
 	if err != nil || tvShowID == 0 {
 		return nil
 	}
@@ -231,6 +218,38 @@ func (db *DB) CreateSeasonPackEpisodeItems(ctx context.Context, selectedReleaseI
 			libItemID, srID, ikey)
 	}
 	return nil
+}
+
+func (db *DB) resolveSeasonPackShow(ctx context.Context, triggeringLibraryItemID int64) (int64, string, error) {
+	var (
+		tvShowID  int64
+		showTitle string
+	)
+	err := db.SQL.QueryRowContext(ctx, `
+		SELECT
+			coalesce(
+				e.tv_show_id,
+				(
+					SELECT tv.id
+					FROM tv_shows tv
+					WHERE lower(tv.title) = lower(li.title)
+					ORDER BY tv.id ASC
+					LIMIT 1
+				),
+				0
+			),
+			coalesce(nullif(tv.title, ''), nullif(li.title, ''), '')
+		FROM library_items li
+		LEFT JOIN episodes e ON e.id = li.episode_id
+		LEFT JOIN tv_shows tv ON tv.id = e.tv_show_id
+		WHERE li.id = $1`, triggeringLibraryItemID).Scan(&tvShowID, &showTitle)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return 0, "", nil
+		}
+		return 0, "", err
+	}
+	return tvShowID, showTitle, nil
 }
 
 // FulfillEpisodeLibraryItem creates a selected_release + queue_item for an

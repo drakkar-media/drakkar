@@ -51,6 +51,34 @@ func TestScoreRejectsBadSource(t *testing.T) {
 	}
 }
 
+func TestScoreRejectsForeignLanguageOutsideProfilePreferences(t *testing.T) {
+	result := ScoreWithPreferences(Candidate{
+		Title:      "Yellowstone.S01E01.Spanish.1080p.WEB-DL",
+		Resolution: "1080p",
+		Source:     "web-dl",
+		Language:   "foreign",
+	}, Requirements{Title: "Yellowstone", MediaType: "episode", Year: 2018, SeasonNumber: 1, EpisodeNumber: 1}, Preferences{
+		Languages: []string{"nl", "en"},
+	})
+	if !result.Rejected || result.RejectReason != "wrong_language" {
+		t.Fatalf("unexpected result %+v", result)
+	}
+}
+
+func TestScoreAllowsUnknownLanguageWithProfilePreferences(t *testing.T) {
+	result := ScoreWithPreferences(Candidate{
+		Title:      "Yellowstone.S01E01.1080p.WEB-DL",
+		Resolution: "1080p",
+		Source:     "web-dl",
+		Language:   "unknown",
+	}, Requirements{Title: "Yellowstone", MediaType: "episode", Year: 2018, SeasonNumber: 1, EpisodeNumber: 1}, Preferences{
+		Languages: []string{"nl", "en"},
+	})
+	if result.Rejected {
+		t.Fatalf("unexpected rejection %+v", result)
+	}
+}
+
 func TestScorePrefersExactEpisodeOverSeasonPack(t *testing.T) {
 	exact := Score(Candidate{
 		Title:      "Loki.S01E02.1080p.WEB-DL",
@@ -209,10 +237,10 @@ func TestScoreWithPreferencesIndexerPolicy(t *testing.T) {
 		Language:   "en",
 	}, Requirements{Title: "Dune", MediaType: "movie", Year: 2021}, Preferences{})
 	withPolicy := ScoreWithPreferences(Candidate{
-		Title:             "Dune.2021.1080p.WEB-DL",
-		Resolution:        "1080p",
-		Source:            "web-dl",
-		Language:          "en",
+		Title:              "Dune.2021.1080p.WEB-DL",
+		Resolution:         "1080p",
+		Source:             "web-dl",
+		Language:           "en",
 		IndexerPolicyScore: 25,
 	}, Requirements{Title: "Dune", MediaType: "movie", Year: 2021}, Preferences{})
 	if withPolicy.Score != base.Score+25 {

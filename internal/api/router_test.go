@@ -109,6 +109,9 @@ func (w workflowStub) CreateSeerrSeasonRequest(ctx context.Context, tmdbID int64
 func (w workflowStub) SearchPendingLibrary(ctx context.Context) (workflow.BulkSearchResult, error) {
 	return w.pending, nil
 }
+func (w workflowStub) PrioritizeTVShowMissing(ctx context.Context, tvShowID int64) (workflow.PrioritizeTVShowResult, error) {
+	return workflow.PrioritizeTVShowResult{TVShowID: tvShowID, Queued: 3}, nil
+}
 
 func (w workflowStub) WorkQueueStatus(ctx context.Context) (workflow.WorkQueueStatus, error) {
 	return w.workQueue, nil

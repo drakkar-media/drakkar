@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -625,10 +626,12 @@ func (db *DB) GetQueueRetryTarget(ctx context.Context, queueItemID int64) (Queue
 
 func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLibrarySearchTarget, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
-		select item.library_item_id
+		select item.library_item_id, item.selected
 		from (
 			select distinct on (q.library_item_id)
 				q.library_item_id,
+				(q.selected_release_id is not null and q.state in ($1, $3)) as selected,
+				q.updated_at,
 				q.created_at,
 				q.id
 			from queue_items q
@@ -641,6 +644,10 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLib
 			    -- Normal pending items: no release selected yet.
 			    (q.selected_release_id is null and q.state in ($1, $2)
 			     and (q.state != $2 or q.updated_at < now() - interval '2 hours'))
+			    -- Resume items: release already selected, but queue item is still
+			    -- in requested. These should be dispatched immediately so the
+			    -- worker can continue fetch/import without waiting for retry pass.
+			    or (q.state = $1 and q.selected_release_id is not null)
 			    -- Stranded selected items: release chosen but BullMQ job stalled before
 			    -- download began. Re-pushing is safe: BullMQ deduplicates by libraryItemID
 			    -- so an active job for this item ignores the duplicate push.
@@ -674,9 +681,13 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLib
 			    and tv.id is not null
 			    and coalesce(tv.monitoring_mode, 'all') = 'none'
 			  )
-			order by q.library_item_id, q.created_at asc, q.id asc
+			order by q.library_item_id,
+			         (q.state = $3) desc,
+			         q.updated_at asc,
+			         q.created_at asc,
+			         q.id asc
 		) item
-		order by item.created_at asc, item.id asc`, QueueRequested, QueueFailed, QueueSelected)
+		order by item.selected desc, item.updated_at asc, item.created_at asc, item.id asc`, QueueRequested, QueueFailed, QueueSelected)
 	if err != nil {
 		return nil, err
 	}
@@ -685,12 +696,48 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLib
 	var out []PendingLibrarySearchTarget
 	for rows.Next() {
 		var item PendingLibrarySearchTarget
-		if err := rows.Scan(&item.LibraryItemID); err != nil {
+		if err := rows.Scan(&item.LibraryItemID, &item.Selected); err != nil {
 			return nil, err
 		}
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func (db *DB) CountActiveSearchBacklog(ctx context.Context) (int, error) {
+	var count int
+	err := db.SQL.QueryRowContext(ctx, `
+		select count(distinct q.library_item_id)
+		from queue_items q
+		join library_items li on li.id = q.library_item_id
+		where li.available = false
+		  and li.media_type in ('movie', 'episode', 'tv')
+		  and q.state in ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		QueueRequested,
+		QueueFailed,
+		QueueSelected,
+		QueueFetchingNZB,
+		QueuePreflight,
+		QueueSearching,
+		QueueRanking,
+		QueueIndexing,
+		QueuePublishing,
+	).Scan(&count)
+	return count, err
+}
+
+func (db *DB) CountSelectedQueueBacklog(ctx context.Context) (int, error) {
+	var count int
+	err := db.SQL.QueryRowContext(ctx, `
+		select count(distinct q.library_item_id)
+		from queue_items q
+		join library_items li on li.id = q.library_item_id
+		where li.available = false
+		  and li.media_type in ('movie', 'episode', 'tv')
+		  and q.state = $1`,
+		QueueSelected,
+	).Scan(&count)
+	return count, err
 }
 
 // ListFailedQueueRetryTargets returns failed items eligible for retry.
@@ -1725,10 +1772,18 @@ func isHardRejectReason(reason string) bool {
 	if strings.HasPrefix(r, "archive_") {
 		return true
 	}
+	if strings.Contains(r, "invalid media payload") ||
+		strings.Contains(r, "file header does not match") ||
+		strings.Contains(r, "returned no readable bytes") ||
+		strings.Contains(r, "all zero bytes") {
+		return true
+	}
 	// Missing/expired articles are permanent — NNTP doesn't bring them back.
 	if strings.Contains(r, "missing_articles") ||
 		strings.Contains(r, "nntp_article_unavailable") ||
+		strings.Contains(r, "article missing") ||
 		strings.Contains(r, "article not found") ||
+		strings.Contains(r, "crc mismatch") ||
 		strings.Contains(r, "430") {
 		return true
 	}
@@ -1740,6 +1795,18 @@ func isHardRejectReason(reason string) bool {
 func shouldPersistBlocklistReason(reason string) bool {
 	r := strings.TrimSpace(strings.ToLower(reason))
 	if strings.HasPrefix(r, "archive_") || strings.HasPrefix(r, "manual_") {
+		return true
+	}
+	if strings.Contains(r, "invalid media payload") ||
+		strings.Contains(r, "file header does not match") ||
+		strings.Contains(r, "returned no readable bytes") ||
+		strings.Contains(r, "all zero bytes") {
+		return true
+	}
+	if strings.Contains(r, "article missing") ||
+		strings.Contains(r, "article not found") ||
+		strings.Contains(r, "crc mismatch") ||
+		strings.Contains(r, "430") {
 		return true
 	}
 	// Any NZB fetch HTTP error except 403 — blocklist the URL permanently.
@@ -1772,13 +1839,59 @@ func blocklistReleaseSignatureKey(title, indexerName string, sizeBytes int64, po
 	}, "|")
 }
 
+func blocklistReleaseFamilyKey(title string, sizeBytes int64, postedAt time.Time) string {
+	normalizedTitle := normalizeReleaseTitle(title)
+	if normalizedTitle == "" {
+		return ""
+	}
+	sizeBucket := "0"
+	if sizeBytes > 0 {
+		sizeBucket = fmt.Sprintf("%d", sizeBytes/(1024*1024))
+	}
+	dateBucket := "none"
+	if !postedAt.IsZero() {
+		dateBucket = postedAt.UTC().Format("2006-01-02")
+	}
+	return "release_family:" + strings.Join([]string{
+		normalizedTitle,
+		sizeBucket,
+		dateBucket,
+	}, "|")
+}
+
+func blocklistReleasePatternKey(title string, sizeBytes int64, postedAt time.Time) string {
+	pattern := normalizeReleasePattern(title)
+	if pattern == "" {
+		return ""
+	}
+	sizeBucket := "0"
+	if sizeBytes > 0 {
+		sizeBucket = fmt.Sprintf("%d", sizeBytes/(1024*1024))
+	}
+	dateBucket := "none"
+	if !postedAt.IsZero() {
+		dateBucket = postedAt.UTC().Format("2006-01-02")
+	}
+	return "release_pattern:" + strings.Join([]string{
+		pattern,
+		sizeBucket,
+		dateBucket,
+	}, "|")
+}
+
 func blocklistKeysForRelease(title, externalURL, indexerName string, sizeBytes int64, postedAt time.Time) []string {
-	keys := make([]string, 0, 2)
+	keys := make([]string, 0, 4)
 	if strings.TrimSpace(externalURL) != "" {
 		keys = append(keys, blocklistKeyForExternalURL(externalURL))
 	}
 	if signature := blocklistReleaseSignatureKey(title, indexerName, sizeBytes, postedAt); signature != "" {
 		keys = append(keys, signature)
+	}
+	if pattern := blocklistReleasePatternKey(title, sizeBytes, postedAt); pattern != "" {
+		keys = append(keys, pattern)
+	}
+	if family := blocklistReleaseFamilyKey(title, sizeBytes, postedAt); family != "" {
+		keys = append(keys, family)
 	}
 	return keys
 }
@@ -1795,6 +1908,90 @@ func blockedReleaseReason(blocked map[string]string, candidate SearchCandidateRe
 func normalizeReleaseTitle(value string) string {
 	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ", "{", " ", "}", " ")
 	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(strings.TrimSpace(value)))), " ")
+}
+
+func normalizeReleasePattern(value string) string {
+	tokens := strings.Fields(normalizeReleaseTitle(value))
+	if len(tokens) == 0 {
+		return ""
+	}
+
+	var out []string
+	var sawEpisode bool
+	var sawResolution bool
+	var sawSource bool
+	for _, token := range tokens {
+		switch {
+		case isSeasonEpisodeToken(token):
+			out = append(out, token)
+			sawEpisode = true
+		case isResolutionToken(token):
+			if !sawResolution {
+				out = append(out, token)
+				sawResolution = true
+			}
+		case isSourceToken(token):
+			if !sawSource {
+				out = append(out, canonicalSourceToken(token))
+				sawSource = true
+			}
+		case !sawEpisode:
+			out = append(out, token)
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	return strings.Join(out, " ")
+}
+
+func isSeasonEpisodeToken(token string) bool {
+	if len(token) >= 6 && token[0] == 's' {
+		hasE := false
+		for i := 1; i < len(token); i++ {
+			if token[i] == 'e' {
+				hasE = i > 1 && i < len(token)-1
+				break
+			}
+		}
+		if hasE {
+			return true
+		}
+	}
+	if strings.Count(token, "x") == 1 {
+		parts := strings.Split(token, "x")
+		return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+	}
+	return false
+}
+
+func isResolutionToken(token string) bool {
+	switch token {
+	case "2160p", "1080p", "720p", "576p", "480p":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSourceToken(token string) bool {
+	switch token {
+	case "bluray", "remux", "web", "webdl", "webrip", "hdtv", "bdrip", "dvdrip":
+		return true
+	default:
+		return false
+	}
+}
+
+func canonicalSourceToken(token string) string {
+	switch token {
+	case "web", "webdl", "webrip":
+		return "web"
+	case "bluray", "bdrip":
+		return "bluray"
+	default:
+		return token
+	}
 }
 
 func loadBlocklistMap(ctx context.Context, tx *sql.Tx) (map[string]string, error) {
@@ -1983,6 +2180,17 @@ func (db *DB) ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) 
 	return tx.Commit()
 }
 
+func (db *DB) RequeueSelectedRelease(ctx context.Context, queueItemID int64) error {
+	_, err := db.SQL.ExecContext(ctx, `
+		update queue_items
+		set state = $2, failure_reason = '', updated_at = now()
+		where id = $1
+		  and selected_release_id is not null`,
+		queueItemID, QueueRequested,
+	)
+	return err
+}
+
 // ResetLibraryItemState wipes the selected_release (and its cascading NZB data)
 // for the library item's queue entry, resets the queue state back to 'requested',
 // and marks the library item as unavailable so it re-enters the normal search cycle.
@@ -2095,6 +2303,13 @@ type ShowWithMissingEpisodes struct {
 	ShowTitle string
 }
 
+type MissingEpisodeBatchInput struct {
+	SeasonNumber  int    `json:"season_number"`
+	EpisodeNumber int    `json:"episode_number"`
+	Title         string `json:"title"`
+	AirDate       string `json:"air_date"`
+}
+
 // ListShowsWithMissingEpisodes returns TV shows that either have fewer episode
 // records than TMDB reports, or have episodes with NULL air_date (so we can
 // backfill air dates from TMDB on the next FillMissingEpisodes pass).
@@ -2139,67 +2354,155 @@ func (db *DB) ListShowsWithMissingEpisodes(ctx context.Context) ([]ShowWithMissi
 	return out, rows.Err()
 }
 
+func (db *DB) GetShowWithMissingEpisodes(ctx context.Context, tvShowID int64) (*ShowWithMissingEpisodes, error) {
+	var s ShowWithMissingEpisodes
+	err := db.SQL.QueryRowContext(ctx, `
+		select tv.id, coalesce(tv.tmdb_id, 0), tv.title
+		from tv_shows tv
+		where tv.id = $1
+		  and tv.tmdb_id > 0`, tvShowID,
+	).Scan(&s.TVShowID, &s.TMDBID, &s.ShowTitle)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &s, nil
+}
+
+func (db *DB) ListPendingTVShowLibraryItemIDs(ctx context.Context, tvShowID int64) ([]int64, error) {
+	rows, err := db.SQL.QueryContext(ctx, `
+		select distinct li.id
+		from library_items li
+		join episodes ep on ep.id = li.episode_id
+		join queue_items q on q.library_item_id = li.id
+		where ep.tv_show_id = $1
+		  and li.available = false
+		  and q.state in ($2, $3, $4)
+		order by li.id asc`,
+		tvShowID,
+		QueueRequested,
+		QueueFailed,
+		QueueSelected,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// EnsureEpisodeLibraryItemsBatch upserts episode rows for a season, inserts any
+// missing library_items in bulk, queues them for search, and returns newly
+// created library_item IDs for immediate work-queue dispatch.
+func (db *DB) EnsureEpisodeLibraryItemsBatch(ctx context.Context, tvShowID int64, showTitle string, episodes []MissingEpisodeBatchInput) ([]int64, error) {
+	if len(episodes) == 0 {
+		return nil, nil
+	}
+	payload, err := json.Marshal(episodes)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := db.SQL.QueryContext(ctx, `
+		WITH input AS (
+			SELECT
+				x.season_number,
+				x.episode_number,
+				coalesce(x.title, '') AS title,
+				CASE
+					WHEN length(coalesce(x.air_date, '')) >= 10 THEN substring(x.air_date from 1 for 10)::date
+					ELSE NULL
+				END AS air_date
+			FROM jsonb_to_recordset($3::jsonb) AS x(
+				season_number integer,
+				episode_number integer,
+				title text,
+				air_date text
+			)
+			WHERE x.episode_number > 0
+		),
+		upserted_episodes AS (
+			INSERT INTO episodes (tv_show_id, season_number, episode_number, title, air_date)
+			SELECT $1, i.season_number, i.episode_number, i.title, i.air_date
+			FROM input i
+			ON CONFLICT (tv_show_id, season_number, episode_number) DO UPDATE
+			  SET title    = CASE WHEN excluded.title != '' THEN excluded.title ELSE episodes.title END,
+			      air_date = CASE WHEN excluded.air_date IS NOT NULL THEN excluded.air_date ELSE episodes.air_date END
+			RETURNING id
+		),
+		episode_rows AS (
+			SELECT e.id, e.season_number, e.episode_number
+			FROM episodes e
+			JOIN input i
+			  ON i.season_number = e.season_number
+			 AND i.episode_number = e.episode_number
+			WHERE e.tv_show_id = $1
+		),
+		inserted_library AS (
+			INSERT INTO library_items (media_type, episode_id, title)
+			SELECT
+				'episode',
+				er.id,
+				format('%s S%02sE%02s', $2, er.season_number, er.episode_number)
+			FROM episode_rows er
+			ON CONFLICT (episode_id) WHERE episode_id IS NOT NULL DO NOTHING
+			RETURNING id, episode_id
+		),
+		queued AS (
+			INSERT INTO queue_items (library_item_id, state, idempotency_key)
+			SELECT
+				il.id,
+				'requested',
+				format('tmdb-ep-%s-%s-%s', $1::bigint, e.season_number, e.episode_number)
+			FROM inserted_library il
+			JOIN episodes e ON e.id = il.episode_id
+			ON CONFLICT (idempotency_key) DO UPDATE SET
+				state      = CASE WHEN queue_items.state = 'failed' THEN 'requested' ELSE queue_items.state END,
+				updated_at = CASE WHEN queue_items.state = 'failed' THEN now() ELSE queue_items.updated_at END
+			RETURNING library_item_id
+		)
+		SELECT library_item_id
+		FROM queued
+		ORDER BY library_item_id ASC`, tvShowID, showTitle, payload)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var createdIDs []int64
+	for rows.Next() {
+		var libraryItemID int64
+		if err := rows.Scan(&libraryItemID); err != nil {
+			return nil, err
+		}
+		createdIDs = append(createdIDs, libraryItemID)
+	}
+	return createdIDs, rows.Err()
+}
+
 // EnsureEpisodeLibraryItem creates an episode record and a library_item for the
 // given TV show + season + episode if they don't already exist, then queues the
 // item for search. Returns (true, nil) when a new item was created.
 func (db *DB) EnsureEpisodeLibraryItem(ctx context.Context, tvShowID int64, showTitle string, seasonNum, episodeNum int, episodeTitle, airDate string) (bool, error) {
-	// Upsert the episode record — also store the air_date when provided.
-	var episodeID int64
-	var airDateVal interface{}
-	if len(airDate) >= 10 {
-		airDateVal = airDate[:10]
-	}
-	err := db.SQL.QueryRowContext(ctx, `
-		INSERT INTO episodes (tv_show_id, season_number, episode_number, title, air_date)
-		VALUES ($1, $2, $3, $4, $5::date)
-		ON CONFLICT (tv_show_id, season_number, episode_number) DO UPDATE
-		  SET title    = CASE WHEN excluded.title != '' THEN excluded.title ELSE episodes.title END,
-		      air_date = CASE WHEN excluded.air_date IS NOT NULL THEN excluded.air_date ELSE episodes.air_date END
-		RETURNING id`, tvShowID, seasonNum, episodeNum, episodeTitle, airDateVal).Scan(&episodeID)
+	createdIDs, err := db.EnsureEpisodeLibraryItemsBatch(ctx, tvShowID, showTitle, []MissingEpisodeBatchInput{{
+		SeasonNumber:  seasonNum,
+		EpisodeNumber: episodeNum,
+		Title:         episodeTitle,
+		AirDate:       airDate,
+	}})
 	if err != nil {
 		return false, err
 	}
-
-	// Check if a library item already exists for this episode.
-	var existingID int64
-	if scanErr := db.SQL.QueryRowContext(ctx, `SELECT id FROM library_items WHERE episode_id = $1`, episodeID).Scan(&existingID); scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
-		return false, scanErr
-	}
-	if existingID > 0 {
-		return false, nil // already tracked
-	}
-
-	// Create the library_item.
-	title := showTitle
-	if seasonNum > 0 && episodeNum > 0 {
-		title = fmt.Sprintf("%s S%02dE%02d", showTitle, seasonNum, episodeNum)
-	}
-	var libItemID int64
-	err = db.SQL.QueryRowContext(ctx, `
-		INSERT INTO library_items (media_type, episode_id, title)
-		VALUES ('episode', $1, $2)
-		ON CONFLICT (episode_id) WHERE episode_id IS NOT NULL DO NOTHING
-		RETURNING id`, episodeID, title).Scan(&libItemID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil // concurrent insert won the race; item already tracked
-		}
-		return false, err
-	}
-	if libItemID == 0 {
-		return false, nil
-	}
-
-	// Queue it for search.
-	ikey := fmt.Sprintf("tmdb-ep-%d-%d-%d", tvShowID, seasonNum, episodeNum)
-	_, err = db.SQL.ExecContext(ctx, `
-		INSERT INTO queue_items (library_item_id, state, idempotency_key)
-		VALUES ($1, 'requested', $2)
-		ON CONFLICT (idempotency_key) DO UPDATE SET
-			state      = CASE WHEN queue_items.state = 'failed' THEN 'requested' ELSE queue_items.state END,
-			updated_at = CASE WHEN queue_items.state = 'failed' THEN now() ELSE queue_items.updated_at END`,
-		libItemID, ikey)
-	return err == nil, err
+	return len(createdIDs) > 0, nil
 }
 
 // SetTVShowMonitoringMode updates the monitoring_mode column on a tv_show.

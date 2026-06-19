@@ -58,22 +58,19 @@ func TestFallbackSourceFallsThroughProviders(t *testing.T) {
 	}
 }
 
-func TestFallbackSourceRetriesSingleProvider(t *testing.T) {
+func TestFallbackSourceDoesNotRetrySingleProvider(t *testing.T) {
 	only := &failThenOKSource{
 		errs: []error{errors.New("timeout")},
 		body: []byte("retry-ok"),
 	}
 	source := NewFallbackSource([]NamedArticleSource{{Name: "solo", Source: only}}, 1)
 
-	body, err := source.Body(context.Background(), "<msg1>")
-	if err != nil {
-		t.Fatal(err)
+	_, err := source.Body(context.Background(), "<msg1>")
+	if err == nil {
+		t.Fatal("expected timeout")
 	}
-	if string(body) != "retry-ok" {
-		t.Fatalf("got %q", string(body))
-	}
-	if only.calls != 2 {
-		t.Fatalf("expected 2 calls, got %d", only.calls)
+	if only.calls != 1 {
+		t.Fatalf("expected 1 call, got %d", only.calls)
 	}
 }
 

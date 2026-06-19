@@ -145,8 +145,8 @@ type BlockRule struct {
 // ScoreWithPreferences.
 type unifiedRule struct {
 	id          int64
-	name        string   // custom format name; empty for block rules
-	patternType string   // "regex" | "release_group" | "title_pattern" | "missing_release_group"
+	name        string // custom format name; empty for block rules
+	patternType string // "regex" | "release_group" | "title_pattern" | "missing_release_group"
 	pattern     string
 	mediaType   string // "movie" | "tv" | "both"
 	action      string // "score" | "penalty" | "block"
@@ -221,12 +221,12 @@ type Preferences struct {
 }
 
 type Result struct {
-	Score                  int
-	CustomFormatScore      int
-	Explanations           []string
-	CompatibilityWarnings  []string
-	Rejected               bool
-	RejectReason           string
+	Score                 int
+	CustomFormatScore     int
+	Explanations          []string
+	CompatibilityWarnings []string
+	Rejected              bool
+	RejectReason          string
 }
 
 // ── Scoring entry points ─────────────────────────────────────────────────────
@@ -289,6 +289,9 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 	}
 	if sizeReject := rejectBySize(candidate, prefs, required.RuntimeMinutes); sizeReject != "" {
 		return Result{Rejected: true, RejectReason: sizeReject, Explanations: []string{"Rejected: size was outside configured MB/min limits."}}
+	}
+	if rejectLanguageMismatch(candidate.Language, prefs) {
+		return Result{Rejected: true, RejectReason: "wrong_language", Explanations: []string{"Rejected: detected language did not match the profile language preferences."}}
 	}
 
 	// ── Year / episode match ─────────────────────────────────────────────────
@@ -745,6 +748,23 @@ func scoreLanguage(language string, prefs Preferences) int {
 	default:
 		return -80
 	}
+}
+
+func rejectLanguageMismatch(language string, prefs Preferences) bool {
+	if len(prefs.Languages) == 0 {
+		return false
+	}
+	normalized := strings.ToLower(strings.TrimSpace(language))
+	switch normalized {
+	case "", "unknown", "multi":
+		return false
+	}
+	for _, preferred := range prefs.Languages {
+		if strings.EqualFold(strings.TrimSpace(preferred), normalized) {
+			return false
+		}
+	}
+	return true
 }
 
 func scoreByPreference(value string, ordered []string, base int, step int) (int, bool) {

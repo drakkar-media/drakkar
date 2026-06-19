@@ -252,6 +252,20 @@
     }
   }
 
+  async function prioritizeMissingForShow() {
+    if (!localDetail?.tvShowId) return;
+    working = true;
+    try {
+      const result = await api.prioritizeTVShowMissing(localDetail.tvShowId);
+      toastSuccess(`Prioritized show — queued ${result.queued}, created ${result.itemsCreated}`);
+      await loadDetail();
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : String(error));
+    } finally {
+      working = false;
+    }
+  }
+
   async function downloadSubtitle(candidateID: number) {
     if (!libraryMatch) return;
     working = true;
@@ -323,6 +337,12 @@
                 <Search size={15} />
                 {libraryMatch.available ? 'Find Upgrade' : 'Search'}
               </Button>
+              {#if localDetail?.tvShowId && (libraryMatch.missingCount ?? 0) > 0}
+                <Button kind="secondary" on:click={prioritizeMissingForShow} disabled={working}>
+                  <Download size={15} />
+                  Prioritize Missing
+                </Button>
+              {/if}
               <Button kind="secondary" on:click={() => runSubtitleSearch()} disabled={working}>
                 <Languages size={15} />
                 Subs

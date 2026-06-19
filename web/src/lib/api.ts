@@ -33,7 +33,8 @@ import type {
   ReleaseBlockRule,
   BlockTestResult,
   IndexerPolicy,
-  SubtitleProfile
+  SubtitleProfile,
+  PrioritizeTVShowResult
 } from '$lib/types';
 
 function baseURL() {
@@ -337,6 +338,8 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode })
     }),
+  prioritizeTVShowMissing: (tvShowId: number) =>
+    request<PrioritizeTVShowResult>(`/api/tv-shows/${tvShowId}/prioritize-missing`, { method: 'POST' }),
   // Auth
   me: () => request<User>('/api/auth/me'),
   logout: () => fetch(`${baseURL()}/api/auth/logout`, { method: 'POST' }),

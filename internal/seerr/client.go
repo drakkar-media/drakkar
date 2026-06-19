@@ -3,7 +3,9 @@ package seerr
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -18,6 +20,8 @@ type Client struct {
 	apiKey     string
 	httpClient *http.Client
 }
+
+var errRequestNotVisible = errors.New("seerr request not yet visible")
 
 type Request struct {
 	ID            int64
@@ -159,12 +163,19 @@ func (c *Client) fetchRequestPage(ctx context.Context, skip, take int) (requestL
 		return requestListPayload{}, err
 	}
 	defer resp.Body.Close()
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return requestListPayload{}, readErr
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return requestListPayload{}, fmt.Errorf("seerr request list status %d", resp.StatusCode)
+		return requestListPayload{}, classifySeerrHTTPError("request list", resp.StatusCode, body)
+	}
+	if err := detectSeerrResponseError("request list", resp.StatusCode, body); err != nil {
+		return requestListPayload{}, err
 	}
 
 	var payload requestListPayload
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		return requestListPayload{}, err
 	}
 	return payload, nil
@@ -178,27 +189,10 @@ func (c *Client) CreateRequest(ctx context.Context, mediaType string, tmdbID int
 	if mediaType == "tv" {
 		body["seasons"] = "all"
 	}
-	data, err := json.Marshal(body)
-	if err != nil {
-		return err
+	match := func(request Request) bool {
+		return strings.EqualFold(request.Type, mediaType) && request.TMDBID == tmdbID
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/request", strings.NewReader(string(data)))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("X-Api-Key", c.apiKey)
-	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("seerr create request status %d", resp.StatusCode)
-	}
-	return nil
+	return c.createRequestWithRecovery(ctx, body, match)
 }
 
 func (c *Client) CreateTVSeasonRequest(ctx context.Context, tmdbID int64, seasons []int) error {
@@ -207,10 +201,55 @@ func (c *Client) CreateTVSeasonRequest(ctx context.Context, tmdbID int64, season
 		"mediaId":   tmdbID,
 		"seasons":   seasons,
 	}
+	expected := make(map[int]struct{}, len(seasons))
+	for _, season := range seasons {
+		expected[season] = struct{}{}
+	}
+	match := func(request Request) bool {
+		if !strings.EqualFold(request.Type, "tv") || request.TMDBID != tmdbID {
+			return false
+		}
+		if len(expected) == 0 {
+			return true
+		}
+		_, ok := expected[request.SeasonNumber]
+		return ok
+	}
+	return c.createRequestWithRecovery(ctx, body, match)
+}
+
+func (c *Client) createRequestWithRecovery(ctx context.Context, body map[string]any, match func(Request) bool) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
+	if err := c.postCreateRequest(ctx, data); err != nil {
+		if !isRetryableSeerrError(err) {
+			return err
+		}
+		if waitErr := c.waitForVisibleRequest(ctx, match); waitErr == nil {
+			return nil
+		}
+		if err := c.postCreateRequest(ctx, data); err != nil {
+			if !isRetryableSeerrError(err) {
+				return err
+			}
+			if waitErr := c.waitForVisibleRequest(ctx, match); waitErr == nil {
+				return nil
+			}
+			return err
+		}
+	}
+	if err := c.waitForVisibleRequest(ctx, match); err != nil {
+		if errors.Is(err, errRequestNotVisible) || isRetryableSeerrError(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func (c *Client) postCreateRequest(ctx context.Context, data []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/request", strings.NewReader(string(data)))
 	if err != nil {
 		return err
@@ -224,10 +263,46 @@ func (c *Client) CreateTVSeasonRequest(ctx context.Context, tmdbID int64, season
 		return err
 	}
 	defer resp.Body.Close()
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return readErr
+	}
+	if resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusUnprocessableEntity {
+		return nil
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("seerr create season request status %d", resp.StatusCode)
+		return classifySeerrHTTPError("create request", resp.StatusCode, body)
+	}
+	if err := detectSeerrResponseError("create request", resp.StatusCode, body); err != nil {
+		return err
 	}
 	return nil
+}
+
+func (c *Client) waitForVisibleRequest(ctx context.Context, match func(Request) bool) error {
+	backoff := []time.Duration{0, 1 * time.Second, 2 * time.Second, 3 * time.Second}
+	for _, delay := range backoff {
+		if delay > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		requests, err := c.PendingRequests(ctx)
+		if err != nil {
+			if isRetryableSeerrError(err) {
+				continue
+			}
+			return err
+		}
+		for _, request := range requests {
+			if match(request) {
+				return nil
+			}
+		}
+	}
+	return errRequestNotVisible
 }
 
 // NotifyAvailable marks a media item as available in Seerr/Overseerr.
@@ -287,6 +362,95 @@ func (c *Client) NotifyAvailable(ctx context.Context, tmdbID int64, mediaType st
 		return fmt.Errorf("seerr notify available status %d", postResp.StatusCode)
 	}
 	return nil
+}
+
+func classifySeerrHTTPError(action string, statusCode int, body []byte) error {
+	snippet := summarizeSeerrBody(body)
+	switch statusCode {
+	case 520, 521, 522, 523:
+		if snippet != "" {
+			return fmt.Errorf("seerr %s cloudflare unavailable status %d: %s", action, statusCode, snippet)
+		}
+		return fmt.Errorf("seerr %s cloudflare unavailable status %d", action, statusCode)
+	case 524:
+		if snippet != "" {
+			return fmt.Errorf("seerr %s cloudflare timeout status %d: %s", action, statusCode, snippet)
+		}
+		return fmt.Errorf("seerr %s cloudflare timeout status %d", action, statusCode)
+	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		if snippet != "" {
+			return fmt.Errorf("seerr %s status %d: %s", action, statusCode, snippet)
+		}
+	}
+	if snippet != "" {
+		return fmt.Errorf("seerr %s status %d: %s", action, statusCode, snippet)
+	}
+	return fmt.Errorf("seerr %s status %d", action, statusCode)
+}
+
+func detectSeerrResponseError(action string, statusCode int, body []byte) error {
+	text := strings.ToLower(strings.TrimSpace(string(body)))
+	switch {
+	case strings.Contains(text, "cloudflare") && strings.Contains(text, "524"):
+		return fmt.Errorf("seerr %s cloudflare timeout status %d", action, statusCode)
+	case strings.Contains(text, "cloudflare") && strings.Contains(text, "522"):
+		return fmt.Errorf("seerr %s cloudflare unavailable status %d", action, statusCode)
+	case strings.Contains(text, "cloudflare") && strings.Contains(text, "timed out"):
+		return fmt.Errorf("seerr %s cloudflare timeout status %d", action, statusCode)
+	case strings.Contains(text, "<html") && strings.Contains(text, "cloudflare"):
+		return fmt.Errorf("seerr %s cloudflare unavailable status %d", action, statusCode)
+	case strings.Contains(text, "<html") && strings.Contains(text, "bad gateway"):
+		return fmt.Errorf("seerr %s status %d: bad gateway", action, statusCode)
+	case strings.Contains(text, "<html") && strings.Contains(text, "gateway timeout"):
+		return fmt.Errorf("seerr %s status %d: gateway timeout", action, statusCode)
+	default:
+		return nil
+	}
+}
+
+func isRetryableSeerrError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(text, "timeout"),
+		strings.Contains(text, "deadline exceeded"),
+		strings.Contains(text, "status 500"),
+		strings.Contains(text, "status 502"),
+		strings.Contains(text, "status 503"),
+		strings.Contains(text, "status 504"),
+		strings.Contains(text, "status 520"),
+		strings.Contains(text, "status 521"),
+		strings.Contains(text, "status 522"),
+		strings.Contains(text, "status 523"),
+		strings.Contains(text, "status 524"),
+		strings.Contains(text, "cloudflare"),
+		strings.Contains(text, "bad gateway"),
+		strings.Contains(text, "gateway timeout"),
+		strings.Contains(text, "connection refused"),
+		strings.Contains(text, "no such host"):
+		return true
+	default:
+		return false
+	}
+}
+
+func summarizeSeerrBody(body []byte) string {
+	text := strings.TrimSpace(string(body))
+	if text == "" {
+		return ""
+	}
+	text = strings.ReplaceAll(text, "\n", " ")
+	text = strings.ReplaceAll(text, "\r", " ")
+	text = strings.Join(strings.Fields(text), " ")
+	if len(text) > 160 {
+		text = text[:160]
+	}
+	return text
 }
 
 func parseYear(value string) int {

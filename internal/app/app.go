@@ -65,15 +65,37 @@ const (
 const (
 	backgroundHealthCheckInterval = 15 * time.Minute
 	backgroundDeepHealthBatchSize = 48
+	backgroundDeepHealthSkipDepth = 150
+	pendingQueueDispatchInterval  = 1 * time.Minute
 )
 
+func boundedTVRSSInterval(minutes int) time.Duration {
+	interval := time.Duration(minutes) * time.Minute
+	if interval < 15*time.Minute {
+		return 15 * time.Minute
+	}
+	return interval
+}
+
+func boundedMovieRSSInterval(minutes int) time.Duration {
+	interval := time.Duration(minutes) * time.Minute
+	if interval < 30*time.Minute {
+		return 30 * time.Minute
+	}
+	return interval
+}
+
 type runtimeStatus struct {
+	mu     sync.RWMutex
 	status api.Status
 }
 
 type fileSettingsService struct {
-	path string
-	mu   sync.Mutex
+	path    string
+	mu      sync.Mutex
+	applier interface {
+		ApplySettings(ctx context.Context, cfg config.Settings) error
+	}
 }
 
 func (s *fileSettingsService) GetSettings(_ context.Context) (config.Settings, error) {
@@ -88,20 +110,42 @@ func (s *fileSettingsService) UpdateSettings(_ context.Context, cfg config.Setti
 	if err := config.Save(s.path, cfg); err != nil {
 		return config.Settings{}, err
 	}
-	return config.Load(s.path)
+	loaded, err := config.Load(s.path)
+	if err != nil {
+		return config.Settings{}, err
+	}
+	if s.applier != nil {
+		if err := s.applier.ApplySettings(context.Background(), loaded); err != nil {
+			return config.Settings{}, err
+		}
+	}
+	return loaded, nil
 }
 
 type taskScheduleStatusService struct {
+	mu                          sync.RWMutex
 	db                          *database.DB
 	tvRssSyncIntervalMinutes    int
 	movieRssSyncIntervalMinutes int
 }
 
 func (s *runtimeStatus) Status() api.Status {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return s.status
 }
 
+func (s *runtimeStatus) SetStatus(status api.Status) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status = status
+}
+
 func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]api.TaskSchedule, error) {
+	s.mu.RLock()
+	tvRSSInterval := s.tvRssSyncIntervalMinutes
+	movieRSSInterval := s.movieRssSyncIntervalMinutes
+	s.mu.RUnlock()
 	cursorRows, err := s.db.ListMaintenanceCursors(ctx)
 	if err != nil {
 		return nil, err
@@ -116,9 +160,9 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 	}
 	defs := []api.TaskSchedule{
 		{ID: taskSeerrSync, Label: "Sync Seerr Requests", Group: "Indexing", Interval: "10m", Automated: true, LastRunState: "idle"},
-		{ID: taskPendingQueuePush, Label: "Dispatch Pending Queue", Group: "Indexing", Interval: "5m", Automated: true, LastRunState: "idle"},
-		{ID: maintenanceRecentTVTask, Label: "Recent TV Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", s.tvRssSyncIntervalMinutes), Automated: true, LastRunState: "idle"},
-		{ID: maintenanceRecentMovieTask, Label: "Recent Movie Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", s.movieRssSyncIntervalMinutes), Automated: true, LastRunState: "idle"},
+		{ID: taskPendingQueuePush, Label: "Dispatch Pending Queue", Group: "Indexing", Interval: "1m", Automated: true, LastRunState: "idle"},
+		{ID: maintenanceRecentTVTask, Label: "Recent TV Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", tvRSSInterval), Automated: true, LastRunState: "idle"},
+		{ID: maintenanceRecentMovieTask, Label: "Recent Movie Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", movieRSSInterval), Automated: true, LastRunState: "idle"},
 		{ID: taskRetryFailedQueue, Label: "Retry Failed Queue", Group: "Indexing", Interval: "15m", Automated: true, LastRunState: "idle"},
 		{ID: taskRepublishPending, Label: "Republish Pending", Group: "Publishing", Interval: "30m", Automated: true, LastRunState: "idle"},
 		{ID: taskResetOrphaned, Label: "Reset Orphaned Available Items", Group: "Publishing", Interval: "Manual", Automated: false, LastRunState: "idle"},
@@ -138,6 +182,13 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 		}
 	}
 	return defs, nil
+}
+
+func (s *taskScheduleStatusService) SetRSSIntervals(tvMinutes, movieMinutes int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tvRssSyncIntervalMinutes = tvMinutes
+	s.movieRssSyncIntervalMinutes = movieMinutes
 }
 
 func Run(ctx context.Context, logger zerolog.Logger) error {
@@ -190,9 +241,10 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	db.ReadAhead = stream.NewReadAheadManager(rt.ReadAheadLimitBytes)
 	db.ReadAhead.SetArticleBufferSize(cfg.Usenet.ArticleBufferSize)
 	var (
-		articleSources []nntp.NamedArticleSource
-		pooledSources  []*nntp.PooledSource
-		totalWorkers   int
+		articleSources         []nntp.NamedArticleSource
+		pooledSources          []*nntp.PooledSource
+		totalWorkers           int
+		maxDownloadConnections int
 	)
 	for _, provider := range cfg.Usenet.Providers {
 		if !provider.Enabled || provider.Host == "" {
@@ -208,7 +260,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		totalWorkers += max(provider.MaxConnections, 1)
 	}
 	if len(articleSources) > 0 {
-		maxDownloadConnections := cfg.Usenet.MaxDownloadConnections
+		maxDownloadConnections = cfg.Usenet.MaxDownloadConnections
 		if maxDownloadConnections <= 0 {
 			maxDownloadConnections = totalWorkers
 		}
@@ -268,10 +320,18 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	queueSvc := queue.NewService(db, nzb.NewImporter(rt.StagingNZBPath, rt.NZBUploadLimitBytes))
 	seerrClient := seerr.NewClient(cfg.Seerr)
 	hydraClient := hydra.NewClient(cfg.NZBHydra2)
-	if cfg.Indexer.SearchDelayMs > 0 {
-		hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)
-	}
+	hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)
 	workflowSvc := workflow.NewService(db, seerrClient, hydraClient)
+	if maxDownloadConnections > 0 {
+		importWorkers := (maxDownloadConnections + 2) / 3
+		if importWorkers < 2 {
+			importWorkers = 2
+		}
+		if importWorkers > 6 {
+			importWorkers = 6
+		}
+		workflowSvc.SetImportConcurrency(importWorkers)
+	}
 	if checker, ok := db.SegmentFetcher.(database.SegmentChecker); ok {
 		workflowSvc.SetEarlyChecker(checker.Exists)
 	}
@@ -285,7 +345,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		defer cancel()
 		return db.PreflightCheckFirstSegments(preflightCtx, *item.NZBDocumentID)
 	})
-	wq, err := workflow.NewWorkQueue(3, valkey, wqWorkerClient)
+	wq, err := newDynamicWorkQueue(cfg.Indexer.BackgroundSearchWorkers, valkey, wqWorkerClient, logger)
 	if err != nil {
 		return fmt.Errorf("workqueue init: %w", err)
 	}
@@ -450,10 +510,21 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		blockCache: blockCache,
 	}
 	taskScheduleSvc := &taskScheduleStatusService{db: db, tvRssSyncIntervalMinutes: cfg.Indexer.TvRssSyncIntervalMinutes, movieRssSyncIntervalMinutes: cfg.Indexer.MovieRssSyncIntervalMinutes}
+	recentTaskMgr := newRecurringTaskManager(ctx, logger)
+	liveSettings := &liveSettingsController{
+		rt:            rt,
+		startedAt:     startedAt,
+		status:        statusSvc,
+		taskSchedules: taskScheduleSvc,
+		workflowSvc:   workflowSvc,
+		hydraClient:   hydraClient,
+		workQueue:     wq,
+		recentTasks:   recentTaskMgr,
+	}
 
 	server := &http.Server{
 		Addr:              rt.HTTPAddress,
-		Handler:           api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, jellyfinClient, &fileSettingsService{path: rt.SettingsPath}, db, metricsColl),
+		Handler:           api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, jellyfinClient, &fileSettingsService{path: rt.SettingsPath, applier: liveSettings}, db, metricsColl),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -467,8 +538,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// Start the BullMQ worker pool in the background.
 	go func() {
 		if err := workflowSvc.WorkQueue.Start(ctx, func(qCtx context.Context, libraryItemID int64) {
-			if _, err := workflowSvc.SearchLibrary(qCtx, libraryItemID); err != nil {
-				logger.Error().Err(err).Int64("libraryItemId", libraryItemID).Msg("workqueue: search error (see above for details)")
+			_ = qCtx
+			jobCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+			defer cancel()
+			if err := workflowSvc.ProcessLibraryItem(jobCtx, libraryItemID); err != nil {
+				logger.Error().Err(err).Int64("libraryItemId", libraryItemID).Msg("workqueue: processing error (see above for details)")
 			}
 		}); err != nil && err != context.Canceled {
 			logger.Error().Err(err).Msg("workqueue: worker stopped unexpectedly")
@@ -544,8 +618,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		logger.Info().Int("seen", result.Seen).Int("created", result.Created).Msg("seerr sync complete")
 	}
 
-	// runPendingDispatch pushes ALL pending items to the WorkQueue for concurrent
-	// 3-worker processing. Using SearchPendingLibrary() (WorkQueue) instead of
+	// runPendingDispatch pushes ALL pending items to WorkQueue for concurrent
+	// configured-worker processing. Using SearchPendingLibrary() (WorkQueue) instead of
 	// SearchPendingBatch() (sequential) increases throughput from ~45 items/hour
 	// to ~3000+ items/hour — same approach as Radarr's parallel indexer dispatch.
 	runPendingDispatch := func() {
@@ -600,9 +674,22 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 				healthy++
 			}
 		}
-		deepResult, err := runNZBHealthCheckBatch(ctx, db, workflowSvc, publicationSvc, logger, backgroundDeepHealthBatchSize, false)
-		if err != nil {
-			logger.Error().Err(err).Msg("monitoring: background deep health check error")
+		deepResult := maintenance.Result{TaskName: "nzb-health-check"}
+		backlog, backlogErr := db.CountActiveSearchBacklog(ctx)
+		switch {
+		case backlogErr != nil:
+			logger.Warn().Err(backlogErr).Msg("monitoring: backlog probe failed; running deep health check")
+			deepResult, err = runNZBHealthCheckBatch(ctx, db, workflowSvc, publicationSvc, logger, backgroundDeepHealthBatchSize, false)
+			if err != nil {
+				logger.Error().Err(err).Msg("monitoring: background deep health check error")
+			}
+		case backlog >= backgroundDeepHealthSkipDepth:
+			logger.Info().Int("backlog", backlog).Msg("monitoring: skipping background deep health check while queue backlog is high")
+		default:
+			deepResult, err = runNZBHealthCheckBatch(ctx, db, workflowSvc, publicationSvc, logger, backgroundDeepHealthBatchSize, false)
+			if err != nil {
+				logger.Error().Err(err).Msg("monitoring: background deep health check error")
+			}
 		}
 		_ = db.TouchMaintenanceCursor(ctx, taskHealthCheck, time.Now().UTC().Format(time.RFC3339))
 		broker.Publish(map[string]any{
@@ -660,23 +747,15 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// background worker: Seerr sync every 10 min. Sync imports requests only;
 	// discovery happens via recent-feed polling or explicit/manual search.
 	startRecurring(taskSeerrSync, 10*time.Minute, true, runSyncOnce)
-	startRecurring(taskPendingQueuePush, 5*time.Minute, true, runPendingDispatch) // was 20m; push all pending every 5m for Radarr-like throughput
+	startRecurring(taskPendingQueuePush, pendingQueueDispatchInterval, true, runPendingDispatch)
 
-	// TV RSS interval — Sonarr default 15 min, minimum 15 min.
-	tvRssInterval := time.Duration(cfg.Indexer.TvRssSyncIntervalMinutes) * time.Minute
-	if tvRssInterval < 15*time.Minute {
-		tvRssInterval = 15 * time.Minute
-	}
-	// Movie RSS interval — Radarr default 30 min, minimum 30 min.
-	movieRssInterval := time.Duration(cfg.Indexer.MovieRssSyncIntervalMinutes) * time.Minute
-	if movieRssInterval < 30*time.Minute {
-		movieRssInterval = 30 * time.Minute
-	}
+	tvRssInterval := boundedTVRSSInterval(cfg.Indexer.TvRssSyncIntervalMinutes)
+	movieRssInterval := boundedMovieRSSInterval(cfg.Indexer.MovieRssSyncIntervalMinutes)
 
-	startRecurring(maintenanceRecentTVTask, tvRssInterval, shouldRunRecentOnStartup(ctx, db, maintenanceRecentTVTask, tvRssInterval, time.Duration(cfg.NZBHydra2.FeedCacheTTLSeconds)*time.Second, time.Now().UTC()), func() {
+	recentTaskMgr.Start(maintenanceRecentTVTask, tvRssInterval, shouldRunRecentOnStartup(ctx, db, maintenanceRecentTVTask, tvRssInterval, time.Duration(cfg.NZBHydra2.FeedCacheTTLSeconds)*time.Second, time.Now().UTC()), func() {
 		runRecentPass("tv")
 	})
-	startRecurring(maintenanceRecentMovieTask, movieRssInterval, shouldRunRecentOnStartup(ctx, db, maintenanceRecentMovieTask, movieRssInterval, time.Duration(cfg.NZBHydra2.FeedCacheTTLSeconds)*time.Second, time.Now().UTC()), func() {
+	recentTaskMgr.Start(maintenanceRecentMovieTask, movieRssInterval, shouldRunRecentOnStartup(ctx, db, maintenanceRecentMovieTask, movieRssInterval, time.Duration(cfg.NZBHydra2.FeedCacheTTLSeconds)*time.Second, time.Now().UTC()), func() {
 		runRecentPass("movie")
 	})
 
