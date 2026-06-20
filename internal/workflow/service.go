@@ -51,6 +51,7 @@ type Repository interface {
 	GetShowWithMissingEpisodes(ctx context.Context, tvShowID int64) (*database.ShowWithMissingEpisodes, error)
 	ListPendingTVShowLibraryItemIDs(ctx context.Context, tvShowID int64) ([]int64, error)
 	ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]database.FailedQueueRetryTarget, error)
+	ListSelectedQueueRetryTargets(ctx context.Context, limit int) ([]database.SelectedQueueRetryTarget, error)
 	ListUpgradableLibraryItems(ctx context.Context) ([]int64, error)
 	ClearFailedQueueItems(ctx context.Context) (int, error)
 	GetQueueRetryTarget(ctx context.Context, queueItemID int64) (database.QueueRetryTarget, error)
@@ -136,11 +137,15 @@ type Service struct {
 	profileCacheAt     map[string]time.Time
 	profileCachedPrefs map[string]ranking.Preferences
 
-	// importSem limits fetchAndImportSelectedRelease to 1 concurrent execution.
-	// Like nzbdav's SemaphoreSlim(1,1): parallel searching is fine, but only one
-	// NZB may go through preflight + publish at a time to avoid exhausting the
-	// NNTP connection pool.
+	// importSem is kept for ImportNZBFromPush (SABnzbd push path) only.
+	// The main download path uses downloader instead.
 	importSem chan struct{}
+
+	// downloader is a priority download queue processed by dedicated workers
+	// (started in app.go). Replaces the importSem lottery so downloads execute
+	// in priority/FIFO order — like SABnzbd's sequential download queue.
+	// Priority 0 = fast-lane (CompleteSelectedQueue), 1 = normal (BullMQ).
+	downloader *downloadDispatcher
 
 	// searchInflight deduplicates concurrent SearchLibrary calls for the same
 	// library item ID (O-05). Keyed by int64 library item ID.
@@ -236,18 +241,101 @@ type QueueManageResult struct {
 const pendingQueueBatchSize = 200 // process up to 200 items per scheduler tick (was 50)
 
 const (
-	defaultInlineFallbackDepth = 12
-	busyInlineFallbackDepth    = 1
-	busyQueueDepthThreshold    = 150
+	defaultInlineFallbackDepth  = 12
+	busyInlineFallbackDepth     = 1
+	fastLaneInlineFallbackDepth = 24
+	busyQueueDepthThreshold     = 150
 )
+
+type completionFastLaneKey struct{}
+
+// downloadJob is a unit of work submitted to the download dispatcher.
+type downloadJob struct {
+	ctx               context.Context
+	selectedReleaseID int64
+	priority          int // 0 = highest (fast-lane), 1 = normal
+	enqueuedAt        time.Time
+	resultCh          chan downloadJobResult
+}
+
+// downloadJobResult carries the outcome back to the caller.
+type downloadJobResult struct {
+	selectedReleaseID *int64
+	err               error
+}
+
+// downloadDispatcher is a priority queue processed by N dedicated worker goroutines.
+// Items with lower priority value execute first; within a priority, oldest first.
+// This replaces the importSem goroutine lottery — callers submit a job and block
+// until the worker completes it, just like SABnzbd's sequential download queue.
+// When workerCount==0 (e.g. in unit tests), callers fall back to inline execution.
+type downloadDispatcher struct {
+	mu          sync.Mutex
+	queue       []downloadJob
+	signal      chan struct{} // non-blocking notify: item added
+	workerCount int
+}
+
+func newDownloadDispatcher() *downloadDispatcher {
+	return &downloadDispatcher{signal: make(chan struct{}, 1)}
+}
+
+func (d *downloadDispatcher) submit(job downloadJob) {
+	d.mu.Lock()
+	d.queue = append(d.queue, job)
+	sort.SliceStable(d.queue, func(i, j int) bool {
+		if d.queue[i].priority != d.queue[j].priority {
+			return d.queue[i].priority < d.queue[j].priority
+		}
+		return d.queue[i].enqueuedAt.Before(d.queue[j].enqueuedAt)
+	})
+	d.mu.Unlock()
+	select {
+	case d.signal <- struct{}{}:
+	default:
+	}
+}
+
+func (d *downloadDispatcher) next(ctx context.Context) (downloadJob, bool) {
+	for {
+		d.mu.Lock()
+		if len(d.queue) > 0 {
+			job := d.queue[0]
+			d.queue = d.queue[1:]
+			d.mu.Unlock()
+			return job, true
+		}
+		d.mu.Unlock()
+		select {
+		case <-d.signal:
+		case <-ctx.Done():
+			return downloadJob{}, false
+		}
+	}
+}
+
+func (d *downloadDispatcher) depth() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.queue)
+}
+
+func (d *downloadDispatcher) incWorker() { d.mu.Lock(); d.workerCount++; d.mu.Unlock() }
+func (d *downloadDispatcher) decWorker() { d.mu.Lock(); d.workerCount--; d.mu.Unlock() }
+func (d *downloadDispatcher) hasWorkers() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.workerCount > 0
+}
 
 func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service {
 	return &Service{
-		repo:      repo,
-		seerr:     seerr,
-		hydra:     hydra,
-		fetcher:   HTTPNZBFetcher{},
-		importSem: make(chan struct{}, 2), // 2 concurrent NZB fetch+index+preflight
+		repo:       repo,
+		seerr:      seerr,
+		hydra:      hydra,
+		fetcher:    HTTPNZBFetcher{},
+		importSem:  make(chan struct{}, 2), // kept for ImportNZBFromPush only
+		downloader: newDownloadDispatcher(),
 	}
 }
 
@@ -543,6 +631,15 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 	return result, nil
 }
 
+func withCompletionFastLane(ctx context.Context) context.Context {
+	return context.WithValue(ctx, completionFastLaneKey{}, true)
+}
+
+func isCompletionFastLane(ctx context.Context) bool {
+	value, _ := ctx.Value(completionFastLaneKey{}).(bool)
+	return value
+}
+
 // ProcessLibraryItem handles a queue-dispatched library item.
 // If the item already has a selected release, resume fetch/import for that
 // release instead of performing a brand-new search.
@@ -555,11 +652,33 @@ func (s *Service) ProcessLibraryItem(ctx context.Context, libraryItemID int64) e
 		return err
 	}
 	if current != nil && current.SelectedReleaseID != 0 {
-		_, err := s.fetchAndImportSelectedRelease(ctx, current.SelectedReleaseID)
+		_, err := s.fetchAndImportSelectedRelease(withCompletionFastLane(ctx), current.SelectedReleaseID)
 		return err
 	}
 	_, err = s.SearchLibrary(ctx, libraryItemID)
 	return err
+}
+
+func (s *Service) CompleteSelectedQueue(ctx context.Context, limit int) (BulkQueueRetryResult, error) {
+	targets, err := s.repo.ListSelectedQueueRetryTargets(ctx, limit)
+	if err != nil {
+		return BulkQueueRetryResult{}, err
+	}
+	result := BulkQueueRetryResult{Processed: len(targets)}
+	for _, target := range targets {
+		result.ProcessedQueues = append(result.ProcessedQueues, target.QueueItemID)
+		itemCtx, cancel := context.WithTimeout(withCompletionFastLane(ctx), 45*time.Minute)
+		_, err := s.RetryQueueItem(itemCtx, target.QueueItemID)
+		cancel()
+		if err != nil {
+			s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Str("state", string(target.State)).Msg("completion: RetryQueueItem failed")
+			result.Failed++
+			result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+			continue
+		}
+		result.Retried++
+	}
+	return result, nil
 }
 
 func (s *Service) WorkQueueStatus(ctx context.Context) (WorkQueueStatus, error) {
@@ -1209,26 +1328,64 @@ func isRetryableSeerrSyncFailure(err error) bool {
 }
 
 func (s *Service) fetchAndImportSelectedRelease(ctx context.Context, selectedReleaseID int64) (*int64, error) {
-	// Semaphore: 1 NZB fetch+index at a time to avoid DB write contention.
-	// Released before publish so season packs don't block the next fetch.
+	// If no worker is running (e.g. in unit tests), execute inline — same as the
+	// old importSem path but without semaphore contention.
+	if !s.downloader.hasWorkers() {
+		result, importedRelease, err := s.fetchIndexAndRelease(ctx, selectedReleaseID)
+		if err != nil || importedRelease == nil {
+			return result, err
+		}
+		return s.publishImportedRelease(ctx, *importedRelease)
+	}
+	// Submit to the priority download queue and block until the dedicated worker
+	// processes this job. Priority 0 (fast-lane) executes before priority 1 (BullMQ)
+	// so "wanted" items always run ahead of bulk backfill — like SABnzbd priority.
+	priority := 1
+	if isCompletionFastLane(ctx) {
+		priority = 0
+	}
+	resultCh := make(chan downloadJobResult, 1)
+	s.downloader.submit(downloadJob{
+		ctx:               ctx,
+		selectedReleaseID: selectedReleaseID,
+		priority:          priority,
+		enqueuedAt:        time.Now(),
+		resultCh:          resultCh,
+	})
 	select {
-	case s.importSem <- struct{}{}:
+	case result := <-resultCh:
+		return result.selectedReleaseID, result.err
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	semReleased := false
-	defer func() {
-		if !semReleased {
-			<-s.importSem
+}
+
+// RunDownloadWorker processes download jobs from the dispatcher sequentially.
+// Start N goroutines running this in app.go to allow N concurrent downloads
+// (each with ~10 dedicated NNTP connections), matching SABnzbd's queue model.
+func (s *Service) RunDownloadWorker(ctx context.Context) {
+	s.downloader.incWorker()
+	defer s.downloader.decWorker()
+	for {
+		job, ok := s.downloader.next(ctx)
+		if !ok {
+			return
 		}
-	}()
-	result, importedRelease, err := s.fetchIndexAndRelease(ctx, selectedReleaseID)
-	<-s.importSem // release before publish — next NZB can be fetched while this one publishes
-	semReleased = true
-	if err != nil || importedRelease == nil {
-		return result, err
+		// Skip jobs whose caller context already expired while queued.
+		select {
+		case <-job.ctx.Done():
+			job.resultCh <- downloadJobResult{nil, job.ctx.Err()}
+			continue
+		default:
+		}
+		result, importedRelease, err := s.fetchIndexAndRelease(job.ctx, job.selectedReleaseID)
+		if err != nil || importedRelease == nil {
+			job.resultCh <- downloadJobResult{result, err}
+			continue
+		}
+		selectedReleaseID, pubErr := s.publishImportedRelease(job.ctx, *importedRelease)
+		job.resultCh <- downloadJobResult{selectedReleaseID, pubErr}
 	}
-	return s.publishImportedRelease(ctx, *importedRelease)
 }
 
 // pendingPublish holds data needed to publish an already-indexed release.
@@ -1770,6 +1927,9 @@ func cleanupCtx(ctx context.Context) context.Context {
 func (s *Service) maxInlineFallbackDepth(ctx context.Context) int {
 	if s == nil {
 		return defaultInlineFallbackDepth
+	}
+	if isCompletionFastLane(ctx) {
+		return fastLaneInlineFallbackDepth
 	}
 	if s.repo != nil {
 		if backlog, err := s.repo.CountActiveSearchBacklog(ctx); err == nil && backlog >= busyQueueDepthThreshold {

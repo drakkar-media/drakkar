@@ -49,6 +49,7 @@ const (
 	maintenanceRecentMovieTask = "hydra_recent_movie"
 	taskSeerrSync              = "seerr_sync"
 	taskPendingQueuePush       = "pending_queue_push"
+	taskCompleteSelectedQueue  = "complete_selected_queue"
 	taskRetryFailedQueue       = "retry_failed_queue"
 	taskRepublishPending       = "republish_pending"
 	taskHealthCheck            = "health_check"
@@ -67,6 +68,7 @@ const (
 	backgroundDeepHealthBatchSize = 48
 	backgroundDeepHealthSkipDepth = 150
 	pendingQueueDispatchInterval  = 1 * time.Minute
+	selectedQueueCompleteInterval = 1 * time.Minute
 )
 
 func boundedTVRSSInterval(minutes int) time.Duration {
@@ -161,6 +163,7 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 	defs := []api.TaskSchedule{
 		{ID: taskSeerrSync, Label: "Sync Seerr Requests", Group: "Indexing", Interval: "10m", Automated: true, LastRunState: "idle"},
 		{ID: taskPendingQueuePush, Label: "Dispatch Pending Queue", Group: "Indexing", Interval: "1m", Automated: true, LastRunState: "idle"},
+		{ID: taskCompleteSelectedQueue, Label: "Complete Selected Queue", Group: "Indexing", Interval: "1m", Automated: true, LastRunState: "idle"},
 		{ID: maintenanceRecentTVTask, Label: "Recent TV Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", tvRSSInterval), Automated: true, LastRunState: "idle"},
 		{ID: maintenanceRecentMovieTask, Label: "Recent Movie Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", movieRSSInterval), Automated: true, LastRunState: "idle"},
 		{ID: taskRetryFailedQueue, Label: "Retry Failed Queue", Group: "Indexing", Interval: "15m", Automated: true, LastRunState: "idle"},
@@ -322,15 +325,18 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	hydraClient := hydra.NewClient(cfg.NZBHydra2)
 	hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)
 	workflowSvc := workflow.NewService(db, seerrClient, hydraClient)
+	// importWorkers = number of concurrent downloads, each with ~10 NNTP connections.
+	// 15 connections → 1 worker; 30 → 3 workers; capped at 4.
+	importWorkers := 1
 	if maxDownloadConnections > 0 {
-		importWorkers := (maxDownloadConnections + 2) / 3
-		if importWorkers < 2 {
-			importWorkers = 2
+		importWorkers = maxDownloadConnections / 10
+		if importWorkers < 1 {
+			importWorkers = 1
 		}
-		if importWorkers > 6 {
-			importWorkers = 6
+		if importWorkers > 4 {
+			importWorkers = 4
 		}
-		workflowSvc.SetImportConcurrency(importWorkers)
+		workflowSvc.SetImportConcurrency(importWorkers) // keeps importSem sized for ImportNZBFromPush
 	}
 	if checker, ok := db.SegmentFetcher.(database.SegmentChecker); ok {
 		workflowSvc.SetEarlyChecker(checker.Exists)
@@ -535,11 +541,19 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		logger.Info().Int("reset", n).Msg("reset stuck queue items to failed")
 	}
 
+	// Start dedicated download workers — one per concurrent download slot.
+	// These are the only goroutines that call fetchIndexAndRelease; all other
+	// callers (BullMQ workers, CompleteSelectedQueue, HTTP retry) submit jobs
+	// to the priority queue and wait, exactly like SABnzbd's download queue.
+	for i := 0; i < importWorkers; i++ {
+		go workflowSvc.RunDownloadWorker(ctx)
+	}
+
 	// Start the BullMQ worker pool in the background.
 	go func() {
 		if err := workflowSvc.WorkQueue.Start(ctx, func(qCtx context.Context, libraryItemID int64) {
 			_ = qCtx
-			jobCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+			jobCtx, cancel := context.WithTimeout(ctx, 90*time.Minute)
 			defer cancel()
 			if err := workflowSvc.ProcessLibraryItem(jobCtx, libraryItemID); err != nil {
 				logger.Error().Err(err).Int64("libraryItemId", libraryItemID).Msg("workqueue: processing error (see above for details)")
@@ -567,9 +581,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// runStaleReset resets items stuck in transitional states.
 	// Idle transitions (selected, searching, etc.) time out after 10 minutes.
 	// Active download states (fetching_nzb, indexing, publishing) time out after
-	// 45 minutes — large episodes can take 20-40 minutes to fetch and import.
+	// 90 minutes — large episodes plus fallback churn can legitimately run long.
+	// Selected state gets 45 minutes because completion fast-lane now retries it
+	// every minute; if it still sits selected that long, it is genuinely stale.
 	runStaleReset := func() {
-		n, err := db.ResetStaleQueueItems(ctx, 10*time.Minute, 45*time.Minute, 20*time.Minute)
+		n, err := db.ResetStaleQueueItems(ctx, 10*time.Minute, 90*time.Minute, 45*time.Minute)
 		if err != nil {
 			logger.Error().Err(err).Msg("monitoring: stale reset error")
 			return
@@ -602,6 +618,18 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			broker.Publish(map[string]any{"kind": "queue.retry_background", "retried": rr.Retried})
 		}
 		logger.Info().Int("retried", rr.Retried).Msg("monitoring: retry failed queue complete")
+	}
+
+	runSelectedCompletionPass := func() {
+		cr, err := workflowSvc.CompleteSelectedQueue(ctx, 8)
+		if err != nil {
+			logger.Error().Err(err).Msg("monitoring: selected completion error")
+			return
+		}
+		_ = db.TouchMaintenanceCursor(ctx, taskCompleteSelectedQueue, time.Now().UTC().Format(time.RFC3339))
+		if cr.Retried > 0 || cr.Processed > 0 {
+			logger.Info().Int("processed", cr.Processed).Int("retried", cr.Retried).Int("failed", cr.Failed).Msg("monitoring: selected completion complete")
+		}
 	}
 
 	// runSyncOnce syncs Seerr requests.
@@ -748,6 +776,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// discovery happens via recent-feed polling or explicit/manual search.
 	startRecurring(taskSeerrSync, 10*time.Minute, true, runSyncOnce)
 	startRecurring(taskPendingQueuePush, pendingQueueDispatchInterval, true, runPendingDispatch)
+	startRecurring(taskCompleteSelectedQueue, selectedQueueCompleteInterval, true, runSelectedCompletionPass)
 
 	tvRssInterval := boundedTVRSSInterval(cfg.Indexer.TvRssSyncIntervalMinutes)
 	movieRssInterval := boundedMovieRSSInterval(cfg.Indexer.MovieRssSyncIntervalMinutes)
