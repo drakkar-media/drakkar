@@ -174,33 +174,33 @@ type LibraryItemSummary struct {
 }
 
 type ReleaseSummary struct {
-	SelectedReleaseID  int64                   `json:"selectedReleaseId"`
-	ReleaseCandidateID int64                   `json:"releaseCandidateId"`
-	LibraryItemID      int64                   `json:"libraryItemId"`
-	Title              string                  `json:"title"`
-	ExternalURL        string                  `json:"externalUrl,omitempty"`
-	IndexerName        string                  `json:"indexerName,omitempty"`
-	SizeBytes          int64                   `json:"sizeBytes"`
-	PostedAt           time.Time               `json:"postedAt,omitempty"`
-	Score              int                     `json:"score"`
-	CustomFormatScore  int                     `json:"customFormatScore"`
-	Selected           bool                    `json:"selected"`
-	Rejected           bool                    `json:"rejected"`
-	RejectReason       string                  `json:"rejectReason"`
-	FailureCount       int                     `json:"failureCount"`
-	LastFailureReason  string                  `json:"lastFailureReason"`
-	ArchiveCount       int                     `json:"archiveCount"`
-	ArchiveVolumeCount int                     `json:"archiveVolumeCount"`
-	ArchiveStatuses    string                  `json:"archiveStatuses"`
-	ArchiveRejects     string                  `json:"archiveRejects"`
-	VirtualFileCount   int                     `json:"virtualFileCount"`
-	Archives           []ReleaseArchiveSummary `json:"archives,omitempty"`
-	FailedAttempts     []FailedReleaseAttempt  `json:"failedAttempts,omitempty"`
-	Explanations            []string                `json:"explanations,omitempty"`
-	CompatibilityWarnings   []string                `json:"compatibilityWarnings,omitempty"`
-	CreatedAt               time.Time               `json:"createdAt"`
-	NZBDocumentID      *int64                  `json:"nzbDocumentId,omitempty"`
-	NZBFileName        string                  `json:"nzbFileName,omitempty"`
+	SelectedReleaseID     int64                   `json:"selectedReleaseId"`
+	ReleaseCandidateID    int64                   `json:"releaseCandidateId"`
+	LibraryItemID         int64                   `json:"libraryItemId"`
+	Title                 string                  `json:"title"`
+	ExternalURL           string                  `json:"externalUrl,omitempty"`
+	IndexerName           string                  `json:"indexerName,omitempty"`
+	SizeBytes             int64                   `json:"sizeBytes"`
+	PostedAt              time.Time               `json:"postedAt,omitempty"`
+	Score                 int                     `json:"score"`
+	CustomFormatScore     int                     `json:"customFormatScore"`
+	Selected              bool                    `json:"selected"`
+	Rejected              bool                    `json:"rejected"`
+	RejectReason          string                  `json:"rejectReason"`
+	FailureCount          int                     `json:"failureCount"`
+	LastFailureReason     string                  `json:"lastFailureReason"`
+	ArchiveCount          int                     `json:"archiveCount"`
+	ArchiveVolumeCount    int                     `json:"archiveVolumeCount"`
+	ArchiveStatuses       string                  `json:"archiveStatuses"`
+	ArchiveRejects        string                  `json:"archiveRejects"`
+	VirtualFileCount      int                     `json:"virtualFileCount"`
+	Archives              []ReleaseArchiveSummary `json:"archives,omitempty"`
+	FailedAttempts        []FailedReleaseAttempt  `json:"failedAttempts,omitempty"`
+	Explanations          []string                `json:"explanations,omitempty"`
+	CompatibilityWarnings []string                `json:"compatibilityWarnings,omitempty"`
+	CreatedAt             time.Time               `json:"createdAt"`
+	NZBDocumentID         *int64                  `json:"nzbDocumentId,omitempty"`
+	NZBFileName           string                  `json:"nzbFileName,omitempty"`
 }
 
 type FailedReleaseAttempt struct {
@@ -367,14 +367,14 @@ type BlockFilterResult struct {
 }
 
 type SubtitleProfile struct {
-	ID                   int64     `json:"id"`
-	Name                 string    `json:"name"`
-	Languages            []string  `json:"languages"`
-	PreferHearingImpaired bool     `json:"preferHearingImpaired"`
-	RequireExactLanguage  bool     `json:"requireExactLanguage"`
-	IsDefault            bool      `json:"isDefault"`
-	CreatedAt            time.Time `json:"createdAt"`
-	UpdatedAt            time.Time `json:"updatedAt"`
+	ID                    int64     `json:"id"`
+	Name                  string    `json:"name"`
+	Languages             []string  `json:"languages"`
+	PreferHearingImpaired bool      `json:"preferHearingImpaired"`
+	RequireExactLanguage  bool      `json:"requireExactLanguage"`
+	IsDefault             bool      `json:"isDefault"`
+	CreatedAt             time.Time `json:"createdAt"`
+	UpdatedAt             time.Time `json:"updatedAt"`
 }
 
 type IndexerPolicy struct {
@@ -472,11 +472,17 @@ type PendingLibrarySearchTarget struct {
 }
 
 type FailedQueueRetryTarget struct {
-	QueueItemID          int64  `json:"queueItemId"`
-	LibraryItemID        int64  `json:"libraryItemId"`
-	FailureReason        string `json:"failureReason"`
-	HasSelectedRelease   bool   `json:"hasSelectedRelease"`
-	CandidateFailureCount int   `json:"candidateFailureCount"`
+	QueueItemID           int64  `json:"queueItemId"`
+	LibraryItemID         int64  `json:"libraryItemId"`
+	FailureReason         string `json:"failureReason"`
+	HasSelectedRelease    bool   `json:"hasSelectedRelease"`
+	CandidateFailureCount int    `json:"candidateFailureCount"`
+}
+
+type SelectedQueueRetryTarget struct {
+	QueueItemID   int64      `json:"queueItemId"`
+	LibraryItemID int64      `json:"libraryItemId"`
+	State         QueueState `json:"state"`
 }
 
 type PendingRepublishTarget struct {

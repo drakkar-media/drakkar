@@ -768,7 +768,13 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]Fai
 		    q.state = $1
 		    or (q.state = $2 and q.selected_release_id is not null and q.updated_at < now() - interval '2 minutes')
 		  )
-		order by q.updated_at asc, q.id asc`
+		order by
+			-- Prioritise restart/stale interruptions first: they are cheap (no Hydra
+			-- call) and must not be pushed past the per-pass limit by older failures.
+			case when q.failure_reason in ('interrupted_by_restart', 'stale_worker')
+			          or (q.state = $2 and q.selected_release_id is not null)
+			     then 0 else 1 end asc,
+			q.updated_at asc, q.id asc`
 	args := []any{QueueFailed, QueueRequested}
 	if limit > 0 {
 		query += ` LIMIT $3`
@@ -785,6 +791,54 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]Fai
 		var item FailedQueueRetryTarget
 		if err := rows.Scan(&item.QueueItemID, &item.LibraryItemID, &item.FailureReason,
 			&item.HasSelectedRelease, &item.CandidateFailureCount); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+func (db *DB) ListSelectedQueueRetryTargets(ctx context.Context, limit int) ([]SelectedQueueRetryTarget, error) {
+	query := `
+		select
+			q.id,
+			q.library_item_id,
+			q.state
+		from queue_items q
+		join library_items li on li.id = q.library_item_id
+		where li.available = false
+		  and q.selected_release_id is not null
+		  and (
+		    q.state = $1
+		    or q.state = $2
+		    or (q.state = $3 and q.updated_at < now() - interval '2 minutes')
+		  )
+		order by
+			-- selected items first: they have a release chosen and just need a download slot.
+			-- failed second: need a retry but are ready to go.
+			-- requested last: BullMQ is already handling these; we only fast-lane them here.
+			case q.state
+				when $3 then 0
+				when $1 then 1
+				else 2
+			end,
+			q.updated_at asc,
+			q.id asc`
+	args := []any{QueueFailed, QueueRequested, QueueSelected}
+	if limit > 0 {
+		query += ` LIMIT $4`
+		args = append(args, limit)
+	}
+	rows, err := db.SQL.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []SelectedQueueRetryTarget
+	for rows.Next() {
+		var item SelectedQueueRetryTarget
+		if err := rows.Scan(&item.QueueItemID, &item.LibraryItemID, &item.State); err != nil {
 			return nil, err
 		}
 		out = append(out, item)

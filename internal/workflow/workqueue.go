@@ -110,16 +110,16 @@ func (q *WorkQueue) Start(ctx context.Context, fn func(ctx context.Context, libr
 			Concurrency:      q.workers,
 			RemoveOnComplete: &gobullmq.KeepJobs{Count: 0},
 			RemoveOnFail:     &gobullmq.KeepJobs{Count: 0},
-			// A single library item can chain through many expired-NZB candidates and
-			// large file downloads (2-4 GB). 30s default lock causes stalled-check
-			// re-queues mid-processing, racing two workers on the same item (FK violations).
-			// Lock renewal runs every LockDuration/4 so 10-min lock = renewal every 2.5 min.
-			LockDuration:    10 * time.Minute,
-			StalledInterval: 5 * time.Minute,
+			// A single item can spend a long time in fetch/import/publish while
+			// walking multiple bad candidates. Keep the lock long enough that BullMQ
+			// does not race a second worker onto the same library item mid-completion.
+			// Lock renewal runs every LockDuration/4.
+			LockDuration:    30 * time.Minute,
+			StalledInterval: 10 * time.Minute,
 			// Allow one recovery attempt before failing: if the stalled check fires
 			// while the lock is briefly between renewals, the job is moved back to
 			// wait instead of immediately to failed (MaxStalledCount=0 default).
-			MaxStalledCount: 1,
+			MaxStalledCount: 2,
 		},
 	)
 	if err != nil {

@@ -827,7 +827,13 @@ func (w *Worker[D, R]) handleJobSuccess(job rawJob, token string, result R, fetc
 	}
 
 	getNext := fetchNextCallback() && !(w.closing.Load() || w.paused.Load())
-	keys, args, scriptErr := w.scripts.moveToFinishedArgs(&job, string(stringifiedReturnValue), "returnvalue", job.opts.RemoveOnComplete, "completed", token, time.Now(), getNext, lockDurationMs, maxMetricsSize)
+	var removeOnComplete KeepJobs
+	if w.opts.RemoveOnComplete != nil {
+		removeOnComplete = *w.opts.RemoveOnComplete
+	} else if job.opts.RemoveOnComplete != nil {
+		removeOnComplete = *job.opts.RemoveOnComplete
+	}
+	keys, args, scriptErr := w.scripts.moveToFinishedArgs(&job, string(stringifiedReturnValue), "returnvalue", removeOnComplete, "completed", token, time.Now(), getNext, lockDurationMs, maxMetricsSize)
 	if scriptErr != nil {
 		w.Emit("error", fmt.Sprintf("Error moving job to completed: %v", scriptErr))
 		return rawJob{}, scriptErr

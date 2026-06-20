@@ -28,6 +28,7 @@ type repoStub struct {
 	backlog         int
 	selectedBacklog int
 	failedQueues    []database.FailedQueueRetryTarget
+	selectedQueues  []database.SelectedQueueRetryTarget
 	upgradable      []int64
 	movieCalls      int
 	tvCalls         int
@@ -156,6 +157,9 @@ func (r *repoStub) ListPendingTVShowLibraryItemIDs(_ context.Context, _ int64) (
 }
 func (r *repoStub) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]database.FailedQueueRetryTarget, error) {
 	return r.failedQueues, nil
+}
+func (r *repoStub) ListSelectedQueueRetryTargets(ctx context.Context, limit int) ([]database.SelectedQueueRetryTarget, error) {
+	return r.selectedQueues, nil
 }
 func (r *repoStub) GetQueueRetryTarget(ctx context.Context, queueItemID int64) (database.QueueRetryTarget, error) {
 	return r.retryTarget, nil
@@ -1285,6 +1289,13 @@ func TestMaxInlineFallbackDepthUsesDefaultWhenQueueSmall(t *testing.T) {
 	}
 }
 
+func TestMaxInlineFallbackDepthUsesFastLaneOverride(t *testing.T) {
+	service := NewService(&repoStub{backlog: busyQueueDepthThreshold + 50}, seerrStub{}, hydraStub{})
+	if got := service.maxInlineFallbackDepth(withCompletionFastLane(context.Background())); got != fastLaneInlineFallbackDepth {
+		t.Fatalf("expected fast-lane depth %d, got %d", fastLaneInlineFallbackDepth, got)
+	}
+}
+
 func TestSearchPendingLibrary(t *testing.T) {
 	repo := &repoStub{
 		pending: []database.PendingLibrarySearchTarget{
@@ -1814,6 +1825,38 @@ func TestRetryQueueItemSelectedRelease(t *testing.T) {
 	}
 	if result.Action != "retried_selected_release" || result.SelectedReleaseID == nil || *result.SelectedReleaseID != 303 {
 		t.Fatalf("unexpected result %+v", result)
+	}
+}
+
+func TestCompleteSelectedQueue(t *testing.T) {
+	repo := &repoStub{
+		selectedQueues: []database.SelectedQueueRetryTarget{
+			{QueueItemID: 55, LibraryItemID: 42, State: database.QueueFailed},
+			{QueueItemID: 56, LibraryItemID: 43, State: database.QueueRequested},
+		},
+		retryTarget: database.QueueRetryTarget{
+			QueueItemID:       55,
+			LibraryItemID:     42,
+			SelectedReleaseID: func() *int64 { v := int64(303); return &v }(),
+		},
+		selected: database.ReleaseSummary{
+			SelectedReleaseID: 303,
+			LibraryItemID:     42,
+			ExternalURL:       "http://example/retry.nzb",
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	service.fetcher = fetcherStub{
+		fileName: "retry.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Retry (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+	}
+
+	result, err := service.CompleteSelectedQueue(context.Background(), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Processed != 2 || result.Retried != 2 || result.Failed != 0 {
+		t.Fatalf("unexpected completion result %+v", result)
 	}
 }
 
