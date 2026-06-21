@@ -3,8 +3,6 @@ package database
 import (
 	"testing"
 	"time"
-
-	"github.com/hjongedijk/drakkar/internal/stream"
 )
 
 func TestIsPlayableMedia(t *testing.T) {
@@ -19,31 +17,6 @@ func TestIsPlayableMedia(t *testing.T) {
 	}
 }
 
-func TestResolveArchiveEntryRanges(t *testing.T) {
-	source := importedFileSegments{
-		spans: []stream.SegmentSpan{
-			{SegmentID: 1, Start: 0, End: 100},
-			{SegmentID: 2, Start: 100, End: 200},
-		},
-	}
-	ranges, err := resolveArchiveEntryRanges(source, ImportedArchiveRange{
-		EntryOffset:   20,
-		ArchiveOffset: 90,
-		LengthBytes:   40,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(ranges) != 2 {
-		t.Fatalf("unexpected ranges %+v", ranges)
-	}
-	if ranges[0].SegmentID != 1 || ranges[0].RangeStart != 20 || ranges[0].RangeEnd != 30 {
-		t.Fatalf("unexpected first range %+v", ranges[0])
-	}
-	if ranges[1].SegmentID != 2 || ranges[1].RangeStart != 30 || ranges[1].RangeEnd != 60 {
-		t.Fatalf("unexpected second range %+v", ranges[1])
-	}
-}
 
 func TestIsHardRejectReason(t *testing.T) {
 	if !isHardRejectReason("archive_video_not_found") {

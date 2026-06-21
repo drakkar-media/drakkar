@@ -10,13 +10,11 @@ import (
 	"time"
 
 	"github.com/hjongedijk/drakkar/internal/policy"
-	"github.com/hjongedijk/drakkar/internal/stream"
 )
 
 type importedFileSegments struct {
 	fileName  string
 	nzbFileID int64
-	spans     []stream.SegmentSpan // computed from inline data for resolveArchiveEntryRanges
 }
 
 func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
@@ -207,11 +205,9 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 			return QueueSnapshot{}, err
 		}
 
-		spans := computeSpans(msgIDs, decSegSize, lastDecSize, 0, file.FileSizeBytes)
 		fileSegments[file.FileName] = importedFileSegments{
 			fileName:  file.FileName,
 			nzbFileID: nzbFileID,
-			spans:     spans,
 		}
 
 		if isPlayableMedia(file.FileName) {
@@ -328,11 +324,9 @@ func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID in
 		).Scan(&nzbFileID); err != nil {
 			return QueueSnapshot{}, err
 		}
-		spans := computeSpans(msgIDs, decSegSize, lastDecSize, 0, file.FileSizeBytes)
 		fileSegments[file.FileName] = importedFileSegments{
 			fileName:  file.FileName,
 			nzbFileID: nzbFileID,
-			spans:     spans,
 		}
 		if isPlayableMedia(file.FileName) {
 			virtualPath := "releases/" + fmt.Sprintf("%d", selectedReleaseID) + "/" + file.FileName
@@ -492,9 +486,6 @@ func insertArchiveVirtualFile(ctx context.Context, tx *sql.Tx, selectedReleaseID
 	return virtualFileID, nil
 }
 
-func resolveArchiveEntryRanges(source importedFileSegments, item ImportedArchiveRange) ([]stream.SegmentRange, error) {
-	return stream.ResolveRange(source.spans, item.ArchiveOffset, item.LengthBytes)
-}
 
 // segmentSizes returns (decodedSegmentSize, lastDecodedSize) from the imported segments.
 // decodedSegmentSize is the size of the first (uniform) segment; lastDecodedSize is the
