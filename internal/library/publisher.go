@@ -72,8 +72,13 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 	if len(files) == 0 {
 		return ErrNoVirtualFiles
 	}
-	if err := p.validateReleaseMedia(ctx, files); err != nil {
-		return err
+	// Only validate media headers on initial publish. Republishes just recreate
+	// the missing symlink — re-checking NNTP availability is unnecessary and
+	// fails for older content that has aged off the provider.
+	if isNew {
+		if err := p.validateReleaseMedia(ctx, files); err != nil {
+			return err
+		}
 	}
 	libraryItemIDs := make(map[int64]struct{})
 	for _, file := range files {
@@ -274,7 +279,7 @@ func (p *Publisher) RepublishLibraryItem(ctx context.Context, libraryItemID int6
 		return p.republishEpisodeFromSourceRelease(ctx, libraryItemID, sourceID)
 	}
 	for _, selectedReleaseID := range selectedReleaseIDs {
-		if err := p.PublishSelectedRelease(ctx, selectedReleaseID); err != nil {
+		if err := p.publishSelectedRelease(ctx, selectedReleaseID, false); err != nil {
 			return err
 		}
 	}
