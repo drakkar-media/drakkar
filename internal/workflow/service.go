@@ -144,7 +144,7 @@ type Service struct {
 	// downloader is a priority download queue processed by dedicated workers
 	// (started in app.go). Replaces the importSem lottery so downloads execute
 	// in priority/FIFO order — like SABnzbd's sequential download queue.
-	// Priority 0 = fast-lane (CompleteSelectedQueue), 1 = normal (BullMQ).
+	// Priority 0 = fast-lane (HTTP retry, BullMQ workers), 1 = normal.
 	downloader *downloadDispatcher
 
 	// searchInflight deduplicates concurrent SearchLibrary calls for the same
@@ -241,9 +241,9 @@ type QueueManageResult struct {
 const pendingQueueBatchSize = 200 // process up to 200 items per scheduler tick (was 50)
 
 const (
-	defaultInlineFallbackDepth  = 12
+	defaultInlineFallbackDepth  = 3
 	busyInlineFallbackDepth     = 1
-	fastLaneInlineFallbackDepth = 24
+	fastLaneInlineFallbackDepth = 3
 	busyQueueDepthThreshold     = 150
 )
 
@@ -607,27 +607,19 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 	if err != nil {
 		return BulkSearchResult{}, err
 	}
-	selectedBacklog := 0
-	if s.WorkQueue != nil && s.repo != nil {
-		selectedBacklog, _ = s.repo.CountSelectedQueueBacklog(ctx)
-	}
 	result := BulkSearchResult{Processed: len(targets)}
 	for _, target := range targets {
 		result.ProcessedItems = append(result.ProcessedItems, target.LibraryItemID)
 		// If the work queue is running, push items for concurrent processing
-		// rather than searching sequentially. Limit one bulk dispatch batch so
-		// a giant import does not hammer Hydra all at once.
+		// rather than searching sequentially.
+		// Items with a selected release are ready to download — push with
+		// priority=0 (BullMQ high-priority) so they drain before new searches.
+		// Items needing a Hydra search get priority=10 (BullMQ lower-priority).
 		if s.WorkQueue != nil {
-			if selectedBacklog > 0 && !target.Selected {
-				continue
-			}
-			priority := 0
+			priority := 10
 			if target.Selected {
-				priority = 1
+				priority = 0
 			}
-			// Push ALL pending items to WorkQueue — no artificial cap.
-			// Workers drain at configured Hydra delay / worker concurrency.
-			// Matches Radarr's "Search All Missing" bulk-dispatch behaviour.
 			s.WorkQueue.Push(ctx, target.LibraryItemID, priority)
 			result.Searched++
 			continue
@@ -672,28 +664,6 @@ func (s *Service) ProcessLibraryItem(ctx context.Context, libraryItemID int64) e
 	}
 	_, err = s.SearchLibrary(ctx, libraryItemID)
 	return err
-}
-
-func (s *Service) CompleteSelectedQueue(ctx context.Context, limit int) (BulkQueueRetryResult, error) {
-	targets, err := s.repo.ListSelectedQueueRetryTargets(ctx, limit)
-	if err != nil {
-		return BulkQueueRetryResult{}, err
-	}
-	result := BulkQueueRetryResult{Processed: len(targets)}
-	for _, target := range targets {
-		result.ProcessedQueues = append(result.ProcessedQueues, target.QueueItemID)
-		itemCtx, cancel := context.WithTimeout(withCompletionFastLane(ctx), 45*time.Minute)
-		_, err := s.RetryQueueItem(itemCtx, target.QueueItemID)
-		cancel()
-		if err != nil {
-			s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Str("state", string(target.State)).Msg("completion: RetryQueueItem failed")
-			result.Failed++
-			result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-			continue
-		}
-		result.Retried++
-	}
-	return result, nil
 }
 
 func (s *Service) WorkQueueStatus(ctx context.Context) (WorkQueueStatus, error) {
@@ -2422,75 +2392,6 @@ func (s *Service) ManageQueueItems(ctx context.Context, queueItemIDs []int64, ac
 			continue
 		}
 		result.Retried++
-	}
-	return result, nil
-}
-
-func (s *Service) AutoManageFailedQueue(ctx context.Context) (BulkQueueRetryResult, error) {
-	targets, err := s.repo.ListFailedQueueRetryTargets(ctx, 100)
-	if err != nil {
-		return BulkQueueRetryResult{}, err
-	}
-	settings := policy.DefaultSettings()
-	if s.queuePolicy != nil {
-		if loaded, loadErr := s.queuePolicy.Settings(ctx); loadErr == nil {
-			settings = loaded
-		}
-	}
-	result := BulkQueueRetryResult{Processed: len(targets)}
-	for _, target := range targets {
-		result.ProcessedQueues = append(result.ProcessedQueues, target.QueueItemID)
-		action := policy.ActionForReason(settings, target.FailureReason)
-		switch action {
-		case policy.QueueActionSearchAgain:
-			// Items with a valid existing release (failure_count=0) should be
-			// retried by RetryFailedQueue via RetryQueueItem, not searched again.
-			// Searching again would discard a perfectly good selected release and
-			// add an unnecessary 12-second NZBHydra2 round-trip per item.
-			if target.HasSelectedRelease && target.CandidateFailureCount == 0 {
-				continue
-			}
-			if _, err := s.SearchLibrary(ctx, target.LibraryItemID); err != nil {
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-			} else {
-				result.Retried++
-			}
-		case policy.QueueActionRemove:
-			if err := s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID); err != nil {
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-			}
-		case policy.QueueActionRemoveAndBlocklist:
-			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, settings.BlocklistTTLDays); err != nil {
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-				continue
-			}
-			if err := s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID); err != nil {
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-			}
-		case policy.QueueActionRemoveBlocklistAndSearch:
-			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, settings.BlocklistTTLDays); err != nil {
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-				continue
-			}
-			if err := s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID); err != nil {
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-				continue
-			}
-			if _, err := s.SearchLibrary(ctx, target.LibraryItemID); err != nil {
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-			} else {
-				result.Retried++
-			}
-		default:
-			continue
-		}
 	}
 	return result, nil
 }

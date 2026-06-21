@@ -48,9 +48,8 @@ const (
 	maintenanceRecentTVTask    = "hydra_recent_tv"
 	maintenanceRecentMovieTask = "hydra_recent_movie"
 	taskSeerrSync              = "seerr_sync"
-	taskPendingQueuePush       = "pending_queue_push"
-	taskCompleteSelectedQueue  = "complete_selected_queue"
-	taskRetryFailedQueue       = "retry_failed_queue"
+	taskPendingQueuePush = "pending_queue_push"
+	taskRetryFailedQueue = "retry_failed_queue"
 	taskRepublishPending       = "republish_pending"
 	taskHealthCheck            = "health_check"
 	taskNZBHealthCheck         = "nzb_health_check"
@@ -67,8 +66,7 @@ const (
 	backgroundHealthCheckInterval = 15 * time.Minute
 	backgroundDeepHealthBatchSize = 48
 	backgroundDeepHealthSkipDepth = 150
-	pendingQueueDispatchInterval  = 1 * time.Minute
-	selectedQueueCompleteInterval = 1 * time.Minute
+	pendingQueueDispatchInterval = 1 * time.Minute
 )
 
 func boundedTVRSSInterval(minutes int) time.Duration {
@@ -163,7 +161,6 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 	defs := []api.TaskSchedule{
 		{ID: taskSeerrSync, Label: "Sync Seerr Requests", Group: "Indexing", Interval: "10m", Automated: true, LastRunState: "idle"},
 		{ID: taskPendingQueuePush, Label: "Dispatch Pending Queue", Group: "Indexing", Interval: "1m", Automated: true, LastRunState: "idle"},
-		{ID: taskCompleteSelectedQueue, Label: "Complete Selected Queue", Group: "Indexing", Interval: "1m", Automated: true, LastRunState: "idle"},
 		{ID: maintenanceRecentTVTask, Label: "Recent TV Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", tvRSSInterval), Automated: true, LastRunState: "idle"},
 		{ID: maintenanceRecentMovieTask, Label: "Recent Movie Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", movieRSSInterval), Automated: true, LastRunState: "idle"},
 		{ID: taskRetryFailedQueue, Label: "Retry Failed Queue", Group: "Indexing", Interval: "15m", Automated: true, LastRunState: "idle"},
@@ -541,6 +538,17 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		logger.Info().Int("reset", n).Msg("reset stuck queue items to failed")
 	}
 
+	// Immediately recover all items interrupted by a restart (stale_worker /
+	// interrupted_by_restart with an existing selected release).  These only
+	// need a DB state flip — no Hydra call — so there is no reason to delay
+	// them behind the 500-per-pass cap that RetryFailedQueue uses for items
+	// that do call Hydra.
+	if n, err := db.RecoverInterruptedDownloads(ctx); err != nil {
+		logger.Error().Err(err).Msg("startup: interrupted download recovery error")
+	} else if n > 0 {
+		logger.Info().Int("recovered", n).Msg("startup: interrupted downloads recovered — re-queued for download")
+	}
+
 	// Start dedicated download workers — one per concurrent download slot.
 	// These are the only goroutines that call fetchIndexAndRelease; all other
 	// callers (BullMQ workers, CompleteSelectedQueue, HTTP retry) submit jobs
@@ -596,18 +604,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}
 	}
 
-	// runRetryPass retries failed queue items using both the hardcoded
-	// search/preflight recovery rules and the user-configured queue rules.
 	runRetryPass := func() {
-		// Apply user-configured queue rules first (e.g. Remove and Blocklist,
-		// Remove Blocklist and Search) for import/processing failures.
-		if ar, err := workflowSvc.AutoManageFailedQueue(ctx); err != nil {
-			logger.Error().Err(err).Msg("monitoring: auto-manage queue error")
-		} else if ar.Retried > 0 || ar.Processed > 0 {
-			logger.Info().Int("processed", ar.Processed).Int("retried", ar.Retried).Msg("monitoring: auto-manage queue complete")
-		}
-
-		// Then apply hardcoded recovery for search/preflight failures.
 		rr, err := workflowSvc.RetryFailedQueue(ctx)
 		if err != nil {
 			logger.Error().Err(err).Msg("monitoring: retry failed queue error")
@@ -618,18 +615,6 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			broker.Publish(map[string]any{"kind": "queue.retry_background", "retried": rr.Retried})
 		}
 		logger.Info().Int("retried", rr.Retried).Msg("monitoring: retry failed queue complete")
-	}
-
-	runSelectedCompletionPass := func() {
-		cr, err := workflowSvc.CompleteSelectedQueue(ctx, 8)
-		if err != nil {
-			logger.Error().Err(err).Msg("monitoring: selected completion error")
-			return
-		}
-		_ = db.TouchMaintenanceCursor(ctx, taskCompleteSelectedQueue, time.Now().UTC().Format(time.RFC3339))
-		if cr.Retried > 0 || cr.Processed > 0 {
-			logger.Info().Int("processed", cr.Processed).Int("retried", cr.Retried).Int("failed", cr.Failed).Msg("monitoring: selected completion complete")
-		}
 	}
 
 	// runSyncOnce syncs Seerr requests.
@@ -776,7 +761,6 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// discovery happens via recent-feed polling or explicit/manual search.
 	startRecurring(taskSeerrSync, 10*time.Minute, true, runSyncOnce)
 	startRecurring(taskPendingQueuePush, pendingQueueDispatchInterval, true, runPendingDispatch)
-	startRecurring(taskCompleteSelectedQueue, selectedQueueCompleteInterval, true, runSelectedCompletionPass)
 
 	tvRssInterval := boundedTVRSSInterval(cfg.Indexer.TvRssSyncIntervalMinutes)
 	movieRssInterval := boundedMovieRSSInterval(cfg.Indexer.MovieRssSyncIntervalMinutes)

@@ -1376,7 +1376,9 @@ func TestSearchPendingLibraryQueuesAllItems(t *testing.T) {
 	}
 }
 
-func TestSearchPendingLibraryQueuesOnlySelectedWhenSelectedBacklogExists(t *testing.T) {
+func TestSearchPendingLibraryQueuesAllItemsRegardlessOfBacklog(t *testing.T) {
+	// All items are pushed regardless of selected backlog; priority differs:
+	// selected items (ready to download) get priority=0, others get priority=10.
 	repo := &repoStub{
 		selectedBacklog: 2,
 		pending: []database.PendingLibrarySearchTarget{
@@ -1392,11 +1394,11 @@ func TestSearchPendingLibraryQueuesOnlySelectedWhenSelectedBacklogExists(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Processed != 3 || result.Searched != 2 {
+	if result.Processed != 3 || result.Searched != 3 {
 		t.Fatalf("unexpected bulk result %+v", result)
 	}
-	if depth := service.WorkQueue.Depth(context.Background()); depth != 2 {
-		t.Fatalf("expected only selected items queued, got depth %d", depth)
+	if depth := service.WorkQueue.Depth(context.Background()); depth != 3 {
+		t.Fatalf("expected all 3 items queued, got depth %d", depth)
 	}
 }
 
@@ -1828,37 +1830,6 @@ func TestRetryQueueItemSelectedRelease(t *testing.T) {
 	}
 }
 
-func TestCompleteSelectedQueue(t *testing.T) {
-	repo := &repoStub{
-		selectedQueues: []database.SelectedQueueRetryTarget{
-			{QueueItemID: 55, LibraryItemID: 42, State: database.QueueFailed},
-			{QueueItemID: 56, LibraryItemID: 43, State: database.QueueRequested},
-		},
-		retryTarget: database.QueueRetryTarget{
-			QueueItemID:       55,
-			LibraryItemID:     42,
-			SelectedReleaseID: func() *int64 { v := int64(303); return &v }(),
-		},
-		selected: database.ReleaseSummary{
-			SelectedReleaseID: 303,
-			LibraryItemID:     42,
-			ExternalURL:       "http://example/retry.nzb",
-		},
-	}
-	service := NewService(repo, seerrStub{}, hydraStub{})
-	service.fetcher = fetcherStub{
-		fileName: "retry.nzb",
-		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Retry (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
-	}
-
-	result, err := service.CompleteSelectedQueue(context.Background(), 8)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.Processed != 2 || result.Retried != 2 || result.Failed != 0 {
-		t.Fatalf("unexpected completion result %+v", result)
-	}
-}
 
 func TestRetryQueueItemStoredNZB(t *testing.T) {
 	repo := &repoStub{

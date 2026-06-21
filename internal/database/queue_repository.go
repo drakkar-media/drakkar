@@ -694,6 +694,28 @@ func (db *DB) ResetStuckQueueItems(ctx context.Context) (int, error) {
 	return int(n), nil
 }
 
+// RecoverInterruptedDownloads resets all failed items whose failure reason is
+// 'interrupted_by_restart' or 'stale_worker' and that have a selected release
+// back to 'requested' so they re-enter the normal download cycle.  This runs
+// once on startup to instantly recover the full backlog without the 500-item
+// per-pass limit that RetryFailedQueue imposes (needed to cap Hydra calls for
+// non-stale items, but irrelevant here since no Hydra call is made).
+func (db *DB) RecoverInterruptedDownloads(ctx context.Context) (int, error) {
+	result, err := db.SQL.ExecContext(ctx, `
+		UPDATE queue_items
+		SET state = $1, failure_reason = '', updated_at = now()
+		WHERE state = $2
+		  AND failure_reason IN ('interrupted_by_restart', 'stale_worker')
+		  AND selected_release_id IS NOT NULL`,
+		QueueRequested, QueueFailed,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
 // ResetStaleQueueItems resets items stuck in transitional states.
 // Active download states (fetching_nzb, indexing, publishing) use downloadStaleAfter
 // because large files can take tens of minutes. The selected state uses
