@@ -309,7 +309,7 @@ func (s *Service) SearchLibraryCards(ctx context.Context, query string) ([]Media
 		if hay == "" {
 			continue
 		}
-		if strings.Contains(hay, q) {
+		if strings.Contains(hay, q) || (card.TMDBID > 0 && strconv.FormatInt(card.TMDBID, 10) == q) {
 			matches = append(matches, card)
 		}
 	}

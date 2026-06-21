@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -767,6 +768,13 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			}
 			q := r.URL.Query()
 			filtered := filterLibraryCards(items, q.Get("kind"), q.Get("state"), q.Get("q"))
+			sort.SliceStable(filtered, func(i, j int) bool {
+				pi, pj := libStatusPriority(filtered[i]), libStatusPriority(filtered[j])
+				if pi != pj {
+					return pi < pj
+				}
+				return strings.ToLower(filtered[i].Title) < strings.ToLower(filtered[j].Title)
+			})
 			page, _ := strconv.Atoi(q.Get("page"))
 			pageSize, _ := strconv.Atoi(q.Get("pageSize"))
 			if page < 1 {
@@ -2155,6 +2163,29 @@ func accepted(kind string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusAccepted, map[string]any{"status": kind})
 	}
+}
+
+// libStatusPriority mirrors the frontend itemStatus/STATUS_ORDER for server-side sort:
+// 0=available, 1=partial, 2=active/unreleased, 3=missing/failed.
+func libStatusPriority(item catalog.MediaCard) int {
+	switch strings.ToLower(item.QueueState) {
+	case "searching", "ranking", "selected", "fetching_nzb", "indexing", "preflight", "publishing", "downloading":
+		return 2
+	case "failed":
+		return 3
+	case "requested":
+		return 2
+	}
+	if item.Available {
+		if (item.MediaType == "tv" || item.MediaType == "episode") && item.MissingCount > 0 {
+			return 1
+		}
+		return 0
+	}
+	if item.MissingCount > 0 && item.AvailableCount > 0 {
+		return 1
+	}
+	return 3
 }
 
 func respondJSON(w http.ResponseWriter, status int, payload any) {

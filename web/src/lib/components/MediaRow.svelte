@@ -40,7 +40,7 @@
   function onPointerMove(event: PointerEvent) {
     if (!dragging || !scroller) return;
     const dx = event.clientX - startX;
-    if (Math.abs(dx) > 4) hasDragged = true;
+    if (Math.abs(dx) > 8) hasDragged = true;
     scroller.scrollLeft = startScrollLeft - dx;
   }
 

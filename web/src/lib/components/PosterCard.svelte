@@ -101,6 +101,7 @@
     background: hsl(var(--card) / 0.9);
     transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
     text-decoration: none;
+    cursor: pointer;
   }
 
   .poster-card:hover {
