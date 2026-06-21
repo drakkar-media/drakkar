@@ -2056,9 +2056,9 @@ func (s *Service) promoteNextAfterFailureDepth(ctx context.Context, current data
 	if depth >= s.maxInlineFallbackDepth(ctx) {
 		// Stop inline candidate churn and leave the next candidate selected for a
 		// later queue pass. This keeps throughput fair when backlog is large.
-		if _, depthErr := s.repo.FailSelectedReleaseAndPromoteNext(dbCtx, current.SelectedReleaseID, reason); depthErr != nil {
+		if _, depthErr := s.repo.FailSelectedReleaseAndPromoteNext(context.Background(), current.SelectedReleaseID, reason); depthErr != nil {
 			s.logger.Error().Err(depthErr).Int64("selectedReleaseId", current.SelectedReleaseID).Msg("workqueue: depth-limit fail failed")
-			_ = s.repo.MarkLibrarySearchFailed(dbCtx, current.LibraryItemID, reason)
+			_ = s.repo.MarkLibrarySearchFailed(context.Background(), current.LibraryItemID, reason)
 		}
 		return nil, nil
 	}
@@ -2066,14 +2066,20 @@ func (s *Service) promoteNextAfterFailureDepth(ctx context.Context, current data
 	next, promoteErr := s.repo.FailSelectedReleaseAndPromoteNext(dbCtx, current.SelectedReleaseID, reason)
 	if promoteErr != nil {
 		// Transient DB errors (e.g. "driver: bad connection") must not leave the item
-		// stuck in fetching_nzb. Retry once after a short pause; if it fails again, use
-		// the simpler MarkLibrarySearchFailed as a last resort so the queue_item at
-		// least moves to failed state and can be retried by the stale-recovery pass.
-		time.Sleep(300 * time.Millisecond)
-		next, promoteErr = s.repo.FailSelectedReleaseAndPromoteNext(dbCtx, current.SelectedReleaseID, reason)
+		// stuck in fetching_nzb. Retry with increasing backoff; use a fresh
+		// context.Background() for each attempt so a stale/canceled caller context
+		// does not permanently block cleanup.
+		for attempt, delay := range []time.Duration{300 * time.Millisecond, 1 * time.Second, 3 * time.Second} {
+			time.Sleep(delay)
+			next, promoteErr = s.repo.FailSelectedReleaseAndPromoteNext(context.Background(), current.SelectedReleaseID, reason)
+			if promoteErr == nil {
+				break
+			}
+			s.logger.Warn().Err(promoteErr).Int("attempt", attempt+1).Int64("libraryItemId", current.LibraryItemID).Msg("workqueue: promote retry failed")
+		}
 		if promoteErr != nil {
-			s.logger.Error().Err(promoteErr).Int64("libraryItemId", current.LibraryItemID).Msg("workqueue: promote failed twice — falling back to direct fail")
-			_ = s.repo.MarkLibrarySearchFailed(dbCtx, current.LibraryItemID, reason)
+			s.logger.Error().Err(promoteErr).Int64("libraryItemId", current.LibraryItemID).Msg("workqueue: promote failed — falling back to direct fail")
+			_ = s.repo.MarkLibrarySearchFailed(context.Background(), current.LibraryItemID, reason)
 			return nil, nil
 		}
 	}
