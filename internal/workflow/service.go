@@ -162,6 +162,8 @@ type Service struct {
 	// searchInflight deduplicates concurrent SearchLibrary calls for the same
 	// library item ID (O-05). Keyed by int64 library item ID.
 	searchInflight sync.Map
+	recentURLMu    sync.Mutex
+	recentURLHits  map[string]time.Time
 
 	// TTL caches for policy data, guarded by profileCacheMu (O-04).
 	// These are loaded from the DB at most once per 5 minutes.
@@ -257,6 +259,8 @@ const (
 	busyInlineFallbackDepth     = 1
 	fastLaneInlineFallbackDepth = 3
 	busyQueueDepthThreshold     = 150
+	selectedResumeCooldown      = 5 * time.Minute
+	selectedURLCooldown         = 30 * time.Minute
 )
 
 type completionFastLaneKey struct{}
@@ -382,13 +386,14 @@ func (d *downloadDispatcher) hasWorkers() bool {
 
 func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service {
 	return &Service{
-		repo:       repo,
-		seerr:      seerr,
-		hydra:      hydra,
-		fetcher:    HTTPNZBFetcher{},
-		importSem:  make(chan struct{}, 2), // kept for ImportNZBFromPush only
-		downloader: newDownloadDispatcher(),
-		dispatchC:  make(chan struct{}, 1),
+		repo:          repo,
+		seerr:         seerr,
+		hydra:         hydra,
+		fetcher:       HTTPNZBFetcher{},
+		importSem:     make(chan struct{}, 2), // kept for ImportNZBFromPush only
+		downloader:    newDownloadDispatcher(),
+		dispatchC:     make(chan struct{}, 1),
+		recentURLHits: make(map[string]time.Time),
 	}
 }
 
@@ -809,11 +814,11 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 		// Items needing a Hydra search get priority=10 (BullMQ lower-priority).
 		if s.WorkQueue != nil {
 			if target.SelectedReleaseID > 0 {
-				// Cooldown: don't re-submit releases that were updated within the last
-				// 30 minutes. This prevents burst downloads on restart (inFlight map
-				// is cleared) and rapid re-cycling after preflight failures (failure →
-				// promote → new sr_id with updated_at=now → immediate re-download).
-				if time.Since(target.UpdatedAt) < 30*time.Minute {
+				// Cooldown only for requested+selected resume items. Newly promoted
+				// selected candidates need to advance quickly under backlog; the
+				// downloadDispatcher already deduplicates true in-flight duplicates.
+				now := time.Now()
+				if !s.shouldDispatchSelectedTarget(target, now) {
 					continue
 				}
 				resultCh := make(chan downloadJobResult, 1)
@@ -824,6 +829,7 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 					enqueuedAt:        time.Now(),
 					resultCh:          resultCh,
 				}) {
+					s.markSelectedReleaseURLDispatched(target.ExternalURL, now)
 					go func() { <-resultCh }()
 				}
 				result.Searched++
@@ -845,6 +851,45 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 		}
 	}
 	return result, nil
+}
+
+func (s *Service) shouldDispatchSelectedTarget(target database.PendingLibrarySearchTarget, now time.Time) bool {
+	if target.SelectedReleaseID <= 0 {
+		return false
+	}
+	if target.State != database.QueueRequested {
+		return true
+	}
+	rawURL := strings.TrimSpace(target.ExternalURL)
+	if rawURL != "" && s != nil {
+		s.recentURLMu.Lock()
+		lastAt, ok := s.recentURLHits[rawURL]
+		if ok && now.Sub(lastAt) < selectedURLCooldown {
+			s.recentURLMu.Unlock()
+			return false
+		}
+		// Drop stale URL entries opportunistically to keep the map bounded.
+		for url, hitAt := range s.recentURLHits {
+			if now.Sub(hitAt) >= selectedURLCooldown {
+				delete(s.recentURLHits, url)
+			}
+		}
+		s.recentURLMu.Unlock()
+	}
+	return now.Sub(target.UpdatedAt) >= selectedResumeCooldown
+}
+
+func (s *Service) markSelectedReleaseURLDispatched(rawURL string, now time.Time) {
+	if s == nil {
+		return
+	}
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return
+	}
+	s.recentURLMu.Lock()
+	s.recentURLHits[rawURL] = now
+	s.recentURLMu.Unlock()
 }
 
 func withCompletionFastLane(ctx context.Context) context.Context {
@@ -2401,6 +2446,52 @@ func buildSearchRequests(input database.LibrarySearchInput) SearchRequestPlan {
 			EpisodeNumber: input.EpisodeNumber,
 		}
 	}
+	addTVTitleVariant := func(show string, season, episode int, showYear int, episodeTitle string) {
+		show = strings.TrimSpace(show)
+		if show == "" {
+			return
+		}
+		add := func(query string) {
+			query = strings.TrimSpace(query)
+			if query == "" {
+				return
+			}
+			dedup(&tier2, baseTV(query, 0, "", 0))
+		}
+		if season > 0 && episode > 0 {
+			add(fmt.Sprintf("%s S%02dE%02d", show, season, episode))
+			add(fmt.Sprintf("%s %dx%02d", show, season, episode))
+			if showYear > 0 {
+				add(fmt.Sprintf("%s %d S%02dE%02d", show, showYear, season, episode))
+				add(fmt.Sprintf("%s %d %dx%02d", show, showYear, season, episode))
+			}
+			if strings.TrimSpace(episodeTitle) != "" {
+				add(fmt.Sprintf("%s %s", show, strings.TrimSpace(episodeTitle)))
+				add(fmt.Sprintf("%s S%02dE%02d %s", show, season, episode, strings.TrimSpace(episodeTitle)))
+			}
+			add(show)
+			if showYear > 0 {
+				add(fmt.Sprintf("%s %d", show, showYear))
+			}
+			return
+		}
+		if season > 0 {
+			add(fmt.Sprintf("%s S%02d", show, season))
+			add(fmt.Sprintf("%s Season %d", show, season))
+			if showYear > 0 {
+				add(fmt.Sprintf("%s %d S%02d", show, showYear, season))
+			}
+			add(show)
+			if showYear > 0 {
+				add(fmt.Sprintf("%s %d", show, showYear))
+			}
+			return
+		}
+		add(show)
+		if showYear > 0 {
+			add(fmt.Sprintf("%s %d", show, showYear))
+		}
+	}
 
 	switch strings.ToLower(input.MediaType) {
 	case "movie":
@@ -2435,21 +2526,13 @@ func buildSearchRequests(input database.LibrarySearchInput) SearchRequestPlan {
 		}
 		if isWholeShowRequest(input) {
 			// Whole-show request: title fallbacks only
-			if input.ShowYear > 0 {
-				dedup(&tier2, baseTV(fmt.Sprintf("%s %d", show, input.ShowYear), 0, "", 0))
-			}
-			dedup(&tier2, baseTV(show, 0, "", 0))
+			addTVTitleVariant(show, input.SeasonNumber, input.EpisodeNumber, input.ShowYear, input.EpisodeTitle)
 			break
 		}
-		// Tier 2: one canonical title query — NZBHydra2 handles per-indexer
-		// format variants internally, so a single SxxExx query is sufficient.
-		if input.SeasonNumber > 0 && input.EpisodeNumber > 0 {
-			dedup(&tier2, baseTV(fmt.Sprintf("%s S%02dE%02d", show, input.SeasonNumber, input.EpisodeNumber), 0, "", 0))
-		} else if input.SeasonNumber > 0 {
-			dedup(&tier2, baseTV(fmt.Sprintf("%s S%02d", show, input.SeasonNumber), 0, "", 0))
-		} else {
-			dedup(&tier2, baseTV(show, 0, "", 0))
-		}
+		// Tier 2: broader TV title variants. Old TV backlog often needs multiple
+		// naming styles because indexers vary between SxxExx, 1x02, season, and
+		// episode-title conventions.
+		addTVTitleVariant(show, input.SeasonNumber, input.EpisodeNumber, input.ShowYear, input.EpisodeTitle)
 
 	default:
 		return SearchRequestPlan{Tier2: []hydra.SearchRequest{{

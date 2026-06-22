@@ -379,6 +379,12 @@ func (r *repoStub) ResetLibraryItemState(_ context.Context, _ int64) error { ret
 func (r *repoStub) ListUnrecoverableLibraryItems(_ context.Context) ([]int64, error) {
 	return nil, nil
 }
+func (r *repoStub) ListMovieTmdbIDs(_ context.Context) ([]int64, error) {
+	return nil, nil
+}
+func (r *repoStub) ListTVShowTmdbIDsWithSeasons(_ context.Context) ([]database.TVShowSeerrInfo, error) {
+	return nil, nil
+}
 func (r *repoStub) ListReleaseBlockRules(_ context.Context) ([]database.ReleaseBlockRule, error) {
 	return nil, nil
 }
@@ -396,6 +402,10 @@ func (s seerrStub) PendingRequests(ctx context.Context) ([]seerr.Request, error)
 }
 func (s seerrStub) CreateRequest(_ context.Context, _ string, _ int64) error        { return nil }
 func (s seerrStub) CreateTVSeasonRequest(_ context.Context, _ int64, _ []int) error { return nil }
+func (s seerrStub) CreateTVSeasonRequestNoWait(_ context.Context, _ int64, _ []int) error {
+	return nil
+}
+func (s seerrStub) PartialTVItems(_ context.Context) ([]seerr.PartialTVItem, error) { return nil, nil }
 
 type seasonRequestSeerrStub struct {
 	seerrStub
@@ -407,6 +417,10 @@ func (s *seasonRequestSeerrStub) CreateTVSeasonRequest(_ context.Context, tmdbID
 	s.seasonRequestID = tmdbID
 	s.seasonNumbers = append([]int(nil), seasons...)
 	return nil
+}
+
+func (s *seasonRequestSeerrStub) CreateTVSeasonRequestNoWait(_ context.Context, tmdbID int64, seasons []int) error {
+	return s.CreateTVSeasonRequest(context.Background(), tmdbID, seasons)
 }
 
 type hydraStub struct {
@@ -898,79 +912,45 @@ func TestSearchLibraryContinuesPastSelectedCandidateWithFailureHistory(t *testin
 	}
 }
 
-func TestSearchLibraryUsesOnlyOneEpisodeTitleQuery(t *testing.T) {
-	repo := &repoStub{
-		searchInput: database.LibrarySearchInput{
-			LibraryItemID: 42,
-			MediaType:     "episode",
-			Title:         "Loki S01E02",
-			ShowTitle:     "Loki",
-			ShowYear:      2021,
-			SeasonNumber:  1,
-			EpisodeNumber: 2,
-		},
-	}
+func TestBuildSearchRequestsIncludesEpisodeQueryVariants(t *testing.T) {
+	plan := buildSearchRequests(database.LibrarySearchInput{
+		LibraryItemID: 42,
+		MediaType:     "episode",
+		Title:         "Loki S01E02",
+		ShowTitle:     "Loki",
+		EpisodeTitle:  "The Variant",
+		ShowYear:      2021,
+		SeasonNumber:  1,
+		EpisodeNumber: 2,
+	})
 	var queries []string
-	service := NewService(repo, seerrStub{}, hydraStub{byQuery: map[string][]hydra.SearchResult{
-		"Loki S01E02": {
-			{Title: "Loki.S01E02.1080p.WEB-DL", Link: "http://example/episode", Indexer: "hydra", SizeBytes: 1200, PublishedAt: time.Now()},
-		},
-	}, queries: &queries})
-	service.fetcher = fetcherStub{
-		fileName: "loki.nzb",
-		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Loki S01E02.mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.tv</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+	for _, req := range plan.Tier2 {
+		queries = append(queries, req.Query)
 	}
-
-	result, err := service.SearchLibrary(context.Background(), 42)
-	if err != nil {
-		t.Fatal(err)
+	expected := []string{
+		"Loki S01E02",
+		"Loki 1x02",
+		"Loki 2021 S01E02",
+		"Loki 2021 1x02",
+		"Loki The Variant",
+		"Loki S01E02 The Variant",
+		"Loki",
+		"Loki 2021",
 	}
-	if result.SelectedReleaseID == nil {
-		t.Fatalf("expected selected release, got %+v", result)
-	}
-	// Only the canonical SxxExx query should be sent — no year variants, 3x02, episode title, etc.
-	if len(queries) != 1 || queries[0] != "Loki S01E02" {
-		t.Fatalf("expected exactly 1 episode query 'Loki S01E02', got %+v", queries)
-	}
-}
-
-func TestSearchLibraryEpisodeNoExtraTitleVariants(t *testing.T) {
-	// Episode title, year, and 3x02 variants are NOT sent as separate queries.
-	// NZBHydra2 handles per-indexer format adaptation internally.
-	repo := &repoStub{
-		searchInput: database.LibrarySearchInput{
-			LibraryItemID: 42,
-			MediaType:     "episode",
-			Title:         "Loki S01E02",
-			ShowTitle:     "Loki",
-			EpisodeTitle:  "The Variant",
-			ShowYear:      2021,
-			SeasonNumber:  1,
-			EpisodeNumber: 2,
-		},
-	}
-	var queries []string
-	service := NewService(repo, seerrStub{}, hydraStub{byQuery: map[string][]hydra.SearchResult{
-		"Loki S01E02": {
-			{Title: "Loki.S01E02.1080p.WEB-DL", Link: "http://example/episode", Indexer: "hydra", SizeBytes: 1200, PublishedAt: time.Now()},
-		},
-	}, queries: &queries})
-	service.fetcher = fetcherStub{
-		fileName: "loki.nzb",
-		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Loki S01E02.mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.tv</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
-	}
-
-	result, err := service.SearchLibrary(context.Background(), 42)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.SelectedReleaseID == nil {
-		t.Fatalf("expected selected release, got %+v", result)
-	}
-	for _, q := range queries {
-		if q == "Loki The Variant" || q == "Loki 1x02" || q == "Loki 2021 S01E02" {
-			t.Fatalf("unexpected extra query variant sent: %q (all queries: %v)", q, queries)
+	for _, q := range expected {
+		found := false
+		for _, got := range queries {
+			if got == q {
+				found = true
+				break
+			}
 		}
+		if !found {
+			t.Fatalf("expected query %q in %+v", q, queries)
+		}
+	}
+	if queries[0] != "Loki S01E02" {
+		t.Fatalf("expected most-specific query first, got %+v", queries)
 	}
 }
 
@@ -1406,6 +1386,59 @@ func TestSearchPendingLibraryQueuesAllItemsRegardlessOfBacklog(t *testing.T) {
 	}
 }
 
+func TestShouldDispatchSelectedTargetAllowsFreshSelectedFallback(t *testing.T) {
+	now := time.Now()
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
+	target := database.PendingLibrarySearchTarget{
+		LibraryItemID:     42,
+		SelectedReleaseID: 303,
+		State:             database.QueueSelected,
+		UpdatedAt:         now,
+	}
+	if !service.shouldDispatchSelectedTarget(target, now) {
+		t.Fatal("expected selected fallback candidate to dispatch immediately")
+	}
+}
+
+func TestShouldDispatchSelectedTargetCooldownsRequestedResume(t *testing.T) {
+	now := time.Now()
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
+	target := database.PendingLibrarySearchTarget{
+		LibraryItemID:     42,
+		SelectedReleaseID: 303,
+		State:             database.QueueRequested,
+		UpdatedAt:         now.Add(-selectedResumeCooldown + time.Minute),
+	}
+	if service.shouldDispatchSelectedTarget(target, now) {
+		t.Fatal("expected recent requested+selected resume item to stay in cooldown")
+	}
+	target.UpdatedAt = now.Add(-selectedResumeCooldown - time.Minute)
+	if !service.shouldDispatchSelectedTarget(target, now) {
+		t.Fatal("expected older requested+selected resume item to dispatch after cooldown")
+	}
+}
+
+func TestShouldDispatchSelectedTargetBlocksRecentlyDispatchedSameURL(t *testing.T) {
+	now := time.Now()
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
+	rawURL := "http://example/release.nzb"
+	service.markSelectedReleaseURLDispatched(rawURL, now.Add(-selectedURLCooldown+time.Minute))
+	target := database.PendingLibrarySearchTarget{
+		LibraryItemID:     42,
+		SelectedReleaseID: 303,
+		ExternalURL:       rawURL,
+		State:             database.QueueRequested,
+		UpdatedAt:         now.Add(-selectedResumeCooldown - time.Minute),
+	}
+	if service.shouldDispatchSelectedTarget(target, now) {
+		t.Fatal("expected same external_url to stay in cooldown")
+	}
+	target.ExternalURL = "http://example/other.nzb"
+	if !service.shouldDispatchSelectedTarget(target, now) {
+		t.Fatal("expected different external_url to bypass duplicate cooldown")
+	}
+}
+
 func TestSearchRecentPendingMovieSelectsWithoutActiveHydraSearch(t *testing.T) {
 	repo := &repoStub{
 		pending: []database.PendingLibrarySearchTarget{{LibraryItemID: 42}},
@@ -1833,7 +1866,6 @@ func TestRetryQueueItemSelectedRelease(t *testing.T) {
 		t.Fatalf("unexpected result %+v", result)
 	}
 }
-
 
 func TestRetryQueueItemStoredNZB(t *testing.T) {
 	repo := &repoStub{

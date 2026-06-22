@@ -470,6 +470,7 @@ type PendingLibrarySearchTarget struct {
 	LibraryItemID     int64      `json:"libraryItemId"`
 	Selected          bool       `json:"selected"`
 	SelectedReleaseID int64      `json:"selectedReleaseId"` // 0 if none
+	ExternalURL       string     `json:"externalUrl,omitempty"`
 	State             QueueState `json:"state"`
 	UpdatedAt         time.Time  `json:"updatedAt"`
 }

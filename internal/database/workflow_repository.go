@@ -637,12 +637,13 @@ func (db *DB) GetQueueRetryTarget(ctx context.Context, queueItemID int64) (Queue
 
 func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLibrarySearchTarget, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
-		select item.library_item_id, item.selected, coalesce(item.selected_release_id, 0), item.state, item.updated_at
+		select item.library_item_id, item.selected, coalesce(item.selected_release_id, 0), coalesce(item.external_url, ''), item.state, item.updated_at
 		from (
 			select distinct on (q.library_item_id)
 				q.library_item_id,
 				(q.selected_release_id is not null and q.state in ($1, $3)) as selected,
 				q.selected_release_id,
+				rc.external_url,
 				q.state,
 				q.updated_at,
 				q.created_at,
@@ -651,6 +652,8 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLib
 			join library_items li on li.id = q.library_item_id
 			left join episodes ep on ep.id = li.episode_id
 			left join tv_shows tv on tv.id = ep.tv_show_id
+			left join selected_releases sr on sr.id = q.selected_release_id
+			left join release_candidates rc on rc.id = sr.release_candidate_id
 			where li.available = false
 			  and li.media_type in ('movie', 'episode', 'tv')
 			  and (
@@ -709,7 +712,7 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLib
 	var out []PendingLibrarySearchTarget
 	for rows.Next() {
 		var item PendingLibrarySearchTarget
-		if err := rows.Scan(&item.LibraryItemID, &item.Selected, &item.SelectedReleaseID, &item.State, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.LibraryItemID, &item.Selected, &item.SelectedReleaseID, &item.ExternalURL, &item.State, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, item)
