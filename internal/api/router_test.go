@@ -190,6 +190,13 @@ func (w workflowStub) ResetOrphanedAvailableItems(_ context.Context) (workflow.R
 	return workflow.ResetOrphanedAvailableItemsResult{}, nil
 }
 
+func (w workflowStub) PushMissingLibraryItemsToSeerr(_ context.Context) (workflow.PushMissingToSeerrResult, error) {
+	return workflow.PushMissingToSeerrResult{}, nil
+}
+func (w workflowStub) SyncPlexDetectedShows(_ context.Context) (workflow.SyncPlexDetectedResult, error) {
+	return workflow.SyncPlexDetectedResult{}, nil
+}
+
 func (w workflowStub) ImportNZBFromPush(_ context.Context, content []byte, filename, mediaType string) (string, error) {
 	if w.importCall != nil {
 		w.importCall.filename = filename

@@ -87,6 +87,7 @@ services:
   seerr:
     image: ghcr.io/seerr-team/seerr:latest
     container_name: drakkar_seerr
+    user: 0:0
     init: true
     environment:
       - LOG_LEVEL=debug

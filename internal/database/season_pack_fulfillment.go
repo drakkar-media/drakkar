@@ -213,7 +213,7 @@ func (db *DB) CreateSeasonPackEpisodeItems(ctx context.Context, selectedReleaseI
 			INSERT INTO queue_items
 			    (library_item_id, selected_release_id, state, idempotency_key, updated_at)
 			VALUES ($1, $2, 'available', $3, now())
-			ON CONFLICT (idempotency_key) DO UPDATE
+			ON CONFLICT (library_item_id) DO UPDATE
 			  SET state = 'available', selected_release_id = $2, updated_at = now()`,
 			libItemID, srID, ikey)
 	}

@@ -218,6 +218,126 @@ func (c *Client) CreateTVSeasonRequest(ctx context.Context, tmdbID int64, season
 	return c.createRequestWithRecovery(ctx, body, match)
 }
 
+// CreateTVSeasonRequestNoWait posts a season request to Seerr without waiting
+// for the request to become visible in the request list. Use this for bulk
+// imports where visibility confirmation is not needed per-item.
+func (c *Client) CreateTVSeasonRequestNoWait(ctx context.Context, tmdbID int64, seasons []int) error {
+	body := map[string]any{
+		"mediaType": "tv",
+		"mediaId":   tmdbID,
+		"seasons":   seasons,
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	return c.postCreateRequest(ctx, data)
+}
+
+// PartialTVItem represents a TV show that is partially available in Plex
+// (Seerr status=4) with no explicit download request.
+type PartialTVItem struct {
+	TMDBID         int64
+	TVDBID         int64
+	PartialSeasons []int // season numbers where status != 5 (not fully available)
+}
+
+// PartialTVItems returns TV shows tracked by Seerr that are partially available
+// (have some episodes in Plex but not all). Items with no seasons of interest
+// (all seasons already status=5) are omitted.
+func (c *Client) PartialTVItems(ctx context.Context) ([]PartialTVItem, error) {
+	const pageSize = 500
+	var out []PartialTVItem
+	for page := 1; ; page++ {
+		payload, err := c.fetchPartialMediaPage(ctx, page, pageSize)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range payload.Results {
+			if r.MediaType != "tv" {
+				continue
+			}
+			var partial []int
+			for _, s := range r.Seasons {
+				if s.Status != 5 && s.SeasonNumber > 0 {
+					partial = append(partial, s.SeasonNumber)
+				}
+			}
+			if len(partial) == 0 {
+				continue
+			}
+			out = append(out, PartialTVItem{
+				TMDBID:         r.TMDBiD,
+				TVDBID:         r.TVDBiD,
+				PartialSeasons: partial,
+			})
+		}
+		if page >= payload.PageInfo.Pages || len(payload.Results) == 0 {
+			break
+		}
+	}
+	return out, nil
+}
+
+type partialMediaPayload struct {
+	PageInfo struct {
+		Pages    int `json:"pages"`
+		PageSize int `json:"pageSize"`
+		Results  int `json:"results"`
+		Page     int `json:"page"`
+	} `json:"pageInfo"`
+	Results []struct {
+		MediaType string `json:"mediaType"`
+		TMDBiD    int64  `json:"tmdbId"`
+		TVDBiD    int64  `json:"tvdbId"`
+		Status    int    `json:"status"`
+		Seasons   []struct {
+			SeasonNumber int `json:"seasonNumber"`
+			Status       int `json:"status"`
+		} `json:"seasons"`
+	} `json:"results"`
+}
+
+func (c *Client) fetchPartialMediaPage(ctx context.Context, page, pageSize int) (partialMediaPayload, error) {
+	u, err := url.Parse(c.baseURL + "/api/v1/media")
+	if err != nil {
+		return partialMediaPayload{}, err
+	}
+	q := u.Query()
+	q.Set("filter", "partial")
+	q.Set("take", strconv.Itoa(pageSize))
+	q.Set("page", strconv.Itoa(page))
+	u.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return partialMediaPayload{}, err
+	}
+	if c.apiKey != "" {
+		req.Header.Set("X-Api-Key", c.apiKey)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return partialMediaPayload{}, err
+	}
+	defer resp.Body.Close()
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return partialMediaPayload{}, readErr
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return partialMediaPayload{}, classifySeerrHTTPError("partial media", resp.StatusCode, body)
+	}
+	if err := detectSeerrResponseError("partial media", resp.StatusCode, body); err != nil {
+		return partialMediaPayload{}, err
+	}
+	var payload partialMediaPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return partialMediaPayload{}, err
+	}
+	return payload, nil
+}
+
 func (c *Client) createRequestWithRecovery(ctx context.Context, body map[string]any, match func(Request) bool) error {
 	data, err := json.Marshal(body)
 	if err != nil {

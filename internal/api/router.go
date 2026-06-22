@@ -144,6 +144,7 @@ type WorkflowService interface {
 	ResetLibraryItem(ctx context.Context, libraryItemID int64) error
 	ResetOrphanedAvailableItems(ctx context.Context) (workflow.ResetOrphanedAvailableItemsResult, error)
 	PushMissingLibraryItemsToSeerr(ctx context.Context) (workflow.PushMissingToSeerrResult, error)
+	SyncPlexDetectedShows(ctx context.Context) (workflow.SyncPlexDetectedResult, error)
 }
 
 type PublicationService interface {
@@ -1222,6 +1223,18 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		result, err := workflowSvc.PushMissingLibraryItemsToSeerr(r.Context())
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, result)
+	})
+	r.Post("/api/requests/sync-plex-detected", func(w http.ResponseWriter, r *http.Request) {
+		if workflowSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
+			return
+		}
+		result, err := workflowSvc.SyncPlexDetectedShows(r.Context())
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, err)
 			return

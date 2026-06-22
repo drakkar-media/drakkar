@@ -64,6 +64,7 @@ const (
 	taskFillMissingEpisodes    = "fill_missing_episodes"
 	taskSearchUpgrades         = "search_upgrades"
 	taskResetOrphaned          = "reset_orphaned_available"
+	taskSyncPlexDetected       = "sync_plex_detected"
 )
 
 const (
@@ -804,6 +805,18 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// background worker: Seerr sync every 10 min. Sync imports requests only;
 	// discovery happens via recent-feed polling or explicit/manual search.
 	startRecurring(taskSeerrSync, 10*time.Minute, true, runSyncOnce)
+	// Sync Plex-detected shows (partial Seerr media without requests) hourly.
+	startRecurringWithStartupDelay(taskSyncPlexDetected, 60*time.Minute, 90*time.Second, func() {
+		result, err := workflowSvc.SyncPlexDetectedShows(ctx)
+		if err != nil {
+			logger.Error().Err(err).Msg("sync plex detected shows failed")
+			return
+		}
+		if result.Requested > 0 {
+			broker.Publish(map[string]any{"kind": "requests.sync_background", "seen": result.Found, "created": result.Requested})
+		}
+		logger.Info().Int("found", result.Found).Int("requested", result.Requested).Int("skipped", result.Skipped).Msg("sync plex detected shows complete")
+	})
 	startRecurring(taskPendingQueuePush, pendingQueueDispatchInterval, true, runPendingDispatch)
 
 	tvRssInterval := boundedTVRSSInterval(cfg.Indexer.TvRssSyncIntervalMinutes)

@@ -98,6 +98,8 @@ type SeerrClient interface {
 	PendingRequests(ctx context.Context) ([]seerr.Request, error)
 	CreateRequest(ctx context.Context, mediaType string, tmdbID int64) error
 	CreateTVSeasonRequest(ctx context.Context, tmdbID int64, seasons []int) error
+	CreateTVSeasonRequestNoWait(ctx context.Context, tmdbID int64, seasons []int) error
+	PartialTVItems(ctx context.Context) ([]seerr.PartialTVItem, error)
 }
 
 type HydraClient interface {
@@ -548,6 +550,62 @@ func (s *Service) PushMissingLibraryItemsToSeerr(ctx context.Context) (PushMissi
 			continue
 		}
 		result.ShowsPushed++
+	}
+
+	return result, nil
+}
+
+// SyncPlexDetectedResult is returned by SyncPlexDetectedShows.
+type SyncPlexDetectedResult struct {
+	Found     int `json:"found"`
+	Requested int `json:"requested"`
+	Skipped   int `json:"skipped"`
+}
+
+// SyncPlexDetectedShows creates Seerr requests for TV shows that Seerr has
+// detected via a Plex scan (status=PARTIAL) but that have no download request
+// yet. Only seasons not already fully available in Plex are requested.
+// After posting all requests it runs SyncRequests to immediately import them.
+func (s *Service) SyncPlexDetectedShows(ctx context.Context) (SyncPlexDetectedResult, error) {
+	if s == nil || s.seerr == nil {
+		return SyncPlexDetectedResult{}, fmt.Errorf("seerr client unavailable")
+	}
+
+	partialItems, err := s.seerr.PartialTVItems(ctx)
+	if err != nil {
+		return SyncPlexDetectedResult{}, fmt.Errorf("fetch partial tv items: %w", err)
+	}
+
+	existing, err := s.seerr.PendingRequests(ctx)
+	if err != nil {
+		return SyncPlexDetectedResult{}, fmt.Errorf("fetch seerr requests: %w", err)
+	}
+	requestedTMDB := make(map[int64]struct{}, len(existing))
+	for _, r := range existing {
+		if strings.EqualFold(r.Type, "tv") {
+			requestedTMDB[r.TMDBID] = struct{}{}
+		}
+	}
+
+	result := SyncPlexDetectedResult{Found: len(partialItems)}
+	for _, item := range partialItems {
+		if _, exists := requestedTMDB[item.TMDBID]; exists {
+			result.Skipped++
+			continue
+		}
+		if err := s.seerr.CreateTVSeasonRequestNoWait(ctx, item.TMDBID, item.PartialSeasons); err != nil {
+			s.logger.Warn().Err(err).Int64("tmdbID", item.TMDBID).Msg("sync plex detected: season request failed")
+			result.Skipped++
+			continue
+		}
+		result.Requested++
+	}
+
+	// Import the newly created requests immediately.
+	if result.Requested > 0 {
+		if _, syncErr := s.SyncRequests(ctx); syncErr != nil {
+			s.logger.Warn().Err(syncErr).Msg("sync plex detected: SyncRequests after request creation failed")
+		}
 	}
 
 	return result, nil

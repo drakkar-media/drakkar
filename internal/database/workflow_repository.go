@@ -158,10 +158,10 @@ func (db *DB) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID 
 	if err == nil {
 		var libraryItemID int64
 		err = tx.QueryRowContext(ctx, `
-			select q.library_item_id
-			from queue_items q
-			where q.idempotency_key = $1
-			limit 1`, "seerr-movie-"+externalID).Scan(&libraryItemID)
+			select li.id from library_items li
+			join movies m on m.id = li.movie_id
+			where m.tmdb_id = $1
+			limit 1`, tmdbID).Scan(&libraryItemID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return 0, false, err
 		}
@@ -207,7 +207,7 @@ func (db *DB) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID 
 	if _, err = tx.ExecContext(ctx, `
 		insert into queue_items (library_item_id, state, idempotency_key)
 		values ($1, $2, $3)
-		on conflict (idempotency_key) do update set
+		on conflict (library_item_id) do update set
 			state      = case when queue_items.state = 'failed' then 'requested' else queue_items.state end,
 			updated_at = case when queue_items.state = 'failed' then now() else queue_items.updated_at end`,
 		libraryItemID, QueueRequested, "seerr-movie-"+externalID,
@@ -333,10 +333,11 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 	if err == nil {
 		var libraryItemID int64
 		err = tx.QueryRowContext(ctx, `
-			select q.library_item_id
-			from queue_items q
-			where q.idempotency_key = $1
-			limit 1`, "seerr-tv-"+externalID).Scan(&libraryItemID)
+			select li.id from library_items li
+			join episodes e on e.id = li.episode_id
+			join tv_shows ts on ts.id = e.tv_show_id
+			where ts.tvdb_id = $1 and e.season_number = $2 and e.episode_number = $3
+			limit 1`, tvdbID, season, episode).Scan(&libraryItemID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return 0, false, err
 		}
@@ -350,8 +351,18 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 	}
 
 	var showID int64
-	err = tx.QueryRowContext(ctx, `select id from tv_shows where tvdb_id = $1`, tvdbID).Scan(&showID)
-	if errors.Is(err, sql.ErrNoRows) {
+	var existingTmdbID int64
+	err = tx.QueryRowContext(ctx, `select id, coalesce(tmdb_id, 0) from tv_shows where tvdb_id = $1`, tvdbID).Scan(&showID, &existingTmdbID)
+	if err == nil && tmdbID > 0 && existingTmdbID > 0 && existingTmdbID != tmdbID {
+		// tvdb_id found but belongs to a different show (tmdb_id mismatch) — look up by tmdb_id instead
+		err = tx.QueryRowContext(ctx, `select id from tv_shows where tmdb_id = $1`, tmdbID).Scan(&showID)
+		if errors.Is(err, sql.ErrNoRows) {
+			err = tx.QueryRowContext(ctx, `
+				insert into tv_shows (tmdb_id, title, release_year)
+				values ($1, $2, $3)
+				returning id`, tmdbID, show, year).Scan(&showID)
+		}
+	} else if errors.Is(err, sql.ErrNoRows) {
 		err = tx.QueryRowContext(ctx, `
 			insert into tv_shows (tvdb_id, tmdb_id, title, release_year)
 			values ($1, $2, $3, $4)
@@ -401,7 +412,7 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 	if _, err = tx.ExecContext(ctx, `
 		insert into queue_items (library_item_id, state, idempotency_key)
 		values ($1, $2, $3)
-		on conflict (idempotency_key) do update set
+		on conflict (library_item_id) do update set
 			state      = case when queue_items.state = 'failed' then 'requested' else queue_items.state end,
 			updated_at = case when queue_items.state = 'failed' then now() else queue_items.updated_at end`,
 		libraryItemID, QueueRequested, "seerr-tv-"+externalID,
@@ -1062,6 +1073,15 @@ func (db *DB) MarkLibrarySearchFailed(ctx context.Context, libraryItemID int64, 
 		set state = $2, failure_reason = $3, selected_release_id = null, updated_at = now()
 		where library_item_id = $1`, libraryItemID, QueueFailed, reason,
 	)
+	if err != nil {
+		return err
+	}
+	// Clean up any stale selected_releases rows so the item re-enters the normal
+	// search cycle on the next pass rather than getting stuck re-attempting the
+	// same failed release.
+	_, err = db.SQL.ExecContext(ctx, `
+		delete from selected_releases where library_item_id = $1`, libraryItemID,
+	)
 	return err
 }
 
@@ -1667,9 +1687,19 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 	// hanging indefinitely on lock contention.
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
+
+	// Pre-load the blocklist map before opening the transaction. This is a
+	// large read (1500+ rows) and doing it inside the transaction held write
+	// locks on release_candidates, causing "driver: bad connection" when many
+	// workers hit the same indexer group simultaneously.
+	blocked, err := loadBlocklistMapUncached(ctx, db.SQL)
+	if err != nil {
+		return nil, fmt.Errorf("fail/blocklist-preload (sr=%d): %w", selectedReleaseID, err)
+	}
+
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fail/begin (sr=%d): %w", selectedReleaseID, err)
 	}
 	defer func() {
 		if err != nil {
@@ -1693,7 +1723,7 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 			err = nil
 			return nil, nil
 		}
-		return nil, err
+		return nil, fmt.Errorf("fail/select-sr (sr=%d): %w", selectedReleaseID, err)
 	}
 
 	hardReject := isHardRejectReason(reason)
@@ -1706,7 +1736,7 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 			last_failure_reason = $2
 		where id = $1`, releaseCandidateID, reason, hardReject,
 	); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fail/update-rc (rc=%d): %w", releaseCandidateID, err)
 	}
 	if _, err = tx.ExecContext(ctx, `
 		insert into failed_releases (release_candidate_id, reason)
@@ -1714,8 +1744,13 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		on conflict do nothing`, releaseCandidateID, reason,
 	); err != nil && !isFKViolation(err) {
 		// FK violation = candidate was deleted by concurrent worker; safe to skip
-		return nil, err
+		return nil, fmt.Errorf("fail/insert-fr (rc=%d): %w", releaseCandidateID, err)
 	}
+
+	// Collect blocklist keys for hard-reject releases. Inserts happen after
+	// commit to avoid row-lock contention when many workers process releases
+	// from the same indexer group simultaneously.
+	var pendingBlocklistKeys []string
 	if hardReject && strings.TrimSpace(externalURL) != "" {
 		var title, indexerName string
 		var sizeBytes int64
@@ -1725,36 +1760,21 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 			from release_candidates
 			where id = $1`, releaseCandidateID,
 		).Scan(&title, &indexerName, &sizeBytes, &postedAt); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fail/select-rc-title (rc=%d): %w", releaseCandidateID, err)
 		}
-		for _, key := range blocklistKeysForRelease(title, externalURL, indexerName, sizeBytes, postedAt) {
-			if _, err = tx.ExecContext(ctx, `
-				insert into blocklist_items (key, reason)
-				values ($1, $2)
-				on conflict (key)
-				do update set reason = excluded.reason, expires_at = null`,
-				key, reason,
-			); err != nil {
-				return nil, err
-			}
-		}
-		invalidateBlocklistCache()
+		pendingBlocklistKeys = blocklistKeysForRelease(title, externalURL, indexerName, sizeBytes, postedAt)
 	}
 	if err = preDeleteVFRBySelectedRelease(ctx, tx, selectedReleaseID); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fail/pre-delete-vfr (sr=%d): %w", selectedReleaseID, err)
 	}
 	if _, err = tx.ExecContext(ctx, `
 		delete from selected_releases
 		where id = $1`, selectedReleaseID,
 	); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fail/delete-sr (sr=%d): %w", selectedReleaseID, err)
 	}
 
 	var nextCandidateID sql.NullInt64
-	blocked, err := loadBlocklistMapUncached(ctx, tx)
-	if err != nil {
-		return nil, err
-	}
 	rows, err := tx.QueryContext(ctx, `
 		select id, title, coalesce(external_url, ''), coalesce(indexer_name, ''), coalesce(size_bytes, 0), coalesce(posted_at, to_timestamp(0))
 		from release_candidates
@@ -1801,11 +1821,12 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 			set state = $2, failure_reason = $3, selected_release_id = null, updated_at = now()
 			where library_item_id = $1`, libraryItemID, QueueFailed, reason,
 		); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fail/update-qi-failed (li=%d): %w", libraryItemID, err)
 		}
 		if err = tx.Commit(); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fail/commit-no-next (li=%d): %w", libraryItemID, err)
 		}
+		db.flushBlocklistKeys(pendingBlocklistKeys, reason)
 		return nil, nil
 	}
 
@@ -1814,7 +1835,7 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		set selected = true
 		where id = $1`, nextCandidateID.Int64,
 	); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fail/update-rc-next (rc=%d): %w", nextCandidateID.Int64, err)
 	}
 
 	var nextSelectedReleaseID int64
@@ -1823,18 +1844,19 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		values ($1, $2)
 		returning id`, libraryItemID, nextCandidateID.Int64,
 	).Scan(&nextSelectedReleaseID); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fail/insert-sr-next (li=%d): %w", libraryItemID, err)
 	}
 	if _, err = tx.ExecContext(ctx, `
 		update queue_items
 		set state = $2, failure_reason = '', selected_release_id = $3, updated_at = now()
 		where library_item_id = $1`, libraryItemID, QueueSelected, nextSelectedReleaseID,
 	); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fail/update-qi-next (li=%d): %w", libraryItemID, err)
 	}
 	if err = tx.Commit(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fail/commit-next (li=%d): %w", libraryItemID, err)
 	}
+	db.flushBlocklistKeys(pendingBlocklistKeys, reason)
 
 	next, err := db.GetSelectedReleaseSummary(ctx, nextSelectedReleaseID)
 	if err != nil {
@@ -2122,8 +2144,13 @@ func loadBlocklistMap(ctx context.Context, tx *sql.Tx) (map[string]string, error
 	return out, nil
 }
 
-func loadBlocklistMapUncached(ctx context.Context, tx *sql.Tx) (map[string]string, error) {
-	rows, err := tx.QueryContext(ctx, `
+// sqlQuerier is satisfied by both *sql.DB and *sql.Tx.
+type sqlQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func loadBlocklistMapUncached(ctx context.Context, q sqlQuerier) (map[string]string, error) {
+	rows, err := q.QueryContext(ctx, `
 		select key, reason
 		from blocklist_items
 		where expires_at is null or expires_at > now()`)
@@ -2144,6 +2171,24 @@ func loadBlocklistMapUncached(ctx context.Context, tx *sql.Tx) (map[string]strin
 		return nil, err
 	}
 	return out, nil
+}
+
+// flushBlocklistKeys inserts collected hard-reject blocklist keys outside any
+// transaction. Errors are swallowed: the item is already failed; missing a
+// blocklist entry just means the release might be picked again next cycle.
+func (db *DB) flushBlocklistKeys(keys []string, reason string) {
+	if len(keys) == 0 {
+		return
+	}
+	for _, key := range keys {
+		_, _ = db.SQL.ExecContext(context.Background(), `
+			insert into blocklist_items (key, reason)
+			values ($1, $2)
+			on conflict (key)
+			do update set reason = excluded.reason, expires_at = null`,
+			key, reason)
+	}
+	invalidateBlocklistCache()
 }
 
 func invalidateBlocklistCache() {
@@ -2578,7 +2623,7 @@ func (db *DB) EnsureEpisodeLibraryItemsBatch(ctx context.Context, tvShowID int64
 				format('tmdb-ep-%s-%s-%s', $1::bigint, e.season_number, e.episode_number)
 			FROM inserted_library il
 			JOIN episodes e ON e.id = il.episode_id
-			ON CONFLICT (idempotency_key) DO UPDATE SET
+			ON CONFLICT (library_item_id) DO UPDATE SET
 				state      = CASE WHEN queue_items.state = 'failed' THEN 'requested' ELSE queue_items.state END,
 				updated_at = CASE WHEN queue_items.state = 'failed' THEN now() ELSE queue_items.updated_at END
 			RETURNING library_item_id
