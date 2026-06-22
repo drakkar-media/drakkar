@@ -152,6 +152,12 @@ type Service struct {
 	// Priority 0 = fast-lane (HTTP retry, BullMQ workers), 1 = normal.
 	downloader *downloadDispatcher
 
+	// dispatchC is a buffered wake signal for the pending-dispatch loop in app.go.
+	// Send a value (non-blocking) after creating new library items so the loop
+	// re-scans and pushes them to BullMQ immediately instead of waiting for the
+	// next scheduled tick.
+	dispatchC chan struct{}
+
 	// searchInflight deduplicates concurrent SearchLibrary calls for the same
 	// library item ID (O-05). Keyed by int64 library item ID.
 	searchInflight sync.Map
@@ -289,19 +295,35 @@ type downloadJobResult struct {
 // This replaces the importSem goroutine lottery — callers submit a job and block
 // until the worker completes it, just like SABnzbd's sequential download queue.
 // When workerCount==0 (e.g. in unit tests), callers fall back to inline execution.
+//
+// inFlight deduplicates by selectedReleaseID: if the same release is already
+// queued or being processed, a second submit is a no-op. This prevents the
+// duplicate-download race when BullMQ jobs complete quickly (due to WithAsyncDownload)
+// and the same selected item is re-pushed before the download worker changes its state.
 type downloadDispatcher struct {
 	mu          sync.Mutex
 	queue       []downloadJob
 	signal      chan struct{} // non-blocking notify: item added
 	workerCount int
+	inFlight    map[int64]bool // selectedReleaseID → true while queued or in progress
 }
 
 func newDownloadDispatcher() *downloadDispatcher {
-	return &downloadDispatcher{signal: make(chan struct{}, 1)}
+	return &downloadDispatcher{
+		signal:   make(chan struct{}, 1),
+		inFlight: make(map[int64]bool),
+	}
 }
 
-func (d *downloadDispatcher) submit(job downloadJob) {
+// submit enqueues a download job. Returns false (no-op) if the same
+// selectedReleaseID is already queued or being processed by a worker.
+func (d *downloadDispatcher) submit(job downloadJob) bool {
 	d.mu.Lock()
+	if d.inFlight[job.selectedReleaseID] {
+		d.mu.Unlock()
+		return false
+	}
+	d.inFlight[job.selectedReleaseID] = true
 	d.queue = append(d.queue, job)
 	sort.SliceStable(d.queue, func(i, j int) bool {
 		if d.queue[i].priority != d.queue[j].priority {
@@ -314,6 +336,15 @@ func (d *downloadDispatcher) submit(job downloadJob) {
 	case d.signal <- struct{}{}:
 	default:
 	}
+	return true
+}
+
+// markDone removes a selectedReleaseID from the in-flight set so a future
+// submit for the same release is accepted again.
+func (d *downloadDispatcher) markDone(selectedReleaseID int64) {
+	d.mu.Lock()
+	delete(d.inFlight, selectedReleaseID)
+	d.mu.Unlock()
 }
 
 func (d *downloadDispatcher) next(ctx context.Context) (downloadJob, bool) {
@@ -356,7 +387,23 @@ func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service 
 		fetcher:    HTTPNZBFetcher{},
 		importSem:  make(chan struct{}, 2), // kept for ImportNZBFromPush only
 		downloader: newDownloadDispatcher(),
+		dispatchC:  make(chan struct{}, 1),
 	}
+}
+
+// wakeDispatch sends a non-blocking signal to the pending-dispatch loop so it
+// re-scans and pushes new items immediately instead of waiting for the next tick.
+func (s *Service) wakeDispatch() {
+	select {
+	case s.dispatchC <- struct{}{}:
+	default:
+	}
+}
+
+// DispatchWakeCh returns the channel that app.go should select on to wake the
+// pending-dispatch loop as soon as new library items are created.
+func (s *Service) DispatchWakeCh() <-chan struct{} {
+	return s.dispatchC
 }
 
 func (s *Service) SetIndexerLimits(limits IndexerLimits) {
@@ -457,6 +504,9 @@ func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 				_ = s.enrichEpisodeRequest(enrichCtx, lid, tmdbID, tvdbID, epTitle)
 			}()
 		}
+	}
+	if result.Created > 0 {
+		s.wakeDispatch()
 	}
 	return result, nil
 }
@@ -691,7 +741,9 @@ func (s *Service) enrichEpisodeRequest(ctx context.Context, libraryItemID, tmdbI
 }
 
 // PushPendingToQueue fetches all pending library items and pushes them to the
-// work queue with the given priority instead of searching synchronously.
+// work queue. Items that already have a selected release always get priority 0
+// (fast-lane) regardless of the caller-supplied priority; items needing a new
+// search get the caller-supplied priority.
 // Called from the webhook handler so newly approved requests are processed
 // immediately with high priority.
 func (s *Service) PushPendingToQueue(priority int) {
@@ -705,7 +757,11 @@ func (s *Service) PushPendingToQueue(priority int) {
 		return
 	}
 	for _, target := range targets {
-		s.WorkQueue.Push(ctx, target.LibraryItemID, priority)
+		p := priority
+		if target.Selected {
+			p = 0 // already-selected items always jump ahead of new searches
+		}
+		s.WorkQueue.Push(ctx, target.LibraryItemID, p)
 	}
 }
 
@@ -780,8 +836,11 @@ func isCompletionFastLane(ctx context.Context) bool {
 }
 
 // ProcessLibraryItem handles a queue-dispatched library item.
-// If the item already has a selected release, resume fetch/import for that
-// release instead of performing a brand-new search.
+// If the item already has a selected release, submit to the download queue
+// asynchronously and return — blocking the BullMQ worker on the download
+// would starve the other search workers.
+// For items needing a search, the search runs synchronously (BullMQ workers
+// are search workers) but the resulting download is kicked off asynchronously.
 func (s *Service) ProcessLibraryItem(ctx context.Context, libraryItemID int64) error {
 	if s == nil {
 		return nil
@@ -791,10 +850,10 @@ func (s *Service) ProcessLibraryItem(ctx context.Context, libraryItemID int64) e
 		return err
 	}
 	if current != nil && current.SelectedReleaseID != 0 {
-		_, err := s.fetchAndImportSelectedRelease(withCompletionFastLane(ctx), current.SelectedReleaseID)
+		_, err := s.fetchAndImportSelectedRelease(WithAsyncDownload(ctx), current.SelectedReleaseID)
 		return err
 	}
-	_, err = s.SearchLibrary(ctx, libraryItemID)
+	_, err = s.SearchLibrary(WithAsyncDownload(ctx), libraryItemID)
 	return err
 }
 
@@ -1466,7 +1525,7 @@ func (s *Service) fetchAndImportSelectedRelease(ctx context.Context, selectedRel
 		jobCtx = context.Background()
 	}
 	resultCh := make(chan downloadJobResult, 1)
-	s.downloader.submit(downloadJob{
+	submitted := s.downloader.submit(downloadJob{
 		ctx:               jobCtx,
 		selectedReleaseID: selectedReleaseID,
 		priority:          priority,
@@ -1474,9 +1533,15 @@ func (s *Service) fetchAndImportSelectedRelease(ctx context.Context, selectedRel
 		resultCh:          resultCh,
 	})
 	if isAsyncDownload(ctx) {
-		// Fire-and-forget: drain the result channel in the background so the
-		// download worker is never blocked sending its result.
-		go func() { <-resultCh }()
+		if submitted {
+			// Fire-and-forget: drain the result channel in the background so the
+			// download worker is never blocked sending its result.
+			go func() { <-resultCh }()
+		}
+		return nil, nil
+	}
+	if !submitted {
+		// Already queued or in progress — caller doesn't need to wait.
 		return nil, nil
 	}
 	select {
@@ -1501,11 +1566,15 @@ func (s *Service) RunDownloadWorker(ctx context.Context) {
 		// Skip jobs whose caller context already expired while queued.
 		select {
 		case <-job.ctx.Done():
+			s.downloader.markDone(job.selectedReleaseID)
 			job.resultCh <- downloadJobResult{nil, job.ctx.Err()}
 			continue
 		default:
 		}
 		result, importedRelease, err := s.fetchIndexAndRelease(job.ctx, job.selectedReleaseID)
+		// Release the in-flight slot before sending the result so that a
+		// promoted release or a re-queued retry can be accepted immediately.
+		s.downloader.markDone(job.selectedReleaseID)
 		if err != nil || importedRelease == nil {
 			job.resultCh <- downloadJobResult{result, err}
 			continue

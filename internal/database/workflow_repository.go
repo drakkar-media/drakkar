@@ -1774,7 +1774,20 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		return nil, fmt.Errorf("fail/delete-sr (sr=%d): %w", selectedReleaseID, err)
 	}
 
-	var nextCandidateID sql.NullInt64
+	// Collect blocked candidates and the next viable candidate in a single read
+	// pass. rows must be closed before issuing any ExecContext on this
+	// transaction — pgx holds a pgConn lock for the duration of the rows
+	// resultReader, and ExecContext on the same connection returns
+	// driver.ErrBadConn (connLockError.SafeToRetry = true) while that lock
+	// is held.
+	type blockedEntry struct {
+		id     int64
+		reason string
+	}
+	var (
+		nextCandidateID sql.NullInt64
+		blockedEntries  []blockedEntry
+	)
 	rows, err := tx.QueryContext(ctx, `
 		select id, title, coalesce(external_url, ''), coalesce(indexer_name, ''), coalesce(size_bytes, 0), coalesce(posted_at, to_timestamp(0))
 		from release_candidates
@@ -1789,30 +1802,38 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	for rows.Next() {
 		var candidateID int64
 		var candidate SearchCandidateRecord
 		if err = rows.Scan(&candidateID, &candidate.Title, &candidate.ExternalURL, &candidate.IndexerName, &candidate.SizeBytes, &candidate.PostedAt); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		if blockedReason, isBlocked := blockedReleaseReason(blocked, candidate); isBlocked {
-			if _, err = tx.ExecContext(ctx, `
-				update release_candidates
-				set rejected = true,
-				    reject_reason = $2,
-				    selected = false
-				where id = $1`, candidateID, blockedReason,
-			); err != nil {
-				return nil, err
-			}
+			blockedEntries = append(blockedEntries, blockedEntry{id: candidateID, reason: blockedReason})
 			continue
 		}
 		nextCandidateID = sql.NullInt64{Int64: candidateID, Valid: true}
 		break
 	}
-	if err = rows.Err(); err != nil {
-		return nil, err
+	// Close rows before any ExecContext to release the pgConn lock.
+	if rowsErr := rows.Err(); rowsErr != nil {
+		rows.Close()
+		return nil, rowsErr
+	}
+	rows.Close()
+
+	// Now safe to issue writes: mark blocked candidates as rejected.
+	for _, be := range blockedEntries {
+		if _, err = tx.ExecContext(ctx, `
+			update release_candidates
+			set rejected = true,
+			    reject_reason = $2,
+			    selected = false
+			where id = $1`, be.id, be.reason,
+		); err != nil {
+			return nil, err
+		}
 	}
 
 	if !nextCandidateID.Valid {
@@ -2256,27 +2277,35 @@ func (db *DB) BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int
 			err = qErr
 			return err
 		}
-		defer candRows.Close()
+		// Collect keys during iteration; close rows before any ExecContext to
+		// release the pgConn lock (connLockError.SafeToRetry=true → driver.ErrBadConn).
+		var pendingKeys []string
 		for candRows.Next() {
 			var ct, cu, ci string
 			var cs int64
 			var cp time.Time
-			if err = candRows.Scan(&ct, &cu, &ci, &cs, &cp); err != nil {
+			if scanErr := candRows.Scan(&ct, &cu, &ci, &cs, &cp); scanErr != nil {
+				candRows.Close()
+				err = scanErr
 				return err
 			}
-			for _, key := range blocklistKeysForRelease(ct, cu, ci, cs, cp) {
-				if _, err = tx.ExecContext(ctx, `
-					insert into blocklist_items (key, reason, expires_at)
-					values ($1, $2, case when $3 > 0 then now() + ($3 * interval '1 day') else null end)
-					on conflict (key)
-					do update set reason = excluded.reason, expires_at = excluded.expires_at`, key, reason, ttlDays,
-				); err != nil {
-					return err
-				}
-			}
+			pendingKeys = append(pendingKeys, blocklistKeysForRelease(ct, cu, ci, cs, cp)...)
 		}
-		if err = candRows.Err(); err != nil {
+		if rowsErr := candRows.Err(); rowsErr != nil {
+			candRows.Close()
+			err = rowsErr
 			return err
+		}
+		candRows.Close()
+		for _, key := range pendingKeys {
+			if _, err = tx.ExecContext(ctx, `
+				insert into blocklist_items (key, reason, expires_at)
+				values ($1, $2, case when $3 > 0 then now() + ($3 * interval '1 day') else null end)
+				on conflict (key)
+				do update set reason = excluded.reason, expires_at = excluded.expires_at`, key, reason, ttlDays,
+			); err != nil {
+				return err
+			}
 		}
 	}
 

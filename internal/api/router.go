@@ -1181,13 +1181,13 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 				"seen":         result.Seen,
 				"created":      result.Created,
 			})
-			// Items created from webhook are pushed to the work queue with
-			// high priority (10) so they jump ahead of normal monitoring items.
+			// Items created from webhook get priority 0 (highest) so they
+			// jump ahead of normal monitoring items.
 			if result.Created > 0 {
 				if wq, ok := workflowSvc.(interface {
 					PushPendingToQueue(priority int)
 				}); ok {
-					wq.PushPendingToQueue(10)
+					wq.PushPendingToQueue(0)
 				} else {
 					workflowSvc.SearchPendingLibrary(bgCtx) //nolint:errcheck
 				}

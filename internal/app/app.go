@@ -71,7 +71,7 @@ const (
 	backgroundHealthCheckInterval = 15 * time.Minute
 	backgroundDeepHealthBatchSize = 48
 	backgroundDeepHealthSkipDepth = 150
-	pendingQueueDispatchInterval  = 1 * time.Minute
+	pendingQueueDispatchInterval  = 30 * time.Second
 	nonCriticalBacklogThreshold   = 1000
 	nonCriticalQueueDepthLimit    = 500
 )
@@ -167,7 +167,7 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 	}
 	defs := []api.TaskSchedule{
 		{ID: taskSeerrSync, Label: "Sync Seerr Requests", Group: "Indexing", Interval: "10m", Automated: true, LastRunState: "idle"},
-		{ID: taskPendingQueuePush, Label: "Dispatch Pending Queue", Group: "Indexing", Interval: "1m", Automated: true, LastRunState: "idle"},
+		{ID: taskPendingQueuePush, Label: "Dispatch Pending Queue", Group: "Indexing", Interval: "30s", Automated: true, LastRunState: "idle"},
 		{ID: maintenanceRecentTVTask, Label: "Recent TV Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", tvRSSInterval), Automated: true, LastRunState: "idle"},
 		{ID: maintenanceRecentMovieTask, Label: "Recent Movie Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", movieRSSInterval), Automated: true, LastRunState: "idle"},
 		{ID: taskStaleQueueReset, Label: "Reset Stale Queue Items", Group: "Indexing", Interval: "5m", Automated: true, LastRunState: "idle"},
@@ -817,7 +817,24 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}
 		logger.Info().Int("found", result.Found).Int("requested", result.Requested).Int("skipped", result.Skipped).Msg("sync plex detected shows complete")
 	})
-	startRecurring(taskPendingQueuePush, pendingQueueDispatchInterval, true, runPendingDispatch)
+	// Wake-driven dispatch: fires immediately when SyncRequests creates new items
+	// (via workflowSvc.DispatchWakeCh()) and falls back to the tick interval.
+	go func() {
+		ticker := time.NewTicker(pendingQueueDispatchInterval)
+		defer ticker.Stop()
+		logger.Info().Str("task", taskPendingQueuePush).Dur("interval", pendingQueueDispatchInterval).Bool("startup", true).Msg("scheduler: task started")
+		runPendingDispatch()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-workflowSvc.DispatchWakeCh():
+				runPendingDispatch()
+			case <-ticker.C:
+				runPendingDispatch()
+			}
+		}
+	}()
 
 	tvRssInterval := boundedTVRSSInterval(cfg.Indexer.TvRssSyncIntervalMinutes)
 	movieRssInterval := boundedMovieRSSInterval(cfg.Indexer.MovieRssSyncIntervalMinutes)

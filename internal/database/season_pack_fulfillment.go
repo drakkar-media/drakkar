@@ -275,8 +275,8 @@ func (db *DB) FulfillEpisodeLibraryItem(ctx context.Context, libraryItemID, sour
 	// Insert a new selected_release row for this episode.
 	var newSelectedReleaseID int64
 	err = tx.QueryRowContext(ctx, `
-		INSERT INTO selected_releases (release_candidate_id, library_item_id, state)
-		VALUES ($1, $2, 'available')
+		INSERT INTO selected_releases (release_candidate_id, library_item_id)
+		VALUES ($1, $2)
 		ON CONFLICT DO NOTHING
 		RETURNING id`, releaseCandidateID, libraryItemID).Scan(&newSelectedReleaseID)
 	if err != nil || newSelectedReleaseID == 0 {
