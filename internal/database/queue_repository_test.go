@@ -19,14 +19,20 @@ func TestIsPlayableMedia(t *testing.T) {
 
 
 func TestIsHardRejectReason(t *testing.T) {
-	if !isHardRejectReason("archive_video_not_found") {
-		t.Fatal("expected archive reject to be hard")
+	if isHardRejectReason("archive_video_not_found") {
+		t.Fatal("archive_video_not_found should stay retryable")
+	}
+	if isHardRejectReason("archive_headers_invalid") {
+		t.Fatal("archive_headers_invalid should stay retryable")
 	}
 	if !isHardRejectReason(" Archive_Encrypted ") {
-		t.Fatal("expected normalized archive reject to be hard")
+		t.Fatal("expected permanent archive reject to be hard")
 	}
-	if !isHardRejectReason("early preflight: Newshosting attempt 1: article missing") {
-		t.Fatal("expected article missing to be hard")
+	if isHardRejectReason("early preflight: Newshosting attempt 1: article missing") {
+		t.Fatal("early preflight article missing should stay retryable")
+	}
+	if isHardRejectReason("preflight: first segment unavailable: article not found (cached)") {
+		t.Fatal("preflight article-missing should stay retryable")
 	}
 	if !isHardRejectReason("strict health: first segment abc unavailable: yenc crc mismatch") {
 		t.Fatal("expected crc mismatch to be hard")
@@ -41,13 +47,19 @@ func TestIsHardRejectReason(t *testing.T) {
 
 func TestShouldPersistBlocklistReason(t *testing.T) {
 	if !shouldPersistBlocklistReason("archive_encrypted") {
-		t.Fatal("expected archive reject to persist in blocklist")
+		t.Fatal("expected permanent archive reject to persist in blocklist")
+	}
+	if shouldPersistBlocklistReason("archive_headers_invalid") {
+		t.Fatal("archive_headers_invalid should not persist in blocklist")
 	}
 	if !shouldPersistBlocklistReason(" manual_reject ") {
 		t.Fatal("expected manual reject to persist in blocklist")
 	}
-	if !shouldPersistBlocklistReason("early preflight: Newshosting attempt 1: article missing") {
-		t.Fatal("expected article missing to persist in blocklist")
+	if shouldPersistBlocklistReason("early preflight: Newshosting attempt 1: article missing") {
+		t.Fatal("early preflight article missing should not persist in blocklist")
+	}
+	if shouldPersistBlocklistReason("preflight: first segment unavailable: article not found (cached)") {
+		t.Fatal("preflight article-missing should not persist in blocklist")
 	}
 	if !shouldPersistBlocklistReason("strict health: first segment abc unavailable: yenc crc mismatch") {
 		t.Fatal("expected crc mismatch to persist in blocklist")

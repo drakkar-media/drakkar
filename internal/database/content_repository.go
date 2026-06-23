@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path/filepath"
+	"sort"
+	"strings"
 
 	"github.com/hjongedijk/drakkar/internal/stream"
 )
@@ -52,6 +55,202 @@ func computeSpans(messageIDs []string, decodedSegmentSize, lastDecodedSize, segm
 		vfPos += chunkLen
 	}
 	return spans
+}
+
+type storedRarRangeSource struct {
+	VolumePath    string
+	EntryOffset   int64
+	ArchiveOffset int64
+	LengthBytes   int64
+}
+
+type storedRarNZBSource struct {
+	MessageIDs         []string
+	DecodedSegmentSize int64
+	LastDecodedSize    int64
+	FileSizeBytes      int64
+}
+
+type storedRarVolumeMeta struct {
+	Path        string
+	VolumeIndex int
+}
+
+func buildStoredRarSpans(sources map[string]storedRarNZBSource, ranges []storedRarRangeSource) []stream.SegmentSpan {
+	if len(ranges) == 0 || len(sources) == 0 {
+		return nil
+	}
+	sort.SliceStable(ranges, func(i, j int) bool {
+		if ranges[i].EntryOffset != ranges[j].EntryOffset {
+			return ranges[i].EntryOffset < ranges[j].EntryOffset
+		}
+		if ranges[i].VolumePath != ranges[j].VolumePath {
+			return ranges[i].VolumePath < ranges[j].VolumePath
+		}
+		return ranges[i].ArchiveOffset < ranges[j].ArchiveOffset
+	})
+	var (
+		out           []stream.SegmentSpan
+		nextSegmentID int64
+	)
+	for _, item := range ranges {
+		source, ok := sources[strings.ToLower(strings.TrimSpace(item.VolumePath))]
+		if !ok {
+			continue
+		}
+		spans := computeSpans(source.MessageIDs, source.DecodedSegmentSize, source.LastDecodedSize, item.ArchiveOffset, item.LengthBytes)
+		for _, span := range spans {
+			span.Start += item.EntryOffset
+			span.End += item.EntryOffset
+			span.SegmentID = nextSegmentID
+			nextSegmentID++
+			out = append(out, span)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Start != out[j].Start {
+			return out[i].Start < out[j].Start
+		}
+		return out[i].End < out[j].End
+	})
+	return out
+}
+
+func storedRarSourceSize(source storedRarNZBSource) int64 {
+	if source.FileSizeBytes > 0 && (len(source.MessageIDs) == 0 || source.DecodedSegmentSize <= 0) {
+		return source.FileSizeBytes
+	}
+	if len(source.MessageIDs) == 0 || source.DecodedSegmentSize <= 0 {
+		return 0
+	}
+	if len(source.MessageIDs) == 1 {
+		if source.LastDecodedSize > 0 {
+			return source.LastDecodedSize
+		}
+		return source.DecodedSegmentSize
+	}
+	total := int64(len(source.MessageIDs)-1) * source.DecodedSegmentSize
+	if source.LastDecodedSize > 0 {
+		return total + source.LastDecodedSize
+	}
+	return total + source.DecodedSegmentSize
+}
+
+func reconstructStoredRarRanges(
+	sources map[string]storedRarNZBSource,
+	volumes []storedRarVolumeMeta,
+	startVolumePath string,
+	startArchiveOffset int64,
+	continuationOffsets map[string]int64,
+	entrySize int64,
+) []storedRarRangeSource {
+	if len(sources) == 0 || len(volumes) == 0 || entrySize <= 0 {
+		return nil
+	}
+	startIndex := -1
+	for i, volume := range volumes {
+		if strings.EqualFold(strings.TrimSpace(volume.Path), strings.TrimSpace(startVolumePath)) {
+			startIndex = i
+			break
+		}
+	}
+	if startIndex < 0 {
+		startIndex = 0
+	}
+	if startArchiveOffset < 0 {
+		startArchiveOffset = 0
+	}
+	remaining := entrySize
+	entryOffset := int64(0)
+	archiveOffset := startArchiveOffset
+	ranges := make([]storedRarRangeSource, 0, len(volumes)-startIndex)
+	for i := startIndex; i < len(volumes) && remaining > 0; i++ {
+		volume := volumes[i]
+		source, ok := sources[strings.ToLower(strings.TrimSpace(volume.Path))]
+		if !ok {
+			return nil
+		}
+		if i > startIndex {
+			if off, ok := continuationOffsets[strings.ToLower(strings.TrimSpace(volume.Path))]; ok && off >= 0 {
+				archiveOffset = off
+			}
+		}
+		sourceSize := storedRarSourceSize(source)
+		if sourceSize <= archiveOffset {
+			return nil
+		}
+		length := remaining
+		available := sourceSize - archiveOffset
+		if length > available {
+			length = available
+		}
+		ranges = append(ranges, storedRarRangeSource{
+			VolumePath:    volume.Path,
+			EntryOffset:   entryOffset,
+			ArchiveOffset: archiveOffset,
+			LengthBytes:   length,
+		})
+		entryOffset += length
+		remaining -= length
+		archiveOffset = 0
+	}
+	if remaining > 0 {
+		return nil
+	}
+	return ranges
+}
+
+func (db *DB) detectStoredRarContinuationOffsets(ctx context.Context, sources map[string]storedRarNZBSource, volumes []storedRarVolumeMeta, startVolumePath string) map[string]int64 {
+	if db.SegmentFetcher == nil || len(volumes) == 0 {
+		return nil
+	}
+	startIndex := -1
+	for i, volume := range volumes {
+		if strings.EqualFold(strings.TrimSpace(volume.Path), strings.TrimSpace(startVolumePath)) {
+			startIndex = i
+			break
+		}
+	}
+	if startIndex < 0 {
+		startIndex = 0
+	}
+	offsets := make(map[string]int64)
+	for i := startIndex + 1; i < len(volumes); i++ {
+		volume := volumes[i]
+		source, ok := sources[strings.ToLower(strings.TrimSpace(volume.Path))]
+		if !ok || len(source.MessageIDs) == 0 {
+			continue
+		}
+		size := storedRarSourceSize(source)
+		if size <= 0 {
+			continue
+		}
+		limit := int64(512)
+		if limit > size {
+			limit = size
+		}
+		prefix, err := db.SegmentFetcher.FetchRange(ctx, stream.SegmentRange{
+			SegmentID:    0,
+			MessageID:    source.MessageIDs[0],
+			RangeStart:   0,
+			RangeEnd:     limit,
+			SegmentStart: 0,
+			SegmentEnd:   limit,
+		})
+		if err != nil || len(prefix) == 0 {
+			continue
+		}
+		var dataStart int64
+		if len(prefix) >= 8 && string(prefix[:8]) == "Rar!\x1a\x07\x01\x00" {
+			dataStart, _ = rar5FindDataStart(prefix)
+		} else {
+			dataStart, _ = rar4FindDataStart(prefix)
+		}
+		if dataStart > 0 {
+			offsets[strings.ToLower(strings.TrimSpace(volume.Path))] = dataStart
+		}
+	}
+	return offsets
 }
 
 func (db *DB) ListContentMountEntriesForRelease(ctx context.Context, selectedReleaseID int64) ([]ContentMountEntry, error) {
@@ -167,7 +366,16 @@ func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, 
 		return nil, err
 	}
 
-	if entry.readerKind == "direct_nzb" || entry.readerKind == "stored_rar" {
+	if entry.readerKind == "stored_rar" {
+		spans, spansErr := db.loadStoredRarSpans(ctx, virtualFileID)
+		if spansErr != nil {
+			return nil, spansErr
+		}
+		if len(spans) > 0 {
+			entry.spans = spans
+		}
+	}
+	if len(entry.spans) == 0 && (entry.readerKind == "direct_nzb" || entry.readerKind == "stored_rar") {
 		var msgIDs []string
 		if messageIDsRaw != nil {
 			msgIDs = parsePostgresArray(*messageIDsRaw)
@@ -179,6 +387,104 @@ func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, 
 	db.vfCache[virtualFileID] = &entry
 	db.vfCacheMu.Unlock()
 	return &entry, nil
+}
+
+func (db *DB) loadStoredRarSpans(ctx context.Context, virtualFileID int64) ([]stream.SegmentSpan, error) {
+	var (
+		selectedReleaseID  int64
+		virtualFileSize    int64
+		startArchiveOffset int64
+		startVolumePath    string
+	)
+	if err := db.SQL.QueryRowContext(ctx, `
+		SELECT vf.selected_release_id,
+		       vf.size_bytes,
+		       vf.segment_byte_offset,
+		       COALESCE(nf.subject, '')
+		FROM virtual_files vf
+		LEFT JOIN nzb_files nf ON nf.id = vf.nzb_file_id
+		WHERE vf.id = $1`, virtualFileID,
+	).Scan(&selectedReleaseID, &virtualFileSize, &startArchiveOffset, &startVolumePath); err != nil {
+		return nil, err
+	}
+	startVolumePath = filepath.Base(strings.TrimSpace(parseNZBSubjectFilename(startVolumePath)))
+
+	rows, err := db.SQL.QueryContext(ctx, `
+		SELECT av.path, ar.entry_offset, ar.archive_offset, ar.length_bytes
+		FROM virtual_files vf
+		JOIN archives a ON a.selected_release_id = vf.selected_release_id
+		JOIN archive_entries ae ON ae.archive_id = a.id AND ae.path = vf.file_name
+		JOIN archive_ranges ar ON ar.archive_entry_id = ae.id
+		JOIN archive_volumes av ON av.id = ar.archive_volume_id
+		WHERE vf.id = $1
+		ORDER BY ar.entry_offset ASC, ar.archive_offset ASC`, virtualFileID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ranges []storedRarRangeSource
+	for rows.Next() {
+		var item storedRarRangeSource
+		if err := rows.Scan(&item.VolumePath, &item.EntryOffset, &item.ArchiveOffset, &item.LengthBytes); err != nil {
+			return nil, err
+		}
+		ranges = append(ranges, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	sourceRows, err := db.SQL.QueryContext(ctx, `
+		SELECT nf.subject, COALESCE(nf.message_ids::text, '{}'),
+		       COALESCE(nf.decoded_segment_size, 0),
+		       COALESCE(nf.last_decoded_size, 0),
+		       COALESCE(nf.file_size_bytes, 0)
+		FROM nzb_files nf
+		JOIN nzb_documents nd ON nd.id = nf.nzb_document_id
+		WHERE nd.selected_release_id = $1`, selectedReleaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer sourceRows.Close()
+
+	sources := make(map[string]storedRarNZBSource)
+	for sourceRows.Next() {
+		var (
+			subject       string
+			messageIDsRaw string
+			source        storedRarNZBSource
+		)
+		if err := sourceRows.Scan(&subject, &messageIDsRaw, &source.DecodedSegmentSize, &source.LastDecodedSize, &source.FileSizeBytes); err != nil {
+			return nil, err
+		}
+		source.MessageIDs = parsePostgresArray(messageIDsRaw)
+		name := strings.ToLower(filepath.Base(strings.TrimSpace(parseNZBSubjectFilename(subject))))
+		if name == "" {
+			name = strings.ToLower(filepath.Base(strings.TrimSpace(subject)))
+		}
+		if name != "" {
+			sources[name] = source
+		}
+	}
+	if err := sourceRows.Err(); err != nil {
+		return nil, err
+	}
+	if len(ranges) > 0 {
+		startVolumePath = ranges[0].VolumePath
+		startArchiveOffset = ranges[0].ArchiveOffset
+	}
+
+	spans := buildStoredRarSpans(sources, ranges)
+	if spanFileSize(spans) == virtualFileSize {
+		return spans, nil
+	}
+	// DB-stored archive_ranges didn't produce a size match; return nil so the
+	// caller falls back to message-ID-based span computation. NNTP-based
+	// continuation-offset detection is intentionally not done here — it makes
+	// network requests that would block every VFS cache miss during a Plex
+	// library scan. That detection belongs in archive inspection at import time.
+	return spans, nil
 }
 
 // InvalidateVFCacheForNZBFile clears all cached virtual-file entries so that

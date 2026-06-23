@@ -1185,11 +1185,13 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			// jump ahead of normal monitoring items.
 			if result.Created > 0 {
 				if wq, ok := workflowSvc.(interface {
-					PushPendingToQueue(priority int)
+					PushLibraryItemsToQueue(ids []int64, priority int)
 				}); ok {
-					wq.PushPendingToQueue(0)
+					wq.PushLibraryItemsToQueue(result.CreatedLibraryItemIDs, 0)
 				} else {
-					workflowSvc.SearchPendingLibrary(bgCtx) //nolint:errcheck
+					for _, id := range result.CreatedLibraryItemIDs {
+						workflowSvc.SearchLibrary(bgCtx, id) //nolint:errcheck
+					}
 				}
 			}
 		}()

@@ -103,8 +103,10 @@ func DefaultIndexerConfig() IndexerConfig {
 		MinimumAgeMinutes:           0,
 		RetentionDays:               0,
 		MaximumSizeMB:               0,
-		SearchDelayMs:               0,
-		BackgroundSearchWorkers:     12,
+		// Hydra-as-single-indexer setups need deliberate pacing to avoid
+		// rate-limiting the underlying providers.
+		SearchDelayMs:           1500,
+		BackgroundSearchWorkers: 3,
 	}
 }
 

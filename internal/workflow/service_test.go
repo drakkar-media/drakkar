@@ -549,6 +549,28 @@ func (tmdbFillMissingStub) TVSeason(_ context.Context, _ int64, seasonNumber int
 	}, nil
 }
 
+type tmdbFillMissingRecentStub struct{}
+
+func (tmdbFillMissingRecentStub) Enabled() bool { return true }
+func (tmdbFillMissingRecentStub) MovieDetails(context.Context, int64) (tmdb.MovieDetails, error) {
+	return tmdb.MovieDetails{}, nil
+}
+func (tmdbFillMissingRecentStub) TVDetails(context.Context, int64) (tmdb.TVDetails, error) {
+	return tmdb.TVDetails{}, nil
+}
+func (tmdbFillMissingRecentStub) TVSeasonNumbers(_ context.Context, _ int64) ([]int, error) {
+	return []int{1}, nil
+}
+func (tmdbFillMissingRecentStub) TVSeason(_ context.Context, _ int64, _ int) (tmdb.TVSeason, error) {
+	now := time.Now().UTC()
+	return tmdb.TVSeason{
+		Episodes: []tmdb.TVEpisode{
+			{EpisodeNumber: 1, Name: "Fresh One", AirDate: now.AddDate(0, 0, -1).Format("2006-01-02")},
+			{EpisodeNumber: 2, Name: "Fresh Two", AirDate: now.Format("2006-01-02")},
+		},
+	}, nil
+}
+
 func TestSyncRequests(t *testing.T) {
 	repo := &repoStub{}
 	service := NewService(repo, seerrStub{requests: []seerr.Request{
@@ -864,6 +886,164 @@ func TestSearchLibraryPenalizesPreviouslyFailedCandidateAcrossRefresh(t *testing
 	if repo.searchApplied[1].FailureCount != 2 || repo.searchApplied[1].LastFailureReason != "context deadline exceeded" {
 		t.Fatalf("expected history carried forward, got %+v", repo.searchApplied[1])
 	}
+	if repo.searchApplied[1].Rejected {
+		t.Fatalf("expected previously failed candidate to be penalized, not auto-rejected: %+v", repo.searchApplied[1])
+	}
+}
+
+func TestSearchLibraryAllowsSinglePreviouslyFailedCandidateAsFallback(t *testing.T) {
+	repo := &repoStub{
+		searchInput: database.LibrarySearchInput{
+			LibraryItemID: 42,
+			MediaType:     "movie",
+			Title:         "Dune",
+			MovieYear:     2021,
+		},
+		history: map[string]database.CandidateHistory{
+			"http://example/old": {
+				ExternalURL:       "http://example/old",
+				FailureCount:      1,
+				LastFailureReason: "context deadline exceeded",
+			},
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
+		{Title: "Dune.2021.1080p.WEB-DL.x265-GRP", Link: "http://example/old", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+	}})
+	service.fetcher = fetcherStub{
+		fileName: "dune.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Dune (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+	}
+
+	result, err := service.SearchLibrary(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SelectedReleaseID == nil {
+		t.Fatalf("expected fallback candidate to remain selectable, got %+v", result)
+	}
+	if len(repo.searchApplied) != 1 {
+		t.Fatalf("unexpected candidates %+v", repo.searchApplied)
+	}
+	if repo.searchApplied[0].Rejected {
+		t.Fatalf("expected single previously failed candidate not to be auto-rejected: %+v", repo.searchApplied[0])
+	}
+}
+
+func TestSearchLibrarySoftensArchiveFailurePenalty(t *testing.T) {
+	repo := &repoStub{
+		searchInput: database.LibrarySearchInput{
+			LibraryItemID: 42,
+			MediaType:     "movie",
+			Title:         "Dune",
+			MovieYear:     2021,
+		},
+		history: map[string]database.CandidateHistory{
+			"http://example/archive": {
+				ExternalURL:       "http://example/archive",
+				FailureCount:      2,
+				LastFailureReason: "archive_headers_invalid",
+			},
+			"http://example/hard": {
+				ExternalURL:       "http://example/hard",
+				FailureCount:      2,
+				LastFailureReason: "context deadline exceeded",
+			},
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
+		{Title: "Dune.2021.1080p.WEB-DL.x265-ARCHIVE", Link: "http://example/archive", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+		{Title: "Dune.2021.1080p.WEB-DL.x265-HARD", Link: "http://example/hard", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+	}})
+	service.fetcher = fetcherStub{
+		fileName: "dune.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Dune (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+	}
+
+	result, err := service.SearchLibrary(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SelectedReleaseID == nil {
+		t.Fatalf("expected selected release, got %+v", result)
+	}
+	if len(repo.searchApplied) != 2 {
+		t.Fatalf("unexpected candidates %+v", repo.searchApplied)
+	}
+	if repo.searchApplied[0].ExternalURL != "http://example/archive" {
+		t.Fatalf("expected retryable archive-failure candidate ranked ahead of hard-failure candidate, got %+v", repo.searchApplied)
+	}
+	if repo.searchApplied[0].Score <= repo.searchApplied[1].Score {
+		t.Fatalf("expected softer archive penalty to preserve a higher score, got %+v", repo.searchApplied)
+	}
+}
+
+func TestSearchLibraryAllowsRepeatedArchiveFailuresLonger(t *testing.T) {
+	repo := &repoStub{
+		searchInput: database.LibrarySearchInput{
+			LibraryItemID: 42,
+			MediaType:     "movie",
+			Title:         "Dune",
+			MovieYear:     2021,
+		},
+		history: map[string]database.CandidateHistory{
+			"http://example/archive": {
+				ExternalURL:       "http://example/archive",
+				FailureCount:      7,
+				LastFailureReason: "archive_headers_invalid",
+			},
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
+		{Title: "Dune.2021.1080p.WEB-DL.x265-ARCHIVE", Link: "http://example/archive", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+	}})
+	service.fetcher = fetcherStub{
+		fileName: "dune.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Dune (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+	}
+
+	result, err := service.SearchLibrary(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SelectedReleaseID == nil {
+		t.Fatalf("expected archive retry candidate to remain eligible at 7 failures, got %+v", result)
+	}
+	if len(repo.searchApplied) != 1 || repo.searchApplied[0].Rejected {
+		t.Fatalf("expected archive retry candidate not to be durably rejected yet, got %+v", repo.searchApplied)
+	}
+}
+
+func TestSearchLibraryStillRejectsRepeatedlyFailedCandidate(t *testing.T) {
+	repo := &repoStub{
+		searchInput: database.LibrarySearchInput{
+			LibraryItemID: 42,
+			MediaType:     "movie",
+			Title:         "Dune",
+			MovieYear:     2021,
+		},
+		history: map[string]database.CandidateHistory{
+			"http://example/old": {
+				ExternalURL:       "http://example/old",
+				FailureCount:      5,
+				LastFailureReason: "context deadline exceeded",
+			},
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
+		{Title: "Dune.2021.1080p.WEB-DL.x265-GRP", Link: "http://example/old", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+	}})
+
+	result, err := service.SearchLibrary(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.SelectedReleaseID != nil {
+		t.Fatalf("expected repeatedly failed candidate to stay rejected, got %+v", result)
+	}
+	if len(repo.searchApplied) != 1 || !repo.searchApplied[0].Rejected || repo.searchApplied[0].RejectReason != "previously_failed" {
+		t.Fatalf("expected durable reject for repeated failures, got %+v", repo.searchApplied)
+	}
 }
 
 func TestSearchLibraryContinuesPastSelectedCandidateWithFailureHistory(t *testing.T) {
@@ -912,6 +1092,40 @@ func TestSearchLibraryContinuesPastSelectedCandidateWithFailureHistory(t *testin
 	}
 }
 
+func TestSearchLibrarySkipsRecentIdenticalHydraRequest(t *testing.T) {
+	repo := &repoStub{
+		searchInput: database.LibrarySearchInput{
+			LibraryItemID: 42,
+			MediaType:     "movie",
+			Title:         "Dune",
+			MovieYear:     2021,
+		},
+	}
+	var queries []string
+	service := NewService(repo, seerrStub{}, hydraStub{
+		byQuery: map[string][]hydra.SearchResult{"Dune 2021": nil, "Dune": nil},
+		queries: &queries,
+	})
+
+	first, err := service.SearchLibrary(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := service.SearchLibrary(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.CandidateCount != 0 || second.CandidateCount != 0 {
+		t.Fatalf("expected no candidates, got first=%+v second=%+v", first, second)
+	}
+	if len(queries) != 2 {
+		t.Fatalf("expected Hydra to be called only for the first search plan, got %+v", queries)
+	}
+	if queries[0] != "Dune 2021" || queries[1] != "Dune" {
+		t.Fatalf("unexpected Hydra queries %+v", queries)
+	}
+}
+
 func TestBuildSearchRequestsIncludesEpisodeQueryVariants(t *testing.T) {
 	plan := buildSearchRequests(database.LibrarySearchInput{
 		LibraryItemID: 42,
@@ -928,14 +1142,9 @@ func TestBuildSearchRequestsIncludesEpisodeQueryVariants(t *testing.T) {
 		queries = append(queries, req.Query)
 	}
 	expected := []string{
-		"Loki S01E02",
-		"Loki 1x02",
-		"Loki 2021 S01E02",
-		"Loki 2021 1x02",
-		"Loki The Variant",
-		"Loki S01E02 The Variant",
 		"Loki",
 		"Loki 2021",
+		"Loki The Variant",
 	}
 	for _, q := range expected {
 		found := false
@@ -949,8 +1158,76 @@ func TestBuildSearchRequestsIncludesEpisodeQueryVariants(t *testing.T) {
 			t.Fatalf("expected query %q in %+v", q, queries)
 		}
 	}
-	if queries[0] != "Loki S01E02" {
+	if queries[0] != "Loki" {
 		t.Fatalf("expected most-specific query first, got %+v", queries)
+	}
+}
+
+func TestLargestFileFirstSegmentPrefersPayloadOverPar2AndSample(t *testing.T) {
+	msgID := largestFileFirstSegment([]database.ImportedNZBFile{
+		{
+			FileName:      "Movie.vol000+01.par2",
+			FileSizeBytes: 9_000,
+			Segments:      []database.ImportedNZBSegment{{MessageID: "<par2@host>"}},
+		},
+		{
+			FileName:      "sample.mkv",
+			FileSizeBytes: 8_000,
+			Segments:      []database.ImportedNZBSegment{{MessageID: "<sample@host>"}},
+		},
+		{
+			FileName:      "Movie.part01.rar",
+			FileSizeBytes: 7_000,
+			Segments:      []database.ImportedNZBSegment{{MessageID: "<payload@host>"}},
+		},
+	})
+	if msgID != "<payload@host>" {
+		t.Fatalf("expected payload segment, got %q", msgID)
+	}
+}
+
+func TestLargestFileFirstSegmentFallsBackWhenOnlySupportFilesExist(t *testing.T) {
+	msgID := largestFileFirstSegment([]database.ImportedNZBFile{
+		{
+			FileName:      "Movie.vol000+01.par2",
+			FileSizeBytes: 9_000,
+			Segments:      []database.ImportedNZBSegment{{MessageID: "<par2@host>"}},
+		},
+		{
+			FileName:      "proof.jpg",
+			FileSizeBytes: 1_000,
+			Segments:      []database.ImportedNZBSegment{{MessageID: "<jpg@host>"}},
+		},
+	})
+	if msgID != "<par2@host>" {
+		t.Fatalf("expected fallback support-file segment, got %q", msgID)
+	}
+}
+
+func TestShouldIgnoreEarlyPreflightFailure(t *testing.T) {
+	if !shouldIgnoreEarlyPreflightFailure(errors.New("Newshosting attempt 1: article missing")) {
+		t.Fatal("expected article missing to be advisory-only for early preflight")
+	}
+	if !shouldIgnoreEarlyPreflightFailure(errors.New("article not found (cached): abc@host")) {
+		t.Fatal("expected cached article-not-found to be advisory-only for early preflight")
+	}
+	if shouldIgnoreEarlyPreflightFailure(errors.New("yenc crc mismatch")) {
+		t.Fatal("crc mismatch should stay fatal for early preflight")
+	}
+}
+
+func TestShouldIgnorePreflightFailure(t *testing.T) {
+	if !shouldIgnorePreflightFailure(errors.New("preflight: first segment unavailable: article not found (cached)")) {
+		t.Fatal("expected preflight article-not-found to be advisory-only")
+	}
+	if !shouldIgnorePreflightFailure(errors.New("preflight: first segment unavailable: Newshosting attempt 1: article missing")) {
+		t.Fatal("expected preflight article-missing to be advisory-only")
+	}
+	if shouldIgnorePreflightFailure(errors.New("strict health: first segment unavailable: yenc crc mismatch")) {
+		t.Fatal("strict health crc mismatch should stay fatal")
+	}
+	if shouldIgnorePreflightFailure(errors.New("preflight: first segment unavailable: yenc crc mismatch")) {
+		t.Fatal("preflight crc mismatch should stay fatal")
 	}
 }
 
@@ -971,7 +1248,7 @@ func TestSearchLibraryUsesStructuredTVDBSearchRequest(t *testing.T) {
 	var requests []hydra.SearchRequest
 	service := NewService(repo, seerrStub{}, hydraStub{
 		byQuery: map[string][]hydra.SearchResult{
-			"Loki S02E03": {
+			"Loki": {
 				{Title: "Loki.S02E03.1080p.WEB-DL", Link: "http://example/episode", Indexer: "hydra", SizeBytes: 1200, PublishedAt: time.Now()},
 			},
 		},
@@ -1351,24 +1628,21 @@ func TestSearchPendingLibraryQueuesAllItems(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// BullMQ queue is Redis-backed — all items are pushed regardless of queue depth.
-	if result.Processed != total || result.Searched != total {
-		t.Fatalf("expected all %d items queued, got %+v", total, result)
+	if result.Processed != pendingQueueBatchSize || result.Searched != pendingQueueBatchSize {
+		t.Fatalf("expected only %d items queued per tick, got %+v", pendingQueueBatchSize, result)
 	}
-	if depth := service.WorkQueue.Depth(context.Background()); depth != total {
-		t.Fatalf("expected workqueue depth=%d got %d", total, depth)
+	if depth := service.WorkQueue.Depth(context.Background()); depth != pendingQueueBatchSize {
+		t.Fatalf("expected workqueue depth=%d got %d", pendingQueueBatchSize, depth)
 	}
 }
 
-func TestSearchPendingLibraryQueuesAllItemsRegardlessOfBacklog(t *testing.T) {
-	// All items are pushed regardless of selected backlog; priority differs:
-	// selected items (ready to download) get priority=0, others get priority=10.
+func TestSearchPendingLibraryDispatchesSelectedAndQueuesSearchItems(t *testing.T) {
 	repo := &repoStub{
 		selectedBacklog: 2,
 		pending: []database.PendingLibrarySearchTarget{
-			{LibraryItemID: 1, Selected: true},
+			{LibraryItemID: 1, Selected: true, SelectedReleaseID: 101},
 			{LibraryItemID: 2, Selected: false},
-			{LibraryItemID: 3, Selected: true},
+			{LibraryItemID: 3, Selected: true, SelectedReleaseID: 103},
 		},
 	}
 	service := NewService(repo, seerrStub{}, hydraStub{})
@@ -1381,8 +1655,55 @@ func TestSearchPendingLibraryQueuesAllItemsRegardlessOfBacklog(t *testing.T) {
 	if result.Processed != 3 || result.Searched != 3 {
 		t.Fatalf("unexpected bulk result %+v", result)
 	}
-	if depth := service.WorkQueue.Depth(context.Background()); depth != 3 {
-		t.Fatalf("expected all 3 items queued, got depth %d", depth)
+	if depth := service.WorkQueue.Depth(context.Background()); depth != 1 {
+		t.Fatalf("expected only non-selected item in work queue, got depth %d", depth)
+	}
+}
+
+func TestSearchPendingLibraryQueuesOnlyOneEpisodePerShowPerTick(t *testing.T) {
+	repo := &repoStub{
+		pending: []database.PendingLibrarySearchTarget{
+			{LibraryItemID: 1, MediaType: "episode", TVShowID: 500},
+			{LibraryItemID: 2, MediaType: "episode", TVShowID: 500},
+			{LibraryItemID: 3, MediaType: "episode", TVShowID: 500},
+			{LibraryItemID: 4, MediaType: "episode", TVShowID: 600},
+			{LibraryItemID: 5, MediaType: "movie"},
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	service.WorkQueue = newWorkQueueStub()
+
+	result, err := service.SearchPendingLibrary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Processed != 3 || result.Searched != 3 {
+		t.Fatalf("expected one search per show plus non-episode item, got %+v", result)
+	}
+	if got := service.WorkQueue.Depth(context.Background()); got != 3 {
+		t.Fatalf("expected workqueue depth 3, got %d", got)
+	}
+	if result.ProcessedItems[0] != 1 || result.ProcessedItems[1] != 4 || result.ProcessedItems[2] != 5 {
+		t.Fatalf("unexpected processed items %+v", result.ProcessedItems)
+	}
+}
+
+func TestDispatchAutomaticPendingOnlyResumesSelectedItems(t *testing.T) {
+	now := time.Now().Add(-selectedResumeCooldown - time.Minute)
+	repo := &repoStub{
+		pending: []database.PendingLibrarySearchTarget{
+			{LibraryItemID: 1, Selected: true, SelectedReleaseID: 101, State: database.QueueRequested, UpdatedAt: now},
+			{LibraryItemID: 2, MediaType: "movie", Selected: false, SelectedReleaseID: 0, State: database.QueueRequested, UpdatedAt: now},
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+
+	result, err := service.DispatchAutomaticPending(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Processed != 1 || result.Searched != 1 {
+		t.Fatalf("expected only selected item to auto-dispatch, got %+v", result)
 	}
 }
 
@@ -2039,7 +2360,7 @@ func TestSearchUpgradesRequiresMinimumCustomFormatScoreIncrement(t *testing.T) {
 	}
 }
 
-func TestFillMissingEpisodesBatchesAndQueuesNewItems(t *testing.T) {
+func TestFillMissingEpisodesBatchesWithoutAutoQueueingNewItems(t *testing.T) {
 	repo := &repoStub{
 		missingShows: []database.ShowWithMissingEpisodes{{
 			TVShowID:  77,
@@ -2062,8 +2383,36 @@ func TestFillMissingEpisodesBatchesAndQueuesNewItems(t *testing.T) {
 	if repo.batchCreatedBatches != 1 {
 		t.Fatalf("expected one batch insert, got %d", repo.batchCreatedBatches)
 	}
+	if depth := service.WorkQueue.Depth(context.Background()); depth != 0 {
+		t.Fatalf("expected no auto-queued items, got %d", depth)
+	}
+}
+
+func TestFillMissingEpisodesQueuesRecentlyAiredNewItems(t *testing.T) {
+	repo := &repoStub{
+		missingShows: []database.ShowWithMissingEpisodes{{
+			TVShowID:  88,
+			TMDBID:    5678,
+			ShowTitle: "The Bear",
+		}},
+		batchCreatedIDs: []int64{601, 602},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	service.SetTMDBClient(tmdbFillMissingRecentStub{})
+	service.WorkQueue = newWorkQueueStub()
+
+	result, err := service.FillMissingEpisodes(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ShowsProcessed != 1 || result.EpisodesFound != 2 || result.ItemsCreated != 2 || result.Queued != 2 {
+		t.Fatalf("unexpected result %+v", result)
+	}
+	if repo.batchCreatedBatches != 1 {
+		t.Fatalf("expected one batch insert, got %d", repo.batchCreatedBatches)
+	}
 	if depth := service.WorkQueue.Depth(context.Background()); depth != 2 {
-		t.Fatalf("expected two queued items, got %d", depth)
+		t.Fatalf("expected two queued recent items, got %d", depth)
 	}
 }
 

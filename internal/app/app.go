@@ -65,6 +65,7 @@ const (
 	taskSearchUpgrades         = "search_upgrades"
 	taskResetOrphaned          = "reset_orphaned_available"
 	taskSyncPlexDetected       = "sync_plex_detected"
+	taskArticleHealthCheck     = "article_health_check"
 )
 
 const (
@@ -176,6 +177,7 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 		{ID: taskResetOrphaned, Label: "Reset Orphaned Available Items", Group: "Publishing", Interval: "30m", Automated: true, LastRunState: "idle"},
 		{ID: taskHealthCheck, Label: "Run Health Check", Group: "Maintenance", Interval: "15m", Automated: true, LastRunState: "idle"},
 		{ID: taskNZBHealthCheck, Label: "Deep NZB Article Check", Group: "Maintenance", Interval: "168h", Automated: true, LastRunState: "idle"},
+		{ID: taskArticleHealthCheck, Label: "Article Health Check", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskCachePrune, Label: "Prune Block Cache", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskOrphanedContent, Label: "Remove Orphaned Content", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskBrokenSymlinks, Label: "Remove Broken Media Symlinks", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
@@ -349,6 +351,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	}
 	if checker, ok := db.SegmentFetcher.(database.SegmentChecker); ok {
 		workflowSvc.SetEarlyChecker(checker.Exists)
+		workflowSvc.SetArticleChecker(checker.Exists)
 	}
 	workflowSvc.SetPreflightChecker(func(ctx context.Context, item database.QueueSnapshot) error {
 		if item.NZBDocumentID == nil {
@@ -640,12 +643,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		logger.Info().Int("seen", result.Seen).Int("created", result.Created).Msg("seerr sync complete")
 	}
 
-	// runPendingDispatch pushes ALL pending items to WorkQueue for concurrent
-	// configured-worker processing. Using SearchPendingLibrary() (WorkQueue) instead of
-	// SearchPendingBatch() (sequential) increases throughput from ~45 items/hour
-	// to ~3000+ items/hour — same approach as Radarr's parallel indexer dispatch.
+	// runPendingDispatch only resumes items that already have a selected release.
+	// Servarr-style automatic behavior uses RSS for discovery and does not
+	// actively search the full missing backlog on a timer.
 	runPendingDispatch := func() {
-		result, err := workflowSvc.SearchPendingLibrary(ctx)
+		result, err := workflowSvc.DispatchAutomaticPending(ctx)
 		if err != nil {
 			logger.Error().Err(err).Msg("monitoring: pending dispatch error")
 			return
@@ -854,6 +856,18 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	startRecurring(taskNZBHealthCheck, 168*time.Hour, false, func() {
 		if _, err := maintenanceSvc.DeepNZBHealthCheck(ctx); err != nil {
 			logger.Error().Err(err).Msg("deep nzb health check failed")
+		}
+	})
+	startRecurringWithStartupDelay(taskArticleHealthCheck, 6*time.Hour, 5*time.Minute, func() {
+		n, err := workflowSvc.ValidatePublishedArticles(ctx)
+		if err != nil {
+			logger.Error().Err(err).Msg("article health check failed")
+			return
+		}
+		if n > 0 {
+			logger.Warn().Int("reset", n).Msg("article health check: reset library items with unavailable articles")
+		} else {
+			logger.Info().Msg("article health check: all published articles reachable")
 		}
 	})
 	startRecurringWithStartupDelay(taskCachePrune, 6*time.Hour, 8*time.Minute, runCachePrune)

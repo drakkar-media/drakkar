@@ -109,7 +109,30 @@ func TestInspectImportedArchivesRejectsInvalidHeaders(t *testing.T) {
 	}
 }
 
-func TestInspectImportedArchivesRejectsIncompleteStoredMapping(t *testing.T) {
+func TestInspectImportedArchivesPropagatesMissingArticleFailure(t *testing.T) {
+	archives := inspectImportedArchives(context.Background(), []ImportedArchive{{
+		Kind: "rar",
+		Volumes: []ImportedArchiveVolume{
+			{Path: "Movie.part01.rar", VolumeIndex: 0},
+		},
+	}}, []ImportedNZBFile{{
+		FileName:      "Movie.part01.rar",
+		FileSizeBytes: 1024,
+		Segments: []ImportedNZBSegment{{
+			MessageID:          "<one@test>",
+			DecodedStartOffset: 0,
+			DecodedEndOffset:   1024,
+		}},
+	}}, fetcherStub{err: errors.New("fetch decoded article <one@test>: Newshosting attempt 1: unexpected BODY status 430")})
+	if archives[0].Status != "rejected" {
+		t.Fatalf("expected rejected archive, got %+v", archives[0])
+	}
+	if !strings.Contains(archives[0].RejectReason, "nntp_article_unavailable") {
+		t.Fatalf("expected missing-article reason, got %+v", archives[0])
+	}
+}
+
+func TestInspectImportedArchivesUsesSegmentSizeWhenNZBFileSizeMetadataIsTooSmall(t *testing.T) {
 	raw := buildRAR4(false, false, 0x30, "Movie.mkv", 1024)
 	archives := inspectImportedArchives(context.Background(), []ImportedArchive{{
 		Kind: "rar",
@@ -125,8 +148,35 @@ func TestInspectImportedArchivesRejectsIncompleteStoredMapping(t *testing.T) {
 			DecodedEndOffset:   int64(len(raw)),
 		}},
 	}}, fetcherStub{data: raw})
-	if archives[0].Status != "rejected" || archives[0].RejectReason != "archive_headers_invalid" {
+	if archives[0].Status != "supported" || archives[0].RejectReason != "" {
 		t.Fatalf("unexpected archive %+v", archives[0])
+	}
+}
+
+func TestInspectImportedArchivesRetriesLargerRARPrefix(t *testing.T) {
+	raw := buildRAR4WithEntries([]rarFixtureEntry{
+		{name: "proof01.nfo", method: 0x30, payloadSize: 300000},
+		{name: "Movie.mkv", method: 0x30, payloadSize: 1024},
+	})
+	archives := inspectImportedArchives(context.Background(), []ImportedArchive{{
+		Kind: "rar",
+		Volumes: []ImportedArchiveVolume{
+			{Path: "Movie.part01.rar", VolumeIndex: 0},
+		},
+	}}, []ImportedNZBFile{{
+		FileName:      "Movie.part01.rar",
+		FileSizeBytes: int64(len(raw)),
+		Segments: []ImportedNZBSegment{{
+			MessageID:          "<one@test>",
+			DecodedStartOffset: 0,
+			DecodedEndOffset:   int64(len(raw)),
+		}},
+	}}, fetcherStub{data: raw})
+	if archives[0].Status != "supported" || archives[0].RejectReason != "" {
+		t.Fatalf("unexpected archive %+v", archives[0])
+	}
+	if len(archives[0].Entries) == 0 {
+		t.Fatalf("expected parsed entries, got %+v", archives[0])
 	}
 }
 
@@ -174,6 +224,49 @@ func TestAssignArchiveRangesAcrossVolumes(t *testing.T) {
 	}
 	if entries[0].Ranges[0].LengthBytes != 20 || entries[0].Ranges[1].EntryOffset != 20 || entries[0].Ranges[1].LengthBytes != 100 {
 		t.Fatalf("unexpected cross-volume mapping %+v", entries[0].Ranges)
+	}
+}
+
+func TestAggregateRARVolumeEntriesAcrossParts(t *testing.T) {
+	entries, err := aggregateRARVolumeEntries([]ImportedArchiveEntry{
+		{
+			Path:              "Movie.mkv",
+			SizeBytes:         120,
+			PackedSizeBytes:   20,
+			CompressionMethod: "m0",
+			VolumeIndex:       0,
+			ArchiveOffset:     80,
+		},
+		{
+			Path:              "Movie.mkv",
+			SizeBytes:         120,
+			PackedSizeBytes:   100,
+			CompressionMethod: "m0",
+			VolumeIndex:       1,
+			ArchiveOffset:     0,
+		},
+	}, map[int]int64{
+		0: 100,
+		1: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %+v", entries)
+	}
+	entry := entries[0]
+	if entry.PackedSizeBytes != 120 || entry.SizeBytes != 120 {
+		t.Fatalf("unexpected entry sizes %+v", entry)
+	}
+	if len(entry.Ranges) != 2 {
+		t.Fatalf("unexpected ranges %+v", entry.Ranges)
+	}
+	if entry.Ranges[0].EntryOffset != 0 || entry.Ranges[0].LengthBytes != 20 {
+		t.Fatalf("unexpected first range %+v", entry.Ranges[0])
+	}
+	if entry.Ranges[1].EntryOffset != 20 || entry.Ranges[1].LengthBytes != 100 {
+		t.Fatalf("unexpected second range %+v", entry.Ranges[1])
 	}
 }
 
@@ -300,6 +393,29 @@ func buildRAR4(solid bool, encrypted bool, method byte, name string, payloadSize
 	}
 	raw = append(raw, rarBlock(0x74, fileFlags, body)...)
 	raw = append(raw, make([]byte, int(payloadSize))...)
+	raw = append(raw, rarBlock(0x7b, 0, nil)...)
+	return raw
+}
+
+type rarFixtureEntry struct {
+	name        string
+	method      byte
+	payloadSize uint32
+}
+
+func buildRAR4WithEntries(entries []rarFixtureEntry) []byte {
+	raw := append([]byte{}, []byte("Rar!\x1a\x07\x00")...)
+	raw = append(raw, rarBlock(0x73, 0x0100, make([]byte, 6))...)
+	for _, entry := range entries {
+		body := make([]byte, 25+len(entry.name))
+		binary.LittleEndian.PutUint32(body[0:4], entry.payloadSize)
+		binary.LittleEndian.PutUint32(body[4:8], entry.payloadSize)
+		body[18] = entry.method
+		binary.LittleEndian.PutUint16(body[19:21], uint16(len(entry.name)))
+		copy(body[25:], []byte(entry.name))
+		raw = append(raw, rarBlock(0x74, 0, body)...)
+		raw = append(raw, make([]byte, int(entry.payloadSize))...)
+	}
 	raw = append(raw, rarBlock(0x7b, 0, nil)...)
 	return raw
 }

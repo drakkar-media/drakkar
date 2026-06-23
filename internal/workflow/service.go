@@ -9,6 +9,7 @@ import (
 	"net/http/cookiejar"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -93,6 +94,7 @@ type Repository interface {
 	ListUnrecoverableLibraryItems(ctx context.Context) ([]int64, error)
 	ListMovieTmdbIDs(ctx context.Context) ([]int64, error)
 	ListTVShowTmdbIDsWithSeasons(ctx context.Context) ([]database.TVShowSeerrInfo, error)
+	ListPublishedDirectNzbSegments(ctx context.Context) ([]database.PublishedDirectNzbSegment, error)
 }
 
 type SeerrClient interface {
@@ -126,8 +128,9 @@ type Service struct {
 	// earlyChecker is called with a single message ID immediately after NZB parsing,
 	// before archive inspection and DB import. A non-nil error rejects the candidate
 	// fast, avoiding expensive segment downloads for expired releases.
-	earlyChecker  func(context.Context, string) error
-	queuePolicy   QueuePolicyProvider
+	earlyChecker   func(context.Context, string) error
+	articleChecker func(ctx context.Context, messageID string) error
+	queuePolicy    QueuePolicyProvider
 	indexerLimits IndexerLimits
 	logger        zerolog.Logger
 	// WorkQueue accepts individual library item IDs for immediate dispatch.
@@ -161,9 +164,13 @@ type Service struct {
 
 	// searchInflight deduplicates concurrent SearchLibrary calls for the same
 	// library item ID (O-05). Keyed by int64 library item ID.
-	searchInflight sync.Map
-	recentURLMu    sync.Mutex
-	recentURLHits  map[string]time.Time
+	searchInflight     sync.Map
+	recentURLMu        sync.Mutex
+	recentURLHits      map[string]time.Time
+	searchAttemptMu    sync.Mutex
+	searchAttempts     map[string]searchAttemptRecord
+	recentShowSearchMu sync.Mutex
+	recentShowSearches map[int64]time.Time
 
 	// TTL caches for policy data, guarded by profileCacheMu (O-04).
 	// These are loaded from the DB at most once per 5 minutes.
@@ -204,8 +211,9 @@ type NZBFetcher interface {
 }
 
 type SyncResult struct {
-	Seen    int `json:"seen"`
-	Created int `json:"created"`
+	Seen                  int     `json:"seen"`
+	Created               int     `json:"created"`
+	CreatedLibraryItemIDs []int64 `json:"createdLibraryItemIds,omitempty"`
 }
 
 type SearchResult struct {
@@ -261,7 +269,15 @@ const (
 	busyQueueDepthThreshold     = 150
 	selectedResumeCooldown      = 5 * time.Minute
 	selectedURLCooldown         = 30 * time.Minute
+	searchRequestCooldown       = 20 * time.Minute
+	tvShowSearchCooldown        = 10 * time.Minute
 )
+
+type searchAttemptRecord struct {
+	at        time.Time
+	outcome   string
+	queryText string
+}
 
 type completionFastLaneKey struct{}
 
@@ -386,14 +402,16 @@ func (d *downloadDispatcher) hasWorkers() bool {
 
 func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service {
 	return &Service{
-		repo:          repo,
-		seerr:         seerr,
-		hydra:         hydra,
-		fetcher:       HTTPNZBFetcher{},
-		importSem:     make(chan struct{}, 2), // kept for ImportNZBFromPush only
-		downloader:    newDownloadDispatcher(),
-		dispatchC:     make(chan struct{}, 1),
-		recentURLHits: make(map[string]time.Time),
+		repo:               repo,
+		seerr:              seerr,
+		hydra:              hydra,
+		fetcher:            HTTPNZBFetcher{},
+		importSem:          make(chan struct{}, 2), // kept for ImportNZBFromPush only
+		downloader:         newDownloadDispatcher(),
+		dispatchC:          make(chan struct{}, 1),
+		recentURLHits:      make(map[string]time.Time),
+		searchAttempts:     make(map[string]searchAttemptRecord),
+		recentShowSearches: make(map[int64]time.Time),
 	}
 }
 
@@ -446,6 +464,48 @@ func (s *Service) SetEarlyChecker(fn func(context.Context, string) error) {
 	s.earlyChecker = fn
 }
 
+func (s *Service) SetArticleChecker(fn func(ctx context.Context, messageID string) error) {
+	s.articleChecker = fn
+}
+
+// ValidatePublishedArticles checks the first NNTP segment of every published
+// direct_nzb library item. Items whose segment returns 430 (No Such Article)
+// are reset so Drakkar can search for a working replacement. Returns the number
+// of items reset.
+func (s *Service) ValidatePublishedArticles(ctx context.Context) (int, error) {
+	if s.articleChecker == nil {
+		return 0, nil
+	}
+	segments, err := s.repo.ListPublishedDirectNzbSegments(ctx)
+	if err != nil {
+		return 0, err
+	}
+	reset := 0
+	for _, seg := range segments {
+		if ctx.Err() != nil {
+			break
+		}
+		if seg.FirstMsgID == "" {
+			continue
+		}
+		checkErr := s.articleChecker(ctx, seg.FirstMsgID)
+		if checkErr == nil {
+			continue
+		}
+		msg := strings.ToLower(checkErr.Error())
+		if !strings.Contains(msg, "430") && !strings.Contains(msg, "article not found") && !strings.Contains(msg, "article missing") {
+			continue
+		}
+		s.logger.Warn().Int64("libraryItemId", seg.LibraryItemID).Str("msgID", seg.FirstMsgID).Err(checkErr).Msg("article health check: first segment unavailable — resetting library item")
+		if resetErr := s.ResetLibraryItem(ctx, seg.LibraryItemID); resetErr != nil {
+			s.logger.Warn().Int64("libraryItemId", seg.LibraryItemID).Err(resetErr).Msg("article health check: reset failed")
+			continue
+		}
+		reset++
+	}
+	return reset, nil
+}
+
 func (s *Service) SetQueuePolicyProvider(provider QueuePolicyProvider) {
 	s.queuePolicy = provider
 }
@@ -478,6 +538,7 @@ func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 			// New items get queued for search immediately; metadata arrives shortly after.
 			if created {
 				result.Created++
+				result.CreatedLibraryItemIDs = append(result.CreatedLibraryItemIDs, libraryItemID)
 			}
 			lid, tmdbID := libraryItemID, request.TMDBID
 			go func() {
@@ -502,6 +563,7 @@ func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 			}
 			if created {
 				result.Created++
+				result.CreatedLibraryItemIDs = append(result.CreatedLibraryItemIDs, libraryItemID)
 			}
 			lid, tmdbID, tvdbID, epTitle := libraryItemID, request.TMDBID, request.TVDBID, request.EpisodeTitle
 			go func() {
@@ -762,12 +824,30 @@ func (s *Service) PushPendingToQueue(priority int) {
 		s.logger.Error().Err(err).Msg("PushPendingToQueue: ListPendingLibrarySearchTargets failed")
 		return
 	}
-	for _, target := range targets {
+	for _, target := range s.filterPendingSearchTargets(targets, time.Now()) {
 		p := priority
 		if target.Selected {
 			p = 0 // already-selected items always jump ahead of new searches
 		}
 		s.WorkQueue.Push(ctx, target.LibraryItemID, p)
+	}
+}
+
+func (s *Service) PushLibraryItemsToQueue(ids []int64, priority int) {
+	if s == nil || s.WorkQueue == nil {
+		return
+	}
+	ctx := context.Background()
+	seen := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		s.WorkQueue.Push(ctx, id, priority)
 	}
 }
 
@@ -801,6 +881,7 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 	if err != nil {
 		return BulkSearchResult{}, err
 	}
+	targets = s.filterPendingSearchTargets(targets, time.Now())
 	result := BulkSearchResult{Processed: len(targets)}
 	for _, target := range targets {
 		result.ProcessedItems = append(result.ProcessedItems, target.LibraryItemID)
@@ -853,6 +934,91 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 	return result, nil
 }
 
+func (s *Service) DispatchAutomaticPending(ctx context.Context) (BulkSearchResult, error) {
+	targets, err := s.repo.ListPendingLibrarySearchTargets(ctx)
+	if err != nil {
+		return BulkSearchResult{}, err
+	}
+	filtered := make([]database.PendingLibrarySearchTarget, 0, len(targets))
+	for _, target := range targets {
+		if target.SelectedReleaseID > 0 || target.Selected {
+			filtered = append(filtered, target)
+		}
+	}
+	result := BulkSearchResult{Processed: len(filtered)}
+	for _, target := range filtered {
+		result.ProcessedItems = append(result.ProcessedItems, target.LibraryItemID)
+		now := time.Now()
+		if !s.shouldDispatchSelectedTarget(target, now) {
+			continue
+		}
+		resultCh := make(chan downloadJobResult, 1)
+		if s.downloader.submit(downloadJob{
+			ctx:               context.Background(),
+			selectedReleaseID: target.SelectedReleaseID,
+			priority:          0,
+			enqueuedAt:        now,
+			resultCh:          resultCh,
+		}) {
+			s.markSelectedReleaseURLDispatched(target.ExternalURL, now)
+			go func() { <-resultCh }()
+			result.Searched++
+		}
+	}
+	return result, nil
+}
+
+func (s *Service) filterPendingSearchTargets(targets []database.PendingLibrarySearchTarget, now time.Time) []database.PendingLibrarySearchTarget {
+	if len(targets) == 0 {
+		return nil
+	}
+	selectedTargets := make([]database.PendingLibrarySearchTarget, 0, len(targets))
+	searchTargets := make([]database.PendingLibrarySearchTarget, 0, len(targets))
+	seenShows := make(map[int64]bool)
+	for _, target := range targets {
+		if target.SelectedReleaseID > 0 || target.Selected {
+			selectedTargets = append(selectedTargets, target)
+			continue
+		}
+		if strings.EqualFold(target.MediaType, "episode") && target.TVShowID > 0 {
+			if seenShows[target.TVShowID] || s.shouldDeferTVShowSearch(target.TVShowID, now) {
+				continue
+			}
+			seenShows[target.TVShowID] = true
+			s.markTVShowSearchQueued(target.TVShowID, now)
+		}
+		searchTargets = append(searchTargets, target)
+		if len(searchTargets) >= pendingQueueBatchSize {
+			break
+		}
+	}
+	return append(selectedTargets, searchTargets...)
+}
+
+func (s *Service) shouldDeferTVShowSearch(tvShowID int64, now time.Time) bool {
+	if s == nil || tvShowID <= 0 {
+		return false
+	}
+	s.recentShowSearchMu.Lock()
+	defer s.recentShowSearchMu.Unlock()
+	for id, queuedAt := range s.recentShowSearches {
+		if now.Sub(queuedAt) >= tvShowSearchCooldown {
+			delete(s.recentShowSearches, id)
+		}
+	}
+	lastAt, ok := s.recentShowSearches[tvShowID]
+	return ok && now.Sub(lastAt) < tvShowSearchCooldown
+}
+
+func (s *Service) markTVShowSearchQueued(tvShowID int64, now time.Time) {
+	if s == nil || tvShowID <= 0 {
+		return
+	}
+	s.recentShowSearchMu.Lock()
+	s.recentShowSearches[tvShowID] = now
+	s.recentShowSearchMu.Unlock()
+}
+
 func (s *Service) shouldDispatchSelectedTarget(target database.PendingLibrarySearchTarget, now time.Time) bool {
 	if target.SelectedReleaseID <= 0 {
 		return false
@@ -890,6 +1056,69 @@ func (s *Service) markSelectedReleaseURLDispatched(rawURL string, now time.Time)
 	s.recentURLMu.Lock()
 	s.recentURLHits[rawURL] = now
 	s.recentURLMu.Unlock()
+}
+
+func searchRequestFingerprint(libraryItemID int64, request hydra.SearchRequest) string {
+	query := normalizeSearchText(request.Query)
+	return fmt.Sprintf("%d|%s|%s|%d|%s|%d|%d", libraryItemID,
+		strings.ToLower(strings.TrimSpace(request.MediaType)),
+		query,
+		request.TMDBID,
+		strings.ToLower(strings.TrimSpace(request.IMDbID)),
+		request.TVDBID,
+		request.SeasonNumber*1000+request.EpisodeNumber,
+	)
+}
+
+func (s *Service) shouldSkipSearchRequest(libraryItemID int64, request hydra.SearchRequest, now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	key := searchRequestFingerprint(libraryItemID, request)
+	s.searchAttemptMu.Lock()
+	defer s.searchAttemptMu.Unlock()
+	for attemptKey, record := range s.searchAttempts {
+		if now.Sub(record.at) >= searchRequestCooldown {
+			delete(s.searchAttempts, attemptKey)
+		}
+	}
+	record, ok := s.searchAttempts[key]
+	if !ok {
+		return false
+	}
+	switch record.outcome {
+	case "selected", "usable", "rejected_only", "empty":
+		return now.Sub(record.at) < searchRequestCooldown
+	default:
+		return false
+	}
+}
+
+func (s *Service) rememberSearchRequest(libraryItemID int64, request hydra.SearchRequest, outcome string, now time.Time) {
+	if s == nil {
+		return
+	}
+	key := searchRequestFingerprint(libraryItemID, request)
+	s.searchAttemptMu.Lock()
+	s.searchAttempts[key] = searchAttemptRecord{
+		at:        now,
+		outcome:   outcome,
+		queryText: searchRequestLabel(request),
+	}
+	s.searchAttemptMu.Unlock()
+}
+
+func searchCandidateOutcome(candidates []database.SearchCandidateRecord, selectedReleaseID *int64) string {
+	if selectedReleaseID != nil {
+		return "selected"
+	}
+	if len(candidates) == 0 {
+		return "empty"
+	}
+	if hasNonRejectedCandidate(candidates) {
+		return "usable"
+	}
+	return "rejected_only"
 }
 
 func withCompletionFastLane(ctx context.Context) context.Context {
@@ -1253,6 +1482,13 @@ func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID i
 		req := searchRequirements(input)
 		req.TrustSource = trustSource
 		for _, candidateRequest := range tierRequests {
+			if s.shouldSkipSearchRequest(libraryItemID, candidateRequest, time.Now()) {
+				s.logger.Debug().
+					Int64("libraryItemId", libraryItemID).
+					Str("query", searchRequestLabel(candidateRequest)).
+					Msg("workqueue: skipping recent identical Hydra request")
+				continue
+			}
 			query = searchRequestLabel(candidateRequest)
 			results, err = s.searchHydraWithRetry(ctx, candidateRequest)
 			if err != nil {
@@ -1270,6 +1506,7 @@ func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID i
 			if err != nil {
 				return true // propagate error via outer err variable
 			}
+			s.rememberSearchRequest(libraryItemID, candidateRequest, searchCandidateOutcome(candidates, selectedReleaseID), time.Now())
 			if selectedReleaseID != nil && !shouldContinueSearch(combinedCandidates, input) {
 				return true
 			}
@@ -1364,8 +1601,14 @@ func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearc
 	)
 	profilePrefs := s.profilePreferencesForItem(ctx, libraryItemID, "episode")
 	for _, req := range packRequests {
+		if s.shouldSkipSearchRequest(libraryItemID, req, time.Now()) {
+			continue
+		}
 		results, err := s.searchHydraWithRetry(ctx, req)
 		if err != nil || len(results) == 0 {
+			if err == nil {
+				s.rememberSearchRequest(libraryItemID, req, "empty", time.Now())
+			}
 			continue
 		}
 		candidates := buildSearchCandidates(results, searchRequirements(packInput), history, profilePrefs, s.indexerLimits, s.loadIndexerPolicyMap(ctx))
@@ -1374,6 +1617,7 @@ func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearc
 		if err != nil {
 			return SearchResult{}, nil, err
 		}
+		s.rememberSearchRequest(libraryItemID, req, searchCandidateOutcome(candidates, selectedReleaseID), time.Now())
 		if selectedReleaseID != nil {
 			break
 		}
@@ -1698,8 +1942,12 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 	if s.earlyChecker != nil {
 		if msgID := largestFileFirstSegment(imported.Files); msgID != "" {
 			if err := s.earlyChecker(ctx, msgID); err != nil {
-				result, err := s.promoteNextAfterFailureDepth(ctx, current, fmt.Sprintf("early preflight: %s", err), 0)
-				return result, nil, err
+				if shouldIgnoreEarlyPreflightFailure(err) {
+					s.logger.Info().Err(err).Int64("srId", current.SelectedReleaseID).Msg("early preflight advisory only; continuing import")
+				} else {
+					result, err := s.promoteNextAfterFailureDepth(ctx, current, fmt.Sprintf("early preflight: %s", err), 0)
+					return result, nil, err
+				}
 			}
 		}
 	}
@@ -1721,8 +1969,12 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 	item.State = database.QueuePreflight
 	if s.preflightChecker != nil {
 		if err := s.preflightChecker(ctx, item); err != nil {
-			result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), 0)
-			return result, nil, err
+			if shouldIgnorePreflightFailure(err) {
+				s.logger.Info().Err(err).Int64("srId", current.SelectedReleaseID).Msg("preflight advisory only; continuing publish")
+			} else {
+				result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), 0)
+				return result, nil, err
+			}
 		}
 	}
 	return nil, &pendingPublish{current: current, item: item}, nil
@@ -1807,7 +2059,11 @@ func (s *Service) fetchAndImportSelectedReleaseDepth(ctx context.Context, select
 	if s.earlyChecker != nil {
 		if msgID := largestFileFirstSegment(imported.Files); msgID != "" {
 			if err := s.earlyChecker(ctx, msgID); err != nil {
-				return s.promoteNextAfterFailureDepth(ctx, current, fmt.Sprintf("early preflight: %s", err), depth)
+				if shouldIgnoreEarlyPreflightFailure(err) {
+					s.logger.Info().Err(err).Int64("srId", current.SelectedReleaseID).Msg("early preflight advisory only; continuing import")
+				} else {
+					return s.promoteNextAfterFailureDepth(ctx, current, fmt.Sprintf("early preflight: %s", err), depth)
+				}
 			}
 		}
 	}
@@ -1815,19 +2071,76 @@ func (s *Service) fetchAndImportSelectedReleaseDepth(ctx context.Context, select
 }
 
 // largestFileFirstSegment returns the first segment message ID of the largest
-// file in the NZB, skipping files with no segments. Used as a cheap proxy for
-// the main content file when doing an early NNTP STAT check.
+// likely-payload file in the NZB, skipping files with no segments plus obvious
+// support files such as PAR2/NFO/JPG and sample clips. If every file is a
+// support file, it falls back to the largest file overall.
 func largestFileFirstSegment(files []database.ImportedNZBFile) string {
+	best := pickLargestEarlyProbeFile(files, false)
+	if len(best.Segments) == 0 {
+		best = pickLargestEarlyProbeFile(files, true)
+		if len(best.Segments) == 0 {
+			return ""
+		}
+	}
+	return best.Segments[0].MessageID
+}
+
+func pickLargestEarlyProbeFile(files []database.ImportedNZBFile, includeSupport bool) database.ImportedNZBFile {
 	var best database.ImportedNZBFile
 	for _, f := range files {
-		if len(f.Segments) > 0 && f.FileSizeBytes > best.FileSizeBytes {
+		if len(f.Segments) == 0 {
+			continue
+		}
+		if !includeSupport && isEarlyProbeSupportFile(f.FileName) {
+			continue
+		}
+		if f.FileSizeBytes > best.FileSizeBytes {
 			best = f
 		}
 	}
-	if len(best.Segments) == 0 {
-		return ""
+	return best
+}
+
+func isEarlyProbeSupportFile(name string) bool {
+	base := strings.ToLower(filepath.Base(strings.TrimSpace(name)))
+	if base == "" {
+		return false
 	}
-	return best.Segments[0].MessageID
+	switch filepath.Ext(base) {
+	case ".par2", ".sfv", ".nfo", ".jpg", ".jpeg", ".png":
+		return true
+	}
+	stem := strings.TrimSuffix(base, filepath.Ext(base))
+	return stem == "sample" ||
+		strings.HasPrefix(stem, "sample-") ||
+		strings.HasPrefix(stem, "sample_") ||
+		strings.HasSuffix(stem, "-sample") ||
+		strings.HasSuffix(stem, "_sample")
+}
+
+func shouldIgnoreEarlyPreflightFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(msg, "article missing") ||
+		strings.Contains(msg, "article not found") ||
+		strings.Contains(msg, "status 430") ||
+		strings.Contains(msg, " 430")
+}
+
+func shouldIgnorePreflightFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if !strings.HasPrefix(msg, "preflight:") {
+		return false
+	}
+	return strings.Contains(msg, "article missing") ||
+		strings.Contains(msg, "article not found") ||
+		strings.Contains(msg, "status 430") ||
+		strings.Contains(msg, " 430")
 }
 
 // dedupeSearchResults removes true duplicates — the same release reported more
@@ -1925,14 +2238,14 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 			continue
 		}
 		known := history[strings.TrimSpace(result.Link)]
-		// Sonarr/Radarr behaviour: blocklist on the first download failure.
-		// Any URL that has already failed is rejected immediately so it won't be
-		// re-selected. Exceptions:
-		//   - interrupted_by_restart / stale_worker: server restarted mid-download, not a real failure.
-		//   - status 403: indexer quota exhausted (e.g. NZBFinder) — temporary, quota may have reset
-		//     by the time the next search cycle runs. Let it through with a score penalty from
-		//     parseCandidate so it ranks below fresh results but remains a viable fallback.
-		if known.FailureCount >= 1 {
+		effectiveFailureCount, degraded, durableRejectThreshold := candidateFailurePenaltyProfile(known)
+		// nzbdav-style tolerance: a prior failed download should penalize a
+		// candidate, not immediately disqualify it. Only URLs that have failed
+		// repeatedly for a non-transient reason are durably rejected up front.
+		// Transient exceptions:
+		//   - interrupted_by_restart / stale_worker: process died mid-download.
+		//   - status 403: indexer quota exhausted temporarily.
+		if known.FailureCount >= durableRejectThreshold {
 			lr := strings.ToLower(known.LastFailureReason)
 			isRestartInterruption := strings.Contains(lr, "interrupted_by_restart") || strings.Contains(lr, "stale_worker")
 			isTemporaryQuota := strings.Contains(lr, "status 403")
@@ -1953,7 +2266,7 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 				continue
 			}
 		}
-		parsed := parseCandidate(result, known, indexerPolicies)
+		parsed := parseCandidate(result, known, effectiveFailureCount, degraded, indexerPolicies)
 		score := ranking.ScoreWithPreferences(parsed, required, prefs)
 		candidates = append(candidates, database.SearchCandidateRecord{
 			Title:                 result.Title,
@@ -1979,6 +2292,52 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 		return candidates[i].Score > candidates[j].Score
 	})
 	return candidates
+}
+
+func candidateFailurePenaltyProfile(history database.CandidateHistory) (effectiveFailureCount int, degraded bool, durableRejectThreshold int) {
+	effectiveFailureCount = history.FailureCount
+	degraded = history.FailureCount > 0
+	durableRejectThreshold = 5
+	if isSoftCandidateFailureReason(history.LastFailureReason) {
+		degraded = false
+		durableRejectThreshold = 8
+		if effectiveFailureCount <= 2 {
+			effectiveFailureCount = 0
+		} else {
+			effectiveFailureCount -= 2
+		}
+	}
+	if effectiveFailureCount < 0 {
+		effectiveFailureCount = 0
+	}
+	return effectiveFailureCount, degraded, durableRejectThreshold
+}
+
+func isSoftCandidateFailureReason(reason string) bool {
+	reason = strings.TrimSpace(strings.ToLower(reason))
+	if reason == "" {
+		return false
+	}
+	if strings.Contains(reason, "interrupted_by_restart") || strings.Contains(reason, "stale_worker") || strings.Contains(reason, "status 403") {
+		return true
+	}
+	if isRetryablePreflightCandidateReason(reason) {
+		return true
+	}
+	switch reason {
+	case "archive_headers_invalid", "archive_video_not_found", "no_publishable_files":
+		return true
+	}
+	return false
+}
+
+func isRetryablePreflightCandidateReason(reason string) bool {
+	if !(strings.HasPrefix(reason, "early preflight:") || strings.HasPrefix(reason, "preflight:")) {
+		return false
+	}
+	return strings.Contains(reason, "article missing") ||
+		strings.Contains(reason, "article not found") ||
+		strings.Contains(reason, "430")
 }
 
 func hasNonRejectedCandidate(candidates []database.SearchCandidateRecord) bool {
@@ -2177,7 +2536,11 @@ func (s *Service) importSelectedRelease(ctx context.Context, current database.Re
 	// early and falls back to the next search candidate instead of publishing dead content.
 	if s.preflightChecker != nil {
 		if err := s.preflightChecker(ctx, item); err != nil {
-			return s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
+			if shouldIgnorePreflightFailure(err) {
+				s.logger.Info().Err(err).Int64("srId", current.SelectedReleaseID).Msg("preflight advisory only; continuing publish")
+			} else {
+				return s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
+			}
 		}
 	}
 	// Fast-fail: if no virtual files were created, skip publish immediately.
@@ -2459,19 +2822,15 @@ func buildSearchRequests(input database.LibrarySearchInput) SearchRequestPlan {
 			dedup(&tier2, baseTV(query, 0, "", 0))
 		}
 		if season > 0 && episode > 0 {
-			add(fmt.Sprintf("%s S%02dE%02d", show, season, episode))
-			add(fmt.Sprintf("%s %dx%02d", show, season, episode))
-			if showYear > 0 {
-				add(fmt.Sprintf("%s %d S%02dE%02d", show, showYear, season, episode))
-				add(fmt.Sprintf("%s %d %dx%02d", show, showYear, season, episode))
-			}
-			if strings.TrimSpace(episodeTitle) != "" {
-				add(fmt.Sprintf("%s %s", show, strings.TrimSpace(episodeTitle)))
-				add(fmt.Sprintf("%s S%02dE%02d %s", show, season, episode, strings.TrimSpace(episodeTitle)))
-			}
+			// Servarr-style fallback: keep q= focused on the series title and let
+			// the structured season/episode parameters do the narrowing. This
+			// avoids spraying Hydra with many near-duplicate text searches.
 			add(show)
 			if showYear > 0 {
 				add(fmt.Sprintf("%s %d", show, showYear))
+			}
+			if strings.TrimSpace(episodeTitle) != "" {
+				add(fmt.Sprintf("%s %s", show, strings.TrimSpace(episodeTitle)))
 			}
 			return
 		}
@@ -2781,7 +3140,7 @@ func (s *Service) SearchUpgrades(ctx context.Context) (UpgradeSearchResult, erro
 	return result, nil
 }
 
-func parseCandidate(item hydra.SearchResult, history database.CandidateHistory, indexerPolicies map[string]int) ranking.Candidate {
+func parseCandidate(item hydra.SearchResult, history database.CandidateHistory, effectiveFailureCount int, degraded bool, indexerPolicies map[string]int) ranking.Candidate {
 	titleLower := strings.ToLower(item.Title)
 	policyScore := 0
 	if indexerPolicies != nil {
@@ -2797,8 +3156,8 @@ func parseCandidate(item hydra.SearchResult, history database.CandidateHistory, 
 		Indexer:            item.Indexer,
 		ReleaseGroup:       detectReleaseGroup(item.Title),
 		UploadedAt:         item.PublishedAt,
-		FailureCount:       history.FailureCount,
-		Degraded:           history.FailureCount > 0,
+		FailureCount:       effectiveFailureCount,
+		Degraded:           degraded,
 		Grabs:              item.Grabs,
 		IndexerScore:       item.IndexerScore,
 		IndexerPolicyScore: policyScore,
@@ -3139,10 +3498,14 @@ func (s *Service) ImportNZBFromPush(ctx context.Context, content []byte, filenam
 		item.State = database.QueuePreflight
 		if s.preflightChecker != nil {
 			if err := s.preflightChecker(bgCtx, item); err != nil {
-				if _, promoteErr := s.promoteNextAfterFailure(bgCtx, current, err.Error()); promoteErr != nil {
-					s.logger.Error().Err(promoteErr).Msg("sabnzbd: promoteNextAfterFailure failed (preflight)")
+				if shouldIgnorePreflightFailure(err) {
+					s.logger.Info().Err(err).Int64("srId", current.SelectedReleaseID).Msg("sabnzbd preflight advisory only; continuing publish")
+				} else {
+					if _, promoteErr := s.promoteNextAfterFailure(bgCtx, current, err.Error()); promoteErr != nil {
+						s.logger.Error().Err(promoteErr).Msg("sabnzbd: promoteNextAfterFailure failed (preflight)")
+					}
+					return
 				}
-				return
 			}
 		}
 		updated, lookupErr := s.repo.GetSelectedReleaseSummary(bgCtx, current.SelectedReleaseID)
@@ -3382,6 +3745,7 @@ type FillMissingEpisodesResult struct {
 	ShowsProcessed int `json:"showsProcessed"`
 	EpisodesFound  int `json:"episodesFound"`
 	ItemsCreated   int `json:"itemsCreated"`
+	Queued         int `json:"queued"`
 }
 
 type PrioritizeTVShowResult struct {
@@ -3397,8 +3761,8 @@ type missingEpisodeBatchEnsurer interface {
 
 // FillMissingEpisodes queries TMDB for the episode list of every TV show that
 // has missing episodes, then creates library_item + queue_item rows for each
-// episode not yet in the local database. Those new items enter the normal
-// search queue and will be picked up by the next SearchPendingLibrary pass.
+// episode not yet in the local database. To mirror Sonarr's episode-refresh
+// behavior, only newly created episodes that aired recently are auto-searched.
 func (s *Service) FillMissingEpisodes(ctx context.Context) (FillMissingEpisodesResult, error) {
 	if s == nil || s.repo == nil || s.tmdb == nil || !s.tmdb.Enabled() {
 		return FillMissingEpisodesResult{}, nil
@@ -3410,6 +3774,9 @@ func (s *Service) FillMissingEpisodes(ctx context.Context) (FillMissingEpisodesR
 	}
 
 	var result FillMissingEpisodesResult
+	autoSearchIDs := make([]int64, 0)
+	now := time.Now().UTC()
+	batchRepo, hasBatchRepo := s.repo.(missingEpisodeBatchEnsurer)
 	for _, show := range targets {
 		select {
 		case <-ctx.Done():
@@ -3448,15 +3815,28 @@ func (s *Service) FillMissingEpisodes(ctx context.Context) (FillMissingEpisodesR
 				continue
 			}
 
-			if batchRepo, ok := s.repo.(missingEpisodeBatchEnsurer); ok {
-				createdIDs, err := batchRepo.EnsureEpisodeLibraryItemsBatch(ctx, show.TVShowID, show.ShowTitle, batch)
-				if err != nil {
-					continue
+			recentBatch := make([]database.MissingEpisodeBatchInput, 0, len(batch))
+			olderBatch := make([]database.MissingEpisodeBatchInput, 0, len(batch))
+			for _, ep := range batch {
+				if shouldAutoSearchNewlyAddedEpisode(ep.AirDate, now) {
+					recentBatch = append(recentBatch, ep)
+				} else {
+					olderBatch = append(olderBatch, ep)
 				}
-				result.ItemsCreated += len(createdIDs)
-				if s.WorkQueue != nil {
-					for _, libraryItemID := range createdIDs {
-						s.WorkQueue.Push(ctx, libraryItemID, 0)
+			}
+
+			if hasBatchRepo {
+				if len(recentBatch) > 0 {
+					createdRecentIDs, err := batchRepo.EnsureEpisodeLibraryItemsBatch(ctx, show.TVShowID, show.ShowTitle, recentBatch)
+					if err == nil {
+						result.ItemsCreated += len(createdRecentIDs)
+						autoSearchIDs = append(autoSearchIDs, createdRecentIDs...)
+					}
+				}
+				if len(olderBatch) > 0 {
+					createdOlderIDs, err := batchRepo.EnsureEpisodeLibraryItemsBatch(ctx, show.TVShowID, show.ShowTitle, olderBatch)
+					if err == nil {
+						result.ItemsCreated += len(createdOlderIDs)
 					}
 				}
 				continue
@@ -3471,7 +3851,45 @@ func (s *Service) FillMissingEpisodes(ctx context.Context) (FillMissingEpisodesR
 			}
 		}
 	}
+	if len(autoSearchIDs) > 0 {
+		autoSearchIDs = dedupeInt64s(autoSearchIDs)
+		s.PushLibraryItemsToQueue(autoSearchIDs, 10)
+		result.Queued = len(autoSearchIDs)
+	}
 	return result, nil
+}
+
+func shouldAutoSearchNewlyAddedEpisode(airDate string, now time.Time) bool {
+	airDate = strings.TrimSpace(airDate)
+	if airDate == "" {
+		return false
+	}
+	parsed, err := time.Parse("2006-01-02", airDate)
+	if err != nil {
+		return false
+	}
+	airDateUTC := parsed.UTC()
+	return !airDateUTC.Before(now.AddDate(0, 0, -14)) &&
+		!airDateUTC.After(now.AddDate(0, 0, 1))
+}
+
+func dedupeInt64s(values []int64) []int64 {
+	if len(values) == 0 {
+		return nil
+	}
+	seen := make(map[int64]struct{}, len(values))
+	out := make([]int64, 0, len(values))
+	for _, value := range values {
+		if value <= 0 {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func (s *Service) PrioritizeTVShowMissing(ctx context.Context, tvShowID int64) (PrioritizeTVShowResult, error) {

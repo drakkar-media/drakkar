@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -14,7 +15,10 @@ import (
 	"github.com/hjongedijk/drakkar/internal/stream"
 )
 
-const inspectHeaderLimit = 256 * 1024
+const (
+	inspectHeaderLimit    = 256 * 1024
+	inspectHeaderLimitMax = 64 * 1024 * 1024
+)
 
 var (
 	errArchiveHeadersInvalid         = errors.New("archive_headers_invalid")
@@ -22,6 +26,7 @@ var (
 	errArchiveSolidUnsupported       = errors.New("archive_solid_unsupported")
 	errArchiveEncrypted              = errors.New("archive_encrypted")
 	errArchiveVideoNotFound          = errors.New("archive_video_not_found")
+	errNNTPArticleUnavailable        = errors.New("nntp_article_unavailable")
 )
 
 func inspectImportedArchives(ctx context.Context, archives []ImportedArchive, files []ImportedNZBFile, fetcher stream.SegmentFetcher) []ImportedArchive {
@@ -55,7 +60,7 @@ func inspectImportedArchives(ctx context.Context, archives []ImportedArchive, fi
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			inspected := item
-			inspectCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			inspectCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 			err := inspectArchive(inspectCtx, &inspected, fileByName, fetcher)
 			cancel()
 			if err != nil {
@@ -100,28 +105,17 @@ func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName
 		if !ok {
 			return errArchiveHeadersInvalid
 		}
-		volumeSizes[volume.VolumeIndex] = file.FileSizeBytes
+		volumeSizes[volume.VolumeIndex] = importedFileEffectiveSize(ctx, file, fetcher)
 	}
-	prefix, err := readImportedFilePrefix(ctx, first, inspectHeaderLimit, fetcher)
-	if err != nil {
-		return fmt.Errorf("%w", errArchiveHeadersInvalid)
-	}
-	var entries []ImportedArchiveEntry
-	if len(prefix) >= 8 && string(prefix[:8]) == "Rar!\x1a\x07\x01\x00" {
-		entries, err = inspectRAR5(prefix)
-	} else {
-		entries, err = inspectRAR4(prefix)
-	}
+
+	entries, err := inspectRARWithRetries(ctx, first, fetcher)
 	if err != nil {
 		return err
 	}
 
-	// For multi-volume archives fetch each continuation volume's data-start offset
-	// in parallel (cap 8 concurrent NNTP connections) so ranges are byte-accurate.
+	// Keep the classic first-volume flow as a fallback for older scene archives
+	// where continuation parts may not expose standalone file headers.
 	volumeDataOffsets := fetchContinuationOffsets(ctx, archive.Volumes[1:], fileByName, fetcher)
-
-	// For stored (m0) multi-volume archives the full packed size equals the
-	// uncompressed size. Vol-0's header only knows its own slice, so fix it up.
 	if len(archive.Volumes) > 1 {
 		for i := range entries {
 			e := &entries[i]
@@ -130,15 +124,107 @@ func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName
 			}
 		}
 	}
+	legacyEntries := make([]ImportedArchiveEntry, len(entries))
+	copy(legacyEntries, entries)
+	assignArchiveRanges(legacyEntries, volumeSizes, volumeDataOffsets)
 
-	assignArchiveRanges(entries, volumeSizes, volumeDataOffsets)
-	if err := validatePlayableArchiveEntries(entries); err != nil {
+	var volumeEntries []ImportedArchiveEntry
+	for i := range entries {
+		entry := entries[i]
+		entry.VolumeIndex = 0
+		volumeEntries = append(volumeEntries, entry)
+	}
+	for _, volume := range archive.Volumes {
+		if volume.VolumeIndex == 0 {
+			continue
+		}
+		file := fileByName[volume.Path]
+		partEntries, partErr := inspectRARWithRetries(ctx, file, fetcher)
+		if partErr != nil {
+			if errors.Is(partErr, errArchiveHeadersInvalid) || errors.Is(partErr, errArchiveVideoNotFound) {
+				continue
+			}
+			return partErr
+		}
+		for i := range partEntries {
+			partEntries[i].VolumeIndex = volume.VolumeIndex
+		}
+		volumeEntries = append(volumeEntries, partEntries...)
+	}
+
+	finalEntries := legacyEntries
+	if len(volumeEntries) > len(entries) {
+		aggregatedEntries, aggErr := aggregateRARVolumeEntries(volumeEntries, volumeSizes)
+		if aggErr == nil {
+			finalEntries = aggregatedEntries
+		}
+	}
+	if err := validatePlayableArchiveEntries(finalEntries); err != nil {
 		return err
 	}
-	archive.Entries = entries
+	archive.Entries = finalEntries
 	archive.Status = "supported"
 	archive.RejectReason = ""
 	return nil
+}
+
+func inspectRARWithRetries(ctx context.Context, file ImportedNZBFile, fetcher stream.SegmentFetcher) ([]ImportedArchiveEntry, error) {
+	available := importedFileEffectiveSize(ctx, file, fetcher)
+	if available <= 0 {
+		return nil, errArchiveHeadersInvalid
+	}
+	limits := []int64{
+		inspectHeaderLimit,
+		1024 * 1024,
+		4 * 1024 * 1024,
+		16 * 1024 * 1024,
+		32 * 1024 * 1024,
+		inspectHeaderLimitMax,
+	}
+	lastLimit := int64(0)
+	for _, limit := range limits {
+		if limit > available {
+			limit = available
+		}
+		if limit <= 0 || limit == lastLimit {
+			continue
+		}
+		lastLimit = limit
+		prefix, err := readImportedFilePrefix(ctx, file, limit, fetcher)
+		if err != nil {
+			return nil, normalizeArchiveFetchError(err)
+		}
+		entries, err := inspectRARPrefix(prefix)
+		if err == nil || !shouldRetryRARInspect(err) || limit == available {
+			return entries, err
+		}
+	}
+	return nil, errArchiveHeadersInvalid
+}
+
+func shouldRetryRARInspect(err error) bool {
+	return errors.Is(err, errArchiveHeadersInvalid) || errors.Is(err, errArchiveVideoNotFound)
+}
+
+func normalizeArchiveFetchError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
+	if strings.Contains(msg, "article missing") ||
+		strings.Contains(msg, "article not found") ||
+		strings.Contains(msg, "status 430") ||
+		strings.Contains(msg, " 430") {
+		return fmt.Errorf("%w: %v", errNNTPArticleUnavailable, err)
+	}
+	return err
+}
+
+func inspectRARPrefix(prefix []byte) ([]ImportedArchiveEntry, error) {
+	if len(prefix) >= 8 && string(prefix[:8]) == "Rar!\x1a\x07\x01\x00" {
+		return inspectRAR5(prefix)
+	}
+	return inspectRAR4(prefix)
 }
 
 // fetchContinuationOffsets fetches 512-byte prefixes from continuation volumes
@@ -282,6 +368,87 @@ func rar4FindDataStart(raw []byte) (int64, error) {
 	return 0, errArchiveHeadersInvalid
 }
 
+func aggregateRARVolumeEntries(parts []ImportedArchiveEntry, volumeSizes map[int]int64) ([]ImportedArchiveEntry, error) {
+	if len(parts) == 0 {
+		return nil, errArchiveHeadersInvalid
+	}
+	grouped := make(map[string][]ImportedArchiveEntry)
+	for _, part := range parts {
+		grouped[part.Path] = append(grouped[part.Path], part)
+	}
+	out := make([]ImportedArchiveEntry, 0, len(grouped))
+	for _, groupedParts := range grouped {
+		sort.SliceStable(groupedParts, func(i, j int) bool {
+			if groupedParts[i].VolumeIndex != groupedParts[j].VolumeIndex {
+				return groupedParts[i].VolumeIndex < groupedParts[j].VolumeIndex
+			}
+			return groupedParts[i].ArchiveOffset < groupedParts[j].ArchiveOffset
+		})
+		first := groupedParts[0]
+		entry := ImportedArchiveEntry{
+			Path:              first.Path,
+			SizeBytes:         first.SizeBytes,
+			CompressionMethod: first.CompressionMethod,
+			Encrypted:         first.Encrypted,
+			Solid:             first.Solid,
+			VolumeIndex:       first.VolumeIndex,
+			ArchiveOffset:     first.ArchiveOffset,
+		}
+		entryOffset := int64(0)
+		for i, part := range groupedParts {
+			if part.Path != entry.Path || part.CompressionMethod != entry.CompressionMethod {
+				return nil, errArchiveHeadersInvalid
+			}
+			if part.Encrypted != entry.Encrypted || part.Solid != entry.Solid {
+				return nil, errArchiveHeadersInvalid
+			}
+			if i > 0 && part.VolumeIndex <= groupedParts[i-1].VolumeIndex {
+				return nil, errArchiveHeadersInvalid
+			}
+			if part.SizeBytes > entry.SizeBytes {
+				entry.SizeBytes = part.SizeBytes
+			}
+			partPackedSize := part.PackedSizeBytes
+			if partPackedSize <= 0 {
+				return nil, errArchiveHeadersInvalid
+			}
+			if size, ok := volumeSizes[part.VolumeIndex]; ok {
+				available := size - part.ArchiveOffset
+				if available <= 0 {
+					return nil, errArchiveHeadersInvalid
+				}
+				if partPackedSize > available {
+					partPackedSize = available
+				}
+			}
+			entry.Ranges = append(entry.Ranges, ImportedArchiveRange{
+				VolumeIndex:   part.VolumeIndex,
+				EntryOffset:   entryOffset,
+				ArchiveOffset: part.ArchiveOffset,
+				LengthBytes:   partPackedSize,
+			})
+			entryOffset += partPackedSize
+			entry.PackedSizeBytes += partPackedSize
+		}
+		if entry.SizeBytes > 0 {
+			diff := entry.SizeBytes - entry.PackedSizeBytes
+			if diff < 0 {
+				diff = -diff
+			}
+			if diff <= 16 && len(entry.Ranges) > 0 {
+				entry.PackedSizeBytes = entry.SizeBytes
+				last := &entry.Ranges[len(entry.Ranges)-1]
+				last.LengthBytes += entry.SizeBytes - entryOffset
+			}
+		}
+		out = append(out, entry)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return strings.ToLower(out[i].Path) < strings.ToLower(out[j].Path)
+	})
+	return out, nil
+}
+
 // isPar2IndexFile returns true for the primary .par2 index file.
 // .vol*.par2 recovery files contain no FileDesc packets and are excluded.
 func isPar2IndexFile(name string) bool {
@@ -365,11 +532,15 @@ func enrichFileByNameFromPar2(ctx context.Context, files []ImportedNZBFile, file
 }
 
 func readImportedFilePrefix(ctx context.Context, file ImportedNZBFile, limit int64, fetcher stream.SegmentFetcher) ([]byte, error) {
-	if limit <= 0 || file.FileSizeBytes <= 0 {
+	size := importedFileSegmentEnd(file)
+	if file.FileSizeBytes > size {
+		size = file.FileSizeBytes
+	}
+	if limit <= 0 || size <= 0 {
 		return nil, errors.New("invalid archive size")
 	}
-	if limit > file.FileSizeBytes {
-		limit = file.FileSizeBytes
+	if limit > size {
+		limit = size
 	}
 	spans := make([]stream.SegmentSpan, 0, len(file.Segments))
 	for _, segment := range file.Segments {
@@ -398,6 +569,28 @@ func readImportedFilePrefix(ctx context.Context, file ImportedNZBFile, limit int
 		return nil, errors.New("short archive header fetch")
 	}
 	return out[:limit], nil
+}
+
+func importedFileSegmentEnd(file ImportedNZBFile) int64 {
+	var end int64
+	for _, segment := range file.Segments {
+		if segment.DecodedEndOffset > end {
+			end = segment.DecodedEndOffset
+		}
+	}
+	return end
+}
+
+func importedFileEffectiveSize(ctx context.Context, file ImportedNZBFile, fetcher stream.SegmentFetcher) int64 {
+	size := importedFileSegmentEnd(file)
+	if file.FileSizeBytes > size {
+		size = file.FileSizeBytes
+	}
+	actual := importedFileActualSize(ctx, file, fetcher)
+	if actual > size {
+		size = actual
+	}
+	return size
 }
 
 // rar5ReadVint reads a RAR5 variable-length integer starting at pos.

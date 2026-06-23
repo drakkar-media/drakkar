@@ -637,10 +637,12 @@ func (db *DB) GetQueueRetryTarget(ctx context.Context, queueItemID int64) (Queue
 
 func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLibrarySearchTarget, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
-		select item.library_item_id, item.selected, coalesce(item.selected_release_id, 0), coalesce(item.external_url, ''), item.state, item.updated_at
+		select item.library_item_id, item.media_type, coalesce(item.tv_show_id, 0), item.selected, coalesce(item.selected_release_id, 0), coalesce(item.external_url, ''), item.state, item.updated_at
 		from (
 			select distinct on (q.library_item_id)
 				q.library_item_id,
+				li.media_type,
+				tv.id as tv_show_id,
 				(q.selected_release_id is not null and q.state in ($1, $3)) as selected,
 				q.selected_release_id,
 				rc.external_url,
@@ -712,7 +714,7 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLib
 	var out []PendingLibrarySearchTarget
 	for rows.Next() {
 		var item PendingLibrarySearchTarget
-		if err := rows.Scan(&item.LibraryItemID, &item.Selected, &item.SelectedReleaseID, &item.ExternalURL, &item.State, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.LibraryItemID, &item.MediaType, &item.TVShowID, &item.Selected, &item.SelectedReleaseID, &item.ExternalURL, &item.State, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, item)
@@ -1902,7 +1904,10 @@ func isFKViolation(err error) bool {
 
 func isHardRejectReason(reason string) bool {
 	r := strings.TrimSpace(strings.ToLower(reason))
-	if strings.HasPrefix(r, "archive_") {
+	if isRetryablePreflightReason(r) {
+		return false
+	}
+	if isPermanentArchiveRejectReason(r) {
 		return true
 	}
 	if strings.Contains(r, "invalid media payload") ||
@@ -1927,7 +1932,10 @@ func isHardRejectReason(reason string) bool {
 
 func shouldPersistBlocklistReason(reason string) bool {
 	r := strings.TrimSpace(strings.ToLower(reason))
-	if strings.HasPrefix(r, "archive_") || strings.HasPrefix(r, "manual_") {
+	if isRetryablePreflightReason(r) {
+		return false
+	}
+	if isPermanentArchiveRejectReason(r) || strings.HasPrefix(r, "manual_") {
 		return true
 	}
 	if strings.Contains(r, "invalid media payload") ||
@@ -1944,6 +1952,26 @@ func shouldPersistBlocklistReason(reason string) bool {
 	}
 	// Any NZB fetch HTTP error except 403 — blocklist the URL permanently.
 	return strings.Contains(r, "nzb fetch status") && !strings.Contains(r, "status 403")
+}
+
+func isPermanentArchiveRejectReason(reason string) bool {
+	switch strings.TrimSpace(strings.ToLower(reason)) {
+	case "archive_encrypted", "archive_solid_unsupported", "archive_compression_unsupported":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRetryablePreflightReason(reason string) bool {
+	r := strings.TrimSpace(strings.ToLower(reason))
+	if !(strings.HasPrefix(r, "early preflight:") ||
+		strings.HasPrefix(r, "preflight:")) {
+		return false
+	}
+	return strings.Contains(r, "article missing") ||
+		strings.Contains(r, "article not found") ||
+		strings.Contains(r, "430")
 }
 
 func blocklistKeyForExternalURL(rawURL string) string {
