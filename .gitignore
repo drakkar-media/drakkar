@@ -14,6 +14,8 @@
 /web/node_modules/
 /internal/frontend/build/
 /coverage.out
+/drakkar
+/drakkar-bin
 /do-not-edit/
 .claude/
 open-codex-task-260526.md
