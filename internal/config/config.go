@@ -97,7 +97,8 @@ type IndexerConfig struct {
 	MaximumSizeMB int `json:"maximumSizeMB"`
 
 	// SearchDelayMs: minimum milliseconds between consecutive NZBHydra2 search
-	// requests. 0 means no delay (Sonarr/Radarr behaviour). Default: 0.
+	// requests. 0 means no delay. Default: 2000 (matches Sonarr/Radarr single-
+	// stream sequential pacing; prevents exhausting daily indexer API quotas).
 	SearchDelayMs int `json:"searchDelayMs"`
 
 	// BackgroundSearchWorkers: BullMQ worker concurrency for missing-item search
@@ -113,8 +114,10 @@ func DefaultIndexerConfig() IndexerConfig {
 		MinimumAgeMinutes:           0,
 		RetentionDays:               0,
 		MaximumSizeMB:               0,
-		// 0 matches Radarr/Sonarr behaviour — NZBHydra2 handles its own rate limiting.
-		SearchDelayMs:           0,
+		// 2s between calls matches Sonarr/Radarr single-stream sequential pacing.
+		// Prevents exhausting daily indexer API quotas during backlog bursts.
+		// Set to 0 to disable (rely purely on NZBHydra2's own rate limiting).
+		SearchDelayMs:           2000,
 		BackgroundSearchWorkers: 10,
 	}
 }

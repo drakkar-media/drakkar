@@ -580,7 +580,7 @@
       draft = cloneSettings(fs);
       // Apply frontend defaults for fields that may be absent from older settings.json
       if (draft && !draft.indexer) {
-        draft.indexer = { tvRssSyncIntervalMinutes: 15, movieRssSyncIntervalMinutes: 30, minimumAgeMinutes: 0, retentionDays: 0, maximumSizeMB: 0, searchDelayMs: 0, backgroundSearchWorkers: 12 };
+        draft.indexer = { tvRssSyncIntervalMinutes: 15, movieRssSyncIntervalMinutes: 30, minimumAgeMinutes: 0, retentionDays: 0, maximumSizeMB: 0, searchDelayMs: 2000, backgroundSearchWorkers: 12 };
       } else if (draft?.indexer && !draft.indexer.backgroundSearchWorkers) {
         draft.indexer.backgroundSearchWorkers = 12;
       }
