@@ -109,9 +109,12 @@ func NewClient(cfg config.ServiceConfig) *Client {
 	if feedMaxResults <= 0 {
 		feedMaxResults = 1200
 	}
-	// 3 concurrent searches matches typical Radarr+Sonarr combined load on
-	// a shared NZBHydra2 instance and respects per-indexer load limiting.
-	const maxConcurrentSearches = 3
+	// 1 concurrent search matches Sonarr/Radarr's strictly sequential per-indexer
+	// behaviour. Radarr/Sonarr process missing items one at a time with a 2-second
+	// rate limit between requests (HttpIndexerBase.RateLimit = TimeSpan.FromSeconds(2)).
+	// When Hydra is configured as a single indexer, this means exactly 1 in-flight
+	// Hydra request at any time.
+	const maxConcurrentSearches = 1
 	return &Client{
 		baseURL: strings.TrimRight(cfg.URL, "/"),
 		apiKey:  cfg.APIKey,
