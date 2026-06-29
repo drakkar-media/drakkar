@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Drakkar API",
-    "version": "0.1.86",
+    "version": "0.1.87",
     "description": "Drakkar NZB/Usenet VFS media manager REST API.\n\nAuthentication: Pass a session cookie (`drakkar_session`) or Bearer API token (`Authorization: Bearer <token>` or `X-Api-Key: <token>`) on all requests except public paths.",
     "contact": { "name": "Drakkar", "url": "https://github.com/hjongedijk/drakkar" }
   },
