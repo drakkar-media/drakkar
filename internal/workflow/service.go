@@ -1514,23 +1514,6 @@ func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID i
 		}
 	}
 
-	// For TV episodes, try the full season pack first if the rate limit allows.
-	// A season pack covers all episodes in the season and avoids many separate downloads.
-	if isEpisodeSearch(input) && input.TVShowID > 0 && input.SeasonNumber > 0 {
-		if ok, _ := s.repo.ShouldAttemptSeasonPack(ctx, input.TVShowID, input.SeasonNumber); ok {
-			packResult, packSelected, packErr := s.trySeasonPack(ctx, input, history, libraryItemID)
-			outcome := database.SeasonPackOutcomeFailed
-			if packSelected != nil {
-				outcome = database.SeasonPackOutcomeSelected
-			}
-			_ = s.repo.RecordSeasonPackAttempt(ctx, input.TVShowID, input.SeasonNumber, outcome)
-			if packSelected != nil || packErr != nil {
-				return packResult, packErr
-			}
-			// Pack found nothing usable — fall through to individual episode search.
-		}
-	}
-
 	plan := buildSearchRequests(input)
 	query := ""
 	var (
@@ -1540,6 +1523,25 @@ func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID i
 		selectedReleaseID  *int64
 		lastSearchErr      error
 	)
+
+	// For TV episodes, try the full season pack first if the rate limit allows.
+	// A season pack covers all episodes in the season and avoids many separate downloads.
+	if isEpisodeSearch(input) && input.TVShowID > 0 && input.SeasonNumber > 0 {
+		if ok, _ := s.repo.ShouldAttemptSeasonPack(ctx, input.TVShowID, input.SeasonNumber); ok {
+			packResult, packSelected, packCandidates, packErr := s.trySeasonPack(ctx, input, history, libraryItemID)
+			outcome := database.SeasonPackOutcomeFailed
+			if packSelected != nil {
+				outcome = database.SeasonPackOutcomeSelected
+			}
+			_ = s.repo.RecordSeasonPackAttempt(ctx, input.TVShowID, input.SeasonNumber, outcome)
+			if packSelected != nil || packErr != nil {
+				return packResult, packErr
+			}
+			// Pack found nothing usable — pre-seed combinedCandidates with any pack
+			// results so they remain visible in the picker alongside episode candidates.
+			combinedCandidates = packCandidates
+		}
+	}
 
 	// searchTier runs all requests in a tier and returns true if the caller
 	// should stop (selected a release or found good candidates).
@@ -1655,9 +1657,12 @@ func matchesRecentMediaType(input database.LibrarySearchInput, mediaType string)
 }
 
 // trySeasonPack searches for the full season pack and selects it if found.
-// Returns (result, selectedID, err). When selectedID is nil and err is nil,
-// no usable pack was found and the caller should fall back to episode search.
-func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearchInput, history map[string]database.CandidateHistory, libraryItemID int64) (SearchResult, *int64, error) {
+// Returns (result, selectedID, packCandidates, err). packCandidates contains
+// any season-pack candidates found, filtered to exclude individual episodes —
+// the caller should pre-seed its combinedCandidates with these so pack options
+// remain visible in the picker even when the individual episode search runs.
+// When selectedID is nil and err is nil, no usable pack was selected.
+func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearchInput, history map[string]database.CandidateHistory, libraryItemID int64) (SearchResult, *int64, []database.SearchCandidateRecord, error) {
 	packInput := input
 	packInput.EpisodeNumber = 0 // season pack: no episode
 
@@ -1679,10 +1684,14 @@ func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearc
 			continue
 		}
 		candidates := buildSearchCandidates(results, searchRequirements(packInput), history, profilePrefs, s.indexerLimits, s.loadIndexerPolicyMap(ctx))
+		// Filter to season-pack-only: drop individual episode results that
+		// Hydra returns when querying by TVDB ID + season without an episode
+		// number. Keeps season packs and obfuscated NZBs (no episode token).
+		candidates = filterToPacksOnly(candidates, input.SeasonNumber)
 		combinedCandidates = mergeSearchCandidates(combinedCandidates, candidates)
 		selectedReleaseID, err = s.repo.ReplaceSearchCandidates(ctx, libraryItemID, combinedCandidates)
 		if err != nil {
-			return SearchResult{}, nil, err
+			return SearchResult{}, nil, nil, err
 		}
 		s.rememberSearchRequest(libraryItemID, req, searchCandidateOutcome(candidates, selectedReleaseID), time.Now())
 		if selectedReleaseID != nil {
@@ -1690,17 +1699,19 @@ func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearc
 		}
 	}
 	if selectedReleaseID == nil {
-		return SearchResult{}, nil, nil
+		// No pack selected — return candidates so the caller can pre-seed the
+		// individual episode search and keep pack options visible in the picker.
+		return SearchResult{}, nil, combinedCandidates, nil
 	}
 	final, err := s.fetchAndImportSelectedRelease(ctx, *selectedReleaseID)
 	if err != nil {
-		return SearchResult{}, nil, err
+		return SearchResult{}, nil, nil, err
 	}
 	return SearchResult{
 		LibraryItemID:     libraryItemID,
 		CandidateCount:    len(combinedCandidates),
 		SelectedReleaseID: final,
-	}, final, nil
+	}, final, combinedCandidates, nil
 }
 
 // buildSeasonPackRequests produces Hydra queries for a full season (no episode number).
@@ -2315,6 +2326,22 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 		if limits.MaximumSizeMB > 0 && result.SizeBytes > int64(limits.MaximumSizeMB)*1024*1024 {
 			continue
 		}
+		// Episode mismatch: reject candidates belonging to a different episode.
+		// Season-pack titles (no SxxEnn token) are allowed through.
+		if required.EpisodeNumber > 0 && hasWrongEpisodeToken(strings.ToLower(result.Title), required.SeasonNumber, required.EpisodeNumber) {
+			candidates = append(candidates, database.SearchCandidateRecord{
+				Title:        result.Title,
+				ExternalURL:  result.Link,
+				IndexerName:  result.Indexer,
+				SizeBytes:    result.SizeBytes,
+				PostedAt:     result.PublishedAt,
+				Score:        0,
+				Rejected:     true,
+				RejectReason: "wrong_episode",
+			})
+			continue
+		}
+
 		known := history[strings.TrimSpace(result.Link)]
 		effectiveFailureCount, degraded, durableRejectThreshold := candidateFailurePenaltyProfile(known)
 		// nzbdav-style tolerance: a prior failed download should penalize a
@@ -2559,6 +2586,77 @@ func shouldKeepSearchingPastCandidate(candidate database.SearchCandidateRecord, 
 		return false
 	}
 	return hasSeasonPackToken(title, input.SeasonNumber)
+}
+
+// hasWrongEpisodeToken returns true when the title contains an episode token for
+// the right season but a different episode. Handles SxxEnn and NxMM formats.
+// Season-pack titles (no episode token) return false so they pass through.
+func hasWrongEpisodeToken(titleLower string, seasonNumber, episodeNumber int) bool {
+	if seasonNumber <= 0 || episodeNumber <= 0 {
+		return false
+	}
+	// SxxEnn format: e.g. s05e01
+	prefix := fmt.Sprintf("s%02de", seasonNumber)
+	if idx := strings.Index(titleLower, prefix); idx >= 0 {
+		rest := titleLower[idx+len(prefix):]
+		ep, digits := 0, 0
+		for _, ch := range rest {
+			if ch >= '0' && ch <= '9' {
+				ep = ep*10 + int(ch-'0')
+				digits++
+			} else {
+				break
+			}
+		}
+		if digits > 0 && ep != episodeNumber {
+			return true
+		}
+	}
+	// NxMM format: e.g. 5x01
+	for e := 1; e <= 99; e++ {
+		if e == episodeNumber {
+			continue
+		}
+		if strings.Contains(titleLower, fmt.Sprintf("%dx%02d", seasonNumber, e)) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterToPacksOnly removes individual-episode candidates from a season-pack
+// search result set. Keeps season packs and obfuscated NZBs (no episode token).
+// This prevents Hydra's "TVDB ID + season" responses from polluting the picker
+// with wrong-episode results when no episode number was sent in the request.
+func filterToPacksOnly(candidates []database.SearchCandidateRecord, seasonNumber int) []database.SearchCandidateRecord {
+	out := make([]database.SearchCandidateRecord, 0, len(candidates))
+	for _, c := range candidates {
+		titleLower := strings.ToLower(c.Title)
+		if c.Rejected || hasSeasonPackToken(normalizeSearchText(titleLower), seasonNumber) || !hasAnyIndividualEpisodeToken(titleLower) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// hasAnyIndividualEpisodeToken returns true when a title contains a SxxEnn or
+// NxMM episode token for any season/episode (indicating a single-episode release).
+func hasAnyIndividualEpisodeToken(titleLower string) bool {
+	for s := 1; s <= 40; s++ {
+		prefix := fmt.Sprintf("s%02de", s)
+		if idx := strings.Index(titleLower, prefix); idx >= 0 {
+			rest := titleLower[idx+len(prefix):]
+			if len(rest) > 0 && rest[0] >= '0' && rest[0] <= '9' {
+				return true
+			}
+		}
+		for e := 1; e <= 99; e++ {
+			if strings.Contains(titleLower, fmt.Sprintf("%dx%02d", s, e)) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func hasExactEpisodeToken(title string, seasonNumber, episodeNumber int) bool {

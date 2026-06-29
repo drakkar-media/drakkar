@@ -842,7 +842,7 @@
   }
   .rel-modal {
     background: hsl(var(--card)); border: 1px solid hsl(0 0% 100% / 0.1);
-    border-radius: 24px; width: 100%; max-width: 780px;
+    border-radius: 24px; width: 100%; max-width: min(95vw, 1100px);
     max-height: 82vh; display: flex; flex-direction: column; overflow: hidden;
   }
   .rel-header {

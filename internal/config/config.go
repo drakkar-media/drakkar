@@ -319,6 +319,9 @@ func applyDefaults(cfg *Settings) {
 	if cfg.Indexer.BackgroundSearchWorkers <= 0 {
 		cfg.Indexer.BackgroundSearchWorkers = DefaultIndexerConfig().BackgroundSearchWorkers
 	}
+	if cfg.Indexer.SearchDelayMs <= 0 {
+		cfg.Indexer.SearchDelayMs = DefaultIndexerConfig().SearchDelayMs
+	}
 	if len(cfg.Subtitles.Languages) == 0 {
 		cfg.Subtitles.Languages = []string{"en"}
 	}

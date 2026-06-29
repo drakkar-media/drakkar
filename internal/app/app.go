@@ -51,16 +51,12 @@ const (
 	maintenanceRecentMovieTask = "hydra_recent_movie"
 	taskSeerrSync              = "seerr_sync"
 	taskPendingQueuePush       = "pending_queue_push"
-	taskStaleQueueReset        = "stale-queue-reset"
-	taskRetryFailedQueue       = "retry_failed_queue"
-	taskRepublishPending       = "republish_pending"
+	taskQueueHousekeeping      = "queue_housekeeping"      // merged: stale-queue-reset + retry_failed_queue
+	taskPublishingMaintenance  = "publishing_maintenance"  // merged: republish_pending + reset_orphaned_available
 	taskHealthCheck            = "health_check"
 	taskNZBHealthCheck         = "nzb_health_check"
-	taskCachePrune             = "cache_prune"
-	taskLibraryCleanup         = "library-cleanup"
-	taskFillMissingEpisodes    = "fill_missing_episodes"
-	taskSearchUpgrades         = "search_upgrades"
-	taskResetOrphaned          = "reset_orphaned_available"
+	taskStorageMaintenance     = "storage_maintenance"     // merged: cache_prune + library-cleanup
+	taskContentMaintenance     = "content_maintenance"     // merged: fill_missing_episodes + search_upgrades
 	taskSyncPlexDetected       = "sync_plex_detected"
 	taskArticleHealthCheck     = "article_health_check"
 	taskBacklogSearch          = "backlog_search"
@@ -169,17 +165,13 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 		{ID: taskPendingQueuePush, Label: "Dispatch Pending Queue", Group: "Indexing", Interval: "30s", Automated: true, LastRunState: "idle"},
 		{ID: maintenanceRecentTVTask, Label: "Recent TV Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", tvRSSInterval), Automated: true, LastRunState: "idle"},
 		{ID: maintenanceRecentMovieTask, Label: "Recent Movie Feed", Group: "Indexing", Interval: fmt.Sprintf("%dm", movieRSSInterval), Automated: true, LastRunState: "idle"},
-		{ID: taskStaleQueueReset, Label: "Reset Stale Queue Items", Group: "Indexing", Interval: "5m", Automated: true, LastRunState: "idle"},
-		{ID: taskRetryFailedQueue, Label: "Retry Failed Queue", Group: "Indexing", Interval: "15m", Automated: true, LastRunState: "idle"},
-		{ID: taskRepublishPending, Label: "Republish Pending", Group: "Publishing", Interval: "30m", Automated: true, LastRunState: "idle"},
-		{ID: taskResetOrphaned, Label: "Reset Orphaned Available Items", Group: "Publishing", Interval: "30m", Automated: true, LastRunState: "idle"},
+		{ID: taskQueueHousekeeping, Label: "Queue Housekeeping", Group: "Indexing", Interval: "10m", Automated: true, LastRunState: "idle"},
+		{ID: taskPublishingMaintenance, Label: "Publishing Maintenance", Group: "Publishing", Interval: "30m", Automated: true, LastRunState: "idle"},
 		{ID: taskHealthCheck, Label: "Run Health Check", Group: "Maintenance", Interval: "15m", Automated: true, LastRunState: "idle"},
 		{ID: taskNZBHealthCheck, Label: "Deep NZB Article Check", Group: "Maintenance", Interval: "168h", Automated: true, LastRunState: "idle"},
 		{ID: taskArticleHealthCheck, Label: "Article Health Check", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
-		{ID: taskCachePrune, Label: "Prune Block Cache", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
-		{ID: taskLibraryCleanup, Label: "Library Cleanup", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
-		{ID: taskFillMissingEpisodes, Label: "Fill Missing Episodes", Group: "Indexing", Interval: "6h", Automated: true, LastRunState: "idle"},
-		{ID: taskSearchUpgrades, Label: "Search Quality Upgrades", Group: "Indexing", Interval: "6h", Automated: true, LastRunState: "idle"},
+		{ID: taskStorageMaintenance, Label: "Storage Maintenance", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
+		{ID: taskContentMaintenance, Label: "Content Maintenance", Group: "Indexing", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskBacklogSearch, Label: "Backlog Search", Group: "Indexing", Interval: "30m", Automated: true, LastRunState: "idle"},
 	}
 	for i := range defs {
@@ -592,30 +584,29 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// 90 minutes — large episodes plus fallback churn can legitimately run long.
 	// Selected state gets 45 minutes because completion fast-lane now retries it
 	// every minute; if it still sits selected that long, it is genuinely stale.
-	runStaleReset := func() {
+	// queue_housekeeping: stale-reset first, then retry-failed, every 10 min.
+	// Merging halves goroutine count; 10m is a compromise between old 5m stale
+	// and old 15m retry — stale items reset sooner, failed items retry sooner.
+	runQueueHousekeeping := func() {
 		n, err := db.ResetStaleQueueItems(ctx, 10*time.Minute, 90*time.Minute, 45*time.Minute)
 		if err != nil {
 			logger.Error().Err(err).Msg("monitoring: stale reset error")
-			return
+		} else {
+			if n > 0 {
+				logger.Warn().Int("reset", n).Msg("monitoring: stale queue items reset")
+				broker.Publish(map[string]any{"kind": "queue.stale_reset", "reset": n})
+			}
 		}
-		_ = db.TouchMaintenanceCursor(ctx, taskStaleQueueReset, time.Now().UTC().Format(time.RFC3339))
-		if n > 0 {
-			logger.Warn().Int("reset", n).Msg("monitoring: stale queue items reset")
-			broker.Publish(map[string]any{"kind": "queue.stale_reset", "reset": n})
-		}
-	}
-
-	runRetryPass := func() {
 		rr, err := workflowSvc.RetryFailedQueue(ctx)
 		if err != nil {
 			logger.Error().Err(err).Msg("monitoring: retry failed queue error")
 			return
 		}
-		_ = db.TouchMaintenanceCursor(ctx, taskRetryFailedQueue, time.Now().UTC().Format(time.RFC3339))
+		_ = db.TouchMaintenanceCursor(ctx, taskQueueHousekeeping, time.Now().UTC().Format(time.RFC3339))
 		if rr.Retried > 0 {
 			broker.Publish(map[string]any{"kind": "queue.retry_background", "retried": rr.Retried})
 		}
-		logger.Info().Int("retried", rr.Retried).Msg("monitoring: retry failed queue complete")
+		logger.Info().Int("retried", rr.Retried).Msg("monitoring: queue housekeeping complete")
 	}
 
 	// runSyncOnce syncs Seerr requests.
@@ -677,35 +668,26 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		return false, ""
 	}
 
-	runRepublishPass := func() {
-		if skip, reason := shouldSkipNonCriticalMaintenance(taskRepublishPending); skip {
-			logger.Info().Str("task", taskRepublishPending).Str("reason", reason).Msg("scheduler: skipping non-critical task")
+	// publishing_maintenance: republish pending + reset orphaned, every 30 min.
+	runPublishingMaintenance := func() {
+		if skip, reason := shouldSkipNonCriticalMaintenance(taskPublishingMaintenance); skip {
+			logger.Info().Str("task", taskPublishingMaintenance).Str("reason", reason).Msg("scheduler: skipping non-critical task")
 			return
 		}
-		result, err := publicationSvc.RepublishPendingLibrary(ctx)
-		if err != nil {
+		if result, err := publicationSvc.RepublishPendingLibrary(ctx); err != nil {
 			logger.Error().Err(err).Msg("monitoring: republish pending error")
-			return
+		} else {
+			if result.Republished > 0 {
+				broker.Publish(map[string]any{"kind": "library.republish_background", "republished": result.Republished})
+			}
+			logger.Info().Int("republished", result.Republished).Msg("monitoring: republish pending complete")
 		}
-		_ = db.TouchMaintenanceCursor(ctx, taskRepublishPending, time.Now().UTC().Format(time.RFC3339))
-		if result.Republished > 0 {
-			broker.Publish(map[string]any{"kind": "library.republish_background", "republished": result.Republished})
-		}
-		logger.Info().Int("republished", result.Republished).Msg("monitoring: republish pending complete")
-	}
-
-	runResetOrphanedPass := func() {
-		if skip, reason := shouldSkipNonCriticalMaintenance(taskResetOrphaned); skip {
-			logger.Info().Str("task", taskResetOrphaned).Str("reason", reason).Msg("scheduler: skipping non-critical task")
-			return
-		}
-		result, err := workflowSvc.ResetOrphanedAvailableItems(ctx)
-		if err != nil {
+		if result, err := workflowSvc.ResetOrphanedAvailableItems(ctx); err != nil {
 			logger.Error().Err(err).Msg("monitoring: reset orphaned available items error")
-			return
+		} else {
+			logger.Info().Int("found", result.Found).Int("reset", result.Reset).Msg("monitoring: reset orphaned available items complete")
 		}
-		_ = db.TouchMaintenanceCursor(ctx, taskResetOrphaned, time.Now().UTC().Format(time.RFC3339))
-		logger.Info().Int("found", result.Found).Int("reset", result.Reset).Msg("monitoring: reset orphaned available items complete")
+		_ = db.TouchMaintenanceCursor(ctx, taskPublishingMaintenance, time.Now().UTC().Format(time.RFC3339))
 	}
 	runHealthCheck := func() {
 		entries, err := db.ListHealthEntries(ctx)
@@ -770,21 +752,42 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			Msg("monitoring: health check complete")
 	}
 
-	runCachePrune := func() {
-		if skip, reason := shouldSkipNonCriticalMaintenance(taskCachePrune); skip {
-			logger.Info().Str("task", taskCachePrune).Str("reason", reason).Msg("scheduler: skipping non-critical task")
+	// storage_maintenance: library cleanup then cache prune, every 6h.
+	runStorageMaintenance := func() {
+		if skip, reason := shouldSkipNonCriticalMaintenance(taskStorageMaintenance); skip {
+			logger.Info().Str("task", taskStorageMaintenance).Str("reason", reason).Msg("scheduler: skipping non-critical task")
 			return
 		}
-		result, err := cacheSvc.Prune(ctx)
-		if err != nil {
+		_, _ = maintenanceSvc.RemoveOrphanedContent(ctx)
+		_, _ = maintenanceSvc.RemoveBrokenMediaSymlinks(ctx)
+		_, _ = maintenanceSvc.RemoveOrphanedCompletedSymlinks(ctx)
+		if result, err := cacheSvc.Prune(ctx); err != nil {
 			logger.Error().Err(err).Msg("monitoring: cache prune error")
+		} else {
+			if result.DeletedFiles > 0 {
+				broker.Publish(map[string]any{"kind": "cache.prune_background", "deletedFiles": result.DeletedFiles})
+			}
+			logger.Info().Int("deletedFiles", result.DeletedFiles).Msg("monitoring: cache prune complete")
+		}
+		_ = db.TouchMaintenanceCursor(ctx, taskStorageMaintenance, time.Now().UTC().Format(time.RFC3339))
+	}
+
+	// content_maintenance: fill missing episodes + upgrade search, every 6h.
+	// Load-gated so it doesn't compete with active backlog processing.
+	runContentMaintenance := func() {
+		if skip, reason := shouldSkipNonCriticalMaintenance(taskContentMaintenance); skip {
+			logger.Info().Str("task", taskContentMaintenance).Str("reason", reason).Msg("scheduler: skipping non-critical task")
 			return
 		}
-		_ = db.TouchMaintenanceCursor(ctx, taskCachePrune, time.Now().UTC().Format(time.RFC3339))
-		if result.DeletedFiles > 0 {
-			broker.Publish(map[string]any{"kind": "cache.prune_background", "deletedFiles": result.DeletedFiles})
+		if _, err := workflowSvc.FillMissingEpisodes(ctx); err != nil {
+			logger.Error().Err(err).Msg("fill missing episodes failed")
 		}
-		logger.Info().Int("deletedFiles", result.DeletedFiles).Msg("monitoring: cache prune complete")
+		if res, err := workflowSvc.SearchUpgrades(ctx); err != nil {
+			logger.Error().Err(err).Msg("upgrade search failed")
+		} else {
+			logger.Info().Int("checked", res.Checked).Int("upgraded", res.Upgraded).Int("failed", res.Failed).Msg("upgrade search complete")
+		}
+		_ = db.TouchMaintenanceCursor(ctx, taskContentMaintenance, time.Now().UTC().Format(time.RFC3339))
 	}
 
 	startRecurring := func(name string, interval time.Duration, runOnStartup bool, fn func()) {
@@ -865,17 +868,15 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		runRecentPass("movie")
 	})
 
-	startRecurring(taskStaleQueueReset, 5*time.Minute, true, runStaleReset)
-	startRecurring(taskRetryFailedQueue, 15*time.Minute, true, runRetryPass) // was 30m
-	startRecurringWithStartupDelay(taskRepublishPending, 30*time.Minute, 2*time.Minute, runRepublishPass)
-	startRecurringWithStartupDelay(taskResetOrphaned, 30*time.Minute, 4*time.Minute, runResetOrphanedPass)
+	startRecurring(taskQueueHousekeeping, 10*time.Minute, true, runQueueHousekeeping)
+	startRecurringWithStartupDelay(taskPublishingMaintenance, 30*time.Minute, 2*time.Minute, runPublishingMaintenance)
 	startRecurringWithStartupDelay(taskHealthCheck, backgroundHealthCheckInterval, 6*time.Minute, runHealthCheck)
 	startRecurring(taskNZBHealthCheck, 168*time.Hour, false, func() {
 		if _, err := maintenanceSvc.DeepNZBHealthCheck(ctx); err != nil {
 			logger.Error().Err(err).Msg("deep nzb health check failed")
 		}
 	})
-	startRecurringWithStartupDelay(taskArticleHealthCheck, 6*time.Hour, 5*time.Minute, func() {
+	startRecurringWithStartupDelay(taskArticleHealthCheck, 6*time.Hour, 15*time.Minute, func() {
 		n, err := workflowSvc.ValidatePublishedArticles(ctx)
 		if err != nil {
 			logger.Error().Err(err).Msg("article health check failed")
@@ -887,28 +888,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			logger.Info().Msg("article health check: all published articles reachable")
 		}
 	})
-	startRecurringWithStartupDelay(taskCachePrune, 6*time.Hour, 8*time.Minute, runCachePrune)
-	startRecurringWithStartupDelay(taskLibraryCleanup, 6*time.Hour, 10*time.Minute, func() {
-		if skip, reason := shouldSkipNonCriticalMaintenance(taskLibraryCleanup); skip {
-			logger.Info().Str("task", taskLibraryCleanup).Str("reason", reason).Msg("scheduler: skipping non-critical task")
-			return
-		}
-		_, _ = maintenanceSvc.RemoveOrphanedContent(ctx)
-		_, _ = maintenanceSvc.RemoveBrokenMediaSymlinks(ctx)
-		_, _ = maintenanceSvc.RemoveOrphanedCompletedSymlinks(ctx)
-	})
-	startRecurring(taskFillMissingEpisodes, 6*time.Hour, false, func() {
-		if _, err := workflowSvc.FillMissingEpisodes(ctx); err != nil {
-			logger.Error().Err(err).Msg("fill missing episodes failed")
-		}
-	})
-	startRecurring(taskSearchUpgrades, 6*time.Hour, false, func() {
-		if res, err := workflowSvc.SearchUpgrades(ctx); err != nil {
-			logger.Error().Err(err).Msg("upgrade search failed")
-		} else {
-			logger.Info().Int("checked", res.Checked).Int("upgraded", res.Upgraded).Int("failed", res.Failed).Msg("upgrade search complete")
-		}
-	})
+	startRecurringWithStartupDelay(taskStorageMaintenance, 6*time.Hour, 10*time.Minute, runStorageMaintenance)
+	startRecurringWithStartupDelay(taskContentMaintenance, 6*time.Hour, 20*time.Minute, runContentMaintenance)
 	startRecurring(taskBacklogSearch, 30*time.Minute, true, runBacklogSearch)
 
 	webdavServer := &http.Server{
