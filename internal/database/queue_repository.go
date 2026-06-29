@@ -210,7 +210,7 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 			nzbFileID: nzbFileID,
 		}
 
-		if isPlayableMedia(file.FileName) {
+		if isPlayableMedia(file.FileName, file.FileSizeBytes) {
 			virtualPath := "releases/" + fmt.Sprintf("%d", selectedReleaseID) + "/" + file.FileName
 			if err = tx.QueryRowContext(ctx, `
 				insert into virtual_files (
@@ -330,7 +330,7 @@ func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID in
 			fileName:  file.FileName,
 			nzbFileID: nzbFileID,
 		}
-		if isPlayableMedia(file.FileName) {
+		if isPlayableMedia(file.FileName, file.FileSizeBytes) {
 			virtualPath := "releases/" + fmt.Sprintf("%d", selectedReleaseID) + "/" + file.FileName
 			if err = tx.QueryRowContext(ctx, `
 				insert into virtual_files (
@@ -439,7 +439,7 @@ func insertImportedArchives(ctx context.Context, tx *sql.Tx, selectedReleaseID i
 					return err
 				}
 			}
-			if archive.Status != "supported" || !isPlayableMedia(entry.Path) || len(entry.Ranges) == 0 {
+			if archive.Status != "supported" || !isPlayableMedia(entry.Path, entry.SizeBytes) || len(entry.Ranges) == 0 {
 				continue
 			}
 			virtualFileID, err := insertArchiveVirtualFile(ctx, tx, selectedReleaseID, entry, volumePaths, fileSegments)
@@ -593,10 +593,15 @@ func (db *DB) ListNZBMountEntries(ctx context.Context) ([]NZBMountEntry, error) 
 	return out, rows.Err()
 }
 
-func isPlayableMedia(name string) bool {
+// minPlayableFileSizeBytes is the minimum size for a virtual media file.
+// Files smaller than this are stubs, extras, or corrupt placeholders — they
+// would show as "Video: none / Audio: none" in Plex.
+const minPlayableFileSizeBytes = 50 * 1024 * 1024 // 50 MB
+
+func isPlayableMedia(name string, sizeBytes int64) bool {
 	switch strings.ToLower(filepath.Ext(name)) {
 	case ".mkv", ".mp4", ".avi":
-		return !isSampleFilename(name)
+		return !isSampleFilename(name) && sizeBytes >= minPlayableFileSizeBytes
 	default:
 		return false
 	}

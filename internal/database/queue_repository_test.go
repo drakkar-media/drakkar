@@ -6,14 +6,18 @@ import (
 )
 
 func TestIsPlayableMedia(t *testing.T) {
-	if !isPlayableMedia("Dune.mkv") {
+	large := int64(200 * 1024 * 1024) // 200 MB — clearly a real video
+	if !isPlayableMedia("Dune.mkv", large) {
 		t.Fatal("expected mkv playable")
 	}
-	if !isPlayableMedia("clip.MP4") {
+	if !isPlayableMedia("clip.MP4", large) {
 		t.Fatal("expected mp4 playable")
 	}
-	if isPlayableMedia("sample.rar") {
+	if isPlayableMedia("sample.rar", large) {
 		t.Fatal("rar should not be marked playable")
+	}
+	if isPlayableMedia("Dune.mkv", 1024*1024) {
+		t.Fatal("tiny mkv should not be playable (stub/extra)")
 	}
 }
 

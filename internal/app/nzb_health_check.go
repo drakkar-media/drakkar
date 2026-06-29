@@ -2,6 +2,9 @@ package app
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -113,14 +116,22 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 		err := db.StrictCheckFirstSegments(checkCtx, c.NZBDocumentID)
 		cancel()
 		if err == nil {
-			_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
-			continue
+			// Also validate the video container magic bytes. Files named .mkv/.mp4
+			// that are actually stubs/extras produce "Video: none / Audio: none" in
+			// Plex. Reading 12 bytes from the VFS path is cheap — the first NNTP
+			// segment is already cached from StrictCheckFirstSegments.
+			if magicErr := checkVFSContainerMagic(c.TargetPath); magicErr != nil {
+				err = fmt.Errorf("invalid video container: %w", magicErr)
+			} else {
+				_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
+				continue
+			}
 		}
 		logger.Warn().
 			Int64("libraryItemId", c.LibraryItemID).
 			Str("title", c.Title).
 			Err(err).
-			Msg("health check: strict NZB validation failed — blocklisting release and promoting next")
+			Msg("health check: NZB validation failed — blocklisting release and promoting next")
 		_ = db.RecordHealthCheck(ctx, c.PublicationID, false)
 		// Remove symlinks before blocklisting so the filesystem is clean
 		// regardless of whether a next candidate exists.
@@ -195,4 +206,55 @@ func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workfl
 		logger.Info().Int("reset", result.ResetItems).Msg("health check: reset broken items for re-queue")
 	}
 	return result, nil
+}
+
+// checkVFSContainerMagic reads the first 12 bytes of a VFS-served file and
+// validates that they carry a recognised video container signature (MKV/WebM,
+// MP4/MOV, or AVI). Files with a .mkv/.mp4 extension that are actually stubs,
+// extras, or corrupt placeholders will have wrong or empty magic bytes and
+// cause Plex to report "Video: none / Audio: none".
+// Non-VFS paths (no "/content/" segment) are skipped — they don't go through
+// the NNTP stack and are always valid.
+func checkVFSContainerMagic(path string) error {
+	if !strings.Contains(path, "/content/") {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open: %w", err)
+	}
+	defer f.Close()
+	// 30-second deadline so a hung FUSE read doesn't block the health check.
+	_ = f.SetDeadline(time.Now().Add(30 * time.Second))
+	buf := make([]byte, 12)
+	n, err := io.ReadAtLeast(f, buf, 4)
+	if err != nil {
+		return fmt.Errorf("read header: %w", err)
+	}
+	return validateVideoContainerHeader(buf[:n])
+}
+
+// validateVideoContainerHeader checks whether the first bytes of a file match
+// a known video container format. Supported: MKV/WebM (EBML), AVI (RIFF),
+// MP4/MOV (ISO Base Media box types: ftyp, moov, mdat, free, wide, skip).
+func validateVideoContainerHeader(header []byte) error {
+	if len(header) < 4 {
+		return errors.New("header too short to identify container")
+	}
+	// MKV / WebM — EBML magic
+	if header[0] == 0x1a && header[1] == 0x45 && header[2] == 0xdf && header[3] == 0xa3 {
+		return nil
+	}
+	// AVI — RIFF header
+	if string(header[0:4]) == "RIFF" {
+		return nil
+	}
+	// MP4 / MOV — ISO Base Media File Format: box type at bytes 4–7
+	if len(header) >= 8 {
+		switch string(header[4:8]) {
+		case "ftyp", "moov", "mdat", "free", "wide", "skip", "pnot":
+			return nil
+		}
+	}
+	return fmt.Errorf("unrecognised video container (magic: %02x %02x %02x %02x)", header[0], header[1], header[2], header[3])
 }
