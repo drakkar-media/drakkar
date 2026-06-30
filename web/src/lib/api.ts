@@ -141,7 +141,7 @@ export const api = {
   blocklistStats: () => request<{ total: number; active: number; expired: number; byReason: Record<string, number> }>('/api/blocklist/stats'),
   syncRequests: () => request<{ seen: number; created: number }>('/api/requests/sync', { method: 'POST' }),
   pushMissingToSeerr: () => request<{ queued: boolean }>('/api/requests/push-library', { method: 'POST' }),
-  searchPendingLibrary: () => request<BulkSearchResult>('/api/library/search-pending', { method: 'POST' }),
+  searchPendingLibrary: () => request<{ queued: boolean }>('/api/library/search-pending', { method: 'POST' }),
   searchUpgrades: () => request<{ checked: number; upgraded: number; failed: number }>('/api/library/search-upgrades', { method: 'POST' }),
   searchLibrary: (libraryItemID: number) =>
     request<{ candidateCount: number; selectedReleaseId?: number }>(`/api/library/${libraryItemID}/search`, { method: 'POST' }),

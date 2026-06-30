@@ -55,8 +55,8 @@
   async function processPending() {
     working = true;
     try {
-      const r = await api.searchPendingLibrary();
-      toastSuccess(`Searched ${r.searched} — selected ${r.selected}`);
+      await api.searchPendingLibrary();
+      toastSuccess('Search started in background — results will appear via SSE');
       await loadLibrary();
     } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
     finally { working = false; }
@@ -100,7 +100,13 @@
 
     void loadLibrary();
 
-    const unsub = subscribeEvents(() => { if (!working) void loadLibrary(); });
+    const unsub = subscribeEvents((event) => {
+      if (event?.kind === 'library.search_pending') {
+        const e = event as Record<string, unknown>;
+        toastSuccess(`Search Pending complete: searched ${e.searched}, selected ${e.selected}`);
+      }
+      if (!working) void loadLibrary();
+    });
     const t = window.setInterval(() => void loadLibrary(), 30000);
     return () => { window.clearInterval(t); unsub(); };
   });
