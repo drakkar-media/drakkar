@@ -1,12 +1,15 @@
 package nzb
 
 import (
+	"bytes"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"sort"
 	"strconv"
 	"strings"
+
+	"golang.org/x/net/html/charset"
 )
 
 type Document struct {
@@ -44,10 +47,14 @@ func Parse(r io.Reader) (*Document, error) {
 		return nil, fmt.Errorf("parse nzb xml: read body: %w", err)
 	}
 	var doc Document
-	if err := xml.Unmarshal(data, &doc); err != nil {
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	dec.CharsetReader = charset.NewReaderLabel
+	if err := dec.Decode(&doc); err != nil {
 		// Check if it's a Newznab API error response rather than an NZB.
 		var apiErr newznabError
-		if xmlErr := xml.Unmarshal(data, &apiErr); xmlErr == nil && apiErr.Code != "" {
+		dec2 := xml.NewDecoder(bytes.NewReader(data))
+		dec2.CharsetReader = charset.NewReaderLabel
+		if xmlErr := dec2.Decode(&apiErr); xmlErr == nil && apiErr.Code != "" {
 			return nil, fmt.Errorf("indexer error %s: %s", apiErr.Code, apiErr.Description)
 		}
 		return nil, fmt.Errorf("parse nzb xml: %w", err)
