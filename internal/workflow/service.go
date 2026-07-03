@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -3774,6 +3775,9 @@ var (
 	nzbFetchLastTime time.Time
 )
 
+// reManualSearchEpisode matches SxxExx / sxxexx in a manual search query.
+var reManualSearchEpisode = regexp.MustCompile(`(?i)s(\d{1,2})e(\d{1,2})`)
+
 func (f HTTPNZBFetcher) Fetch(ctx context.Context, rawURL string) (string, []byte, error) {
 	// Rate-limit NZB fetches globally: wait if less than 2 seconds since last fetch.
 	nzbFetchMu.Lock()
@@ -4177,6 +4181,8 @@ type ManualSearchItem struct {
 }
 
 // ManualSearch queries NZBHydra2 with a free-text query and returns scored candidates.
+// When the query contains a specific episode token (SxxExx), results for other episodes
+// are filtered out — only the requested episode and season packs are returned.
 func (s *Service) ManualSearch(ctx context.Context, query string) ([]ManualSearchItem, error) {
 	if s == nil || s.hydra == nil || query == "" {
 		return nil, nil
@@ -4188,8 +4194,20 @@ func (s *Service) ManualSearch(ctx context.Context, query string) ([]ManualSearc
 	if err != nil {
 		return nil, err
 	}
+
+	// Parse SxxExx from query so we can drop wrong-episode results.
+	var filterSeason, filterEpisode int
+	if m := reManualSearchEpisode.FindStringSubmatch(query); m != nil {
+		filterSeason, _ = strconv.Atoi(m[1])
+		filterEpisode, _ = strconv.Atoi(m[2])
+	}
+
 	out := make([]ManualSearchItem, 0, len(results))
 	for _, r := range results {
+		// Drop results that clearly belong to a different episode.
+		if filterEpisode > 0 && hasWrongEpisodeToken(strings.ToLower(r.Title), filterSeason, filterEpisode) {
+			continue
+		}
 		// hydra.SearchResult has limited fields — extract resolution/source/codec
 		// from the title using the same parser the ranking engine uses.
 		titleLower := strings.ToLower(r.Title)
