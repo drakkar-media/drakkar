@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -659,7 +660,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		req.Header.Set("User-Agent", "Drakkar/1.0")
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, fmt.Errorf("fetch url: %w", err))
 			return
@@ -1907,9 +1908,15 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		if reqPath == "" {
 			reqPath = "/"
 		}
-		// Prevent directory traversal by cleaning the path within the virtual root.
-		clean := "/" + strings.Trim(strings.ReplaceAll(reqPath, "..", ""), "/")
-		fullPath := base + clean
+		// Prevent directory traversal: filepath.Clean normalises ".." sequences,
+		// then we assert the result stays inside base.
+		clean := filepath.Clean("/" + reqPath)
+		cleanBase := filepath.Clean(base)
+		fullPath := filepath.Join(base, clean)
+		if fullPath != cleanBase && !strings.HasPrefix(fullPath, cleanBase+"/") {
+			respondError(w, http.StatusBadRequest, errors.New("invalid path"))
+			return
+		}
 		entries, err := os.ReadDir(fullPath)
 		if err != nil {
 			if os.IsNotExist(err) {

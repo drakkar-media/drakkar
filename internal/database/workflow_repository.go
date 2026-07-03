@@ -338,6 +338,15 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 			join tv_shows ts on ts.id = e.tv_show_id
 			where ts.tvdb_id = $1 and e.season_number = $2 and e.episode_number = $3
 			limit 1`, tvdbID, season, episode).Scan(&libraryItemID)
+		if errors.Is(err, sql.ErrNoRows) && tmdbID > 0 {
+			// TMDB-only show: tvdb_id is NULL, fall back to tmdb_id lookup.
+			err = tx.QueryRowContext(ctx, `
+				select li.id from library_items li
+				join episodes e on e.id = li.episode_id
+				join tv_shows ts on ts.id = e.tv_show_id
+				where ts.tmdb_id = $1 and e.season_number = $2 and e.episode_number = $3
+				limit 1`, tmdbID, season, episode).Scan(&libraryItemID)
+		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return 0, false, err
 		}
@@ -977,7 +986,7 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 		return nil, err
 	}
 
-	blocked, err := loadBlocklistMap(ctx, tx)
+	blocked, err := loadBlocklistMap(ctx, db.SQL)
 	if err != nil {
 		return nil, err
 	}
@@ -2202,7 +2211,7 @@ func canonicalSourceToken(token string) string {
 	}
 }
 
-func loadBlocklistMap(ctx context.Context, tx *sql.Tx) (map[string]string, error) {
+func loadBlocklistMap(ctx context.Context, q sqlQuerier) (map[string]string, error) {
 	const cacheTTL = 30 * time.Second
 	blocklistCacheMu.Lock()
 	if blocklistCached != nil && time.Since(blocklistCachedAt) < cacheTTL {
@@ -2215,7 +2224,7 @@ func loadBlocklistMap(ctx context.Context, tx *sql.Tx) (map[string]string, error
 	}
 	blocklistCacheMu.Unlock()
 
-	rows, err := tx.QueryContext(ctx, `
+	rows, err := q.QueryContext(ctx, `
 		select key, reason
 		from blocklist_items
 		where expires_at is null or expires_at > now()`)
