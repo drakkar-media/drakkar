@@ -61,6 +61,18 @@ func shouldRunDeepHealthCheck(now time.Time, item database.DeepHealthCandidate) 
 	return now.Sub(*item.LastCheckedAt) >= nextDeepHealthCheckDelay(item.CreatedAt)
 }
 
+// isTransientHealthCheckErr reports whether err indicates a temporary
+// condition (timeout, cancellation, NNTP throttle) rather than genuine
+// content corruption/unavailability, so callers can avoid blocklisting a
+// perfectly good release over a provider hiccup.
+func isTransientHealthCheckErr(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "status 430") || strings.Contains(msg, "i/o timeout")
+}
+
 func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, publicationSvc *library.Publisher, logger zerolog.Logger, limit int, force bool) (maintenance.Result, error) {
 	result := maintenance.Result{TaskName: "nzb-health-check"}
 	candidates, err := db.ListDeepHealthCandidates(ctx, limit)
@@ -115,6 +127,17 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 		checkCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		err := db.StrictCheckFirstSegments(checkCtx, c.NZBDocumentID)
 		cancel()
+		if err != nil && isTransientHealthCheckErr(err) {
+			// Timeout/throttle/connection errors don't prove the release is
+			// bad — blocklisting on these caused good releases to be dropped
+			// during provider hiccups. Leave it for the next scheduled pass.
+			logger.Warn().
+				Int64("libraryItemId", c.LibraryItemID).
+				Str("title", c.Title).
+				Err(err).
+				Msg("health check: transient error during validation — skipping, will retry next pass")
+			continue
+		}
 		if err == nil {
 			// Also validate the video container magic bytes. Files named .mkv/.mp4
 			// that are actually stubs/extras produce "Video: none / Audio: none" in
@@ -165,7 +188,7 @@ func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workfl
 	resetSeen := make(map[int64]struct{})
 
 	sampleRows, err := db.SQL.QueryContext(ctx, `
-		SELECT DISTINCT qi.library_item_id, li.title
+		SELECT DISTINCT qi.library_item_id, li.title, sr.id
 		FROM queue_items qi
 		JOIN library_items li ON li.id = qi.library_item_id
 		JOIN selected_releases sr ON sr.id = qi.selected_release_id
@@ -180,18 +203,22 @@ func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workfl
 	if err == nil {
 		defer sampleRows.Close()
 		for sampleRows.Next() {
-			var libID int64
+			var libID, selectedReleaseID int64
 			var title string
-			if err := sampleRows.Scan(&libID, &title); err != nil {
+			if err := sampleRows.Scan(&libID, &title, &selectedReleaseID); err != nil {
 				continue
 			}
 			if _, exists := resetSeen[libID]; exists {
 				continue
 			}
+			// Blocklist the sample-only release rather than a plain reset —
+			// a plain reset only applies a ranking penalty, which isn't
+			// enough to stop the same sample-only release being reselected
+			// out of a small candidate pool.
 			logger.Warn().Int64("libraryItemId", libID).Str("title", title).
-				Msg("health check: only sample file published — resetting item for re-queue")
-			if resetErr := workflowSvc.ResetLibraryItem(ctx, libID); resetErr != nil {
-				logger.Error().Err(resetErr).Int64("libraryItemId", libID).Msg("health check: sample reset failed")
+				Msg("health check: only sample file published — blocklisting release and promoting next")
+			if resetErr := workflowSvc.FailAndBlocklistRelease(ctx, selectedReleaseID, "sample-only release"); resetErr != nil {
+				logger.Error().Err(resetErr).Int64("libraryItemId", libID).Msg("health check: sample blocklist failed")
 			} else {
 				resetSeen[libID] = struct{}{}
 				result.ResetItems++

@@ -66,13 +66,20 @@ func (r *StoredRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 			RangeStart:   rng.DecodedStart + offset,
 			RangeEnd:     rng.DecodedStart + offset + length,
 			SegmentStart: rng.DecodedStart,
-			SegmentEnd:   rng.DecodedStart + (rng.SegmentEnd-rng.SegmentStart) + rng.SegmentByteStart,
+			SegmentEnd:   rng.DecodedStart + (rng.SegmentEnd - rng.SegmentStart) + rng.SegmentByteStart,
 		}
 		block, err := r.fetcher.FetchRange(ctx, adj)
+		expected := int(length)
+		if err == nil && len(block) < expected {
+			// A short read here doesn't necessarily mean the archive layout
+			// is wrong — it can also be a transient network/segment hiccup,
+			// which DirectNzbReader tolerates via its realign/retry loop.
+			// Retry once before treating it as fatal.
+			block, err = r.fetcher.FetchRange(ctx, adj)
+		}
 		if err != nil {
 			return written, err
 		}
-		expected := int(length)
 		if len(block) < expected {
 			return written, errors.New("short fetch")
 		}

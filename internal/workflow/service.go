@@ -27,6 +27,7 @@ import (
 	"github.com/hjongedijk/drakkar/internal/library"
 	"github.com/hjongedijk/drakkar/internal/metrics"
 	"github.com/hjongedijk/drakkar/internal/nzb"
+	"github.com/hjongedijk/drakkar/internal/observability"
 	"github.com/hjongedijk/drakkar/internal/policy"
 	"github.com/hjongedijk/drakkar/internal/ranking"
 	"github.com/hjongedijk/drakkar/internal/seerr"
@@ -135,8 +136,8 @@ type Service struct {
 	earlyChecker   func(context.Context, string) error
 	articleChecker func(ctx context.Context, messageID string) error
 	queuePolicy    QueuePolicyProvider
-	indexerLimits IndexerLimits
-	logger        zerolog.Logger
+	indexerLimits  IndexerLimits
+	logger         zerolog.Logger
 	// WorkQueue accepts individual library item IDs for immediate dispatch.
 	// Push items here from webhooks or sync to bypass the 30-min tick.
 	WorkQueue WorkQueuer
@@ -168,11 +169,11 @@ type Service struct {
 
 	// searchInflight deduplicates concurrent SearchLibrary calls for the same
 	// library item ID (O-05). Keyed by int64 library item ID.
-	searchInflight     sync.Map
-	recentURLMu        sync.Mutex
-	recentURLHits      map[string]time.Time
-	searchAttemptMu    sync.Mutex
-	searchAttempts     map[string]searchAttemptRecord
+	searchInflight  sync.Map
+	recentURLMu     sync.Mutex
+	recentURLHits   map[string]time.Time
+	searchAttemptMu sync.Mutex
+	searchAttempts  map[string]searchAttemptRecord
 
 	// TTL caches for policy data, guarded by profileCacheMu (O-04).
 	// These are loaded from the DB at most once per 5 minutes.
@@ -337,6 +338,21 @@ func newDownloadDispatcher() *downloadDispatcher {
 	}
 }
 
+// downloadPriorityAgingThreshold bounds how long a lower-priority job can be
+// starved by a steady stream of higher-priority submissions. Once a job has
+// waited this long it sorts as if it were priority 0, guaranteeing forward
+// progress for bulk imports even under continuous user-triggered traffic.
+const downloadPriorityAgingThreshold = 5 * time.Minute
+
+// effectiveDownloadPriority returns job's priority for ordering purposes,
+// promoting it to the highest priority once it has aged past the threshold.
+func effectiveDownloadPriority(job downloadJob, now time.Time) int {
+	if job.priority > 0 && now.Sub(job.enqueuedAt) > downloadPriorityAgingThreshold {
+		return 0
+	}
+	return job.priority
+}
+
 // submit enqueues a download job. Returns false (no-op) if the same
 // selectedReleaseID is already queued or being processed by a worker.
 func (d *downloadDispatcher) submit(job downloadJob) bool {
@@ -347,9 +363,11 @@ func (d *downloadDispatcher) submit(job downloadJob) bool {
 	}
 	d.inFlight[job.selectedReleaseID] = true
 	d.queue = append(d.queue, job)
+	now := time.Now()
 	sort.SliceStable(d.queue, func(i, j int) bool {
-		if d.queue[i].priority != d.queue[j].priority {
-			return d.queue[i].priority < d.queue[j].priority
+		pi, pj := effectiveDownloadPriority(d.queue[i], now), effectiveDownloadPriority(d.queue[j], now)
+		if pi != pj {
+			return pi < pj
 		}
 		return d.queue[i].enqueuedAt.Before(d.queue[j].enqueuedAt)
 	})
@@ -403,15 +421,15 @@ func (d *downloadDispatcher) hasWorkers() bool {
 
 func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service {
 	return &Service{
-		repo:               repo,
-		seerr:              seerr,
-		hydra:              hydra,
-		fetcher:            HTTPNZBFetcher{},
-		importSem:          make(chan struct{}, 2), // kept for ImportNZBFromPush only
-		downloader:         newDownloadDispatcher(),
-		dispatchC:          make(chan struct{}, 1),
-		recentURLHits:      make(map[string]time.Time),
-		searchAttempts:     make(map[string]searchAttemptRecord),
+		repo:           repo,
+		seerr:          seerr,
+		hydra:          hydra,
+		fetcher:        HTTPNZBFetcher{},
+		importSem:      make(chan struct{}, 2), // kept for ImportNZBFromPush only
+		downloader:     newDownloadDispatcher(),
+		dispatchC:      make(chan struct{}, 1),
+		recentURLHits:  make(map[string]time.Time),
+		searchAttempts: make(map[string]searchAttemptRecord),
 	}
 }
 
@@ -550,6 +568,7 @@ func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 			}
 			lid, tmdbID := libraryItemID, request.TMDBID
 			go func() {
+				defer observability.Recover("enrich-movie-request")
 				enrichCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				_ = s.enrichMovieRequest(enrichCtx, lid, tmdbID)
@@ -586,6 +605,7 @@ func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 			}
 			lid, tmdbID, tvdbID, epTitle := libraryItemID, request.TMDBID, request.TVDBID, request.EpisodeTitle
 			go func() {
+				defer observability.Recover("enrich-episode-request")
 				enrichCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				_ = s.enrichEpisodeRequest(enrichCtx, lid, tmdbID, tvdbID, epTitle)
@@ -649,6 +669,7 @@ func (s *Service) syncSeasonRequest(ctx context.Context, req seerr.Request) (int
 	if created > 0 {
 		tmdbID, tvdbID := req.TMDBID, req.TVDBID
 		go func() {
+			defer observability.Recover("enrich-episode-request")
 			enrichCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			_ = s.enrichEpisodeRequest(enrichCtx, ids[0], tmdbID, tvdbID, "")
@@ -1055,7 +1076,10 @@ func (s *Service) filterPendingSearchTargets(targets []database.PendingLibrarySe
 	// Sonarr/Radarr group missing episodes by show+season: one search per season,
 	// not one per episode. The season pack attempt inside the BullMQ worker covers
 	// all missing episodes from that season in a single Hydra2 query.
-	type showSeason struct{ tvShowID int64; season int }
+	type showSeason struct {
+		tvShowID int64
+		season   int
+	}
 	seenShowSeasons := make(map[showSeason]bool)
 	for _, target := range targets {
 		if target.SelectedReleaseID > 0 || target.Selected {
@@ -1076,7 +1100,6 @@ func (s *Service) filterPendingSearchTargets(targets []database.PendingLibrarySe
 	}
 	return append(selectedTargets, searchTargets...)
 }
-
 
 func (s *Service) shouldDispatchSelectedTarget(target database.PendingLibrarySearchTarget, now time.Time) bool {
 	if target.SelectedReleaseID <= 0 {
@@ -1957,25 +1980,34 @@ func (s *Service) RunDownloadWorker(ctx context.Context) {
 		if !ok {
 			return
 		}
-		// Skip jobs whose caller context already expired while queued.
-		select {
-		case <-job.ctx.Done():
-			s.downloader.markDone(job.selectedReleaseID)
-			job.resultCh <- downloadJobResult{nil, job.ctx.Err()}
-			continue
-		default:
-		}
-		result, importedRelease, err := s.fetchIndexAndRelease(job.ctx, job.selectedReleaseID)
-		// Release the in-flight slot before sending the result so that a
-		// promoted release or a re-queued retry can be accepted immediately.
-		s.downloader.markDone(job.selectedReleaseID)
-		if err != nil || importedRelease == nil {
-			job.resultCh <- downloadJobResult{result, err}
-			continue
-		}
-		selectedReleaseID, pubErr := s.publishImportedRelease(job.ctx, *importedRelease)
-		job.resultCh <- downloadJobResult{selectedReleaseID, pubErr}
+		s.runDownloadJob(job)
 	}
+}
+
+// runDownloadJob processes a single download job. Panic recovery is scoped
+// per-job (not around the whole worker loop) so one bad job can't
+// permanently kill this worker goroutine and silently shrink download
+// concurrency for the process lifetime.
+func (s *Service) runDownloadJob(job downloadJob) {
+	defer observability.Recover("download-worker")
+	// Skip jobs whose caller context already expired while queued.
+	select {
+	case <-job.ctx.Done():
+		s.downloader.markDone(job.selectedReleaseID)
+		job.resultCh <- downloadJobResult{nil, job.ctx.Err()}
+		return
+	default:
+	}
+	result, importedRelease, err := s.fetchIndexAndRelease(job.ctx, job.selectedReleaseID)
+	// Release the in-flight slot before sending the result so that a
+	// promoted release or a re-queued retry can be accepted immediately.
+	s.downloader.markDone(job.selectedReleaseID)
+	if err != nil || importedRelease == nil {
+		job.resultCh <- downloadJobResult{result, err}
+		return
+	}
+	selectedReleaseID, pubErr := s.publishImportedRelease(job.ctx, *importedRelease)
+	job.resultCh <- downloadJobResult{selectedReleaseID, pubErr}
 }
 
 // pendingPublish holds data needed to publish an already-indexed release.

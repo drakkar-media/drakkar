@@ -5,9 +5,28 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/hjongedijk/drakkar/internal/stream"
 )
+
+// retryBackoff is applied between fallback attempt rounds so a retry against
+// a source that just failed/throttled doesn't immediately hammer it again.
+// Kept short since this sits in the interactive streaming read path.
+const retryBackoff = 200 * time.Millisecond
+
+// waitBackoff pauses briefly before the next retry round, returning ctx.Err()
+// if the context is cancelled first.
+func waitBackoff(ctx context.Context) error {
+	timer := time.NewTimer(retryBackoff)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
 type NamedArticleSource struct {
 	Name   string
@@ -56,6 +75,11 @@ func (s *FallbackSource) BodyPriority(ctx context.Context, messageID string, pri
 	}
 	var failures []error
 	for attempt := 0; attempt <= s.retries; attempt++ {
+		if attempt > 0 {
+			if err := waitBackoff(ctx); err != nil {
+				return nil, err
+			}
+		}
 		for _, source := range s.sources {
 			body, err := fetchArticleBody(ctx, source.Source, messageID, priority)
 			if err == nil {
@@ -76,6 +100,11 @@ func (s *FallbackSource) Stat(ctx context.Context, messageID string) error {
 	}
 	var failures []error
 	for attempt := 0; attempt <= s.retries; attempt++ {
+		if attempt > 0 {
+			if err := waitBackoff(ctx); err != nil {
+				return err
+			}
+		}
 		for _, source := range s.sources {
 			err := fetchArticleStat(ctx, source.Source, messageID)
 			if err == nil {

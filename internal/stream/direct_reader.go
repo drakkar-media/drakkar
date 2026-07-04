@@ -79,6 +79,10 @@ func (r *DirectNzbReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 		if err != nil {
 			return written, err
 		}
+		if !r.spanUnchanged(index, span) {
+			r.realignSpans(index, actualSpan)
+			continue
+		}
 		r.realignSpans(index, actualSpan)
 		if len(block) == 0 {
 			// realignSpans just corrected the span boundaries based on actual yEnc
@@ -115,6 +119,18 @@ func (r *DirectNzbReader) findSpan(offset int64) (SegmentSpan, int, error) {
 		return r.spans[i], i, nil
 	}
 	return SegmentSpan{}, -1, ErrRangeOutsideFile
+}
+
+// spanUnchanged reports whether r.spans[index] still matches expected —
+// used to detect a concurrent realignSpans call that shifted this span's
+// offsets while a fetch for it was in flight.
+func (r *DirectNzbReader) spanUnchanged(index int, expected SegmentSpan) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if index < 0 || index >= len(r.spans) {
+		return false
+	}
+	return r.spans[index].Start == expected.Start && r.spans[index].End == expected.End
 }
 
 func (r *DirectNzbReader) realignSpans(index int, actual SegmentSpan) {

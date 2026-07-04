@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"regexp"
 	"strconv"
 	"strings"
@@ -279,6 +280,13 @@ func (db *DB) FulfillEpisodeLibraryItem(ctx context.Context, libraryItemID, sour
 		VALUES ($1, $2)
 		ON CONFLICT DO NOTHING
 		RETURNING id`, releaseCandidateID, libraryItemID).Scan(&newSelectedReleaseID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		// A real DB error (connection drop, constraint violation, etc.) —
+		// do not treat this the same as "row already exists" below, or the
+		// episode gets marked available with no selected_release/queue_item
+		// backing it.
+		return err
+	}
 	if err != nil || newSelectedReleaseID == 0 {
 		// Already selected — run available updates within the open transaction.
 		_, err = tx.ExecContext(ctx, `UPDATE library_items SET available = true WHERE id = $1`, libraryItemID)

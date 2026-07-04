@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -2163,7 +2164,14 @@ func corsMiddleware(next http.Handler) http.Handler {
 		if origin != "" {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			// Only send the session cookie for genuinely same-host requests
+			// (e.g. a different scheme/port on the same box). The frontend
+			// is served from the same origin as the API, so this never
+			// affects normal use — it only stops an arbitrary third-party
+			// origin from making credentialed (cookie-bearing) requests.
+			if originHost(origin) == r.Host {
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
 			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, X-API-KEY")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		}
@@ -2175,6 +2183,15 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// originHost extracts the host:port portion of an Origin header value for
+// comparison against http.Request.Host.
+func originHost(origin string) string {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
 
 // libStatusPriority mirrors the frontend itemStatus/STATUS_ORDER for server-side sort:
 // 0=available, 1=partial, 2=active/unreleased, 3=missing/failed.

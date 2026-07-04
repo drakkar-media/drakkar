@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/hjongedijk/drakkar/internal/observability"
 )
 
 // SegmentSizer can return the actual decoded byte size of an NNTP article.
@@ -110,6 +112,7 @@ func (db *DB) PreflightCheckFirstSegments(ctx context.Context, nzbDocumentID int
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer observability.Recover("nntp-preflight-check")
 			select {
 			case sem <- struct{}{}:
 			case <-checkCtx.Done():

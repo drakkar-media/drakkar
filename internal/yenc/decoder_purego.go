@@ -41,7 +41,11 @@ func DecodeArticle(body []byte) ([]byte, error) {
 		if bytes.HasPrefix(rawLine, []byte("=y")) {
 			continue
 		}
-		line := unstuffDotLine(rawLine)
+		// NNTP dot-stuffing is already reversed at the wire level in
+		// nntp.readMultilineBody before this function ever sees the body —
+		// unstuffing again here would incorrectly strip a legitimate leading
+		// byte from any decoded data line that happens to start with "..".
+		line := rawLine
 		for i := 0; i < len(line); i++ {
 			b := line[i]
 			if b == '=' {
@@ -58,11 +62,4 @@ func DecodeArticle(body []byte) ([]byte, error) {
 		return nil, err
 	}
 	return out, nil
-}
-
-func unstuffDotLine(line []byte) []byte {
-	if len(line) >= 2 && line[0] == '.' && line[1] == '.' {
-		return line[1:]
-	}
-	return line
 }

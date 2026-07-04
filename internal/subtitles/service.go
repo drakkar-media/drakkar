@@ -375,7 +375,16 @@ func subtitlePathForPublication(publicationPath, language, ext string) string {
 }
 
 func normalizeLanguage(language string) string {
-	return strings.ToLower(strings.TrimSpace(language))
+	language = strings.ToLower(strings.TrimSpace(language))
+	// Reject anything that isn't a plain language code — this value is
+	// interpolated directly into a filesystem path in
+	// subtitlePathForPublication, so path separators or ".." must not survive.
+	for _, r := range language {
+		if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') && r != '-' {
+			return ""
+		}
+	}
+	return language
 }
 
 func normalizeLanguages(values []string) []string {

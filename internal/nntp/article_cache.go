@@ -10,12 +10,20 @@ import (
 )
 
 // missingArticleTTL matches the reference implementation's 24-hour cache for
-// articles that return 430 "No Such Article" from the Usenet provider.
+// genuinely absent articles.
 const missingArticleTTL = 24 * time.Hour
 
+// throttleTTL is used for NNTP 430 responses. This provider (and others)
+// returns status 430 both for "no such article" and for a transient
+// connection/transfer-limit throttle — this project has hit that ambiguity
+// and fixed it multiple times on the queue/download path (see policy.go's
+// KeyNNTPThrottled). A short TTL means a throttled article is retried again
+// soon instead of being blacklisted from streaming for a full day.
+const throttleTTL = 30 * time.Second
+
 // CachedFallbackSource wraps FallbackSource and caches message IDs that
-// returned a "not found" (430) status. Repeated fetches for the same dead
-// article are short-circuited for 24 hours without hitting NNTP at all.
+// recently failed, so repeated fetches for the same dead/throttled article
+// are short-circuited without hitting NNTP every time.
 type CachedFallbackSource struct {
 	inner *FallbackSource
 
@@ -39,8 +47,10 @@ func (s *CachedFallbackSource) BodyPriority(ctx context.Context, messageID strin
 		return nil, errArticleNotFound(messageID)
 	}
 	body, err := s.inner.BodyPriority(ctx, messageID, priority)
-	if err != nil && isNotFoundError(err) {
-		s.markMissing(messageID)
+	if err != nil {
+		if ttl, ok := classifyCacheableError(err); ok {
+			s.markMissing(messageID, ttl)
+		}
 	}
 	return body, err
 }
@@ -50,8 +60,10 @@ func (s *CachedFallbackSource) Stat(ctx context.Context, messageID string) error
 		return errArticleNotFound(messageID)
 	}
 	err := s.inner.Stat(ctx, messageID)
-	if err != nil && isNotFoundError(err) {
-		s.markMissing(messageID)
+	if err != nil {
+		if ttl, ok := classifyCacheableError(err); ok {
+			s.markMissing(messageID, ttl)
+		}
 	}
 	return err
 }
@@ -70,9 +82,9 @@ func (s *CachedFallbackSource) isMissing(messageID string) bool {
 	return true
 }
 
-func (s *CachedFallbackSource) markMissing(messageID string) {
+func (s *CachedFallbackSource) markMissing(messageID string, ttl time.Duration) {
 	s.mu.Lock()
-	s.missing[messageID] = time.Now().Add(missingArticleTTL)
+	s.missing[messageID] = time.Now().Add(ttl)
 	s.mu.Unlock()
 }
 
@@ -105,14 +117,24 @@ func (e articleNotFoundError) Error() string {
 	return "article not found (cached): " + string(e)
 }
 
-// isNotFoundError detects a 430-class error from the NNTP client.
-// The client formats it as "unexpected BODY status 430".
-func isNotFoundError(err error) bool {
+// classifyCacheableError decides whether an error is worth short-circuiting
+// on repeat fetches, and for how long. Status 430 is NOT treated as a
+// definitive "article missing" signal — this provider (like others) also
+// returns 430 for a transient connection/transfer-limit throttle, and
+// conflating the two caused releases to be permanently blacklisted for a
+// throttle blip (fixed repeatedly on the queue/download path already).
+func classifyCacheableError(err error) (time.Duration, bool) {
 	if err == nil {
-		return false
+		return 0, false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "status 430") ||
-		strings.Contains(msg, "status 423") || // no such group
-		strings.Contains(msg, "article not found")
+	switch {
+	case strings.Contains(msg, "status 430"):
+		return throttleTTL, true
+	case strings.Contains(msg, "status 423"), // no such group
+		strings.Contains(msg, "article not found"):
+		return missingArticleTTL, true
+	default:
+		return 0, false
+	}
 }

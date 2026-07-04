@@ -77,5 +77,12 @@ func EpisodePath(root, show string, year int, tvdbID int, season, episode int, r
 
 func sanitize(input string) string {
 	replacer := strings.NewReplacer("/", "-", "\\", "-", ":", " -")
-	return replacer.Replace(strings.TrimSpace(input))
+	out := replacer.Replace(strings.TrimSpace(input))
+	// A result of "." or ".." (or empty, from blank/whitespace-only metadata)
+	// would resolve to the library root or its parent when joined into a
+	// path — filepath.Join does not stop a ".." segment from escaping root.
+	if out == "" || out == "." || out == ".." || strings.Trim(out, ".") == "" {
+		return "_"
+	}
+	return out
 }

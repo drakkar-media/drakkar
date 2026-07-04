@@ -7,8 +7,10 @@ import (
 	"time"
 )
 
-// ErrArticleMissing is returned by Stat when the NNTP server confirms the
-// article does not exist (430 No Such Article).
+// ErrArticleMissing is returned by Stat on a 430 status. Note that some
+// providers (including this one) also return 430 for a transient
+// connection/transfer-limit throttle, not just a genuinely absent article —
+// callers must not treat this as a definitive permanent-failure signal.
 var ErrArticleMissing = errors.New("article missing")
 
 type BodySession interface {
@@ -47,7 +49,12 @@ func NewPooledSource(factory SessionFactory, maxOpen int) *PooledSource {
 	p := &PooledSource{
 		factory: factory,
 		maxOpen: maxOpen,
-		idle:    make(chan pooledSession, maxOpen),
+		// Buffer beyond maxOpen: sweepOnce drains the channel into a local
+		// slice before deciding what to keep, which briefly frees slots that
+		// concurrent release() calls can fill; without slack, pushing the
+		// kept (non-stale) sessions back can spuriously overflow and close
+		// perfectly healthy connections. See sweepOnce.
+		idle: make(chan pooledSession, maxOpen*2),
 	}
 	go p.sweepLoop()
 	return p

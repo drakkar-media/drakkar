@@ -2,8 +2,10 @@ package observability
 
 import (
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -57,6 +59,16 @@ func NewWithFile(w io.Writer, level Level, logsDir string) zerolog.Logger {
 
 	logger := zerolog.New(out).With().Timestamp().Str("service", "drakkar").Logger()
 	return logger.Level(parseLevel(level))
+}
+
+// Recover logs and swallows a panic in a long-lived background goroutine so
+// one bad iteration doesn't silently kill the whole worker with no
+// diagnostic trail. Use as `defer observability.Recover("worker-name")` at
+// the top of the goroutine body.
+func Recover(name string) {
+	if r := recover(); r != nil {
+		slog.Error("goroutine panic recovered", "goroutine", name, "panic", r, "stack", string(debug.Stack()))
+	}
 }
 
 func parseLevel(level Level) zerolog.Level {

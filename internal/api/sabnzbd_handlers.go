@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -28,9 +30,23 @@ type sabHandler struct {
 	repo          sabRepository
 	fuseMountPath string
 	log           zerolog.Logger
+	// apiKey, if non-empty, must be supplied by callers via the "apikey" param
+	// (matching real SABnzbd behavior). Empty preserves the historical
+	// no-auth behavior for existing Sonarr/Radarr download-client configs.
+	apiKey string
 }
 
 func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if h.apiKey != "" {
+		key := r.FormValue("apikey")
+		if key == "" {
+			key = r.URL.Query().Get("apikey")
+		}
+		if key != h.apiKey {
+			h.writeJSON(w, map[string]any{"status": false, "error": "API Key Incorrect"})
+			return
+		}
+	}
 	mode := r.FormValue("mode")
 	if mode == "" {
 		mode = r.URL.Query().Get("mode")
@@ -137,6 +153,31 @@ func (h *sabHandler) handleAddFile(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, map[string]any{"status": true, "nzo_ids": []string{nzoID}})
 }
 
+// rejectSSRFTarget blocks fetching from loopback, link-local, and private
+// (RFC1918/ULA) addresses, since handleAddURL is reachable via the
+// unauthenticated SABnzbd-compatible shim and would otherwise let a caller
+// use this server to probe/reach internal-only services.
+func rejectSSRFTarget(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid url: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported url scheme: %s", u.Scheme)
+	}
+	host := u.Hostname()
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("resolve url host: %w", err)
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsPrivate() || ip.IsUnspecified() {
+			return fmt.Errorf("refusing to fetch from non-public address")
+		}
+	}
+	return nil
+}
+
 func (h *sabHandler) handleAddURL(w http.ResponseWriter, r *http.Request) {
 	nzbURL := r.FormValue("name")
 	if nzbURL == "" {
@@ -151,6 +192,10 @@ func (h *sabHandler) handleAddURL(w http.ResponseWriter, r *http.Request) {
 		nzbName = r.URL.Query().Get("nzbname")
 	}
 
+	if err := rejectSSRFTarget(nzbURL); err != nil {
+		h.writeError(w, err.Error())
+		return
+	}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, nzbURL, nil)
 	if err != nil {
 		h.writeError(w, "build request: "+err.Error())

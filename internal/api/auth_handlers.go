@@ -194,6 +194,11 @@ func handleDeleteAPIToken(repo UserRepository) http.HandlerFunc {
 
 func handleListUsers(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := auth.FromContext(r.Context())
+		if !ok || claims.Role != "admin" {
+			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+			return
+		}
 		users, err := repo.ListUsers(r.Context())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -208,6 +213,11 @@ func handleListUsers(repo UserRepository) http.HandlerFunc {
 
 func handleCreateUser(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := auth.FromContext(r.Context())
+		if !ok || claims.Role != "admin" {
+			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+			return
+		}
 		var body struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
@@ -218,7 +228,7 @@ func handleCreateUser(repo UserRepository) http.HandlerFunc {
 			return
 		}
 		if body.Role == "" {
-			body.Role = "admin"
+			body.Role = "user"
 		}
 		hash, err := auth.HashPassword(body.Password)
 		if err != nil {
@@ -238,12 +248,16 @@ func handleCreateUser(repo UserRepository) http.HandlerFunc {
 
 func handleDeleteUser(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := auth.FromContext(r.Context())
+		if !ok || claims.Role != "admin" {
+			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+			return
+		}
 		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
 		if err != nil {
 			http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
 			return
 		}
-		claims, _ := auth.FromContext(r.Context())
 		if claims.UserID == id {
 			http.Error(w, `{"error":"cannot delete your own account"}`, http.StatusBadRequest)
 			return

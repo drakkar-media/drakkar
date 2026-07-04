@@ -3,6 +3,7 @@ package nntp
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 
 	"github.com/hjongedijk/drakkar/internal/cache"
@@ -95,6 +96,13 @@ func (s *DiskCachedDecodedSource) DecodedBodyInfoPriority(ctx context.Context, m
 func (s *DiskCachedDecodedSource) fillPartInfoFromRaw(ctx context.Context, messageID string, priority stream.FetchPriority, decoded []byte) ([]byte, yenc.PartInfo, error) {
 	raw, err := s.fetchRaw(ctx, messageID, priority)
 	if err != nil {
+		// The decoded body already came from disk cache and is still
+		// returned — this refetch is only to recover yEnc header info lost
+		// across a process restart (partInfo is in-memory only). Log so a
+		// persistently failing refetch (e.g. dead provider) is visible
+		// instead of silently degrading every disk-cache hit to estimated
+		// offsets with no signal.
+		slog.Warn("nntp: could not refetch article for part-info enrichment; using estimated offsets", "messageID", messageID, "err", err)
 		return decoded, yenc.PartInfo{}, nil
 	}
 	info, _ := yenc.ParsePartInfo(raw)

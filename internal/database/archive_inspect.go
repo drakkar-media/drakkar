@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hjongedijk/drakkar/internal/observability"
 	"github.com/hjongedijk/drakkar/internal/par2"
 	"github.com/hjongedijk/drakkar/internal/stream"
 )
@@ -57,6 +58,7 @@ func inspectImportedArchives(ctx context.Context, archives []ImportedArchive, fi
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer observability.Recover("archive-inspect")
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			inspected := item
@@ -247,6 +249,7 @@ func fetchContinuationOffsets(ctx context.Context, volumes []ImportedArchiveVolu
 		sem <- struct{}{}
 		go func() {
 			defer wg.Done()
+			defer observability.Recover("archive-volume-inspect")
 			defer func() { <-sem }()
 			f, ok := fileByName[vol.Path]
 			if !ok {
@@ -483,6 +486,7 @@ func enrichFileByNameFromPar2(ctx context.Context, files []ImportedNZBFile, file
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer observability.Recover("par2-filedesc-read")
 			// 512 KB covers all FileDesc packets in any realistic release.
 			readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			data, err := readImportedFilePrefix(readCtx, file, 512*1024, fetcher)
