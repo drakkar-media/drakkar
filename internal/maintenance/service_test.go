@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/hjongedijk/drakkar/internal/config"
 	"github.com/hjongedijk/drakkar/internal/database"
@@ -28,6 +29,10 @@ func (r *repoStub) DeleteSymlinkPublication(ctx context.Context, publicationID i
 func (r *repoStub) TouchMaintenanceCursor(ctx context.Context, taskName string, cursor string) error {
 	r.touched = append(r.touched, taskName)
 	return nil
+}
+
+func (r *repoStub) PruneStaleReleaseCandidates(ctx context.Context, olderThan time.Duration) (int64, error) {
+	return 0, nil
 }
 
 func TestRemoveBrokenMediaSymlinks(t *testing.T) {

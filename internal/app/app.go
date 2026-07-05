@@ -761,6 +761,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		_, _ = maintenanceSvc.RemoveOrphanedContent(ctx)
 		_, _ = maintenanceSvc.RemoveBrokenMediaSymlinks(ctx)
 		_, _ = maintenanceSvc.RemoveOrphanedCompletedSymlinks(ctx)
+		if result, err := maintenanceSvc.PruneStaleReleaseCandidates(ctx); err != nil {
+			logger.Error().Err(err).Msg("monitoring: release candidate prune error")
+		} else if result.DeletedRows > 0 {
+			logger.Info().Int("deletedRows", result.DeletedRows).Msg("monitoring: pruned stale release candidates")
+		}
 		if result, err := cacheSvc.Prune(ctx); err != nil {
 			logger.Error().Err(err).Msg("monitoring: cache prune error")
 		} else {

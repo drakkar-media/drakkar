@@ -36,6 +36,10 @@ func (s *maintenanceOpsService) RemoveOrphanedContent(ctx context.Context) (main
 	return s.base.RemoveOrphanedContent(ctx)
 }
 
+func (s *maintenanceOpsService) PruneStaleReleaseCandidates(ctx context.Context) (maintenance.Result, error) {
+	return s.base.PruneStaleReleaseCandidates(ctx)
+}
+
 func (s *maintenanceOpsService) DeepNZBHealthCheck(ctx context.Context) (maintenance.Result, error) {
 	return runNZBHealthCheck(ctx, s.db, s.workflowSvc, s.publicationSvc, s.logger)
 }

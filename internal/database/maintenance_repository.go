@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"time"
 )
 
 func (db *DB) ListSymlinkPublicationRecords(ctx context.Context) ([]SymlinkPublicationRecord, error) {
@@ -56,6 +57,41 @@ func (db *DB) GetMaintenanceCursor(ctx context.Context, taskName string) (string
 		return "", err
 	}
 	return cursor, nil
+}
+
+// PruneStaleReleaseCandidates deletes release_candidates rows older than
+// olderThan that were never selected and are not referenced by
+// selected_releases (which would cascade-delete real grab history). It runs
+// in batches to avoid holding a long-lived lock on a large table.
+func (db *DB) PruneStaleReleaseCandidates(ctx context.Context, olderThan time.Duration) (int64, error) {
+	cutoff := time.Now().UTC().Add(-olderThan)
+	const batchSize = 5000
+	var total int64
+	for {
+		res, err := db.SQL.ExecContext(ctx, `
+			delete from release_candidates
+			where id in (
+				select rc.id
+				from release_candidates rc
+				where rc.selected = false
+				  and rc.created_at < $1
+				  and not exists (
+					select 1 from selected_releases sr where sr.release_candidate_id = rc.id
+				  )
+				limit $2
+			)`, cutoff, batchSize)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n < batchSize {
+			return total, nil
+		}
+	}
 }
 
 func (db *DB) ListMaintenanceCursors(ctx context.Context) ([]MaintenanceCursorEntry, error) {

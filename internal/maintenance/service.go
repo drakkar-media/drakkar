@@ -14,7 +14,12 @@ type Repository interface {
 	ListSymlinkPublicationRecords(ctx context.Context) ([]database.SymlinkPublicationRecord, error)
 	DeleteSymlinkPublication(ctx context.Context, publicationID int64) error
 	TouchMaintenanceCursor(ctx context.Context, taskName string, cursor string) error
+	PruneStaleReleaseCandidates(ctx context.Context, olderThan time.Duration) (int64, error)
 }
+
+// releaseCandidateRetention is how long an unselected, unreferenced
+// release_candidates row is kept before it's eligible for pruning.
+const releaseCandidateRetention = 14 * 24 * time.Hour
 
 type Service struct {
 	repo    Repository
@@ -82,6 +87,18 @@ func (s *Service) RemoveOrphanedCompletedSymlinks(ctx context.Context) (Result, 
 			return result, err
 		}
 		result.DeletedRows++
+	}
+	return result, s.repo.TouchMaintenanceCursor(ctx, result.TaskName, time.Now().UTC().Format(time.RFC3339))
+}
+
+// PruneStaleReleaseCandidates deletes old, never-selected release_candidates
+// rows so search history doesn't grow unbounded. Rows tied to an actual grab
+// (via selected_releases) are always preserved.
+func (s *Service) PruneStaleReleaseCandidates(ctx context.Context) (Result, error) {
+	deleted, err := s.repo.PruneStaleReleaseCandidates(ctx, releaseCandidateRetention)
+	result := Result{TaskName: "stale-release-candidates", DeletedRows: int(deleted)}
+	if err != nil {
+		return result, err
 	}
 	return result, s.repo.TouchMaintenanceCursor(ctx, result.TaskName, time.Now().UTC().Format(time.RFC3339))
 }
