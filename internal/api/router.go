@@ -1202,6 +1202,21 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 	// Configure in Seerr → Settings → Notifications → Webhook with URL:
 	//   http://<drakkar-host>:8080/api/webhooks/seerr
 	r.Post("/api/webhooks/seerr", func(w http.ResponseWriter, r *http.Request) {
+		// This endpoint is in the auth middleware's public-path exemption list
+		// (Seerr can't send a session cookie or the normal Bearer token flow),
+		// so if the caller supplied an Authorization header at all, it must be
+		// a real API token — matching the "Generate API Token" flow in
+		// Settings → Seerr → Webhook setup. No header at all is still allowed,
+		// keeping the token optional as documented there.
+		if userRepo != nil {
+			if authz := strings.TrimSpace(r.Header.Get("Authorization")); authz != "" {
+				raw := strings.TrimPrefix(authz, "Bearer ")
+				if _, _, _, _, err := userRepo.GetAPITokenByHash(r.Context(), auth.HashToken(raw)); err != nil {
+					respondError(w, http.StatusUnauthorized, errors.New("invalid webhook token"))
+					return
+				}
+			}
+		}
 		var payload seerr.WebhookPayload
 		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 			respondError(w, http.StatusBadRequest, err)
@@ -1209,6 +1224,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		// Acknowledge immediately — never let Seerr time out waiting.
 		respondJSON(w, http.StatusOK, map[string]any{"received": true})
+		slog.Info("seerr webhook received", "notification", payload.NotificationType, "subject", payload.Subject)
 		if !payload.IsActionable() {
 			return
 		}

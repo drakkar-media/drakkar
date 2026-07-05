@@ -566,6 +566,7 @@ func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 			if created {
 				result.Created++
 				result.CreatedLibraryItemIDs = append(result.CreatedLibraryItemIDs, libraryItemID)
+				s.logger.Info().Str("title", request.MediaTitle).Int("year", request.MediaYear).Int64("libraryItemId", libraryItemID).Msg("request: new movie requested")
 			}
 			lid, tmdbID := libraryItemID, request.TMDBID
 			go func() {
@@ -584,6 +585,9 @@ func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 				}
 				result.Created += created
 				result.CreatedLibraryItemIDs = append(result.CreatedLibraryItemIDs, ids...)
+				if created > 0 {
+					s.logger.Info().Str("title", request.MediaTitle).Ints("seasons", request.Seasons).Int("episodesCreated", created).Msg("request: new season pack requested")
+				}
 				continue
 			}
 			libraryItemID, created, err := s.repo.UpsertEpisodeRequest(
@@ -603,6 +607,7 @@ func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 			if created {
 				result.Created++
 				result.CreatedLibraryItemIDs = append(result.CreatedLibraryItemIDs, libraryItemID)
+				s.logger.Info().Str("title", request.MediaTitle).Int("season", request.SeasonNumber).Int("episode", request.EpisodeNumber).Int64("libraryItemId", libraryItemID).Msg("request: new episode requested")
 			}
 			lid, tmdbID, tvdbID, epTitle := libraryItemID, request.TMDBID, request.TVDBID, request.EpisodeTitle
 			go func() {
