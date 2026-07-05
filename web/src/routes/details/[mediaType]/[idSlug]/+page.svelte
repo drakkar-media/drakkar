@@ -212,12 +212,31 @@
   async function selectPickerTab(tab: 'search' | 'auto') {
     pickerTab = tab;
     if (tab !== 'auto' || !pickerLibraryItemID) return;
-    // Always fetch live — never reuse a previously loaded candidate list,
-    // since candidates can be replaced/deleted server-side between views.
+    // Read-only fetch of whatever candidates already exist — do NOT trigger
+    // a new search here. api.replacementCandidates (POST) deletes and
+    // reinserts every candidate row with fresh IDs; calling it just to
+    // *view* the tab meant the list you were looking at could be replaced
+    // out from under you before you clicked anything, causing "release
+    // candidate no longer available" on every single click. Searching again
+    // is now an explicit action (see searchAgain below).
+    pickerSearching = true;
+    try {
+      const result = await api.releases(pickerLibraryItemID);
+      releaseCandidates = (result.items ?? []).sort((a, b) => b.score - a.score);
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : String(error));
+    } finally {
+      pickerSearching = false;
+    }
+  }
+
+  async function searchAgain() {
+    if (!pickerLibraryItemID) return;
     pickerSearching = true;
     try {
       const result = await api.replacementCandidates(pickerLibraryItemID);
       releaseCandidates = (result.items ?? []).sort((a, b) => b.score - a.score);
+      toastSuccess('Search queued — results will update shortly');
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -237,15 +256,34 @@
     return openReleasePicker(epLibraryItemId, label);
   }
 
-  async function pickRelease(candidateId: number) {
+  async function pickRelease(candidate: ReleaseItem, isRetry = false) {
     working = true;
     try {
-      await api.selectRelease(candidateId);
+      await api.selectRelease(candidate.releaseCandidateId);
       showReleasePicker = false;
       await loadDetail();
       toastSuccess('Release selected');
     } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      // A concurrent background search can replace candidate rows (new IDs)
+      // between when this list was fetched and when the click landed. If
+      // that happens, retry once against the fresh list by matching title —
+      // most of the time the same release is still there under a new ID.
+      if (!isRetry && message.includes('no longer available') && pickerLibraryItemID) {
+        try {
+          const fresh = await api.releases(pickerLibraryItemID);
+          const match = (fresh.items ?? []).find((item) => item.title === candidate.title);
+          if (match) {
+            releaseCandidates = fresh.items ?? [];
+            await pickRelease(match, true);
+            return;
+          }
+          releaseCandidates = fresh.items ?? [];
+        } catch {
+          // fall through to showing the original error
+        }
+      }
+      toastError(message);
     } finally {
       working = false;
     }
@@ -944,11 +982,12 @@
             {/if}
           </div>
         {:else}
-          {#if pickerSearching}
-            <div class="rel-empty">Searching for releases…</div>
-          {/if}
+          <Button kind="secondary" on:click={searchAgain} disabled={pickerSearching}>
+            <Search size={14} />
+            {pickerSearching ? 'Searching…' : 'Search Again'}
+          </Button>
           {#if releaseCandidates.length === 0 && !pickerSearching}
-            <div class="rel-empty">No candidates found.</div>
+            <div class="rel-empty">No candidates yet — click "Search Again" to run an indexer search.</div>
           {:else if releaseCandidates.length > 0}
             <input
               class="rel-filter-input"
@@ -998,7 +1037,7 @@
                       </div>
                     </details>
                   {/if}
-                  <Button kind={c.selected ? 'primary' : 'secondary'} on:click={() => pickRelease(c.releaseCandidateId)} disabled={working}>
+                  <Button kind={c.selected ? 'primary' : 'secondary'} on:click={() => pickRelease(c)} disabled={working}>
                     <Download size={14} />
                     {c.selected ? 'Re-grab' : 'Download'}
                   </Button>
