@@ -503,24 +503,11 @@
             <h2>Local Seasons</h2>
             <div class="season-stack">
               {#each localDetail.seasons as season}
-                {@const anchorEpisode = season.episodes.find((e) => e.libraryItemId)}
                 <details class="season-panel" open={season.missingCount > 0}>
                   <summary>
                     <strong>{season.name}</strong>
                     <div class="summary-meta">
                       {season.availableCount}/{season.episodeCount} available · {season.missingCount} missing
-                      {#if anchorEpisode?.libraryItemId}
-                        <button
-                          class="ep-sub-btn"
-                          type="button"
-                          title={`Search for a ${season.name} pack — matching episodes are filled in automatically`}
-                          disabled={working}
-                          on:click|preventDefault|stopPropagation={() => openReleasePicker(anchorEpisode.libraryItemId as number, `${season.name} · pack search`)}
-                        >
-                          <Search size={11} />
-                          Search Pack
-                        </button>
-                      {/if}
                       {#if season.missingCount > 0 && detail?.tmdbId}
                         <button
                           class="ep-sub-btn"
@@ -551,7 +538,7 @@
                             {@const epId = episode.libraryItemId}
                             <button
                               class="ep-sub-btn"
-                              title="Search releases for this episode"
+                              title="Search releases for this episode (includes season packs)"
                               disabled={working}
                               on:click={() => runEpisodeSearch(epId, episode.seasonNumber, episode.episodeNumber, episode.title)}
                             ><Search size={11} /> Search</button>
