@@ -702,12 +702,23 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}
 		var checked, healthy int
 		for _, e := range entries {
-			isOK := database.CheckSymlinkHealth(e.LibraryPath, e.TargetPath)
-			_ = db.RecordHealthCheck(ctx, e.ID, isOK)
 			checked++
+			isOK := database.CheckSymlinkHealth(e.LibraryPath, e.TargetPath)
 			if isOK {
 				healthy++
+				// A resolving symlink only proves os.Readlink matched a
+				// content/ path — it never reads a byte of the target, so it
+				// can't prove the content is actually playable. Writing
+				// health_ok=true here unconditionally (every 15 minutes, for
+				// every item) used to silently erase whatever the real deep
+				// content check (runNZBHealthCheckBatch, below) had
+				// determined, and reset its backoff clock so it effectively
+				// never got the chance to re-run. Leave health_ok exactly as
+				// the last real check left it; only a genuine negative
+				// (below) or a successful repair is worth recording here.
+				continue
 			}
+			_ = db.RecordHealthCheck(ctx, e.ID, false)
 		}
 		// Repair pass: re-publish any entries still marked broken after the scan above.
 		var repaired int
