@@ -307,6 +307,14 @@ export const api = {
         score: item.score
       })
     }),
+  manualImportUpload: async (libraryItemID: number, file: File) => {
+    const form = new FormData();
+    form.set('file', file);
+    return request<QueueItem>(`/api/library/${libraryItemID}/manual-import/upload`, {
+      method: 'POST',
+      body: form
+    });
+  },
   // Library replacement — find better release for existing item
   searchReplacements: (libraryItemID: number) =>
     request<{ candidateCount: number; selectedReleaseId?: number }>(`/api/library/${libraryItemID}/search`, { method: 'POST' }),

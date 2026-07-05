@@ -316,6 +316,9 @@ func (db *DB) ListSubtitleLibrary(ctx context.Context, filter SubtitleLibraryFil
 		); err != nil {
 			return SubtitleLibraryPage{}, err
 		}
+		if item.Languages == nil {
+			item.Languages = []string{}
+		}
 		items = append(items, item)
 	}
 	if err := rows.Err(); err != nil {

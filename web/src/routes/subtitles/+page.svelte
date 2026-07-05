@@ -31,7 +31,7 @@
     loading = true;
     try {
       const result = await api.subtitleLibrary({ page, pageSize, q: search || undefined, mediaType, missingOnly });
-      items = result.items ?? [];
+      items = (result.items ?? []).map((item) => ({ ...item, languages: item.languages ?? [] }));
       total = result.total;
       totalPages = result.totalPages;
       selected = new Set(Array.from(selected).filter((id) => items.some((item) => item.libraryItemId === id)));

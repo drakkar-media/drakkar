@@ -2,7 +2,10 @@ package queue
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"slices"
 	"strconv"
@@ -23,6 +26,7 @@ type Repository interface {
 	ListCompletedSymlinkEntries(ctx context.Context) ([]database.CompletedSymlinkEntry, error)
 	OpenVirtualMediaFile(ctx context.Context, virtualFileID int64) (stream.VirtualMediaFile, error)
 	CreateImportedNZB(ctx context.Context, imported database.ImportedNZB) (database.QueueSnapshot, error)
+	AttachImportedNZBToLibraryItem(ctx context.Context, libraryItemID int64, imported database.ImportedNZB) (database.QueueSnapshot, error)
 	SetImportedNZBIndexed(ctx context.Context, queueItemID int64) error
 	CancelNZBDocument(ctx context.Context, nzbDocumentID int64) error
 }
@@ -81,6 +85,44 @@ func (s *Service) ImportNZB(ctx context.Context, fileName string, src io.Reader)
 	if err != nil {
 		return database.QueueSnapshot{}, err
 	}
+	if s.postImportHook != nil {
+		if err := s.postImportHook(ctx, item); err != nil {
+			return database.QueueSnapshot{}, err
+		}
+	}
+	return item, nil
+}
+
+// ImportNZBForLibraryItem attaches a manually-uploaded NZB file directly to
+// an existing library item (movie or a specific TV episode), skipping the
+// indexer search/candidate pipeline entirely.
+func (s *Service) ImportNZBForLibraryItem(ctx context.Context, libraryItemID int64, fileName string, src io.Reader) (database.QueueSnapshot, error) {
+	limit := s.importer.MaxUploadBytes()
+	raw, err := io.ReadAll(io.LimitReader(src, limit+1))
+	if err != nil {
+		return database.QueueSnapshot{}, err
+	}
+	if len(raw) == 0 {
+		return database.QueueSnapshot{}, nzb.ErrEmptyDocument
+	}
+	if err := nzb.ValidateUploadLimit(int64(len(raw)), limit); err != nil {
+		return database.QueueSnapshot{}, err
+	}
+	hasher := sha256.New()
+	hasher.Write(raw)
+	idempotencyKey := fmt.Sprintf("manual-nzb-attach:%d:%s", libraryItemID, hex.EncodeToString(hasher.Sum(nil)))
+	imported, err := nzb.BuildImportedNZB(fileName, raw, idempotencyKey, "")
+	if err != nil {
+		return database.QueueSnapshot{}, err
+	}
+	item, err := s.repo.AttachImportedNZBToLibraryItem(ctx, libraryItemID, imported)
+	if err != nil {
+		return database.QueueSnapshot{}, err
+	}
+	if err := s.repo.SetImportedNZBIndexed(ctx, item.QueueItemID); err != nil {
+		return database.QueueSnapshot{}, err
+	}
+	item.State = database.QueuePreflight
 	if s.postImportHook != nil {
 		if err := s.postImportHook(ctx, item); err != nil {
 			return database.QueueSnapshot{}, err
@@ -373,6 +415,16 @@ func (m *MemoryRepository) ListCompletedSymlinkEntries(ctx context.Context) ([]d
 	out := make([]database.CompletedSymlinkEntry, len(m.completed))
 	copy(out, m.completed)
 	return out, nil
+}
+
+func (m *MemoryRepository) AttachImportedNZBToLibraryItem(ctx context.Context, libraryItemID int64, imported database.ImportedNZB) (database.QueueSnapshot, error) {
+	imported.MediaType = "manual_nzb"
+	item, err := m.CreateImportedNZB(ctx, imported)
+	if err != nil {
+		return database.QueueSnapshot{}, err
+	}
+	item.LibraryItemID = libraryItemID
+	return item, nil
 }
 
 func (m *MemoryRepository) CreateImportedNZB(ctx context.Context, imported database.ImportedNZB) (database.QueueSnapshot, error) {

@@ -72,6 +72,10 @@ func (i *Importer) Import(ctx context.Context, sink ImportSink, fileName string,
 	return i.importFromOpenFile(ctx, sink, sanitizeFileName(fileName), stageFile, hasher)
 }
 
+func (i *Importer) MaxUploadBytes() int64 {
+	return i.maxUploadBytes
+}
+
 func (i *Importer) ImportPath(ctx context.Context, sink ImportSink, fileName, path string) (database.QueueSnapshot, error) {
 	file, err := os.Open(path)
 	if err != nil {

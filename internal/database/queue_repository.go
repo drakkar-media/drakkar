@@ -266,6 +266,135 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 	return snapshot, nil
 }
 
+// AttachImportedNZBToLibraryItem attaches a manually-uploaded NZB directly to
+// an existing library item (movie or a specific TV episode), bypassing the
+// indexer search/candidate pipeline entirely. Mirrors CreateImportedNZB but
+// reuses the given library item instead of creating a new one, and upserts
+// its queue_items row instead of inserting a fresh one.
+func (db *DB) AttachImportedNZBToLibraryItem(ctx context.Context, libraryItemID int64, imported ImportedNZB) (QueueSnapshot, error) {
+	imported = db.applyImportPolicies(ctx, imported)
+	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher)
+	tx, err := db.SQL.BeginTx(ctx, nil)
+	if err != nil {
+		return QueueSnapshot{}, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var libraryTitle string
+	if err = tx.QueryRowContext(ctx, `select title from library_items where id = $1`, libraryItemID).Scan(&libraryTitle); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return QueueSnapshot{}, fmt.Errorf("library item %d not found", libraryItemID)
+		}
+		return QueueSnapshot{}, err
+	}
+
+	var existing bool
+	if err = tx.QueryRowContext(ctx, `select exists(select 1 from queue_items where idempotency_key = $1)`, imported.IdempotencyKey).Scan(&existing); err != nil {
+		return QueueSnapshot{}, err
+	}
+	if existing {
+		if err := tx.Rollback(); err != nil {
+			return QueueSnapshot{}, err
+		}
+		items, err := db.ListQueue(ctx)
+		if err != nil {
+			return QueueSnapshot{}, err
+		}
+		for _, item := range items {
+			if item.IdempotencyKey == imported.IdempotencyKey {
+				return item, nil
+			}
+		}
+		return QueueSnapshot{}, errors.New("existing queue item not found after idempotency hit")
+	}
+
+	if err = preDeleteVFRByLibraryItem(ctx, tx, libraryItemID); err != nil {
+		return QueueSnapshot{}, err
+	}
+	if _, err = tx.ExecContext(ctx, `delete from selected_releases where library_item_id = $1`, libraryItemID); err != nil {
+		return QueueSnapshot{}, err
+	}
+
+	var releaseCandidateID int64
+	if err = tx.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, score, custom_format_score, selected)
+		values ($1, $2, 0, 0, true)
+		returning id`, libraryItemID, imported.FileName).Scan(&releaseCandidateID); err != nil {
+		return QueueSnapshot{}, err
+	}
+
+	var selectedReleaseID int64
+	if err = tx.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, libraryItemID, releaseCandidateID).Scan(&selectedReleaseID); err != nil {
+		return QueueSnapshot{}, err
+	}
+
+	var nzbDocumentID int64
+	if err = tx.QueryRowContext(ctx, `
+		insert into nzb_documents (selected_release_id, file_name, xml)
+		values ($1, $2, $3)
+		returning id`, selectedReleaseID, imported.FileName, compressNZBXML(imported.XML)).Scan(&nzbDocumentID); err != nil {
+		return QueueSnapshot{}, err
+	}
+
+	fileSegments, err := insertImportedFiles(ctx, tx, selectedReleaseID, nzbDocumentID, imported.Files)
+	if err != nil {
+		return QueueSnapshot{}, err
+	}
+	if err = insertImportedArchives(ctx, tx, selectedReleaseID, imported.Archives, fileSegments); err != nil {
+		return QueueSnapshot{}, err
+	}
+
+	var snapshot QueueSnapshot
+	tag, updateErr := tx.ExecContext(ctx, `
+		update queue_items
+		set state = $2, failure_reason = '', idempotency_key = $3, selected_release_id = $4, updated_at = now()
+		where library_item_id = $1`,
+		libraryItemID, QueueIndexing, imported.IdempotencyKey, selectedReleaseID,
+	)
+	if updateErr != nil {
+		err = updateErr
+		return QueueSnapshot{}, err
+	}
+	rows, _ := tag.RowsAffected()
+	if rows == 0 {
+		if err = tx.QueryRowContext(ctx, `
+			insert into queue_items (library_item_id, state, idempotency_key, selected_release_id)
+			values ($1, $2, $3, $4)
+			returning id`,
+			libraryItemID, QueueIndexing, imported.IdempotencyKey, selectedReleaseID,
+		).Scan(&snapshot.QueueItemID); err != nil {
+			return QueueSnapshot{}, err
+		}
+	}
+	if err = tx.QueryRowContext(ctx, `
+		select id, created_at, updated_at from queue_items where library_item_id = $1`, libraryItemID,
+	).Scan(&snapshot.QueueItemID, &snapshot.CreatedAt, &snapshot.UpdatedAt); err != nil {
+		return QueueSnapshot{}, err
+	}
+
+	snapshot.LibraryItemID = libraryItemID
+	snapshot.LibraryTitle = libraryTitle
+	snapshot.State = QueueIndexing
+	snapshot.IdempotencyKey = imported.IdempotencyKey
+	snapshot.SelectedRelease = &selectedReleaseID
+	snapshot.NZBDocumentID = &nzbDocumentID
+	snapshot.NZBFileName = imported.FileName
+	snapshot.NZBFileCount = imported.FileCount
+	snapshot.NZBSegmentCount = imported.SegmentCount
+
+	if err = tx.Commit(); err != nil {
+		return QueueSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
 func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID int64, imported ImportedNZB) (QueueSnapshot, error) {
 	imported = db.applyImportPolicies(ctx, imported)
 	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher)

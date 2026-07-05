@@ -104,6 +104,7 @@ type QueueService interface {
 	ListLibraryItems(ctx context.Context) ([]database.LibraryItemSummary, error)
 	ListReleaseSummaries(ctx context.Context, libraryItemID int64) ([]database.ReleaseSummary, error)
 	ImportNZB(ctx context.Context, fileName string, src io.Reader) (database.QueueSnapshot, error)
+	ImportNZBForLibraryItem(ctx context.Context, libraryItemID int64, fileName string, src io.Reader) (database.QueueSnapshot, error)
 	CancelNZB(ctx context.Context, nzbDocumentID int64) error
 }
 
@@ -1935,6 +1936,30 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		publishMutation("library.manual_import", map[string]any{"libraryItemId": libraryItemID, "selectedReleaseId": result.SelectedReleaseID})
 		respondJSON(w, http.StatusAccepted, result)
+	})
+	r.Post("/api/library/{id}/manual-import/upload", func(w http.ResponseWriter, r *http.Request) {
+		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := r.ParseMultipartForm(64 << 20); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		defer file.Close()
+		item, err := queue.ImportNZBForLibraryItem(r.Context(), libraryItemID, multipartFileName(header), file)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		publishMutation("library.manual_import", map[string]any{"libraryItemId": libraryItemID, "selectedReleaseId": item.SelectedRelease})
+		respondJSON(w, http.StatusAccepted, item)
 	})
 
 	// Release calendar — upcoming releases from TMDB.
