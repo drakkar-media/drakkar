@@ -11,6 +11,10 @@
   let query = '';
   let activeQuery = '';
   let result: DiscoverSearchResult = { movies: [], tv: [] };
+  // Guards against a slower earlier request's response landing after a
+  // faster later one's and clobbering the newer results (e.g. typing
+  // quickly navigates through several ?q= values in a row).
+  let searchToken = 0;
 
   function asLibraryLike(item: DiscoverMediaItem): LibraryItem {
     return {
@@ -31,6 +35,7 @@
   }
 
   async function loadSearch() {
+    const token = ++searchToken;
     query = page.url.searchParams.get('q')?.trim() ?? '';
     if (!query) {
       result = { movies: [], tv: [] };
@@ -39,12 +44,15 @@
     }
     loading = true;
     try {
-      result = await api.discoverSearch(query);
+      const data = await api.discoverSearch(query);
+      if (token !== searchToken) return;
+      result = data;
     } catch (error) {
+      if (token !== searchToken) return;
       toastError(error instanceof Error ? error.message : String(error));
       result = { movies: [], tv: [] };
     } finally {
-      loading = false;
+      if (token === searchToken) loading = false;
     }
   }
 

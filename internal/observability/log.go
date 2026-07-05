@@ -71,6 +71,20 @@ func Recover(name string) {
 	}
 }
 
+// RecoverWithCleanup behaves like Recover, but additionally invokes cleanup
+// with the recovered value — and only if a panic actually occurred. For
+// goroutines that must release a resource (an in-flight-job slot, a result
+// channel a caller is blocked reading from) even when the work they were
+// doing panics instead of returning normally; without this, a panic mid-job
+// would recover safely but silently skip whatever cleanup the normal
+// return path would have done.
+func RecoverWithCleanup(name string, cleanup func(recovered any)) {
+	if r := recover(); r != nil {
+		slog.Error("goroutine panic recovered", "goroutine", name, "panic", r, "stack", string(debug.Stack()))
+		cleanup(r)
+	}
+}
+
 func parseLevel(level Level) zerolog.Level {
 	switch strings.ToLower(string(level)) {
 	case "trace":

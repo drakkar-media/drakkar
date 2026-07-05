@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hjongedijk/drakkar/internal/auth"
 	"github.com/hjongedijk/drakkar/internal/cache"
 	"github.com/hjongedijk/drakkar/internal/config"
 	"github.com/hjongedijk/drakkar/internal/database"
@@ -822,6 +823,7 @@ func TestWorkflowEndpoints(t *testing.T) {
 	}
 
 	blocklistReq := httptest.NewRequest(http.MethodGet, "/api/blocklist", nil)
+	blocklistReq = blocklistReq.WithContext(auth.NewContext(blocklistReq.Context(), auth.Claims{Role: "admin"}))
 	blocklistRec := httptest.NewRecorder()
 	router.ServeHTTP(blocklistRec, blocklistReq)
 	if blocklistRec.Code != http.StatusOK || !strings.Contains(blocklistRec.Body.String(), `"manual_reject"`) {
@@ -829,6 +831,7 @@ func TestWorkflowEndpoints(t *testing.T) {
 	}
 
 	blocklistClearAllReq := httptest.NewRequest(http.MethodDelete, "/api/blocklist", nil)
+	blocklistClearAllReq = blocklistClearAllReq.WithContext(auth.NewContext(blocklistClearAllReq.Context(), auth.Claims{Role: "admin"}))
 	blocklistClearAllRec := httptest.NewRecorder()
 	router.ServeHTTP(blocklistClearAllRec, blocklistClearAllReq)
 	if blocklistClearAllRec.Code != http.StatusOK || !strings.Contains(blocklistClearAllRec.Body.String(), `"cleared":1`) {
@@ -836,6 +839,7 @@ func TestWorkflowEndpoints(t *testing.T) {
 	}
 
 	clearReq := httptest.NewRequest(http.MethodDelete, "/api/blocklist/9", nil)
+	clearReq = clearReq.WithContext(auth.NewContext(clearReq.Context(), auth.Claims{Role: "admin"}))
 	clearRec := httptest.NewRecorder()
 	router.ServeHTTP(clearRec, clearReq)
 	if clearRec.Code != http.StatusOK || blocklist.cleared != 9 {
@@ -996,6 +1000,7 @@ func TestManualBlocklistCreateEndpoint(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPost, "/api/blocklist/manual", strings.NewReader(`{"keyType":"external_url","externalUrl":"https://example.invalid/a.nzb","reason":"manual"}`))
 	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(auth.NewContext(req.Context(), auth.Claims{Role: "admin"}))
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -1015,6 +1020,7 @@ func TestManualBlocklistUpdateEndpoint(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodPut, "/api/blocklist/9", strings.NewReader(`{"keyType":"raw","key":"release_signature:dune 2021|nzb finder|7000|2026-06-14","reason":"manual"}`))
 	req.Header.Set("Content-Type", "application/json")
+	req = req.WithContext(auth.NewContext(req.Context(), auth.Claims{Role: "admin"}))
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 

@@ -15,6 +15,7 @@
   import StatusPill from '$lib/components/StatusPill.svelte';
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
+  import { runAction } from '$lib/actions';
   import type { QueueItem, WorkQueueStatus } from '$lib/types';
 
   let uploading = false;
@@ -89,55 +90,38 @@
   }
 
   async function toggleQueuePause() {
-    working = true;
-    try {
-      workQueue = workQueue.paused ? await api.resumeQueue() : await api.pauseQueue();
-      toastSuccess(workQueue.paused ? 'Background queue paused' : 'Background queue resumed');
-      await load();
-    } catch (err) {
-      toastError(err instanceof Error ? err.message : String(err));
-    } finally {
-      working = false;
-    }
+    await runAction(() => (workQueue.paused ? api.resumeQueue() : api.pauseQueue()), {
+      setWorking: (v) => (working = v),
+      successMessage: (result) => {
+        workQueue = result;
+        return result.paused ? 'Background queue paused' : 'Background queue resumed';
+      },
+      afterSuccess: load
+    });
   }
 
   async function retryItem(id: number) {
-    working = true;
-    try {
-      await api.retryQueue(id);
-      toastSuccess('Retry queued');
-      await load();
-    } catch (err) {
-      toastError(err instanceof Error ? err.message : String(err));
-    } finally {
-      working = false;
-    }
+    await runAction(() => api.retryQueue(id), {
+      setWorking: (v) => (working = v),
+      successMessage: () => 'Retry queued',
+      afterSuccess: load
+    });
   }
 
   async function retryAll() {
-    working = true;
-    try {
-      const result = await api.retryFailedQueue();
-      toastSuccess(`Retried ${result.retried}`);
-      await load();
-    } catch (err) {
-      toastError(err instanceof Error ? err.message : String(err));
-    } finally {
-      working = false;
-    }
+    await runAction(() => api.retryFailedQueue(), {
+      setWorking: (v) => (working = v),
+      successMessage: (result) => `Retried ${result.retried}`,
+      afterSuccess: load
+    });
   }
 
   async function clearFailed() {
-    working = true;
-    try {
-      const result = await api.clearFailedQueue();
-      toastSuccess(`Cleared ${result.cleared} failed item${result.cleared === 1 ? '' : 's'}`);
-      await load();
-    } catch (err) {
-      toastError(err instanceof Error ? err.message : String(err));
-    } finally {
-      working = false;
-    }
+    await runAction(() => api.clearFailedQueue(), {
+      setWorking: (v) => (working = v),
+      successMessage: (result) => `Cleared ${result.cleared} failed item${result.cleared === 1 ? '' : 's'}`,
+      afterSuccess: load
+    });
   }
 
   async function manageFailedItem(id: number, action: 'remove' | 'remove_and_blocklist' | 'remove_blocklist_and_search') {
@@ -147,16 +131,11 @@
       remove_blocklist_and_search: 'Remove this failed queue item, blocklist its release, and search for a replacement now?'
     };
     if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
-    working = true;
-    try {
-      const result = await api.queueAction(id, action);
-      toastSuccess(result.action.replaceAll('_', ' '));
-      await load();
-    } catch (err) {
-      toastError(err instanceof Error ? err.message : String(err));
-    } finally {
-      working = false;
-    }
+    await runAction(() => api.queueAction(id, action), {
+      setWorking: (v) => (working = v),
+      successMessage: (result) => result.action.replaceAll('_', ' '),
+      afterSuccess: load
+    });
   }
 
   async function manageAllFailed(action: 'remove' | 'remove_and_blocklist' | 'remove_blocklist_and_search') {
@@ -166,16 +145,11 @@
       remove_blocklist_and_search: `Remove, blocklist, and re-search all ${failedItems.length} failed queue items?`
     };
     if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
-    working = true;
-    try {
-      const result = await api.failedQueueAction(action);
-      toastSuccess(`${result.retried} handled, ${result.failed} failed`);
-      await load();
-    } catch (err) {
-      toastError(err instanceof Error ? err.message : String(err));
-    } finally {
-      working = false;
-    }
+    await runAction(() => api.failedQueueAction(action), {
+      setWorking: (v) => (working = v),
+      successMessage: (result) => `${result.retried} handled, ${result.failed} failed`,
+      afterSuccess: load
+    });
   }
 
   async function manageSelectedFailed(action: 'remove' | 'remove_and_blocklist' | 'remove_blocklist_and_search') {
@@ -186,30 +160,22 @@
       remove_blocklist_and_search: `Remove, blocklist, and re-search ${selectedFailedIds.length} selected failed queue item${selectedFailedIds.length === 1 ? '' : 's'}?`
     };
     if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
-    working = true;
-    try {
-      const result = await api.bulkQueueAction(selectedFailedIds, action);
-      toastSuccess(`${result.retried} handled, ${result.failed} failed`);
-      selectedHistoryIds = new Set();
-      await load();
-    } catch (err) {
-      toastError(err instanceof Error ? err.message : String(err));
-    } finally {
-      working = false;
-    }
+    await runAction(() => api.bulkQueueAction(selectedFailedIds, action), {
+      setWorking: (v) => (working = v),
+      successMessage: (result) => `${result.retried} handled, ${result.failed} failed`,
+      afterSuccess: async () => {
+        selectedHistoryIds = new Set();
+        await load();
+      }
+    });
   }
 
   async function processPending() {
-    working = true;
-    try {
-      const result = await api.searchPendingLibrary();
-      toastSuccess(`Processed ${result.processed}, selected ${result.selected}`);
-      await load();
-    } catch (err) {
-      toastError(err instanceof Error ? err.message : String(err));
-    } finally {
-      working = false;
-    }
+    await runAction(() => api.searchPendingLibrary(), {
+      setWorking: (v) => (working = v),
+      successMessage: (result) => `Processed ${result.processed}, selected ${result.selected}`,
+      afterSuccess: load
+    });
   }
 
   function stageProgress(state: string): number {

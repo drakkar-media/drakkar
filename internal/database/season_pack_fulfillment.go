@@ -70,6 +70,32 @@ func (db *DB) FindSeasonPackMatches(ctx context.Context, selectedReleaseID, trig
 		return nil, err
 	}
 
+	// Batch-load every library item for this show keyed by (season, episode)
+	// instead of issuing one query per virtual file — a season pack's file
+	// count and a show's episode count are both small, so this is one query
+	// either way, but it no longer scales with the number of files.
+	itemRows, err := db.SQL.QueryContext(ctx, `
+		SELECT li.id, e.season_number, e.episode_number
+		FROM library_items li
+		JOIN episodes e ON e.id = li.episode_id
+		WHERE e.tv_show_id = $1`, tvShowID)
+	if err != nil {
+		return nil, err
+	}
+	defer itemRows.Close()
+	libraryItemByEpisode := map[[2]int]int64{}
+	for itemRows.Next() {
+		var id int64
+		var season, episode int
+		if err := itemRows.Scan(&id, &season, &episode); err != nil {
+			return nil, err
+		}
+		libraryItemByEpisode[[2]int{season, episode}] = id
+	}
+	if err := itemRows.Err(); err != nil {
+		return nil, err
+	}
+
 	var matches []SeasonPackEpisodeMatch
 	seen := map[[2]int]bool{}
 
@@ -82,18 +108,8 @@ func (db *DB) FindSeasonPackMatches(ctx context.Context, selectedReleaseID, trig
 		if seen[key] {
 			continue
 		}
-
-		// Find the library item for this episode.
-		var libraryItemID int64
-		err := db.SQL.QueryRowContext(ctx, `
-			SELECT li.id
-			FROM library_items li
-			JOIN episodes e ON e.id = li.episode_id
-			WHERE e.tv_show_id = $1
-			  AND e.season_number = $2
-			  AND e.episode_number = $3
-			LIMIT 1`, tvShowID, season, episode).Scan(&libraryItemID)
-		if err != nil {
+		libraryItemID, ok := libraryItemByEpisode[key]
+		if !ok {
 			continue // no matching un-fulfilled library item
 		}
 		seen[key] = true
@@ -162,63 +178,79 @@ func (db *DB) CreateSeasonPackEpisodeItems(ctx context.Context, selectedReleaseI
 			continue
 		}
 		seen[key] = true
-
-		// Upsert the episode record.
-		var episodeID int64
-		err = db.SQL.QueryRowContext(ctx, `
-			INSERT INTO episodes (tv_show_id, season_number, episode_number, title)
-			VALUES ($1, $2, $3, '')
-			ON CONFLICT (tv_show_id, season_number, episode_number) DO UPDATE
-			  SET tv_show_id = excluded.tv_show_id
-			RETURNING id`, tvShowID, season, episode).Scan(&episodeID)
-		if err != nil {
-			continue
-		}
-
-		// Upsert the library_item for this episode (unique on episode_id).
-		var libItemID int64
-		err = db.SQL.QueryRowContext(ctx, `
-			INSERT INTO library_items (media_type, episode_id, title, available)
-			VALUES ('episode', $1, $2, true)
-			ON CONFLICT (episode_id) WHERE episode_id IS NOT NULL DO UPDATE
-			  SET available = true
-			RETURNING id`, episodeID, showTitle).Scan(&libItemID)
-		if err != nil || libItemID == 0 {
-			// May already exist — find and update.
-			_ = db.SQL.QueryRowContext(ctx, `
-				SELECT id FROM library_items WHERE episode_id = $1`, episodeID).Scan(&libItemID)
-			if libItemID > 0 {
-				_, _ = db.SQL.ExecContext(ctx, `
-					UPDATE library_items SET available = true WHERE id = $1`, libItemID)
-			}
-			if libItemID == 0 {
-				continue
-			}
-		}
-
-		// Link a selected_release so the episode is associated with the NZB release.
-		var srID int64
-		_ = db.SQL.QueryRowContext(ctx, `
-			INSERT INTO selected_releases (release_candidate_id, library_item_id)
-			VALUES ($1, $2)
-			ON CONFLICT DO NOTHING
-			RETURNING id`, releaseCandidateID, libItemID).Scan(&srID)
-		if srID == 0 {
-			_ = db.SQL.QueryRowContext(ctx, `
-				SELECT id FROM selected_releases WHERE library_item_id = $1`, libItemID).Scan(&srID)
-		}
-
-		// Create a queue_item so the monitoring system knows this episode is done.
-		ikey := strings.ToLower(showTitle) + "-pack-" + strconv.Itoa(season) + "-" + strconv.Itoa(episode)
-		_, _ = db.SQL.ExecContext(ctx, `
-			INSERT INTO queue_items
-			    (library_item_id, selected_release_id, state, idempotency_key, updated_at)
-			VALUES ($1, $2, 'available', $3, now())
-			ON CONFLICT (library_item_id) DO UPDATE
-			  SET state = 'available', selected_release_id = $2, updated_at = now()`,
-			libItemID, srID, ikey)
+		// Best-effort per episode, same as before: one bad episode (e.g. a
+		// transient connection error) shouldn't abort the rest of the pack.
+		// createSeasonPackEpisodeItem itself now runs atomically, though, so
+		// a failure can no longer leave this episode half-linked (episode
+		// row created but no library_item, or library_item but no
+		// queue_item) the way the previous unguarded statement-by-statement
+		// version could.
+		_ = db.createSeasonPackEpisodeItem(ctx, tvShowID, showTitle, releaseCandidateID, season, episode)
 	}
 	return nil
+}
+
+// createSeasonPackEpisodeItem upserts one episode's episode/library_item/
+// selected_release/queue_item rows in a single transaction.
+func (db *DB) createSeasonPackEpisodeItem(ctx context.Context, tvShowID int64, showTitle string, releaseCandidateID int64, season, episode int) error {
+	tx, err := db.SQL.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Upsert the episode record.
+	var episodeID int64
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO episodes (tv_show_id, season_number, episode_number, title)
+		VALUES ($1, $2, $3, '')
+		ON CONFLICT (tv_show_id, season_number, episode_number) DO UPDATE
+		  SET tv_show_id = excluded.tv_show_id
+		RETURNING id`, tvShowID, season, episode).Scan(&episodeID); err != nil {
+		return err
+	}
+
+	// Upsert the library_item for this episode (unique on episode_id).
+	var libItemID int64
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO library_items (media_type, episode_id, title, available)
+		VALUES ('episode', $1, $2, true)
+		ON CONFLICT (episode_id) WHERE episode_id IS NOT NULL DO UPDATE
+		  SET available = true
+		RETURNING id`, episodeID, showTitle).Scan(&libItemID); err != nil {
+		return err
+	}
+
+	// Link a selected_release so the episode is associated with the NZB release.
+	var srID int64
+	err = tx.QueryRowContext(ctx, `
+		INSERT INTO selected_releases (release_candidate_id, library_item_id)
+		VALUES ($1, $2)
+		ON CONFLICT DO NOTHING
+		RETURNING id`, releaseCandidateID, libItemID).Scan(&srID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if srID == 0 {
+		if err := tx.QueryRowContext(ctx, `
+			SELECT id FROM selected_releases WHERE library_item_id = $1`, libItemID).Scan(&srID); err != nil {
+			return err
+		}
+	}
+
+	// Create a queue_item so the monitoring system knows this episode is done.
+	ikey := strings.ToLower(showTitle) + "-pack-" + strconv.Itoa(season) + "-" + strconv.Itoa(episode)
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO queue_items
+		    (library_item_id, selected_release_id, state, idempotency_key, updated_at)
+		VALUES ($1, $2, 'available', $3, now())
+		ON CONFLICT (library_item_id) DO UPDATE
+		  SET state = 'available', selected_release_id = $2, updated_at = now()`,
+		libItemID, srID, ikey); err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func (db *DB) resolveSeasonPackShow(ctx context.Context, triggeringLibraryItemID int64) (int64, string, error) {
@@ -289,12 +321,7 @@ func (db *DB) FulfillEpisodeLibraryItem(ctx context.Context, libraryItemID, sour
 	}
 	if err != nil || newSelectedReleaseID == 0 {
 		// Already selected — run available updates within the open transaction.
-		_, err = tx.ExecContext(ctx, `UPDATE library_items SET available = true WHERE id = $1`, libraryItemID)
-		if err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx, `UPDATE queue_items SET state = 'available', updated_at = now() WHERE library_item_id = $1 AND state != 'available'`, libraryItemID)
-		if err != nil {
+		if err := markLibraryItemAvailable(ctx, tx, libraryItemID); err != nil {
 			return err
 		}
 		return tx.Commit()
@@ -322,13 +349,21 @@ func (db *DB) FulfillEpisodeLibraryItem(ctx context.Context, libraryItemID, sour
 	return tx.Commit()
 }
 
-func (db *DB) markLibraryItemAvailable(ctx context.Context, libraryItemID int64) error {
-	_, err := db.SQL.ExecContext(ctx, `
-		UPDATE library_items SET available = true WHERE id = $1`, libraryItemID)
-	if err != nil {
+// sqlExecer is satisfied by both *sql.DB and *sql.Tx, so callers can reuse
+// the same statement helper whether or not they're inside a transaction.
+type sqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// markLibraryItemAvailable marks a library item and its queue item
+// available. Pass tx when called from within an existing transaction so
+// both updates commit atomically with the rest of it; pass db.SQL otherwise.
+func markLibraryItemAvailable(ctx context.Context, exec sqlExecer, libraryItemID int64) error {
+	if _, err := exec.ExecContext(ctx, `
+		UPDATE library_items SET available = true WHERE id = $1`, libraryItemID); err != nil {
 		return err
 	}
-	_, err = db.SQL.ExecContext(ctx, `
+	_, err := exec.ExecContext(ctx, `
 		UPDATE queue_items SET state = 'available', updated_at = now()
 		WHERE library_item_id = $1 AND state != 'available'`, libraryItemID)
 	return err

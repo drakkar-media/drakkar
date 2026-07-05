@@ -1988,13 +1988,26 @@ func (s *Service) RunDownloadWorker(ctx context.Context) {
 // per-job (not around the whole worker loop) so one bad job can't
 // permanently kill this worker goroutine and silently shrink download
 // concurrency for the process lifetime.
+//
+// If fetchIndexAndRelease/publishImportedRelease panics, resultSent lets the
+// deferred RecoverWithCleanup know whether the normal path already sent a
+// result and released the in-flight slot — without it, a panic would leave
+// job.selectedReleaseID marked in-flight forever (un-resubmittable until
+// process restart) and leave the caller blocked forever reading resultCh.
 func (s *Service) runDownloadJob(job downloadJob) {
-	defer observability.Recover("download-worker")
+	resultSent := false
+	defer observability.RecoverWithCleanup("download-worker", func(recovered any) {
+		s.downloader.markDone(job.selectedReleaseID)
+		if !resultSent {
+			job.resultCh <- downloadJobResult{nil, fmt.Errorf("download worker panic: %v", recovered)}
+		}
+	})
 	// Skip jobs whose caller context already expired while queued.
 	select {
 	case <-job.ctx.Done():
 		s.downloader.markDone(job.selectedReleaseID)
 		job.resultCh <- downloadJobResult{nil, job.ctx.Err()}
+		resultSent = true
 		return
 	default:
 	}
@@ -2004,10 +2017,12 @@ func (s *Service) runDownloadJob(job downloadJob) {
 	s.downloader.markDone(job.selectedReleaseID)
 	if err != nil || importedRelease == nil {
 		job.resultCh <- downloadJobResult{result, err}
+		resultSent = true
 		return
 	}
 	selectedReleaseID, pubErr := s.publishImportedRelease(job.ctx, *importedRelease)
 	job.resultCh <- downloadJobResult{selectedReleaseID, pubErr}
+	resultSent = true
 }
 
 // pendingPublish holds data needed to publish an already-indexed release.

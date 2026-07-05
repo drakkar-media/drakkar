@@ -293,7 +293,12 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 		if err != nil {
 			slog.Warn("calibrate: could not fetch first segment — marking as skipped", "nzb_file_id", f.id, "err", err)
 			// Mark calibrated so expired/missing articles are not retried on every startup.
-			_, _ = db.SQL.ExecContext(ctx, `UPDATE nzb_files SET calibrated_at = now() WHERE id = $1`, f.id)
+			// If this UPDATE itself fails (e.g. a transient DB error), the file is
+			// NOT actually marked calibrated — log it, so a hung/lost mark-as-skipped
+			// isn't invisible (it would otherwise just look like a normal retry).
+			if _, updateErr := db.SQL.ExecContext(ctx, `UPDATE nzb_files SET calibrated_at = now() WHERE id = $1`, f.id); updateErr != nil {
+				slog.Error("calibrate: failed to mark file as skipped", "nzb_file_id", f.id, "err", updateErr)
+			}
 			continue
 		}
 		if actualFirst <= 0 {

@@ -14,6 +14,7 @@ import (
 	"github.com/hjongedijk/drakkar/internal/config"
 	"github.com/hjongedijk/drakkar/internal/database"
 	"github.com/hjongedijk/drakkar/internal/subtitles"
+	"github.com/hjongedijk/drakkar/internal/subtitleutil"
 )
 
 type Client struct {
@@ -54,12 +55,12 @@ func (c *Client) Search(ctx context.Context, input database.SubtitleSearchInput,
 	if input.TMDBID > 0 {
 		q.Set("tmdb_id", fmt.Sprintf("%d", input.TMDBID))
 	} else {
-		q.Set("film_name", titleForSearch(input))
+		q.Set("film_name", subtitleutil.SearchTitle(input))
 	}
 	if value := typeForSearch(input.MediaType); value != "" {
 		q.Set("type", value)
 	}
-	if year := yearForSearch(input); year > 0 {
+	if year := subtitleutil.SearchYear(input); year > 0 {
 		q.Set("year", fmt.Sprintf("%d", year))
 	}
 	if input.SeasonNumber > 0 {
@@ -129,11 +130,11 @@ func (c *Client) Search(ctx context.Context, input database.SubtitleSearchInput,
 			if format == "zip" || format == "srt" || format == "vtt" {
 				out = append(out, subtitles.ProviderCandidate{
 					Language:        strings.ToLower(strings.TrimSpace(item.Language)),
-					Title:           firstNonEmpty(item.Name, item.ReleaseName),
-					ReleaseName:     firstNonEmpty(item.ReleaseName, item.Name),
+					Title:           subtitleutil.FirstNonEmpty(item.Name, item.ReleaseName),
+					ReleaseName:     subtitleutil.FirstNonEmpty(item.ReleaseName, item.Name),
 					Format:          format,
 					HearingImpaired: item.HI,
-					ExternalID:      firstNonEmpty(item.URL, item.Name),
+					ExternalID:      subtitleutil.FirstNonEmpty(item.URL, item.Name),
 					DownloadURL:     c.downloadURL + item.URL,
 					SeasonNumber:    item.Season,
 					EpisodeNumber:   item.Episode,
@@ -147,8 +148,8 @@ func (c *Client) Search(ctx context.Context, input database.SubtitleSearchInput,
 			}
 			out = append(out, subtitles.ProviderCandidate{
 				Language:        strings.ToLower(strings.TrimSpace(unpack.Language)),
-				Title:           firstNonEmpty(unpack.Name, item.Name),
-				ReleaseName:     firstNonEmpty(unpack.ReleaseName, item.ReleaseName, unpack.Name),
+				Title:           subtitleutil.FirstNonEmpty(unpack.Name, item.Name),
+				ReleaseName:     subtitleutil.FirstNonEmpty(unpack.ReleaseName, item.ReleaseName, unpack.Name),
 				Format:          format,
 				HearingImpaired: unpack.HI,
 				ExternalID:      unpack.FileID,
@@ -203,15 +204,6 @@ func normalizeLanguages(values []string) string {
 	return strings.Join(out, ",")
 }
 
-func titleForSearch(input database.SubtitleSearchInput) string {
-	if strings.EqualFold(input.MediaType, "episode") || strings.EqualFold(input.MediaType, "tv") {
-		if strings.TrimSpace(input.ShowTitle) != "" {
-			return input.ShowTitle
-		}
-	}
-	return input.Title
-}
-
 func typeForSearch(mediaType string) string {
 	switch strings.ToLower(strings.TrimSpace(mediaType)) {
 	case "movie":
@@ -221,21 +213,4 @@ func typeForSearch(mediaType string) string {
 	default:
 		return ""
 	}
-}
-
-func yearForSearch(input database.SubtitleSearchInput) int {
-	if strings.EqualFold(input.MediaType, "movie") {
-		return input.MovieYear
-	}
-	return input.ShowYear
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			return value
-		}
-	}
-	return ""
 }

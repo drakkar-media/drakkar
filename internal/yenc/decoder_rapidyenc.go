@@ -17,6 +17,23 @@ var (
 )
 
 func DecodeArticle(body []byte) ([]byte, error) {
+	return decodeArticleRapid(body, splitLines(body))
+}
+
+// DecodeArticleWithInfo decodes body and parses its yEnc header info from a
+// single line-split pass, matching the purego build's function of the same
+// name — see decoder_purego.go for why this avoids redundant re-splitting.
+func DecodeArticleWithInfo(body []byte) ([]byte, PartInfo, error) {
+	lines := splitLines(body)
+	info, _ := parsePartInfoLines(lines)
+	decoded, err := decodeArticleRapid(body, lines)
+	if err != nil {
+		return nil, PartInfo{}, err
+	}
+	return decoded, info, nil
+}
+
+func decodeArticleRapid(body []byte, lines [][]byte) ([]byte, error) {
 	stream := make([]byte, 0, len(body)+3)
 	stream = append(stream, body...)
 	stream = append(stream, '.', '\r', '\n')
@@ -32,7 +49,7 @@ func DecodeArticle(body []byte) ([]byte, error) {
 	if response == nil {
 		return nil, ErrMissingBegin
 	}
-	if err := verifyExpectedCRC(body, response.Data); err != nil {
+	if err := verifyExpectedCRCLines(lines, response.Data); err != nil {
 		return nil, err
 	}
 	return response.Data, nil

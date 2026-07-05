@@ -70,7 +70,7 @@ func TestFileCachePruneNeverReturnsNegativeDeletes(t *testing.T) {
 		BytesBefore:  before.Bytes,
 		BytesAfter:   after.Bytes,
 		DeletedFiles: max(0, before.Files-after.Files),
-		DeletedBytes: max64(0, before.Bytes-after.Bytes),
+		DeletedBytes: max(0, before.Bytes-after.Bytes),
 	}
 	if result.DeletedFiles < 0 || result.DeletedBytes < 0 {
 		t.Fatalf("expected clamped deletes, got %+v", result)

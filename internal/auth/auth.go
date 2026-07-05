@@ -78,7 +78,11 @@ func FromContext(ctx context.Context) (Claims, bool) {
 	return c, ok
 }
 
-func withClaims(ctx context.Context, c Claims) context.Context {
+// NewContext attaches Claims to ctx so a downstream handler's FromContext
+// call sees them. The auth middleware uses this on every authenticated
+// request; tests that exercise a handler directly (bypassing the middleware)
+// can call it too, to simulate a logged-in user of a given role.
+func NewContext(ctx context.Context, c Claims) context.Context {
 	return context.WithValue(ctx, contextKey{}, c)
 }
 
@@ -122,7 +126,7 @@ func Middleware(repo SessionLookup, exemptPrefixes []string) func(http.Handler) 
 				userID, username, role, expiresAt, err := repo.GetAPITokenByHash(r.Context(), hash)
 				if err == nil && (expiresAt == nil || time.Now().Before(*expiresAt)) {
 					_ = repo.TouchAPITokenUsed(r.Context(), hash)
-					next.ServeHTTP(w, r.WithContext(withClaims(r.Context(), Claims{
+					next.ServeHTTP(w, r.WithContext(NewContext(r.Context(), Claims{
 						UserID:   userID,
 						Username: username,
 						Role:     role,
@@ -142,7 +146,7 @@ func Middleware(repo SessionLookup, exemptPrefixes []string) func(http.Handler) 
 				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(withClaims(r.Context(), Claims{
+			next.ServeHTTP(w, r.WithContext(NewContext(r.Context(), Claims{
 				UserID:   userID,
 				Username: username,
 				Role:     role,

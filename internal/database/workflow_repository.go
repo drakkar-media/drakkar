@@ -155,23 +155,31 @@ func (db *DB) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID 
 
 	var requestID int64
 	err = tx.QueryRowContext(ctx, `select id from media_requests where external_id = $1 and request_type = 'movie'`, externalID).Scan(&requestID)
-	if err == nil {
+	requestExists := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, err
+	}
+	if requestExists {
 		var libraryItemID int64
 		err = tx.QueryRowContext(ctx, `
 			select li.id from library_items li
 			join movies m on m.id = li.movie_id
 			where m.tmdb_id = $1
 			limit 1`, tmdbID).Scan(&libraryItemID)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if err == nil {
+			if err = tx.Commit(); err != nil {
+				return 0, false, err
+			}
+			return libraryItemID, false, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
 			return 0, false, err
 		}
-		if err = tx.Commit(); err != nil {
-			return 0, false, err
-		}
-		return libraryItemID, false, nil
-	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, false, err
+		// The media_request row exists but its movie/library_item is gone
+		// (e.g. the user deleted it from the library) — fall through and
+		// recreate it below instead of silently no-op'ing on every future
+		// sync for this externalID.
+		err = nil
 	}
 
 	var movieID int64
@@ -198,11 +206,13 @@ func (db *DB) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID 
 		return 0, false, err
 	}
 
-	if err = tx.QueryRowContext(ctx, `
-		insert into media_requests (external_id, request_type)
-		values ($1, 'movie')
-		returning id`, externalID).Scan(&requestID); err != nil {
-		return 0, false, err
+	if !requestExists {
+		if err = tx.QueryRowContext(ctx, `
+			insert into media_requests (external_id, request_type)
+			values ($1, 'movie')
+			returning id`, externalID).Scan(&requestID); err != nil {
+			return 0, false, err
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `
 		insert into queue_items (library_item_id, state, idempotency_key)
@@ -330,7 +340,11 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 
 	var requestID int64
 	err = tx.QueryRowContext(ctx, `select id from media_requests where external_id = $1 and request_type = 'tv'`, externalID).Scan(&requestID)
-	if err == nil {
+	requestExists := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, err
+	}
+	if requestExists {
 		var libraryItemID int64
 		err = tx.QueryRowContext(ctx, `
 			select li.id from library_items li
@@ -347,16 +361,20 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 				where ts.tmdb_id = $1 and e.season_number = $2 and e.episode_number = $3
 				limit 1`, tmdbID, season, episode).Scan(&libraryItemID)
 		}
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if err == nil {
+			if err = tx.Commit(); err != nil {
+				return 0, false, err
+			}
+			return libraryItemID, false, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
 			return 0, false, err
 		}
-		if err = tx.Commit(); err != nil {
-			return 0, false, err
-		}
-		return libraryItemID, false, nil
-	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, false, err
+		// The media_request row exists but its episode/library_item is gone
+		// (e.g. the user deleted it from the library) — fall through and
+		// recreate it below instead of silently no-op'ing on every future
+		// sync for this externalID.
+		err = nil
 	}
 
 	var showID int64
@@ -412,11 +430,13 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 		return 0, false, err
 	}
 
-	if err = tx.QueryRowContext(ctx, `
-		insert into media_requests (external_id, request_type)
-		values ($1, 'tv')
-		returning id`, externalID).Scan(&requestID); err != nil {
-		return 0, false, err
+	if !requestExists {
+		if err = tx.QueryRowContext(ctx, `
+			insert into media_requests (external_id, request_type)
+			values ($1, 'tv')
+			returning id`, externalID).Scan(&requestID); err != nil {
+			return 0, false, err
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `
 		insert into queue_items (library_item_id, state, idempotency_key)
@@ -2286,7 +2306,15 @@ func loadBlocklistMapUncached(ctx context.Context, q sqlQuerier) (map[string]str
 	return out, nil
 }
 
-// flushBlocklistKeys inserts collected blocklist keys outside any transaction.
+// flushBlocklistKeys inserts collected blocklist keys outside any
+// transaction (the caller has already committed by the time this runs) and
+// deliberately decoupled from the caller's ctx — this is a best-effort
+// write ("a missing entry just means the release might surface again next
+// cycle"), so it must not abort just because an HTTP request context ended
+// or a client disconnected mid-request. It previously used
+// context.Background() with no deadline at all, though, so a hung DB
+// connection here could block forever with nothing to time it out; this now
+// bounds it instead of removing the decoupling.
 // ttlDays=0 means permanent (NULL expires_at); ttlDays>0 expires after that many days.
 // Errors are swallowed: the item is already failed; a missing entry just means
 // the release might surface again next cycle.
@@ -2294,14 +2322,16 @@ func (db *DB) flushBlocklistKeys(keys []string, reason string, ttlDays int) {
 	if len(keys) == 0 {
 		return
 	}
-	for _, key := range keys {
-		_, _ = db.SQL.ExecContext(context.Background(), `
-			insert into blocklist_items (key, reason, expires_at)
-			values ($1, $2, case when $3 > 0 then now() + ($3 * interval '1 day') else null end)
-			on conflict (key)
-			do update set reason = excluded.reason, expires_at = excluded.expires_at`,
-			key, reason, ttlDays)
-	}
+	flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// One multi-row insert instead of one round trip per key.
+	_, _ = db.SQL.ExecContext(flushCtx, `
+		insert into blocklist_items (key, reason, expires_at)
+		select k, $2, case when $3 > 0 then now() + ($3 * interval '1 day') else null end
+		from unnest($1::text[]) as k
+		on conflict (key)
+		do update set reason = excluded.reason, expires_at = excluded.expires_at`,
+		pgTextArray(keys), reason, ttlDays)
 	invalidateBlocklistCache()
 }
 

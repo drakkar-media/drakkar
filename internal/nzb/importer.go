@@ -1,6 +1,7 @@
 package nzb
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -68,7 +69,7 @@ func (i *Importer) Import(ctx context.Context, sink ImportSink, fileName string,
 	if written > i.maxUploadBytes {
 		return database.QueueSnapshot{}, ErrUploadTooLarge
 	}
-	return i.importFromOpenFile(ctx, sink, sanitizeFileName(fileName), stageFile, stagePath, hasher)
+	return i.importFromOpenFile(ctx, sink, sanitizeFileName(fileName), stageFile, hasher)
 }
 
 func (i *Importer) ImportPath(ctx context.Context, sink ImportSink, fileName, path string) (database.QueueSnapshot, error) {
@@ -96,22 +97,24 @@ func (i *Importer) ImportPath(ctx context.Context, sink ImportSink, fileName, pa
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return database.QueueSnapshot{}, err
 	}
-	return i.importFromOpenFile(ctx, sink, sanitizeFileName(fileName), file, path, hasher)
+	return i.importFromOpenFile(ctx, sink, sanitizeFileName(fileName), file, hasher)
 }
 
-func (i *Importer) importFromOpenFile(ctx context.Context, sink ImportSink, fileName string, file *os.File, path string, hasher hash.Hash) (database.QueueSnapshot, error) {
+func (i *Importer) importFromOpenFile(ctx context.Context, sink ImportSink, fileName string, file *os.File, hasher hash.Hash) (database.QueueSnapshot, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return database.QueueSnapshot{}, err
 	}
 
-	document, err := Parse(file)
+	// Read the file once and parse from the in-memory bytes — Parse used to
+	// be given the open file handle directly, and a full second os.ReadFile
+	// of the same path ran afterward just to get the raw XML for storage. For
+	// a large season-pack NZB (can be several MB) that's a redundant full
+	// disk read + allocation on every import.
+	raw, err := io.ReadAll(file)
 	if err != nil {
 		return database.QueueSnapshot{}, err
 	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return database.QueueSnapshot{}, err
-	}
-	raw, err := os.ReadFile(path)
+	document, err := Parse(bytes.NewReader(raw))
 	if err != nil {
 		return database.QueueSnapshot{}, err
 	}
@@ -137,7 +140,7 @@ func (i *Importer) importFromOpenFile(ctx context.Context, sink ImportSink, file
 }
 
 func BuildImportedNZB(fileName string, raw []byte, idempotencyKey string, externalURL string) (database.ImportedNZB, error) {
-	document, err := Parse(strings.NewReader(string(raw)))
+	document, err := Parse(bytes.NewReader(raw))
 	if err != nil {
 		return database.ImportedNZB{}, err
 	}

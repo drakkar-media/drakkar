@@ -17,6 +17,56 @@ type importedFileSegments struct {
 	nzbFileID int64
 }
 
+// insertImportedFiles inserts one nzb_files row per imported file, plus a
+// virtual_files row for any that look like real playable media (skipping
+// samples/stubs). Shared by CreateImportedNZB and ImportSelectedReleaseNZB,
+// which previously carried a byte-for-byte identical copy of this loop —
+// any future fix (e.g. to playable-media detection) needed to land twice.
+func insertImportedFiles(ctx context.Context, tx *sql.Tx, selectedReleaseID, nzbDocumentID int64, files []ImportedNZBFile) (map[string]importedFileSegments, error) {
+	fileSegments := make(map[string]importedFileSegments, len(files))
+	for _, file := range files {
+		var postedAt any
+		if file.PostedUnix > 0 {
+			postedAt = time.Unix(file.PostedUnix, 0).UTC()
+		}
+		msgIDs := make([]string, len(file.Segments))
+		for i, s := range file.Segments {
+			msgIDs[i] = s.MessageID
+		}
+		decSegSize, lastDecSize := segmentSizes(file.Segments)
+		var nzbFileID int64
+		if err := tx.QueryRowContext(ctx, `
+			insert into nzb_files (nzb_document_id, subject, poster, posted_at, file_size_bytes, message_ids, decoded_segment_size, last_decoded_size)
+			values ($1, $2, $3, $4, $5, $6, $7, $8)
+			returning id`,
+			nzbDocumentID, file.Subject, file.Poster, postedAt, file.FileSizeBytes,
+			pgTextArray(msgIDs), decSegSize, lastDecSize,
+		).Scan(&nzbFileID); err != nil {
+			return nil, err
+		}
+
+		fileSegments[file.FileName] = importedFileSegments{
+			fileName:  file.FileName,
+			nzbFileID: nzbFileID,
+		}
+
+		if isPlayableMedia(file.FileName, file.FileSizeBytes) {
+			virtualPath := "releases/" + fmt.Sprintf("%d", selectedReleaseID) + "/" + file.FileName
+			if err := tx.QueryRowContext(ctx, `
+				insert into virtual_files (
+					selected_release_id, path, file_name, size_bytes, reader_kind,
+					nzb_file_id, segment_byte_offset
+				) values ($1, $2, $3, $4, 'direct_nzb', $5, 0)
+				returning id`,
+				selectedReleaseID, virtualPath, file.FileName, file.FileSizeBytes, nzbFileID,
+			).Scan(new(int64)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return fileSegments, nil
+}
+
 func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 	// Return active items (all states except requested) + last 200 available/failed.
 	// Skipping 'requested' items keeps the response fast — there can be thousands
@@ -183,46 +233,9 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 		return QueueSnapshot{}, err
 	}
 
-	fileSegments := make(map[string]importedFileSegments, len(imported.Files))
-	for _, file := range imported.Files {
-		var postedAt any
-		if file.PostedUnix > 0 {
-			postedAt = time.Unix(file.PostedUnix, 0).UTC()
-		}
-		msgIDs := make([]string, len(file.Segments))
-		for i, s := range file.Segments {
-			msgIDs[i] = s.MessageID
-		}
-		decSegSize, lastDecSize := segmentSizes(file.Segments)
-		var nzbFileID int64
-		if err = tx.QueryRowContext(ctx, `
-			insert into nzb_files (nzb_document_id, subject, poster, posted_at, file_size_bytes, message_ids, decoded_segment_size, last_decoded_size)
-			values ($1, $2, $3, $4, $5, $6, $7, $8)
-			returning id`,
-			nzbDocumentID, file.Subject, file.Poster, postedAt, file.FileSizeBytes,
-			pgTextArray(msgIDs), decSegSize, lastDecSize,
-		).Scan(&nzbFileID); err != nil {
-			return QueueSnapshot{}, err
-		}
-
-		fileSegments[file.FileName] = importedFileSegments{
-			fileName:  file.FileName,
-			nzbFileID: nzbFileID,
-		}
-
-		if isPlayableMedia(file.FileName, file.FileSizeBytes) {
-			virtualPath := "releases/" + fmt.Sprintf("%d", selectedReleaseID) + "/" + file.FileName
-			if err = tx.QueryRowContext(ctx, `
-				insert into virtual_files (
-					selected_release_id, path, file_name, size_bytes, reader_kind,
-					nzb_file_id, segment_byte_offset
-				) values ($1, $2, $3, $4, 'direct_nzb', $5, 0)
-				returning id`,
-				selectedReleaseID, virtualPath, file.FileName, file.FileSizeBytes, nzbFileID,
-			).Scan(new(int64)); err != nil {
-				return QueueSnapshot{}, err
-			}
-		}
+	fileSegments, err := insertImportedFiles(ctx, tx, selectedReleaseID, nzbDocumentID, imported.Files)
+	if err != nil {
+		return QueueSnapshot{}, err
 	}
 	if err = insertImportedArchives(ctx, tx, selectedReleaseID, imported.Archives, fileSegments); err != nil {
 		return QueueSnapshot{}, err
@@ -305,44 +318,9 @@ func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID in
 		return QueueSnapshot{}, err
 	}
 
-	fileSegments := make(map[string]importedFileSegments, len(imported.Files))
-	for _, file := range imported.Files {
-		var postedAt any
-		if file.PostedUnix > 0 {
-			postedAt = time.Unix(file.PostedUnix, 0).UTC()
-		}
-		msgIDs := make([]string, len(file.Segments))
-		for i, s := range file.Segments {
-			msgIDs[i] = s.MessageID
-		}
-		decSegSize, lastDecSize := segmentSizes(file.Segments)
-		var nzbFileID int64
-		if err = tx.QueryRowContext(ctx, `
-			insert into nzb_files (nzb_document_id, subject, poster, posted_at, file_size_bytes, message_ids, decoded_segment_size, last_decoded_size)
-			values ($1, $2, $3, $4, $5, $6, $7, $8)
-			returning id`,
-			nzbDocumentID, file.Subject, file.Poster, postedAt, file.FileSizeBytes,
-			pgTextArray(msgIDs), decSegSize, lastDecSize,
-		).Scan(&nzbFileID); err != nil {
-			return QueueSnapshot{}, err
-		}
-		fileSegments[file.FileName] = importedFileSegments{
-			fileName:  file.FileName,
-			nzbFileID: nzbFileID,
-		}
-		if isPlayableMedia(file.FileName, file.FileSizeBytes) {
-			virtualPath := "releases/" + fmt.Sprintf("%d", selectedReleaseID) + "/" + file.FileName
-			if err = tx.QueryRowContext(ctx, `
-				insert into virtual_files (
-					selected_release_id, path, file_name, size_bytes, reader_kind,
-					nzb_file_id, segment_byte_offset
-				) values ($1, $2, $3, $4, 'direct_nzb', $5, 0)
-				returning id`,
-				selectedReleaseID, virtualPath, file.FileName, file.FileSizeBytes, nzbFileID,
-			).Scan(new(int64)); err != nil {
-				return QueueSnapshot{}, err
-			}
-		}
+	fileSegments, err := insertImportedFiles(ctx, tx, selectedReleaseID, nzbDocumentID, imported.Files)
+	if err != nil {
+		return QueueSnapshot{}, err
 	}
 	if err = insertImportedArchives(ctx, tx, selectedReleaseID, imported.Archives, fileSegments); err != nil {
 		return QueueSnapshot{}, err
@@ -370,6 +348,11 @@ func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID in
 	return snapshot, nil
 }
 
+// insertImportedArchives inserts one archives row per archive, then
+// batch-inserts its volumes, entries, and ranges — one round trip per level
+// per archive instead of one round trip per volume/entry/range. A season-pack
+// RAR set with dozens of episodes and volumes previously took hundreds of
+// sequential INSERT...RETURNING round trips here.
 func insertImportedArchives(ctx context.Context, tx *sql.Tx, selectedReleaseID int64, archives []ImportedArchive, fileSegments map[string]importedFileSegments) error {
 	for _, archive := range archives {
 		var archiveID int64
@@ -384,72 +367,151 @@ func insertImportedArchives(ctx context.Context, tx *sql.Tx, selectedReleaseID i
 		).Scan(&archiveID); err != nil {
 			return err
 		}
-		volumeIDs := make(map[int]int64, len(archive.Volumes))
-		volumePaths := make(map[int]string, len(archive.Volumes))
-		for _, volume := range archive.Volumes {
-			var archiveVolumeID int64
-			if err := tx.QueryRowContext(ctx, `
-				insert into archive_volumes (archive_id, path, volume_index)
-				values ($1, $2, $3)
-				returning id`,
-				archiveID,
-				volume.Path,
-				volume.VolumeIndex,
-			).Scan(&archiveVolumeID); err != nil {
-				return err
-			}
-			volumeIDs[volume.VolumeIndex] = archiveVolumeID
-			volumePaths[volume.VolumeIndex] = volume.Path
+
+		volumeIDs, volumePaths, err := insertArchiveVolumes(ctx, tx, archiveID, archive.Volumes)
+		if err != nil {
+			return err
 		}
+		if len(archive.Entries) == 0 {
+			continue
+		}
+
+		entryIDByPath, err := insertArchiveEntries(ctx, tx, archiveID, archive.Entries)
+		if err != nil {
+			return err
+		}
+		if err := insertArchiveRanges(ctx, tx, archive.Entries, entryIDByPath, volumeIDs); err != nil {
+			return err
+		}
+
 		for _, entry := range archive.Entries {
-			var archiveEntryID int64
-			if err := tx.QueryRowContext(ctx, `
-				insert into archive_entries (
-					archive_id, path, size_bytes, packed_size_bytes,
-					compression_method, encrypted, solid, source_volume_index, source_archive_offset
-				)
-				values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-				returning id`,
-				archiveID,
-				entry.Path,
-				entry.SizeBytes,
-				entry.PackedSizeBytes,
-				entry.CompressionMethod,
-				entry.Encrypted,
-				entry.Solid,
-				entry.VolumeIndex,
-				entry.ArchiveOffset,
-			).Scan(&archiveEntryID); err != nil {
-				return err
-			}
-			for _, item := range entry.Ranges {
-				archiveVolumeID, ok := volumeIDs[item.VolumeIndex]
-				if !ok {
-					continue
-				}
-				if _, err := tx.ExecContext(ctx, `
-					insert into archive_ranges (archive_entry_id, archive_volume_id, entry_offset, archive_offset, length_bytes)
-					values ($1, $2, $3, $4, $5)`,
-					archiveEntryID,
-					archiveVolumeID,
-					item.EntryOffset,
-					item.ArchiveOffset,
-					item.LengthBytes,
-				); err != nil {
-					return err
-				}
-			}
 			if archive.Status != "supported" || !isPlayableMedia(entry.Path, entry.SizeBytes) || len(entry.Ranges) == 0 {
 				continue
 			}
-			virtualFileID, err := insertArchiveVirtualFile(ctx, tx, selectedReleaseID, entry, volumePaths, fileSegments)
-			if err != nil {
+			if _, err := insertArchiveVirtualFile(ctx, tx, selectedReleaseID, entry, volumePaths, fileSegments); err != nil {
 				return err
 			}
-			_ = virtualFileID
 		}
 	}
 	return nil
+}
+
+// insertArchiveVolumes batch-inserts every volume of one archive in a single
+// round trip. Returns the new row IDs keyed by volume index (not by scan
+// order, which unnest-backed multi-row inserts don't strictly guarantee to
+// match input order).
+func insertArchiveVolumes(ctx context.Context, tx *sql.Tx, archiveID int64, volumes []ImportedArchiveVolume) (map[int]int64, map[int]string, error) {
+	volumeIDs := make(map[int]int64, len(volumes))
+	volumePaths := make(map[int]string, len(volumes))
+	if len(volumes) == 0 {
+		return volumeIDs, volumePaths, nil
+	}
+	paths := make([]string, len(volumes))
+	indexes := make([]int32, len(volumes))
+	for i, v := range volumes {
+		paths[i] = v.Path
+		indexes[i] = int32(v.VolumeIndex)
+		volumePaths[v.VolumeIndex] = v.Path
+	}
+	rows, err := tx.QueryContext(ctx, `
+		insert into archive_volumes (archive_id, path, volume_index)
+		select $1, p, i from unnest($2::text[], $3::int[]) as t(p, i)
+		returning id, volume_index`,
+		archiveID, paths, indexes)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var idx int
+		if err := rows.Scan(&id, &idx); err != nil {
+			return nil, nil, err
+		}
+		volumeIDs[idx] = id
+	}
+	return volumeIDs, volumePaths, rows.Err()
+}
+
+// insertArchiveEntries batch-inserts every entry of one archive in a single
+// round trip. Returns the new row IDs keyed by path — unique per archive, so
+// safe to key by rather than relying on RETURNING row order.
+func insertArchiveEntries(ctx context.Context, tx *sql.Tx, archiveID int64, entries []ImportedArchiveEntry) (map[string]int64, error) {
+	paths := make([]string, len(entries))
+	sizes := make([]int64, len(entries))
+	packedSizes := make([]int64, len(entries))
+	compressions := make([]string, len(entries))
+	encrypteds := make([]bool, len(entries))
+	solids := make([]bool, len(entries))
+	sourceVolumeIndexes := make([]int32, len(entries))
+	sourceOffsets := make([]int64, len(entries))
+	for i, e := range entries {
+		paths[i] = e.Path
+		sizes[i] = e.SizeBytes
+		packedSizes[i] = e.PackedSizeBytes
+		compressions[i] = e.CompressionMethod
+		encrypteds[i] = e.Encrypted
+		solids[i] = e.Solid
+		sourceVolumeIndexes[i] = int32(e.VolumeIndex)
+		sourceOffsets[i] = e.ArchiveOffset
+	}
+	rows, err := tx.QueryContext(ctx, `
+		insert into archive_entries (
+			archive_id, path, size_bytes, packed_size_bytes,
+			compression_method, encrypted, solid, source_volume_index, source_archive_offset
+		)
+		select $1, p, sz, psz, cm, enc, sol, svi, sao
+		from unnest($2::text[], $3::bigint[], $4::bigint[], $5::text[], $6::bool[], $7::bool[], $8::int[], $9::bigint[])
+			as t(p, sz, psz, cm, enc, sol, svi, sao)
+		returning id, path`,
+		archiveID, paths, sizes, packedSizes, compressions, encrypteds, solids, sourceVolumeIndexes, sourceOffsets)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	entryIDByPath := make(map[string]int64, len(entries))
+	for rows.Next() {
+		var id int64
+		var path string
+		if err := rows.Scan(&id, &path); err != nil {
+			return nil, err
+		}
+		entryIDByPath[path] = id
+	}
+	return entryIDByPath, rows.Err()
+}
+
+// insertArchiveRanges batch-inserts every byte range across every entry of
+// one archive in a single round trip.
+func insertArchiveRanges(ctx context.Context, tx *sql.Tx, entries []ImportedArchiveEntry, entryIDByPath map[string]int64, volumeIDs map[int]int64) error {
+	var entryIDs, archiveVolumeIDs, entryOffsets, archiveOffsets, lengths []int64
+	for _, entry := range entries {
+		entryID, ok := entryIDByPath[entry.Path]
+		if !ok {
+			continue
+		}
+		for _, item := range entry.Ranges {
+			archiveVolumeID, ok := volumeIDs[item.VolumeIndex]
+			if !ok {
+				continue
+			}
+			entryIDs = append(entryIDs, entryID)
+			archiveVolumeIDs = append(archiveVolumeIDs, archiveVolumeID)
+			entryOffsets = append(entryOffsets, item.EntryOffset)
+			archiveOffsets = append(archiveOffsets, item.ArchiveOffset)
+			lengths = append(lengths, item.LengthBytes)
+		}
+	}
+	if len(entryIDs) == 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `
+		insert into archive_ranges (archive_entry_id, archive_volume_id, entry_offset, archive_offset, length_bytes)
+		select e, v, eo, ao, l
+		from unnest($1::bigint[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[])
+			as t(e, v, eo, ao, l)`,
+		entryIDs, archiveVolumeIDs, entryOffsets, archiveOffsets, lengths)
+	return err
 }
 
 func insertArchiveVirtualFile(ctx context.Context, tx *sql.Tx, selectedReleaseID int64, entry ImportedArchiveEntry, volumePaths map[int]string, fileSegments map[string]importedFileSegments) (int64, error) {
@@ -487,7 +549,6 @@ func insertArchiveVirtualFile(ctx context.Context, tx *sql.Tx, selectedReleaseID
 	}
 	return virtualFileID, nil
 }
-
 
 // segmentSizes returns (decodedSegmentSize, lastDecodedSize) from the imported segments.
 // decodedSegmentSize is the size of the first (uniform) segment; lastDecodedSize is the
@@ -755,10 +816,10 @@ func (db *DB) ResetStaleQueueItems(ctx context.Context, staleAfter, downloadStal
 		)`,
 		QueueFailed,
 		QueueFetchingNZB, QueueIndexing, QueuePublishing, // slow: download cutoff ($7)
-		QueuePreflight, QueueSearching,                   // fast: idle cutoff ($10)
+		QueuePreflight, QueueSearching, // fast: idle cutoff ($10)
 		downloadCutoff,
-		QueueRanking,    // fast: idle cutoff ($10)
-		QueueSelected,   // medium: selected cutoff ($11)
+		QueueRanking,  // fast: idle cutoff ($10)
+		QueueSelected, // medium: selected cutoff ($11)
 		idleCutoff,
 		selectedCutoff,
 	)

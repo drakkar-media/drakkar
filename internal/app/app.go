@@ -51,12 +51,12 @@ const (
 	maintenanceRecentMovieTask = "hydra_recent_movie"
 	taskSeerrSync              = "seerr_sync"
 	taskPendingQueuePush       = "pending_queue_push"
-	taskQueueHousekeeping      = "queue_housekeeping"      // merged: stale-queue-reset + retry_failed_queue
-	taskPublishingMaintenance  = "publishing_maintenance"  // merged: republish_pending + reset_orphaned_available
+	taskQueueHousekeeping      = "queue_housekeeping"     // merged: stale-queue-reset + retry_failed_queue
+	taskPublishingMaintenance  = "publishing_maintenance" // merged: republish_pending + reset_orphaned_available
 	taskHealthCheck            = "health_check"
 	taskNZBHealthCheck         = "nzb_health_check"
-	taskStorageMaintenance     = "storage_maintenance"     // merged: cache_prune + library-cleanup
-	taskContentMaintenance     = "content_maintenance"     // merged: fill_missing_episodes + search_upgrades
+	taskStorageMaintenance     = "storage_maintenance" // merged: cache_prune + library-cleanup
+	taskContentMaintenance     = "content_maintenance" // merged: fill_missing_episodes + search_upgrades
 	taskSyncPlexDetected       = "sync_plex_detected"
 	taskArticleHealthCheck     = "article_health_check"
 	taskBacklogSearch          = "backlog_search"
@@ -109,7 +109,12 @@ func (s *fileSettingsService) GetSettings(_ context.Context) (config.Settings, e
 func (s *fileSettingsService) UpdateSettings(_ context.Context, cfg config.Settings) (config.Settings, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := config.Save(s.path, cfg); err != nil {
+	current, err := config.Load(s.path)
+	if err != nil {
+		return config.Settings{}, err
+	}
+	merged := config.MergeSecrets(current, cfg)
+	if err := config.Save(s.path, merged); err != nil {
 		return config.Settings{}, err
 	}
 	loaded, err := config.Load(s.path)
@@ -795,39 +800,14 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		_ = db.TouchMaintenanceCursor(ctx, taskContentMaintenance, time.Now().UTC().Format(time.RFC3339))
 	}
 
-	startRecurring := func(name string, interval time.Duration, runOnStartup bool, fn func()) {
-		go func() {
-			if runOnStartup {
-				fn()
-			}
-			timer := time.NewTimer(interval)
-			defer timer.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-timer.C:
-					fn()
-					timer.Reset(interval)
-				}
-			}
-		}()
-		logger.Info().Str("task", name).Dur("interval", interval).Bool("startup", runOnStartup).Msg("scheduler: task started")
-	}
-	startRecurringWithStartupDelay := func(name string, interval, startupDelay time.Duration, fn func()) {
-		startRecurring(name, interval, false, fn)
-		go func() {
-			timer := time.NewTimer(startupDelay)
-			defer timer.Stop()
-			select {
-			case <-ctx.Done():
-				return
-			case <-timer.C:
-				fn()
-			}
-		}()
-		logger.Info().Str("task", name).Dur("startupDelay", startupDelay).Msg("scheduler: delayed startup task armed")
-	}
+	// startRecurring/startRecurringWithStartupDelay used to be a second,
+	// independent copy of the goroutine/ticker loop already implemented by
+	// recurringTaskManager (live_settings.go) — only the RSS sync tasks went
+	// through the manager (for Reschedule support), while every other
+	// startup-scheduled task here ran its own duplicate scheduler with no
+	// cancel/reschedule support. Both now share recentTaskMgr.
+	startRecurring := recentTaskMgr.Start
+	startRecurringWithStartupDelay := recentTaskMgr.StartWithStartupDelay
 
 	// background worker: Seerr sync every 10 min. Sync imports requests only;
 	// discovery happens via recent-feed polling or explicit/manual search.

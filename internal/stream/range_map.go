@@ -40,8 +40,8 @@ func ResolveRange(spans []SegmentSpan, offset, length int64) ([]SegmentRange, er
 		if offset >= span.End {
 			continue
 		}
-		start := max64(offset, span.Start)
-		end := min64(requestEnd, span.End)
+		start := max(offset, span.Start)
+		end := min(requestEnd, span.End)
 		if start >= end {
 			continue
 		}
@@ -64,18 +64,4 @@ func ResolveRange(spans []SegmentSpan, offset, length int64) ([]SegmentRange, er
 		return nil, ErrRangeOutsideFile
 	}
 	return out, nil
-}
-
-func min64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }

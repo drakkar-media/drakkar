@@ -14,7 +14,26 @@ var (
 )
 
 func DecodeArticle(body []byte) ([]byte, error) {
+	return decodeArticleLines(splitLines(body))
+}
+
+// DecodeArticleWithInfo decodes body and parses its yEnc header info from a
+// single line-split pass. Callers that need both (e.g. the segment cache,
+// which always wants the decoded bytes and the header info together)
+// previously called DecodeArticle and ParsePartInfo separately, each
+// re-splitting the same ~700KB article body from scratch — decodeArticleLines
+// also used to re-split it a third time internally via verifyExpectedCRC.
+func DecodeArticleWithInfo(body []byte) ([]byte, PartInfo, error) {
 	lines := splitLines(body)
+	info, _ := parsePartInfoLines(lines)
+	decoded, err := decodeArticleLines(lines)
+	if err != nil {
+		return nil, PartInfo{}, err
+	}
+	return decoded, info, nil
+}
+
+func decodeArticleLines(lines [][]byte) ([]byte, error) {
 	start := -1
 	end := -1
 	for i, line := range lines {
@@ -58,7 +77,7 @@ func DecodeArticle(body []byte) ([]byte, error) {
 			out = append(out, b-42)
 		}
 	}
-	if err := verifyExpectedCRC(body, out); err != nil {
+	if err := verifyExpectedCRCLines(lines, out); err != nil {
 		return nil, err
 	}
 	return out, nil

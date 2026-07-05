@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -655,27 +656,16 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusBadRequest, errors.New("url required"))
 			return
 		}
-		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, body.URL, nil)
+		content, err := fetchRemoteURL(r.Context(), body.URL)
 		if err != nil {
-			respondError(w, http.StatusBadRequest, fmt.Errorf("invalid url: %w", err))
-			return
-		}
-		req.Header.Set("User-Agent", "Drakkar/1.0")
-		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, fmt.Errorf("fetch url: %w", err))
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 400 {
-			respondError(w, http.StatusInternalServerError, fmt.Errorf("remote returned HTTP %d", resp.StatusCode))
+			respondError(w, http.StatusBadRequest, err)
 			return
 		}
 		fileName := path.Base(body.URL)
 		if fileName == "" || fileName == "." {
 			fileName = "import.nzb"
 		}
-		item, err := queue.ImportNZB(r.Context(), fileName, resp.Body)
+		item, err := queue.ImportNZB(r.Context(), fileName, bytes.NewReader(content))
 		if err != nil {
 			switch {
 			case errors.Is(err, nzb.ErrUploadTooLarge):
@@ -1023,7 +1013,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		publishMutation("subtitle.delete", map[string]any{"subtitleFileId": id})
 		respondJSON(w, http.StatusOK, map[string]any{"status": "deleted", "subtitleFileId": id})
 	})
-	r.Get("/api/blocklist", func(w http.ResponseWriter, r *http.Request) {
+	r.Get("/api/blocklist", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 		if blocklistSvc == nil {
 			respondJSON(w, http.StatusOK, database.BlocklistPage{Items: []database.BlocklistItemSummary{}, Page: 1, PageSize: 50, Total: 0, TotalPages: 1})
 			return
@@ -1044,8 +1034,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		respondJSON(w, http.StatusOK, result)
-	})
-	r.Get("/api/blocklist/stats", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	r.Get("/api/blocklist/stats", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 		if blocklistSvc == nil {
 			respondJSON(w, http.StatusOK, database.BlocklistStats{ByReason: map[string]int{}})
 			return
@@ -1056,8 +1046,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		respondJSON(w, http.StatusOK, stats)
-	})
-	r.Post("/api/blocklist/manual", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	r.Post("/api/blocklist/manual", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 		if blocklistSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("blocklist unavailable"))
 			return
@@ -1074,8 +1064,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		publishMutation("blocklist.create", map[string]any{"blocklistItemId": created.ID, "reason": created.Reason})
 		respondJSON(w, http.StatusCreated, created)
-	})
-	r.Put("/api/blocklist/{id}", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	r.Put("/api/blocklist/{id}", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 		if blocklistSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("blocklist unavailable"))
 			return
@@ -1097,8 +1087,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		publishMutation("blocklist.update", map[string]any{"blocklistItemId": updated.ID, "reason": updated.Reason})
 		respondJSON(w, http.StatusOK, updated)
-	})
-	r.Delete("/api/blocklist/{id}", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	r.Delete("/api/blocklist/{id}", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 		if blocklistSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("blocklist unavailable"))
 			return
@@ -1114,8 +1104,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		publishMutation("blocklist.clear", map[string]any{"blocklistItemId": id})
 		respondJSON(w, http.StatusOK, map[string]any{"status": "cleared", "blocklistItemId": id})
-	})
-	r.Delete("/api/blocklist", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	r.Delete("/api/blocklist", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 		if blocklistSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("blocklist unavailable"))
 			return
@@ -1137,7 +1127,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		publishMutation("blocklist.clear_all", map[string]any{"cleared": result.Cleared})
 		respondJSON(w, http.StatusOK, result)
-	})
+	}))
 	// Seerr webhook — Seerr calls this URL when a request is approved/available.
 	// Configure in Seerr → Settings → Notifications → Webhook with URL:
 	//   http://<drakkar-host>:8080/api/webhooks/seerr
@@ -1640,7 +1630,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"items": items})
 	})
-	r.Get("/api/policies", func(w http.ResponseWriter, r *http.Request) {
+	r.Get("/api/policies", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 		if policySvc == nil {
 			respondJSON(w, http.StatusOK, policy.DefaultSettings())
 			return
@@ -1651,8 +1641,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		respondJSON(w, http.StatusOK, settings)
-	})
-	r.Put("/api/policies", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	r.Put("/api/policies", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 		if policySvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("policy service unavailable"))
 			return
@@ -1669,8 +1659,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		publishMutation("policies.update", map[string]any{})
 		respondJSON(w, http.StatusOK, settings)
-	})
-	r.Get("/api/settings", func(w http.ResponseWriter, r *http.Request) {
+	}))
+	r.Get("/api/settings", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 		if settingsSvc == nil {
 			respondError(w, http.StatusServiceUnavailable, errors.New("settings service unavailable"))
 			return
@@ -1680,9 +1670,9 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
-		respondJSON(w, http.StatusOK, cfg)
-	})
-	r.Put("/api/settings", func(w http.ResponseWriter, r *http.Request) {
+		respondJSON(w, http.StatusOK, config.RedactSecrets(cfg))
+	}))
+	r.Put("/api/settings", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 		if settingsSvc == nil {
 			respondError(w, http.StatusServiceUnavailable, errors.New("settings service unavailable"))
 			return
@@ -1698,8 +1688,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		publishMutation("settings.update", map[string]any{})
-		respondJSON(w, http.StatusOK, cfg)
-	})
+		respondJSON(w, http.StatusOK, config.RedactSecrets(cfg))
+	}))
 
 	// Recent structured log lines from the application log file.
 	r.Get("/api/logs", func(w http.ResponseWriter, r *http.Request) {
@@ -2226,6 +2216,21 @@ func respondError(w http.ResponseWriter, status int, err error) {
 	respondJSON(w, status, map[string]any{
 		"error": err.Error(),
 	})
+}
+
+// requireAdmin wraps a handler so only an authenticated admin can reach it.
+// Settings, policies, and the blocklist expose credentials and system-wide
+// behavior — a non-admin "user" account (creatable via handleCreateUser)
+// must not be able to read or mutate them.
+func requireAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := auth.FromContext(r.Context())
+		if !ok || claims.Role != "admin" {
+			respondError(w, http.StatusForbidden, errors.New("admin role required"))
+			return
+		}
+		next(w, r)
+	}
 }
 
 func StatusFromConfig(rt config.Runtime, cfg config.Settings, startedAt time.Time, healthy bool) Status {

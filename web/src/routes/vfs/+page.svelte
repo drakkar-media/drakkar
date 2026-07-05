@@ -15,6 +15,7 @@
   import Button from '$lib/components/Button.svelte';
   import { api } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
+  import { bytes as fmtBytes } from '$lib/format';
 
   type VFSEntry = { name: string; path: string; isDir: boolean; size: number };
   type StreamItem = {
@@ -68,17 +69,6 @@
     return result;
   }
 
-  function fmtBytes(bytes: number): string {
-    if (!bytes) return '—';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let value = bytes;
-    let unit = 0;
-    while (value >= 1024 && unit < units.length - 1) {
-      value /= 1024;
-      unit++;
-    }
-    return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
-  }
 
   async function copyPath(entryPath: string) {
     const full = `/mnt/drakkar/vfs${entryPath === '/' ? '' : entryPath}`;

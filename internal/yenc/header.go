@@ -38,7 +38,12 @@ func (p PartInfo) DecodedStart() int64 {
 // article body. It reads only the header lines and does not decode the payload,
 // making it cheap to call during preflight checks.
 func ParsePartInfo(body []byte) (PartInfo, bool) {
-	lines := splitLines(body)
+	return parsePartInfoLines(splitLines(body))
+}
+
+// parsePartInfoLines is ParsePartInfo for a caller that already has the
+// article split into lines — see verifyExpectedCRCLines for why.
+func parsePartInfoLines(lines [][]byte) (PartInfo, bool) {
 	var info PartInfo
 	var hasBegin, hasPart bool
 	for _, line := range lines {

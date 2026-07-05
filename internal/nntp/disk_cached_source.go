@@ -75,8 +75,7 @@ func (s *DiskCachedDecodedSource) DecodedBodyInfoPriority(ctx context.Context, m
 		if err != nil {
 			return nil, err
 		}
-		info, _ := yenc.ParsePartInfo(raw)
-		decoded, err := yenc.DecodeArticle(raw)
+		decoded, info, err := yenc.DecodeArticleWithInfo(raw)
 		if err != nil {
 			return nil, err
 		}

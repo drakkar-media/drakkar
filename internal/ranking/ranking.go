@@ -9,14 +9,39 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
+
+// compiledRegexCache memoizes regexp.Compile by pattern string. Exclude
+// patterns, custom-format score-rule patterns, and block-rule regexes all
+// come from a quality profile/custom-format list that's static for the
+// duration of a search, but scoring runs once per candidate — without this
+// cache the same handful of patterns were being recompiled from scratch on
+// every single candidate. The pattern set is admin-configured and small, so
+// this cache stays bounded in practice.
+var compiledRegexCache sync.Map // pattern string -> cachedRegex
+
+type cachedRegex struct {
+	re  *regexp.Regexp
+	err error
+}
+
+func compileRegexCached(pattern string) (*regexp.Regexp, error) {
+	if v, ok := compiledRegexCache.Load(pattern); ok {
+		entry := v.(cachedRegex)
+		return entry.re, entry.err
+	}
+	re, err := regexp.Compile(pattern)
+	compiledRegexCache.Store(pattern, cachedRegex{re: re, err: err})
+	return re, err
+}
 
 // compilePatterns compiles a slice of regex strings, silently skipping invalid ones.
 func compilePatterns(patterns []string) []*regexp.Regexp {
 	out := make([]*regexp.Regexp, 0, len(patterns))
 	for _, p := range patterns {
-		if r, err := regexp.Compile(p); err == nil {
+		if r, err := compileRegexCached(p); err == nil {
 			out = append(out, r)
 		}
 	}
@@ -475,7 +500,7 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 				if rule.pattern == "" {
 					continue
 				}
-				re, err := regexp.Compile(rule.pattern)
+				re, err := compileRegexCached(rule.pattern)
 				if err != nil {
 					continue
 				}
@@ -574,7 +599,7 @@ func matchBlockRule(rule BlockRule, titleLower, releaseGroupLower string) bool {
 		normalised := strings.ReplaceAll(titleLower, ".", " ")
 		return strings.Contains(titleLower, patternLower) || strings.Contains(normalised, patternLower)
 	case "regex":
-		if re, err := regexp.Compile("(?i)" + rule.Pattern); err == nil {
+		if re, err := compileRegexCached("(?i)" + rule.Pattern); err == nil {
 			return re.MatchString(titleLower)
 		}
 	case "missing_release_group":
@@ -986,19 +1011,15 @@ func matchEpisode(title string, seasonNumber, episodeNumber int) episodeMatch {
 	return episodeUnknown
 }
 
+// episodeTokenPattern matches an SxxExx or NxNN episode marker anywhere in a
+// release title. Previously containsEpisodeToken brute-forced this by
+// building and checking every combination of season(1-40) x episode(1-99)
+// with fmt.Sprintf+strings.Contains — ~7,920 allocations and scans per call,
+// called at least once per scored candidate (so once per search result).
+var episodeTokenPattern = regexp.MustCompile(`(?i)\bs\d{1,2}e\d{1,3}\b|\b\d{1,2}x\d{2}\b`)
+
 func containsEpisodeToken(title string) bool {
-	title = strings.ToLower(title)
-	for season := 1; season <= 40; season++ {
-		for episode := 1; episode <= 99; episode++ {
-			if strings.Contains(title, fmt.Sprintf("s%02de%02d", season, episode)) {
-				return true
-			}
-			if strings.Contains(title, fmt.Sprintf("%dx%02d", season, episode)) {
-				return true
-			}
-		}
-	}
-	return false
+	return episodeTokenPattern.MatchString(title)
 }
 
 // ── Audio / HDR parsing (regex-based, Radarr custom-format style) ───────────

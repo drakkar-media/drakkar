@@ -26,10 +26,6 @@ export function dismiss(id: number) {
   items.update((current) => current.filter((item) => item.id !== id));
 }
 
-export function toastInfo(message: string) {
-  return push(message, 'info');
-}
-
 export function toastSuccess(message: string) {
   return push(message, 'success');
 }

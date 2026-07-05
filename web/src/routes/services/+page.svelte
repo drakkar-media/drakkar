@@ -17,6 +17,7 @@
   import StatusPill from '$lib/components/StatusPill.svelte';
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
+  import { bytes as fmtBytes } from '$lib/format';
   import type { IntegrationProbeReport, Status } from '$lib/types';
 
   type ServiceCard = {
@@ -64,17 +65,6 @@
     }
   }
 
-  function fmtBytes(bytes: number) {
-    if (!bytes) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let value = bytes;
-    let unit = 0;
-    while (value >= 1024 && unit < units.length - 1) {
-      value /= 1024;
-      unit += 1;
-    }
-    return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
-  }
 
   function fmtCount(value?: number) {
     return Number.isFinite(value) ? String(value) : '0';

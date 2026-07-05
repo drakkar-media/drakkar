@@ -72,6 +72,25 @@ func (m *recurringTaskManager) Reschedule(name string, interval time.Duration) {
 	m.startLocked(task)
 }
 
+// StartWithStartupDelay is Start plus a one-shot extra run after
+// startupDelay, separate from the task's own interval loop — useful to give
+// a task a first run sooner than its steady-state interval without making
+// every subsequent run happen on that shorter cadence.
+func (m *recurringTaskManager) StartWithStartupDelay(name string, interval, startupDelay time.Duration, fn func()) {
+	m.Start(name, interval, false, fn)
+	go func() {
+		timer := time.NewTimer(startupDelay)
+		defer timer.Stop()
+		select {
+		case <-m.rootCtx.Done():
+			return
+		case <-timer.C:
+			fn()
+		}
+	}()
+	m.logger.Info().Str("task", name).Dur("startupDelay", startupDelay).Msg("scheduler: delayed startup task armed")
+}
+
 func (m *recurringTaskManager) startLocked(task *managedRecurringTask) {
 	runCtx, cancel := context.WithCancel(m.rootCtx)
 	task.cancel = cancel

@@ -518,3 +518,102 @@ func redactSubtitleProviders(providers map[string]SubtitleAuth) map[string]any {
 	}
 	return out
 }
+
+// RedactSecrets returns a copy of cfg with every credential field blanked to
+// "". Used for the editable /api/settings response: the settings UI round-
+// trips this struct (edit a field, PUT the whole thing back), so unlike
+// RedactedSettings (a read-only "***" display copy for /api/status), secrets
+// here must come back empty — MergeSecrets treats "" as "leave unchanged"
+// when the edited settings are saved.
+func RedactSecrets(cfg Settings) Settings {
+	redacted := cfg
+	redacted.Database.Password = ""
+	redacted.Valkey.Password = ""
+	redacted.NZBHydra2.APIKey = ""
+	redacted.Seerr.APIKey = ""
+	redacted.Metadata.TMDB.APIKey = ""
+	redacted.Metadata.TVDB.APIKey = ""
+	redacted.Plex.Token = ""
+	redacted.Jellyfin.APIKey = ""
+
+	providers := make([]UsenetProvider, len(cfg.Usenet.Providers))
+	copy(providers, cfg.Usenet.Providers)
+	for i := range providers {
+		providers[i].Password = ""
+	}
+	redacted.Usenet.Providers = providers
+
+	subProviders := make(map[string]SubtitleAuth, len(cfg.Subtitles.Providers))
+	for name, auth := range cfg.Subtitles.Providers {
+		auth.APIKey = ""
+		auth.Password = ""
+		subProviders[name] = auth
+	}
+	redacted.Subtitles.Providers = subProviders
+	return redacted
+}
+
+// MergeSecrets fills any blank credential field in incoming with the
+// matching value from current, so leaving a password/apiKey field untouched
+// in the settings UI (which now receives "" from RedactSecrets) doesn't wipe
+// the stored secret on save. Usenet providers are matched by Name; subtitle
+// providers by map key. A provider that can't be matched (e.g. renamed in
+// the same request as blanking its password) simply keeps its new blank
+// value — no data is corrupted, the secret just needs re-entering.
+func MergeSecrets(current, incoming Settings) Settings {
+	merged := incoming
+	if merged.Database.Password == "" {
+		merged.Database.Password = current.Database.Password
+	}
+	if merged.Valkey.Password == "" {
+		merged.Valkey.Password = current.Valkey.Password
+	}
+	if merged.NZBHydra2.APIKey == "" {
+		merged.NZBHydra2.APIKey = current.NZBHydra2.APIKey
+	}
+	if merged.Seerr.APIKey == "" {
+		merged.Seerr.APIKey = current.Seerr.APIKey
+	}
+	if merged.Metadata.TMDB.APIKey == "" {
+		merged.Metadata.TMDB.APIKey = current.Metadata.TMDB.APIKey
+	}
+	if merged.Metadata.TVDB.APIKey == "" {
+		merged.Metadata.TVDB.APIKey = current.Metadata.TVDB.APIKey
+	}
+	if merged.Plex.Token == "" {
+		merged.Plex.Token = current.Plex.Token
+	}
+	if merged.Jellyfin.APIKey == "" {
+		merged.Jellyfin.APIKey = current.Jellyfin.APIKey
+	}
+
+	currentProvidersByName := make(map[string]UsenetProvider, len(current.Usenet.Providers))
+	for _, p := range current.Usenet.Providers {
+		currentProvidersByName[p.Name] = p
+	}
+	providers := make([]UsenetProvider, len(merged.Usenet.Providers))
+	copy(providers, merged.Usenet.Providers)
+	for i, p := range providers {
+		if p.Password == "" {
+			if cur, ok := currentProvidersByName[p.Name]; ok {
+				providers[i].Password = cur.Password
+			}
+		}
+	}
+	merged.Usenet.Providers = providers
+
+	subProviders := make(map[string]SubtitleAuth, len(merged.Subtitles.Providers))
+	for name, auth := range merged.Subtitles.Providers {
+		if cur, ok := current.Subtitles.Providers[name]; ok {
+			if auth.APIKey == "" {
+				auth.APIKey = cur.APIKey
+			}
+			if auth.Password == "" {
+				auth.Password = cur.Password
+			}
+		}
+		subProviders[name] = auth
+	}
+	merged.Subtitles.Providers = subProviders
+	return merged
+}

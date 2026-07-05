@@ -574,7 +574,7 @@ func (h *uploadHandle) Write(ctx context.Context, data []byte, off int64) (uint3
 	if err != nil {
 		return 0, syscall.EIO
 	}
-	newSize := max64(info.Size(), off+int64(len(data)))
+	newSize := max(info.Size(), off+int64(len(data)))
 	if newSize > h.node.dir.maxUploadBytes {
 		return 0, syscall.ENOSPC
 	}
@@ -657,11 +657,4 @@ func (h *uploadHandle) commit(ctx context.Context) error {
 		h.node.dir.RmChild(h.node.name)
 	}
 	return nil
-}
-
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }

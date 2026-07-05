@@ -4,12 +4,12 @@ package jellyfin
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/hjongedijk/drakkar/internal/mediaserver"
 )
 
 // Client calls the Jellyfin HTTP API.
@@ -68,28 +68,7 @@ func (c *Client) RefreshLibraries(ctx context.Context) error {
 }
 
 func (c *Client) get(ctx context.Context, path string, out interface{}) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.serverURL+path, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("X-MediaBrowser-Token", c.apiKey)
-	req.Header.Set("Accept", "application/json")
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("jellyfin HTTP %d", resp.StatusCode)
-	}
-	if out == nil {
-		return nil
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(body, out)
+	return mediaserver.Get(ctx, c.httpClient, c.serverURL, path, "X-MediaBrowser-Token", c.apiKey, "jellyfin", out)
 }
 
 func (c *Client) post(ctx context.Context, path string) error {

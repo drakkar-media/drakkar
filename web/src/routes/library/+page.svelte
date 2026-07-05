@@ -12,6 +12,7 @@
   import Button from '$lib/components/Button.svelte';
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
+  import { runAction } from '$lib/actions';
   import type { LibraryItem, LibraryPage, Status } from '$lib/types';
 
   let items: LibraryItem[] = [];
@@ -43,23 +44,19 @@
   }
 
   async function syncRequests() {
-    working = true;
-    try {
-      const r = await api.syncRequests();
-      toastSuccess(`Synced — ${r.created} new`);
-      await loadLibrary();
-    } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
-    finally { working = false; }
+    await runAction(() => api.syncRequests(), {
+      setWorking: (v) => (working = v),
+      successMessage: (r) => `Synced — ${r.created} new`,
+      afterSuccess: loadLibrary
+    });
   }
 
   async function processPending() {
-    working = true;
-    try {
-      await api.searchPendingLibrary();
-      toastSuccess('Search started in background — results will appear via SSE');
-      await loadLibrary();
-    } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
-    finally { working = false; }
+    await runAction(() => api.searchPendingLibrary(), {
+      setWorking: (v) => (working = v),
+      successMessage: () => 'Search started in background — results will appear via SSE',
+      afterSuccess: loadLibrary
+    });
   }
 
   // Sync current state back to the URL for bookmarking / browser history.

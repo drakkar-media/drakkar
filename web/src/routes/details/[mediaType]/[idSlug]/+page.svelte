@@ -14,6 +14,7 @@
   import { api, subscribeEvents } from '$lib/api';
   import { idFromSlug } from '$lib/detailsHref';
   import { toastError, toastSuccess } from '$lib/toast';
+  import { bytes as fmtBytes } from '$lib/format';
   import { onMount } from 'svelte';
   import type { DiscoverDetails, GrabHistoryEntry, LibraryDetail, LibraryItem, QualityProfile, ReleaseItem, SubtitleCandidate, SubtitleFile } from '$lib/types';
 
@@ -33,11 +34,11 @@
   let loading = true;
   let working = false;
   let activeKey = '';
+  // Guards against a slower earlier navigation's response landing after a
+  // faster later one's and overwriting the newer page's data (e.g. quickly
+  // clicking through several poster cards in a row).
+  let loadToken = 0;
 
-  function fmtBytes(b: number): string {
-    if (b >= 1e9) return (b / 1e9).toFixed(1) + ' GB';
-    return Math.round(b / 1e6) + ' MB';
-  }
 
   function qualityTags(title: string): string[] {
     const rules: [RegExp, string][] = [
@@ -77,6 +78,7 @@
   }
 
   async function loadDetail() {
+    const token = ++loadToken;
     loading = true;
     try {
       const mediaType = page.params.mediaType === 'tv' ? 'tv' : 'movie';
@@ -89,6 +91,7 @@
         api.discoverDetails(mediaType, { title, year, tmdbId, imdbId }),
         api.librarySearch(title ?? imdbId ?? tmdbSlug ?? '')
       ]);
+      if (token !== loadToken) return;
       detail = discover;
       libraryMatch = library.items.find((item) => sameIdentity(item, mediaType, discover.title, discover.year, discover.tmdbId, discover.imdbId)) ?? null;
       if (libraryMatch) {
@@ -100,6 +103,7 @@
           api.listProfiles().catch(() => ({ profiles: [] })),
           api.getLibraryProfile(libraryMatch.id).catch(() => ({ profile: null }))
         ]);
+        if (token !== loadToken) return;
         localDetail = detailResult;
         subtitles = subtitleResult.items ?? [];
         subtitleCandidates = candidateResult.items ?? [];
@@ -115,6 +119,7 @@
         activeProfileId = null;
       }
     } catch (error) {
+      if (token !== loadToken) return;
       toastError(error instanceof Error ? error.message : String(error));
       detail = null;
       libraryMatch = null;
@@ -124,7 +129,7 @@
       profiles = [];
       activeProfileId = null;
     } finally {
-      loading = false;
+      if (token === loadToken) loading = false;
     }
   }
 

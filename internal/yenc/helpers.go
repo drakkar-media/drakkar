@@ -18,7 +18,14 @@ func splitLines(body []byte) [][]byte {
 }
 
 func verifyExpectedCRC(body, decoded []byte) error {
-	lines := splitLines(body)
+	return verifyExpectedCRCLines(splitLines(body), decoded)
+}
+
+// verifyExpectedCRCLines is verifyExpectedCRC for a caller that already has
+// the article split into lines (e.g. DecodeArticle, which needs the same
+// split for its own decoding pass) — avoids re-splitting the same ~700KB
+// article body a second time.
+func verifyExpectedCRCLines(lines [][]byte, decoded []byte) error {
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := lines[i]
 		if !bytes.HasPrefix(line, []byte("=yend ")) {

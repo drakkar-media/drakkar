@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/hjongedijk/drakkar/internal/config"
+	"github.com/hjongedijk/drakkar/internal/httperr"
+	"github.com/hjongedijk/drakkar/internal/mediadate"
 )
 
 type Client struct {
@@ -89,9 +91,9 @@ func (c *Client) PendingRequests(ctx context.Context) ([]Request, error) {
 			if title == "" {
 				title = strings.TrimSpace(item.Media.Name)
 			}
-			year := parseYear(item.Media.ReleaseDate)
+			year := mediadate.Year(item.Media.ReleaseDate)
 			if year == 0 {
-				year = parseYear(item.Media.FirstAirDate)
+				year = mediadate.Year(item.Media.FirstAirDate)
 			}
 			request := Request{
 				ID:         item.ID,
@@ -496,47 +498,11 @@ func (c *Client) NotifyAvailable(ctx context.Context, tmdbID int64, mediaType st
 }
 
 func classifySeerrHTTPError(action string, statusCode int, body []byte) error {
-	snippet := summarizeSeerrBody(body)
-	switch statusCode {
-	case 520, 521, 522, 523:
-		if snippet != "" {
-			return fmt.Errorf("seerr %s cloudflare unavailable status %d: %s", action, statusCode, snippet)
-		}
-		return fmt.Errorf("seerr %s cloudflare unavailable status %d", action, statusCode)
-	case 524:
-		if snippet != "" {
-			return fmt.Errorf("seerr %s cloudflare timeout status %d: %s", action, statusCode, snippet)
-		}
-		return fmt.Errorf("seerr %s cloudflare timeout status %d", action, statusCode)
-	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		if snippet != "" {
-			return fmt.Errorf("seerr %s status %d: %s", action, statusCode, snippet)
-		}
-	}
-	if snippet != "" {
-		return fmt.Errorf("seerr %s status %d: %s", action, statusCode, snippet)
-	}
-	return fmt.Errorf("seerr %s status %d", action, statusCode)
+	return httperr.ClassifyStatus("seerr", action, statusCode, body)
 }
 
 func detectSeerrResponseError(action string, statusCode int, body []byte) error {
-	text := strings.ToLower(strings.TrimSpace(string(body)))
-	switch {
-	case strings.Contains(text, "cloudflare") && strings.Contains(text, "524"):
-		return fmt.Errorf("seerr %s cloudflare timeout status %d", action, statusCode)
-	case strings.Contains(text, "cloudflare") && strings.Contains(text, "522"):
-		return fmt.Errorf("seerr %s cloudflare unavailable status %d", action, statusCode)
-	case strings.Contains(text, "cloudflare") && strings.Contains(text, "timed out"):
-		return fmt.Errorf("seerr %s cloudflare timeout status %d", action, statusCode)
-	case strings.Contains(text, "<html") && strings.Contains(text, "cloudflare"):
-		return fmt.Errorf("seerr %s cloudflare unavailable status %d", action, statusCode)
-	case strings.Contains(text, "<html") && strings.Contains(text, "bad gateway"):
-		return fmt.Errorf("seerr %s status %d: bad gateway", action, statusCode)
-	case strings.Contains(text, "<html") && strings.Contains(text, "gateway timeout"):
-		return fmt.Errorf("seerr %s status %d: gateway timeout", action, statusCode)
-	default:
-		return nil
-	}
+	return httperr.DetectResponseError("seerr", action, statusCode, body)
 }
 
 func isRetryableSeerrError(err error) bool {
@@ -568,29 +534,4 @@ func isRetryableSeerrError(err error) bool {
 	default:
 		return false
 	}
-}
-
-func summarizeSeerrBody(body []byte) string {
-	text := strings.TrimSpace(string(body))
-	if text == "" {
-		return ""
-	}
-	text = strings.ReplaceAll(text, "\n", " ")
-	text = strings.ReplaceAll(text, "\r", " ")
-	text = strings.Join(strings.Fields(text), " ")
-	if len(text) > 160 {
-		text = text[:160]
-	}
-	return text
-}
-
-func parseYear(value string) int {
-	if len(value) < 4 {
-		return 0
-	}
-	year, err := strconv.Atoi(value[:4])
-	if err != nil {
-		return 0
-	}
-	return year
 }

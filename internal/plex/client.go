@@ -4,14 +4,14 @@ package plex
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/hjongedijk/drakkar/internal/mediaserver"
 )
 
 // Client calls the Plex HTTP API.
@@ -195,26 +195,5 @@ func (c *Client) refreshSection(ctx context.Context, sectionKey string) error {
 }
 
 func (c *Client) get(ctx context.Context, path string, out interface{}) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.serverURL+path, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("X-Plex-Token", c.token)
-	req.Header.Set("Accept", "application/json")
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("plex HTTP %d", resp.StatusCode)
-	}
-	if out == nil {
-		return nil
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(body, out)
+	return mediaserver.Get(ctx, c.httpClient, c.serverURL, path, "X-Plex-Token", c.token, "plex", out)
 }

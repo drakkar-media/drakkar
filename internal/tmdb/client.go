@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hjongedijk/drakkar/internal/config"
+	"github.com/hjongedijk/drakkar/internal/mediadate"
 )
 
 type Client struct {
@@ -23,12 +24,12 @@ type MovieDetails struct {
 	Title               string
 	OriginalTitle       string
 	Year                int
-	ReleaseDate         string   // "YYYY-MM-DD"
+	ReleaseDate         string // "YYYY-MM-DD"
 	IMDbID              string
 	Overview            string
 	Tagline             string
-	Status              string   // "Released", "In Production", etc.
-	ContentRating       string   // "PG-13", "R" from release dates
+	Status              string // "Released", "In Production", etc.
+	ContentRating       string // "PG-13", "R" from release dates
 	OriginalLanguage    string
 	RuntimeMinutes      int
 	PosterURL           string
@@ -51,13 +52,13 @@ type TVDetails struct {
 	Name                string
 	OriginalName        string
 	Year                int
-	FirstAirDate        string   // "YYYY-MM-DD"
-	LastAirDate         string   // "YYYY-MM-DD"
+	FirstAirDate        string // "YYYY-MM-DD"
+	LastAirDate         string // "YYYY-MM-DD"
 	IMDbID              string
 	Overview            string
 	Tagline             string
-	Status              string   // "Returning Series", "Ended", etc.
-	ContentRating       string   // "TV-MA", "TV-14" from content ratings
+	Status              string // "Returning Series", "Ended", etc.
+	ContentRating       string // "TV-MA", "TV-14" from content ratings
 	OriginalLanguage    string
 	Network             string
 	EpisodeRunTime      int
@@ -129,22 +130,22 @@ func (c *Client) Enabled() bool {
 
 func (c *Client) MovieDetails(ctx context.Context, tmdbID int64) (MovieDetails, error) {
 	var payload struct {
-		Title             string  `json:"title"`
-		OriginalTitle     string  `json:"original_title"`
-		ReleaseDate       string  `json:"release_date"`
-		IMDbID            string  `json:"imdb_id"`
-		Overview          string  `json:"overview"`
-		Tagline           string  `json:"tagline"`
-		OriginalLanguage  string  `json:"original_language"`
-		Runtime           int     `json:"runtime"`
-		PosterPath        string  `json:"poster_path"`
-		BackdropPath      string  `json:"backdrop_path"`
-		Popularity        float64 `json:"popularity"`
-		VoteAverage       float64 `json:"vote_average"`
-		VoteCount         int     `json:"vote_count"`
-		Budget            int64   `json:"budget"`
-		Revenue           int64   `json:"revenue"`
-		Genres            []struct {
+		Title            string  `json:"title"`
+		OriginalTitle    string  `json:"original_title"`
+		ReleaseDate      string  `json:"release_date"`
+		IMDbID           string  `json:"imdb_id"`
+		Overview         string  `json:"overview"`
+		Tagline          string  `json:"tagline"`
+		OriginalLanguage string  `json:"original_language"`
+		Runtime          int     `json:"runtime"`
+		PosterPath       string  `json:"poster_path"`
+		BackdropPath     string  `json:"backdrop_path"`
+		Popularity       float64 `json:"popularity"`
+		VoteAverage      float64 `json:"vote_average"`
+		VoteCount        int     `json:"vote_count"`
+		Budget           int64   `json:"budget"`
+		Revenue          int64   `json:"revenue"`
+		Genres           []struct {
 			Name string `json:"name"`
 		} `json:"genres"`
 		ProductionCompanies []struct {
@@ -246,7 +247,7 @@ func (c *Client) MovieDetails(ctx context.Context, tmdbID int64) (MovieDetails, 
 	return MovieDetails{
 		Title:               strings.TrimSpace(payload.Title),
 		OriginalTitle:       strings.TrimSpace(payload.OriginalTitle),
-		Year:                parseYear(payload.ReleaseDate),
+		Year:                mediadate.Year(payload.ReleaseDate),
 		ReleaseDate:         payload.ReleaseDate,
 		IMDbID:              strings.TrimSpace(payload.IMDbID),
 		Overview:            strings.TrimSpace(payload.Overview),
@@ -337,8 +338,8 @@ func (c *Client) TVDetails(ctx context.Context, tmdbID int64) (TVDetails, error)
 				BackdropPath string `json:"backdrop_path"`
 			} `json:"results"`
 		} `json:"similar"`
-		LastAirDate  string `json:"last_air_date"`
-		InProduction bool   `json:"in_production"`
+		LastAirDate    string `json:"last_air_date"`
+		InProduction   bool   `json:"in_production"`
 		ContentRatings struct {
 			Results []struct {
 				ISO3166_1 string `json:"iso_3166_1"`
@@ -415,7 +416,7 @@ func (c *Client) TVDetails(ctx context.Context, tmdbID int64) (TVDetails, error)
 	return TVDetails{
 		Name:                strings.TrimSpace(payload.Name),
 		OriginalName:        strings.TrimSpace(payload.OriginalName),
-		Year:                parseYear(payload.FirstAirDate),
+		Year:                mediadate.Year(payload.FirstAirDate),
 		FirstAirDate:        payload.FirstAirDate,
 		LastAirDate:         payload.LastAirDate,
 		IMDbID:              strings.TrimSpace(payload.ExternalIDs.IMDbID),
@@ -485,52 +486,6 @@ func (c *Client) Search(ctx context.Context, mediaType string, query string) ([]
 	default:
 		return nil, fmt.Errorf("unsupported media type %q", mediaType)
 	}
-}
-
-func (c *Client) MovieSummary(ctx context.Context, tmdbID int64) (MediaSummary, error) {
-	var payload struct {
-		ID           int64  `json:"id"`
-		Title        string `json:"title"`
-		Overview     string `json:"overview"`
-		ReleaseDate  string `json:"release_date"`
-		PosterPath   string `json:"poster_path"`
-		BackdropPath string `json:"backdrop_path"`
-	}
-	if err := c.get(ctx, "/movie/"+strconv.FormatInt(tmdbID, 10), nil, &payload); err != nil {
-		return MediaSummary{}, err
-	}
-	return MediaSummary{
-		Title:       strings.TrimSpace(payload.Title),
-		Year:        parseYear(payload.ReleaseDate),
-		Overview:    strings.TrimSpace(payload.Overview),
-		PosterURL:   imageURL("w500", payload.PosterPath),
-		BackdropURL: imageURL("w1280", payload.BackdropPath),
-		TMDBID:      payload.ID,
-		MediaType:   "movie",
-	}, nil
-}
-
-func (c *Client) TVSummary(ctx context.Context, tmdbID int64) (MediaSummary, error) {
-	var payload struct {
-		ID           int64  `json:"id"`
-		Name         string `json:"name"`
-		Overview     string `json:"overview"`
-		FirstAirDate string `json:"first_air_date"`
-		PosterPath   string `json:"poster_path"`
-		BackdropPath string `json:"backdrop_path"`
-	}
-	if err := c.get(ctx, "/tv/"+strconv.FormatInt(tmdbID, 10), nil, &payload); err != nil {
-		return MediaSummary{}, err
-	}
-	return MediaSummary{
-		Title:       strings.TrimSpace(payload.Name),
-		Year:        parseYear(payload.FirstAirDate),
-		Overview:    strings.TrimSpace(payload.Overview),
-		PosterURL:   imageURL("w500", payload.PosterPath),
-		BackdropURL: imageURL("w1280", payload.BackdropPath),
-		TMDBID:      payload.ID,
-		MediaType:   "tv",
-	}, nil
 }
 
 func (c *Client) Trending(ctx context.Context, mediaType string) ([]MediaSummary, error) {
@@ -619,7 +574,7 @@ func (c *Client) listPath(ctx context.Context, path string, mediaType string, va
 	var payload struct {
 		Page       int `json:"page"`
 		TotalPages int `json:"total_pages"`
-		Results []struct {
+		Results    []struct {
 			ID           int64  `json:"id"`
 			Title        string `json:"title"`
 			Name         string `json:"name"`
@@ -636,10 +591,10 @@ func (c *Client) listPath(ctx context.Context, path string, mediaType string, va
 	out := make([]MediaSummary, 0, len(payload.Results))
 	for _, item := range payload.Results {
 		title := strings.TrimSpace(item.Title)
-		year := parseYear(item.ReleaseDate)
+		year := mediadate.Year(item.ReleaseDate)
 		if mediaType == "tv" {
 			title = strings.TrimSpace(item.Name)
-			year = parseYear(item.FirstAirDate)
+			year = mediadate.Year(item.FirstAirDate)
 		}
 		out = append(out, MediaSummary{
 			Title:       title,
@@ -696,7 +651,7 @@ func mapMovieResults(items []struct {
 	for _, item := range items {
 		out = append(out, MediaSummary{
 			Title:       strings.TrimSpace(item.Title),
-			Year:        parseYear(item.ReleaseDate),
+			Year:        mediadate.Year(item.ReleaseDate),
 			Overview:    strings.TrimSpace(item.Overview),
 			PosterURL:   imageURL("w500", item.PosterPath),
 			BackdropURL: imageURL("w1280", item.BackdropPath),
@@ -719,7 +674,7 @@ func mapTVResults(items []struct {
 	for _, item := range items {
 		out = append(out, MediaSummary{
 			Title:       strings.TrimSpace(item.Name),
-			Year:        parseYear(item.FirstAirDate),
+			Year:        mediadate.Year(item.FirstAirDate),
 			Overview:    strings.TrimSpace(item.Overview),
 			PosterURL:   imageURL("w500", item.PosterPath),
 			BackdropURL: imageURL("w1280", item.BackdropPath),
@@ -761,15 +716,4 @@ func (c *Client) get(ctx context.Context, path string, values url.Values, target
 		return fmt.Errorf("tmdb status %d", resp.StatusCode)
 	}
 	return json.NewDecoder(resp.Body).Decode(target)
-}
-
-func parseYear(value string) int {
-	if len(value) < 4 {
-		return 0
-	}
-	year, err := strconv.Atoi(value[:4])
-	if err != nil {
-		return 0
-	}
-	return year
 }

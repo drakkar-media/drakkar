@@ -16,6 +16,7 @@ import (
 
 	"github.com/hjongedijk/drakkar/internal/database"
 	"github.com/hjongedijk/drakkar/internal/metrics"
+	"github.com/hjongedijk/drakkar/internal/subtitleutil"
 )
 
 const maxUploadBytes = 2 << 20
@@ -556,7 +557,7 @@ func scoreCandidate(provider string, input database.SubtitleSearchInput, languag
 		score -= 5
 	}
 	text := normalizeSubtitleText(item.ReleaseName + " " + item.Title)
-	targetTitle := normalizeSubtitleText(subtitleSearchTitle(input))
+	targetTitle := normalizeSubtitleText(subtitleutil.SearchTitle(input))
 	switch strings.ToLower(strings.TrimSpace(input.MediaType)) {
 	case "episode", "tv":
 		if input.SeasonNumber > 0 && item.SeasonNumber == input.SeasonNumber {
@@ -580,7 +581,7 @@ func scoreCandidate(provider string, input database.SubtitleSearchInput, languag
 	if targetTitle != "" && strings.Contains(text, targetTitle) {
 		score += 18
 	}
-	if year := subtitleSearchYear(input); year > 0 && strings.Contains(text, strconv.Itoa(year)) {
+	if year := subtitleutil.SearchYear(input); year > 0 && strings.Contains(text, strconv.Itoa(year)) {
 		score += 10
 	}
 	switch strings.ToLower(strings.TrimSpace(item.Format)) {
@@ -629,20 +630,4 @@ func seasonEpisodeTokenMatch(text string, season, episode int) bool {
 		}
 	}
 	return false
-}
-
-func subtitleSearchTitle(input database.SubtitleSearchInput) string {
-	if strings.EqualFold(input.MediaType, "episode") || strings.EqualFold(input.MediaType, "tv") {
-		if strings.TrimSpace(input.ShowTitle) != "" {
-			return input.ShowTitle
-		}
-	}
-	return input.Title
-}
-
-func subtitleSearchYear(input database.SubtitleSearchInput) int {
-	if strings.EqualFold(input.MediaType, "movie") {
-		return input.MovieYear
-	}
-	return input.ShowYear
 }

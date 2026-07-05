@@ -365,3 +365,45 @@ func TestTitleMatchRegressions(t *testing.T) {
 		})
 	}
 }
+
+func TestContainsEpisodeToken(t *testing.T) {
+	cases := []struct {
+		title string
+		want  bool
+	}{
+		{"Show.Name.S01E01.1080p.WEB-DL", true},
+		{"Show.Name.S1E1.1080p.WEB-DL", true},
+		{"Show.Name.1x01.HDTV", true},
+		{"Show.Name.S01.Complete.1080p", false},
+		{"Show.Name.2024.1080p.WEB-DL", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := containsEpisodeToken(tc.title); got != tc.want {
+			t.Errorf("containsEpisodeToken(%q) = %v, want %v", tc.title, got, tc.want)
+		}
+	}
+}
+
+func TestMatchEpisode(t *testing.T) {
+	cases := []struct {
+		name       string
+		title      string
+		season, ep int
+		want       episodeMatch
+	}{
+		{"exact-sxxexx", "Show.Name.S01E05.1080p.WEB-DL", 1, 5, episodeExact},
+		{"exact-nxnn", "Show.Name.1x05.HDTV", 1, 5, episodeExact},
+		{"season-pack-complete", "Show.Name.S01.Complete.1080p", 1, 5, episodeSeasonPack},
+		{"season-pack-bare", "Show.Name.S01.1080p", 1, 5, episodeSeasonPack},
+		{"mismatch-different-episode", "Show.Name.S01E09.1080p.WEB-DL", 1, 5, episodeMismatch},
+		{"unknown-no-season-info", "Show.Name.2024.1080p.WEB-DL", 1, 5, episodeUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := matchEpisode(tc.title, tc.season, tc.ep); got != tc.want {
+				t.Errorf("matchEpisode(%q, %d, %d) = %v, want %v", tc.title, tc.season, tc.ep, got, tc.want)
+			}
+		})
+	}
+}
