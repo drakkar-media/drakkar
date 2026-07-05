@@ -93,9 +93,22 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 			break
 		}
 		result.ScannedRows++
+		// symlinkOK only proves the symlink resolves into the VFS content
+		// tree (os.Readlink + string compare) — it never reads a single byte
+		// of the target file, so it cannot prove the content is actually
+		// playable. Previously this unconditionally called
+		// RecordHealthCheck(symlinkOK) here, every 15 minutes, for every
+		// item — which meant a real negative verdict from the deep check
+		// below (StrictCheckFirstSegments + container-magic validation) got
+		// silently overwritten back to healthy on the very next cheap pass,
+		// long before the deep check's own backoff would run it again. A
+		// symlink that resolves fine but whose Usenet articles are gone
+		// (provider outage, expired retention) would report health_ok=true
+		// forever. Only record here when symlinkOK is a genuine signal:
+		// broken (worth flagging immediately) or freshly repaired.
 		symlinkOK := database.CheckSymlinkHealth(c.LibraryPath, c.TargetPath)
-		_ = db.RecordHealthCheck(ctx, c.PublicationID, symlinkOK)
 		if !symlinkOK {
+			_ = db.RecordHealthCheck(ctx, c.PublicationID, false)
 			if publicationSvc != nil {
 				logger.Warn().
 					Int64("libraryItemId", c.LibraryItemID).
@@ -105,8 +118,8 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 					logger.Error().Err(err).Int64("libraryItemId", c.LibraryItemID).Msg("health check: republish failed")
 				} else {
 					symlinkOK = database.CheckSymlinkHealth(c.LibraryPath, c.TargetPath)
-					_ = db.RecordHealthCheck(ctx, c.PublicationID, symlinkOK)
 					if symlinkOK {
+						_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
 						if _, exists := repairedSeen[c.LibraryItemID]; !exists {
 							repairedSeen[c.LibraryItemID] = struct{}{}
 							result.RepairedItems++
@@ -119,6 +132,8 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 			}
 		}
 		if !strings.Contains(c.TargetPath, "/content/") {
+			// Not a VFS-backed symlink (e.g. completed-symlinks) — nothing to
+			// deep-validate; a resolving symlink is the whole health signal.
 			_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
 			continue
 		}
