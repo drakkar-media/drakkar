@@ -64,6 +64,7 @@ type Repository interface {
 	ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) error
 	RequeueSelectedRelease(ctx context.Context, queueItemID int64) error
 	ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord) (*int64, error)
+	InsertManualReleaseCandidate(ctx context.Context, libraryItemID int64, title, externalURL, indexerName, resolution string, sizeBytes int64, score int) (int64, error)
 	MarkLibrarySearchFailed(ctx context.Context, libraryItemID int64, reason string) error
 	GetSelectedReleaseSummary(ctx context.Context, selectedReleaseID int64) (database.ReleaseSummary, error)
 	GetLatestSelectedReleaseSummaryByLibraryItem(ctx context.Context, libraryItemID int64) (*database.ReleaseSummary, error)
@@ -4291,6 +4292,25 @@ func (s *Service) ManualSearch(ctx context.Context, query string) ([]ManualSearc
 		})
 	}
 	return out, nil
+}
+
+// ManualImport takes a single free-text search result (from ManualSearch) that
+// the user picked for a specific library item, stores it as a release
+// candidate, and selects it — running the normal fetch/import/publish
+// pipeline, including automatic season-pack episode fan-out if the release
+// turns out to contain multiple episodes.
+func (s *Service) ManualImport(ctx context.Context, libraryItemID int64, title, externalURL, indexerName, resolution string, sizeBytes int64, score int) (ReleaseActionResult, error) {
+	if strings.TrimSpace(externalURL) == "" {
+		return ReleaseActionResult{}, fmt.Errorf("manual import: externalUrl is required")
+	}
+	if strings.TrimSpace(title) == "" {
+		title = "Manual import"
+	}
+	candidateID, err := s.repo.InsertManualReleaseCandidate(ctx, libraryItemID, title, externalURL, indexerName, resolution, sizeBytes, score)
+	if err != nil {
+		return ReleaseActionResult{}, err
+	}
+	return s.SelectRelease(ctx, candidateID)
 }
 
 // ResetLibraryItem removes the symlinks for a library item from the filesystem,

@@ -176,6 +176,10 @@ func (r *repoStub) RequeueSelectedRelease(ctx context.Context, queueItemID int64
 	r.requeued = append(r.requeued, queueItemID)
 	return nil
 }
+func (r *repoStub) InsertManualReleaseCandidate(ctx context.Context, libraryItemID int64, title, externalURL, indexerName, resolution string, sizeBytes int64, score int) (int64, error) {
+	return 1, nil
+}
+
 func (r *repoStub) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord) (*int64, error) {
 	r.searchApplied = candidates
 	if len(candidates) == 0 || candidates[0].Rejected {

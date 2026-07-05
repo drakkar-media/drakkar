@@ -16,7 +16,7 @@
   import { toastError, toastSuccess } from '$lib/toast';
   import { bytes as fmtBytes } from '$lib/format';
   import { onMount } from 'svelte';
-  import type { DiscoverDetails, GrabHistoryEntry, LibraryDetail, LibraryItem, QualityProfile, ReleaseItem, SubtitleCandidate, SubtitleFile } from '$lib/types';
+  import type { DiscoverDetails, GrabHistoryEntry, LibraryDetail, LibraryItem, ManualSearchItem, QualityProfile, ReleaseItem, SubtitleCandidate, SubtitleFile } from '$lib/types';
 
   let detail: DiscoverDetails | null = null;
   let libraryMatch: LibraryItem | null = null;
@@ -31,6 +31,10 @@
   let pickerLabel = '';
   let pickerLibraryItemID: number | null = null;
   let pickerSearching = false;
+  let manualQuery = '';
+  let manualResults: ManualSearchItem[] = [];
+  let manualSearching = false;
+  let manualImporting = false;
   let loading = true;
   let working = false;
   let activeKey = '';
@@ -168,6 +172,8 @@
   async function openReleasePicker(libraryItemID: number, label: string) {
     working = true;
     releaseCandidates = [];
+    manualQuery = '';
+    manualResults = [];
     pickerLabel = label;
     pickerLibraryItemID = libraryItemID;
     pickerSearching = true;
@@ -206,6 +212,37 @@
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
       working = false;
+    }
+  }
+
+  async function runManualSearch() {
+    if (!manualQuery.trim()) return;
+    manualSearching = true;
+    manualResults = [];
+    try {
+      const result = await api.manualSearch(manualQuery.trim());
+      manualResults = (result.items ?? []).sort((a, b) => b.score - a.score);
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : String(error));
+    } finally {
+      manualSearching = false;
+    }
+  }
+
+  async function importManualResult(item: ManualSearchItem) {
+    if (!pickerLibraryItemID) return;
+    manualImporting = true;
+    try {
+      await api.manualImportRelease(pickerLibraryItemID, item);
+      toastSuccess('Manual release imported');
+      showReleasePicker = false;
+      manualQuery = '';
+      manualResults = [];
+      await loadDetail();
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : String(error));
+    } finally {
+      manualImporting = false;
     }
   }
 
@@ -466,11 +503,24 @@
             <h2>Local Seasons</h2>
             <div class="season-stack">
               {#each localDetail.seasons as season}
+                {@const anchorEpisode = season.episodes.find((e) => e.libraryItemId)}
                 <details class="season-panel" open={season.missingCount > 0}>
                   <summary>
                     <strong>{season.name}</strong>
                     <div class="summary-meta">
                       {season.availableCount}/{season.episodeCount} available · {season.missingCount} missing
+                      {#if anchorEpisode?.libraryItemId}
+                        <button
+                          class="ep-sub-btn"
+                          type="button"
+                          title={`Search for a ${season.name} pack — matching episodes are filled in automatically`}
+                          disabled={working}
+                          on:click|preventDefault|stopPropagation={() => openReleasePicker(anchorEpisode.libraryItemId as number, `${season.name} · pack search`)}
+                        >
+                          <Search size={11} />
+                          Search Pack
+                        </button>
+                      {/if}
                       {#if season.missingCount > 0 && detail?.tmdbId}
                         <button
                           class="ep-sub-btn"
@@ -824,6 +874,44 @@
           {/each}
         </div>
       {/if}
+
+      <div class="manual-search-block">
+        <h3>Manual Search</h3>
+        <form class="manual-search-form" on:submit|preventDefault={runManualSearch}>
+          <input
+            class="manual-search-input"
+            type="text"
+            placeholder="Free-text search (e.g. show name S01 complete)"
+            bind:value={manualQuery}
+            disabled={manualSearching || manualImporting}
+          />
+          <Button kind="secondary" type="submit" disabled={manualSearching || manualImporting || !manualQuery.trim()}>
+            <Search size={14} />
+            {manualSearching ? 'Searching…' : 'Search'}
+          </Button>
+        </form>
+        {#if manualResults.length > 0}
+          <div class="rel-list">
+            {#each manualResults as item}
+              <div class="rel-row">
+                <div class="rel-info">
+                  <div class="rel-title">{item.title}</div>
+                  <div class="rel-meta">
+                    {#if item.indexer}<span class="rel-pill">{item.indexer}</span>{/if}
+                    <span class="rel-pill mono">{fmtBytes(item.sizeBytes)}</span>
+                    <span class="rel-pill mono">score {item.score}</span>
+                    {#each [item.resolution, item.source, item.codec].filter(Boolean) as tag}<span class="rel-pill rel-quality">{tag}</span>{/each}
+                  </div>
+                </div>
+                <Button kind="secondary" on:click={() => importManualResult(item)} disabled={manualImporting}>
+                  <Download size={14} />
+                  Import
+                </Button>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
     </div>
   </div>
 {/if}
@@ -995,6 +1083,19 @@
   }
   .close-btn:hover { background: hsl(0 0% 100% / 0.06); color: hsl(var(--foreground)); }
   .rel-list { overflow-y: auto; padding: 12px; display: grid; gap: 8px; }
+  .manual-search-block {
+    flex-shrink: 0; border-top: 1px solid hsl(0 0% 100% / 0.07);
+    padding: 14px 22px 18px; display: grid; gap: 10px; max-height: 40vh; overflow-y: auto;
+  }
+  .manual-search-block h3 { margin: 0; font-size: 14px; color: hsl(var(--muted-foreground)); }
+  .manual-search-form { display: flex; gap: 8px; }
+  .manual-search-input {
+    flex: 1; height: 38px; padding: 0 12px; border-radius: 12px;
+    border: 1px solid hsl(0 0% 100% / 0.08); background: hsl(0 0% 100% / 0.04);
+    color: hsl(var(--foreground)); font-size: 13px;
+  }
+  .manual-search-input::placeholder { color: hsl(var(--muted-foreground)); }
+  .manual-search-block .rel-list { padding: 0; max-height: none; }
   .rel-empty { padding: 36px; text-align: center; color: hsl(var(--muted-foreground)); font-size: 14px; }
   .rel-row {
     display: flex; align-items: flex-start; gap: 14px; padding: 14px 16px;

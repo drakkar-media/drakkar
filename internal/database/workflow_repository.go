@@ -979,6 +979,23 @@ func (db *DB) LookupCandidateHistory(ctx context.Context, libraryItemID int64) (
 	return history, rows.Err()
 }
 
+// InsertManualReleaseCandidate adds a single unselected release candidate
+// from a user-driven free-text manual search, without touching any existing
+// automatically-discovered candidates for this library item. Selecting it
+// afterwards (SelectReleaseCandidate) runs the same fetch/import/publish path
+// as any other candidate, including season-pack episode fan-out.
+func (db *DB) InsertManualReleaseCandidate(ctx context.Context, libraryItemID int64, title, externalURL, indexerName, resolution string, sizeBytes int64, score int) (int64, error) {
+	var id int64
+	err := db.SQL.QueryRowContext(ctx, `
+		insert into release_candidates (
+			library_item_id, title, score, custom_format_score, selected, external_url, indexer_name, size_bytes, resolution
+		) values ($1, $2, $3, 0, false, $4, $5, $6, $7)
+		returning id`,
+		libraryItemID, title, score, externalURL, indexerName, sizeBytes, resolution,
+	).Scan(&id)
+	return id, err
+}
+
 func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []SearchCandidateRecord) (*int64, error) {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {

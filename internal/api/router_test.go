@@ -183,6 +183,9 @@ func (w workflowStub) FillMissingEpisodes(_ context.Context) (workflow.FillMissi
 func (w workflowStub) SearchUpgrades(_ context.Context) (workflow.UpgradeSearchResult, error) {
 	return w.upgrades, nil
 }
+func (w workflowStub) ManualImport(_ context.Context, _ int64, _, _, _, _ string, _ int64, _ int) (workflow.ReleaseActionResult, error) {
+	return workflow.ReleaseActionResult{}, nil
+}
 func (w workflowStub) ManualSearch(_ context.Context, _ string) ([]workflow.ManualSearchItem, error) {
 	return nil, nil
 }

@@ -144,6 +144,7 @@ type WorkflowService interface {
 	PrioritizeTVShowMissing(ctx context.Context, tvShowID int64) (workflow.PrioritizeTVShowResult, error)
 	SearchUpgrades(ctx context.Context) (workflow.UpgradeSearchResult, error)
 	ManualSearch(ctx context.Context, query string) ([]workflow.ManualSearchItem, error)
+	ManualImport(ctx context.Context, libraryItemID int64, title, externalURL, indexerName, resolution string, sizeBytes int64, score int) (workflow.ReleaseActionResult, error)
 	ImportNZBFromPush(ctx context.Context, content []byte, filename, mediaType string) (string, error)
 	ResetLibraryItem(ctx context.Context, libraryItemID int64) error
 	ResetOrphanedAvailableItems(ctx context.Context) (workflow.ResetOrphanedAvailableItemsResult, error)
@@ -1896,6 +1897,36 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"items": candidates})
+	})
+	r.Post("/api/library/{id}/manual-import", func(w http.ResponseWriter, r *http.Request) {
+		if workflowSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
+			return
+		}
+		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		var payload struct {
+			Title       string `json:"title"`
+			ExternalURL string `json:"externalUrl"`
+			IndexerName string `json:"indexerName"`
+			Resolution  string `json:"resolution"`
+			SizeBytes   int64  `json:"sizeBytes"`
+			Score       int    `json:"score"`
+		}
+		if r.Body == nil || json.NewDecoder(r.Body).Decode(&payload) != nil {
+			respondError(w, http.StatusBadRequest, errors.New("invalid request body"))
+			return
+		}
+		result, err := workflowSvc.ManualImport(r.Context(), libraryItemID, payload.Title, payload.ExternalURL, payload.IndexerName, payload.Resolution, payload.SizeBytes, payload.Score)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		publishMutation("library.manual_import", map[string]any{"libraryItemId": libraryItemID, "selectedReleaseId": result.SelectedReleaseID})
+		respondJSON(w, http.StatusAccepted, result)
 	})
 
 	// Release calendar — upcoming releases from TMDB.

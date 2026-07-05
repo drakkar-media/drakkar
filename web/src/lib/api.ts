@@ -20,6 +20,7 @@ import type {
   SubtitleFile,
   SubtitleCandidate,
   SubtitleLibraryPage,
+  ManualSearchItem,
   BlocklistItem,
   BlocklistMutation,
   LibraryDetail,
@@ -292,9 +293,20 @@ export const api = {
     }),
   // Manual search via Hydra
   manualSearch: (query: string, kind: 'movie' | 'tv' | 'all' = 'all') =>
-    request<{ items: { title: string; externalUrl: string; indexer: string; sizeBytes: number; score: number; resolution: string; source: string; codec: string }[] }>(
-      `/api/search/manual?q=${encodeURIComponent(query)}&kind=${kind}`
-    ),
+    request<{ items: ManualSearchItem[] }>(`/api/search/manual?q=${encodeURIComponent(query)}&kind=${kind}`),
+  manualImportRelease: (libraryItemID: number, item: ManualSearchItem) =>
+    request<{ releaseCandidateId: number; action: string; selectedReleaseId?: number }>(`/api/library/${libraryItemID}/manual-import`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: item.title,
+        externalUrl: item.externalUrl,
+        indexerName: item.indexer,
+        resolution: item.resolution,
+        sizeBytes: item.sizeBytes,
+        score: item.score
+      })
+    }),
   // Library replacement — find better release for existing item
   searchReplacements: (libraryItemID: number) =>
     request<{ candidateCount: number; selectedReleaseId?: number }>(`/api/library/${libraryItemID}/search`, { method: 'POST' }),

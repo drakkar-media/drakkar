@@ -457,6 +457,19 @@ export type SubtitleCandidate = {
   createdAt: string;
 };
 
+export type ManualSearchItem = {
+  title: string;
+  externalUrl: string;
+  indexer: string;
+  sizeBytes: number;
+  score: number;
+  resolution?: string;
+  source?: string;
+  codec?: string;
+  audio?: string;
+  hdr?: string;
+};
+
 export type SubtitleLibraryRow = {
   libraryItemId: number;
   mediaType: string;
