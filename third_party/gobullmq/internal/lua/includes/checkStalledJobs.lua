@@ -94,14 +94,25 @@ local function checkStalledJobs(stalledKey, waitKey, activeKey, failedKey,
                                 local maxAge = opts["removeOnFail"]["age"]
                                 local maxCount = opts["removeOnFail"]["count"]
 
-                                if maxAge ~= nil then
-                                    removeJobsByMaxAge(timestamp, maxAge,
-                                                       failedKey, queueKeyPrefix)
-                                end
+                                if maxCount ~= nil and maxCount == 0 then
+                                    -- count:0 means "keep none", matching the
+                                    -- convention used by moveToFinished. Without this,
+                                    -- stalled-exhausted jobs configured with
+                                    -- RemoveOnFail{Count:0} were never deleted here and
+                                    -- accumulated in the failed set forever, since the
+                                    -- branch below only trims when maxCount > 0.
+                                    removeJob(jobId, false, queueKeyPrefix)
+                                    rcall("ZREM", failedKey, jobId)
+                                else
+                                    if maxAge ~= nil then
+                                        removeJobsByMaxAge(timestamp, maxAge,
+                                                           failedKey, queueKeyPrefix)
+                                    end
 
-                                if maxCount ~= nil and maxCount > 0 then
-                                    removeJobsByMaxCount(maxCount, failedKey,
-                                                         queueKeyPrefix)
+                                    if maxCount ~= nil and maxCount > 0 then
+                                        removeJobsByMaxCount(maxCount, failedKey,
+                                                             queueKeyPrefix)
+                                    end
                                 end
                             end
 
