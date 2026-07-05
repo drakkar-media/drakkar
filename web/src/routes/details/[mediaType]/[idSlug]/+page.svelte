@@ -181,24 +181,35 @@
     });
   });
 
-  async function openReleasePicker(libraryItemID: number, label: string) {
-    working = true;
+  function openReleasePicker(libraryItemID: number, label: string) {
+    // Defaults to the Search tab and does NOT eagerly kick off the automatic
+    // background search — that search replaces (deletes+reinserts) every
+    // release_candidates row for this item, which was racing with manual
+    // imports and causing "release candidate no longer available" errors.
+    // Auto Scrape now always fetches live on demand (see selectPickerTab).
     releaseCandidates = [];
     manualQuery = '';
     manualResults = [];
     pickerTab = 'search';
     pickerLabel = label;
     pickerLibraryItemID = libraryItemID;
+    pickerSearching = false;
+    showReleasePicker = true;
+  }
+
+  async function selectPickerTab(tab: 'search' | 'auto') {
+    pickerTab = tab;
+    if (tab !== 'auto' || !pickerLibraryItemID) return;
+    // Always fetch live — never reuse a previously loaded candidate list,
+    // since candidates can be replaced/deleted server-side between views.
     pickerSearching = true;
     try {
-      const result = await api.replacementCandidates(libraryItemID);
+      const result = await api.replacementCandidates(pickerLibraryItemID);
       releaseCandidates = (result.items ?? []).sort((a, b) => b.score - a.score);
-      showReleasePicker = true;
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
-      pickerSearching = false;
     } finally {
-      working = false;
+      pickerSearching = false;
     }
   }
 
@@ -831,8 +842,8 @@
       </div>
 
       <div class="rel-tabs">
-        <button type="button" class:active={pickerTab === 'search'} on:click={() => (pickerTab = 'search')}>Search</button>
-        <button type="button" class:active={pickerTab === 'auto'} on:click={() => (pickerTab = 'auto')}>Auto Scrape</button>
+        <button type="button" class:active={pickerTab === 'search'} on:click={() => selectPickerTab('search')}>Search</button>
+        <button type="button" class:active={pickerTab === 'auto'} on:click={() => selectPickerTab('auto')}>Auto Scrape</button>
       </div>
 
       <div class="rel-tab-body">

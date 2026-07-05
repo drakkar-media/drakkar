@@ -1925,6 +1925,14 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
+		if result.SelectedReleaseID == nil && result.Action == "selected" {
+			// A concurrent automatic search replaced every candidate for this
+			// item (including the one just inserted) before it could be
+			// selected. Tell the client to retry — the manual result no
+			// longer exists to import.
+			respondError(w, http.StatusGone, errors.New("release candidate no longer available — please search again"))
+			return
+		}
 		publishMutation("library.manual_import", map[string]any{"libraryItemId": libraryItemID, "selectedReleaseId": result.SelectedReleaseID})
 		respondJSON(w, http.StatusAccepted, result)
 	})
