@@ -35,6 +35,7 @@
   let manualResults: ManualSearchItem[] = [];
   let manualSearching = false;
   let manualImporting = false;
+  let pickerTab: 'search' | 'auto' = 'search';
   let loading = true;
   let working = false;
   let activeKey = '';
@@ -67,6 +68,14 @@
       if (re.test(title) && !seen.has(label)) { seen.add(label); out.push(label); }
     }
     return out;
+  }
+
+  function badgeTone(tag: string): 'res-2160' | 'res-1080' | 'res-720' | 'default' {
+    const t = tag.toLowerCase();
+    if (t.includes('2160') || t.includes('4k')) return 'res-2160';
+    if (t.includes('1080')) return 'res-1080';
+    if (t.includes('720')) return 'res-720';
+    return 'default';
   }
 
   function normalizeTitle(value: string) {
@@ -174,6 +183,7 @@
     releaseCandidates = [];
     manualQuery = '';
     manualResults = [];
+    pickerTab = 'search';
     pickerLabel = label;
     pickerLibraryItemID = libraryItemID;
     pickerSearching = true;
@@ -800,103 +810,132 @@
     tabindex="0"
     aria-label="Close release picker"
   >
-    <div class="rel-modal" role="dialog" aria-modal="true" aria-label="Select release" tabindex="-1">
+    <div class="rel-modal" role="dialog" aria-modal="true" aria-label="Manual scrape" tabindex="-1">
       <div class="rel-header">
-        <h2>Select Release{#if pickerLabel} <span class="picker-ctx">— {pickerLabel}</span>{/if}</h2>
-        <button class="close-btn" on:click={() => (showReleasePicker = false)} aria-label="Close">
-          <X size={18} />
-        </button>
+        <div class="rel-header-top">
+          <h2>Manual Scrape</h2>
+          <button class="close-btn" on:click={() => (showReleasePicker = false)} aria-label="Close">
+            <X size={18} />
+          </button>
+        </div>
+        <div class="rel-header-desc">
+          {#if pickerTab === 'search'}
+            Choose how to find streams for "{pickerLabel || detail?.title || 'this item'}"
+          {:else}
+            {releaseCandidates.length} candidate{releaseCandidates.length === 1 ? '' : 's'} found
+          {/if}
+        </div>
       </div>
-      {#if pickerSearching}
-        <div class="rel-empty">Searching for releases…</div>
-      {/if}
-      {#if releaseCandidates.length === 0 && !pickerSearching}
-        <div class="rel-empty">No candidates found.</div>
-      {:else if releaseCandidates.length > 0}
-        <div class="rel-list">
-          {#each releaseCandidates as c}
-            {@const tags = qualityTags(c.title)}
-            <div class="rel-row" class:rel-selected={c.selected} class:rel-rejected={c.rejected && !c.selected}>
-              <div class="rel-info">
-                <div class="rel-title">{c.title}</div>
-                <div class="rel-meta">
-                  {#if c.indexerName}<span class="rel-pill">{c.indexerName}</span>{/if}
-                  <span class="rel-pill mono">{fmtBytes(c.sizeBytes)}</span>
-                  <span class="rel-pill mono">score {c.score}</span>
-                  <span class="rel-pill mono">cf {c.customFormatScore}</span>
-                  {#each tags as tag}<span class="rel-pill rel-quality">{tag}</span>{/each}
-                  {#if c.selected}<span class="rel-pill rel-pill-ok">selected</span>{/if}
-                  {#if c.rejected && !c.selected}<span class="rel-pill rel-pill-danger">{c.rejectReason || 'rejected'}</span>{/if}
-                  {#if c.failureCount > 0}<span class="rel-pill rel-pill-warn">{c.failureCount}× failed</span>{/if}
-                </div>
-                {#if c.compatibilityWarnings && c.compatibilityWarnings.length > 0}
-                  <div class="compat-warnings">
-                    {#each c.compatibilityWarnings as w}
-                      <span class="compat-badge" title={w}>⚠ {w.split('—')[0].trim()}</span>
-                    {/each}
+
+      <div class="rel-tabs">
+        <button type="button" class:active={pickerTab === 'search'} on:click={() => (pickerTab = 'search')}>Search</button>
+        <button type="button" class:active={pickerTab === 'auto'} on:click={() => (pickerTab = 'auto')}>Auto Scrape</button>
+      </div>
+
+      <div class="rel-tab-body">
+        {#if pickerTab === 'search'}
+          <div class="manual-search-block">
+            <form class="manual-search-form" on:submit|preventDefault={runManualSearch}>
+              <div class="manual-search-input-wrap">
+                <Search size={15} />
+                <input
+                  class="manual-search-input"
+                  type="text"
+                  placeholder="Search (e.g. show name S01 complete)"
+                  bind:value={manualQuery}
+                  disabled={manualSearching || manualImporting}
+                  on:keydown={(e) => e.key === 'Enter' && runManualSearch()}
+                />
+              </div>
+              <Button kind="secondary" type="submit" disabled={manualSearching || manualImporting || !manualQuery.trim()}>
+                <Search size={14} />
+                {manualSearching ? 'Searching…' : 'Search Streams'}
+              </Button>
+            </form>
+            {#if manualResults.length > 0}
+              <div class="rel-list">
+                {#each manualResults as item}
+                  {@const tags = [item.resolution, item.source, item.codec, item.audio, item.hdr].filter(Boolean) as string[]}
+                  <div class="rel-card" on:click={() => importManualResult(item)} role="button" tabindex="0" on:keydown={(e) => e.key === 'Enter' && importManualResult(item)}>
+                    <div class="rel-card-top">
+                      <p class="rel-card-title">{item.title}</p>
+                      <span class="rel-badge" class:rel-badge-neg={item.score <= 0}>Rank: {item.score}</span>
+                    </div>
+                    <div class="rel-card-badges">
+                      {#each tags as tag}
+                        <span class={`rel-badge-outline tone-${badgeTone(tag)}`}>{tag}</span>
+                      {/each}
+                      {#if item.indexer}<span class="rel-badge-outline">{item.indexer}</span>{/if}
+                      <span class="rel-badge-outline mono">{fmtBytes(item.sizeBytes)}</span>
+                    </div>
+                    <Button kind="secondary" on:click={(e) => { e.stopPropagation(); importManualResult(item); }} disabled={manualImporting}>
+                      <Download size={14} />
+                      Import
+                    </Button>
                   </div>
-                {/if}
-                {#if c.explanations && c.explanations.length > 0}
-                  <details class="rel-why">
-                    <summary class="rel-why-toggle">Why? ({c.explanations.length} factors)</summary>
-                    <div class="rel-explanations">
-                      {#each c.explanations as line}
-                        {@const ex = parseExplanation(line)}
-                        <div class="rel-explanation" class:rel-exp-reject={ex.isReject} class:rel-exp-pos={!ex.isReject && ex.delta !== null && ex.delta > 0} class:rel-exp-neg={!ex.isReject && ex.delta !== null && ex.delta < 0}>
-                          {#if ex.delta !== null}
-                            <span class="rel-exp-delta">{ex.delta > 0 ? '+' : ''}{ex.delta}</span>
-                          {/if}
-                          <span>{ex.text}</span>
-                        </div>
+                {/each}
+              </div>
+            {:else if manualSearching}
+              <div class="rel-empty">Searching streams…</div>
+            {/if}
+          </div>
+        {:else}
+          {#if pickerSearching}
+            <div class="rel-empty">Searching for releases…</div>
+          {/if}
+          {#if releaseCandidates.length === 0 && !pickerSearching}
+            <div class="rel-empty">No candidates found.</div>
+          {:else if releaseCandidates.length > 0}
+            <div class="rel-list">
+              {#each releaseCandidates as c}
+                {@const tags = qualityTags(c.title)}
+                <div class="rel-card" class:rel-selected={c.selected} class:rel-rejected={c.rejected && !c.selected}>
+                  <div class="rel-card-top">
+                    <p class="rel-card-title">{c.title}</p>
+                    <span class="rel-badge" class:rel-badge-neg={c.rejected && !c.selected}>Score: {c.score}</span>
+                  </div>
+                  <div class="rel-card-badges">
+                    {#each tags as tag}
+                      <span class={`rel-badge-outline tone-${badgeTone(tag)}`}>{tag}</span>
+                    {/each}
+                    {#if c.indexerName}<span class="rel-badge-outline">{c.indexerName}</span>{/if}
+                    <span class="rel-badge-outline mono">{fmtBytes(c.sizeBytes)}</span>
+                    <span class="rel-badge-outline mono">cf {c.customFormatScore}</span>
+                    {#if c.selected}<span class="rel-badge-outline rel-pill-ok">selected</span>{/if}
+                    {#if c.rejected && !c.selected}<span class="rel-badge-outline rel-pill-danger">{c.rejectReason || 'rejected'}</span>{/if}
+                    {#if c.failureCount > 0}<span class="rel-badge-outline rel-pill-warn">{c.failureCount}× failed</span>{/if}
+                  </div>
+                  {#if c.compatibilityWarnings && c.compatibilityWarnings.length > 0}
+                    <div class="compat-warnings">
+                      {#each c.compatibilityWarnings as w}
+                        <span class="compat-badge" title={w}>⚠ {w.split('—')[0].trim()}</span>
                       {/each}
                     </div>
-                  </details>
-                {/if}
-              </div>
-              <Button kind={c.selected ? 'primary' : 'secondary'} on:click={() => pickRelease(c.releaseCandidateId)} disabled={working}>
-                <Download size={14} />
-                {c.selected ? 'Re-grab' : 'Download'}
-              </Button>
-            </div>
-          {/each}
-        </div>
-      {/if}
-
-      <div class="manual-search-block">
-        <h3>Manual Search</h3>
-        <form class="manual-search-form" on:submit|preventDefault={runManualSearch}>
-          <input
-            class="manual-search-input"
-            type="text"
-            placeholder="Free-text search (e.g. show name S01 complete)"
-            bind:value={manualQuery}
-            disabled={manualSearching || manualImporting}
-          />
-          <Button kind="secondary" type="submit" disabled={manualSearching || manualImporting || !manualQuery.trim()}>
-            <Search size={14} />
-            {manualSearching ? 'Searching…' : 'Search'}
-          </Button>
-        </form>
-        {#if manualResults.length > 0}
-          <div class="rel-list">
-            {#each manualResults as item}
-              <div class="rel-row">
-                <div class="rel-info">
-                  <div class="rel-title">{item.title}</div>
-                  <div class="rel-meta">
-                    {#if item.indexer}<span class="rel-pill">{item.indexer}</span>{/if}
-                    <span class="rel-pill mono">{fmtBytes(item.sizeBytes)}</span>
-                    <span class="rel-pill mono">score {item.score}</span>
-                    {#each [item.resolution, item.source, item.codec].filter(Boolean) as tag}<span class="rel-pill rel-quality">{tag}</span>{/each}
-                  </div>
+                  {/if}
+                  {#if c.explanations && c.explanations.length > 0}
+                    <details class="rel-why">
+                      <summary class="rel-why-toggle">Why? ({c.explanations.length} factors)</summary>
+                      <div class="rel-explanations">
+                        {#each c.explanations as line}
+                          {@const ex = parseExplanation(line)}
+                          <div class="rel-explanation" class:rel-exp-reject={ex.isReject} class:rel-exp-pos={!ex.isReject && ex.delta !== null && ex.delta > 0} class:rel-exp-neg={!ex.isReject && ex.delta !== null && ex.delta < 0}>
+                            {#if ex.delta !== null}
+                              <span class="rel-exp-delta">{ex.delta > 0 ? '+' : ''}{ex.delta}</span>
+                            {/if}
+                            <span>{ex.text}</span>
+                          </div>
+                        {/each}
+                      </div>
+                    </details>
+                  {/if}
+                  <Button kind={c.selected ? 'primary' : 'secondary'} on:click={() => pickRelease(c.releaseCandidateId)} disabled={working}>
+                    <Download size={14} />
+                    {c.selected ? 'Re-grab' : 'Download'}
+                  </Button>
                 </div>
-                <Button kind="secondary" on:click={() => importManualResult(item)} disabled={manualImporting}>
-                  <Download size={14} />
-                  Import
-                </Button>
-              </div>
-            {/each}
-          </div>
+              {/each}
+            </div>
+          {/if}
         {/if}
       </div>
     </div>
@@ -1008,7 +1047,6 @@
   }
   .ep-sub-btn:hover { background: hsl(var(--primary) / 0.15); color: hsl(var(--primary)); border-color: hsl(var(--primary) / 0.3); }
   .ep-reset-btn:hover { background: hsl(0 70% 50% / 0.15); color: hsl(0 70% 60%); border-color: hsl(0 70% 50% / 0.3); }
-  .picker-ctx { font-size: 14px; font-weight: 400; color: hsl(var(--muted-foreground)); }
   .media-strip { padding-bottom: 4px; }
   .person-slot { width: 146px; flex: 0 0 auto; }
   .poster-slot { width: 146px; flex: 0 0 auto; }
@@ -1053,15 +1091,15 @@
     display: flex; align-items: center; justify-content: center; padding: 24px;
   }
   .rel-modal {
-    background: hsl(var(--card)); border: 1px solid hsl(0 0% 100% / 0.1);
-    border-radius: 24px; width: 100%; max-width: min(95vw, 1100px);
+    background: hsl(0 0% 4% / 0.95); backdrop-filter: blur(24px);
+    border: 1px solid hsl(0 0% 100% / 0.1);
+    border-radius: 24px; width: 100%; max-width: min(95vw, 1000px);
     max-height: 82vh; display: flex; flex-direction: column; overflow: hidden;
   }
-  .rel-header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 20px 22px 16px; border-bottom: 1px solid hsl(0 0% 100% / 0.07); flex-shrink: 0;
-  }
-  .rel-header h2 { margin: 0; font-size: 18px; }
+  .rel-header { padding: 20px 22px 14px; flex-shrink: 0; }
+  .rel-header-top { display: flex; align-items: center; justify-content: space-between; }
+  .rel-header h2 { margin: 0; font-size: 18px; font-weight: 600; }
+  .rel-header-desc { margin-top: 4px; font-size: 13px; color: hsl(var(--muted-foreground)); }
   .close-btn {
     display: flex; align-items: center; justify-content: center;
     width: 32px; height: 32px; border-radius: 10px;
@@ -1069,32 +1107,60 @@
     color: hsl(var(--muted-foreground)); cursor: pointer;
   }
   .close-btn:hover { background: hsl(0 0% 100% / 0.06); color: hsl(var(--foreground)); }
-  .rel-list { overflow-y: auto; padding: 12px; display: grid; gap: 8px; }
-  .manual-search-block {
-    flex-shrink: 0; border-top: 1px solid hsl(0 0% 100% / 0.07);
-    padding: 14px 22px 18px; display: grid; gap: 10px; max-height: 40vh; overflow-y: auto;
+  .rel-tabs {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 6px;
+    margin: 0 22px 14px; padding: 4px; border-radius: 12px;
+    background: hsl(0 0% 100% / 0.04); flex-shrink: 0;
   }
-  .manual-search-block h3 { margin: 0; font-size: 14px; color: hsl(var(--muted-foreground)); }
+  .rel-tabs button {
+    min-height: 32px; border-radius: 9px; border: none; background: transparent;
+    color: hsl(var(--muted-foreground)); font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  .rel-tabs button.active { background: hsl(0 0% 100% / 0.09); color: hsl(var(--foreground)); }
+  .rel-tab-body { flex: 1; min-height: 0; overflow-y: auto; padding: 0 22px 20px; }
+  .rel-list { display: grid; gap: 10px; }
+  .manual-search-block { display: grid; gap: 14px; }
   .manual-search-form { display: flex; gap: 8px; }
-  .manual-search-input {
-    flex: 1; height: 38px; padding: 0 12px; border-radius: 12px;
+  .manual-search-input-wrap {
+    flex: 1; display: flex; align-items: center; gap: 8px;
+    height: 38px; padding: 0 12px; border-radius: 12px;
     border: 1px solid hsl(0 0% 100% / 0.08); background: hsl(0 0% 100% / 0.04);
+    color: hsl(var(--muted-foreground));
+  }
+  .manual-search-input {
+    flex: 1; background: transparent; border: none; outline: none;
     color: hsl(var(--foreground)); font-size: 13px;
   }
   .manual-search-input::placeholder { color: hsl(var(--muted-foreground)); }
-  .manual-search-block .rel-list { padding: 0; max-height: none; }
   .rel-empty { padding: 36px; text-align: center; color: hsl(var(--muted-foreground)); font-size: 14px; }
-  .rel-row {
-    display: flex; align-items: flex-start; gap: 14px; padding: 14px 16px;
-    border-radius: 16px; border: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(0 0% 100% / 0.03);
+  .rel-card {
+    display: grid; gap: 10px; padding: 14px 16px;
+    border-radius: 16px; border: 1px solid hsl(0 0% 100% / 0.08);
+    background: hsl(0 0% 100% / 0.03); cursor: pointer; transition: border-color .12s;
   }
-  .rel-row:hover { background: hsl(0 0% 100% / 0.055); }
+  .rel-card:hover { border-color: hsl(var(--primary) / 0.5); }
   .rel-selected { border-color: hsl(var(--primary) / 0.4); background: hsl(var(--primary) / 0.06); }
   .rel-rejected { opacity: 0.5; }
-  .rel-info { flex: 1; min-width: 0; display: grid; gap: 7px; }
-  .rel-title { font-size: 13px; font-weight: 600; line-height: 1.4; word-break: break-word; }
-  .rel-meta { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+  .rel-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+  .rel-card-title { margin: 0; flex: 1; min-width: 0; font-size: 13px; font-weight: 600; line-height: 1.4; word-break: break-word; }
+  .rel-badge {
+    flex-shrink: 0; font-size: 11px; font-weight: 700; padding: 2px 9px; border-radius: 999px;
+    background: hsl(var(--primary) / 0.18); color: hsl(var(--primary)); white-space: nowrap;
+  }
+  .rel-badge-neg { background: hsl(0 70% 50% / 0.15); color: hsl(0 70% 62%); }
+  .rel-card-badges { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .rel-badge-outline {
+    font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid hsl(0 0% 100% / 0.12); color: hsl(var(--muted-foreground));
+    background: transparent; white-space: nowrap;
+  }
+  .rel-badge-outline.mono { font-family: 'JetBrains Mono', monospace; }
+  .rel-badge-outline.tone-res-2160 { background: hsl(271 75% 55% / 0.25); border-color: transparent; color: hsl(271 80% 85%); }
+  .rel-badge-outline.tone-res-1080 { background: hsl(217 90% 55% / 0.22); border-color: transparent; color: hsl(217 90% 80%); }
+  .rel-badge-outline.tone-res-720 { background: hsl(160 70% 40% / 0.22); border-color: transparent; color: hsl(160 70% 75%); }
+  .rel-pill-ok { background: hsl(142 70% 45% / 0.15); border-color: hsl(142 70% 45% / 0.3); color: hsl(142 60% 55%); font-weight: 600; }
+  .rel-pill-danger { background: hsl(0 70% 50% / 0.15); border-color: hsl(0 70% 50% / 0.25); color: hsl(0 70% 60%); }
+  .rel-pill-warn { background: hsl(40 90% 50% / 0.15); border-color: hsl(40 90% 50% / 0.25); color: hsl(40 80% 60%); }
   .compat-warnings { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
   .compat-badge {
     font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 8px;
@@ -1122,14 +1188,4 @@
     font-family: 'JetBrains Mono', monospace; font-size: 10px; min-width: 36px;
     text-align: right; flex-shrink: 0; opacity: 0.9;
   }
-  .rel-pill {
-    font-size: 11px; padding: 2px 7px; border-radius: 6px;
-    background: hsl(0 0% 100% / 0.07); border: 1px solid hsl(0 0% 100% / 0.09);
-    color: hsl(var(--muted-foreground)); white-space: nowrap;
-  }
-  .rel-pill.mono { font-family: 'JetBrains Mono', monospace; }
-  .rel-quality { color: hsl(var(--foreground) / 0.85); font-weight: 600; }
-  .rel-pill-ok { background: hsl(142 70% 45% / 0.15); border-color: hsl(142 70% 45% / 0.3); color: hsl(142 60% 55%); font-weight: 600; }
-  .rel-pill-danger { background: hsl(0 70% 50% / 0.15); border-color: hsl(0 70% 50% / 0.25); color: hsl(0 70% 60%); }
-  .rel-pill-warn { background: hsl(40 90% 50% / 0.15); border-color: hsl(40 90% 50% / 0.25); color: hsl(40 80% 60%); }
 </style>
