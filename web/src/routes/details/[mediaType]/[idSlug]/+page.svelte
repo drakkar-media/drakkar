@@ -450,7 +450,7 @@
             {#if libraryMatch}
               <Button kind="secondary" on:click={runLocalSearch} disabled={working}>
                 <Search size={15} />
-                {libraryMatch.available ? 'Find Upgrade' : 'Search'}
+                {libraryMatch.available ? 'Find Upgrade' : localDetail?.tvShowId ? 'Search Show' : 'Search'}
               </Button>
               {#if localDetail?.tvShowId && (libraryMatch.missingCount ?? 0) > 0}
                 <Button kind="secondary" on:click={prioritizeMissingForShow} disabled={working}>
