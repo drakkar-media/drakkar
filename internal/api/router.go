@@ -171,6 +171,8 @@ type SubtitleService interface {
 	DownloadCandidate(ctx context.Context, candidateID int64) (intsub.UploadResult, error)
 	UploadSubtitle(ctx context.Context, libraryItemID int64, language, fileName string, src io.Reader) (intsub.UploadResult, error)
 	DeleteSubtitle(ctx context.Context, subtitleID int64) error
+	DeleteAllForItem(ctx context.Context, libraryItemID int64) error
+	ListLibraryState(ctx context.Context, filter database.SubtitleLibraryFilter) (database.SubtitleLibraryPage, error)
 }
 
 type BlocklistService interface {
@@ -898,6 +900,72 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"items": items})
+	})
+	r.Get("/api/subtitles", func(w http.ResponseWriter, r *http.Request) {
+		if subtitleSvc == nil {
+			respondJSON(w, http.StatusOK, database.SubtitleLibraryPage{Items: []database.SubtitleLibraryRow{}, Page: 1, PageSize: 50, Total: 0, TotalPages: 1})
+			return
+		}
+		q := r.URL.Query()
+		page, _ := strconv.Atoi(q.Get("page"))
+		pageSize, _ := strconv.Atoi(q.Get("pageSize"))
+		result, err := subtitleSvc.ListLibraryState(r.Context(), database.SubtitleLibraryFilter{
+			MediaType:   q.Get("mediaType"),
+			Search:      q.Get("q"),
+			MissingOnly: q.Get("missingOnly") == "true",
+			Page:        page,
+			PageSize:    pageSize,
+		})
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, result)
+	})
+	r.Post("/api/subtitles/bulk", func(w http.ResponseWriter, r *http.Request) {
+		if subtitleSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("subtitles unavailable"))
+			return
+		}
+		var payload struct {
+			Action         string   `json:"action"`
+			LibraryItemIDs []int64  `json:"libraryItemIds"`
+			Languages      []string `json:"languages"`
+		}
+		if r.Body == nil || json.NewDecoder(r.Body).Decode(&payload) != nil {
+			respondError(w, http.StatusBadRequest, errors.New("invalid request body"))
+			return
+		}
+		if len(payload.LibraryItemIDs) == 0 {
+			respondError(w, http.StatusBadRequest, errors.New("libraryItemIds required"))
+			return
+		}
+		switch payload.Action {
+		case "search":
+			ids := payload.LibraryItemIDs
+			languages := payload.Languages
+			go func() {
+				for _, id := range ids {
+					if _, err := subtitleSvc.SearchCandidates(context.Background(), id, languages); err != nil {
+						slog.Warn("bulk subtitle search", "library_item_id", id, "err", err)
+					}
+				}
+				publishMutation("subtitle.search", map[string]any{"libraryItemIds": ids})
+			}()
+			respondJSON(w, http.StatusAccepted, map[string]any{"queued": true, "action": "search", "count": len(ids)})
+		case "delete":
+			var failed []int64
+			for _, id := range payload.LibraryItemIDs {
+				if err := subtitleSvc.DeleteAllForItem(r.Context(), id); err != nil {
+					slog.Warn("bulk subtitle delete", "library_item_id", id, "err", err)
+					failed = append(failed, id)
+				}
+			}
+			publishMutation("subtitle.delete", map[string]any{"libraryItemIds": payload.LibraryItemIDs})
+			respondJSON(w, http.StatusOK, map[string]any{"status": "deleted", "count": len(payload.LibraryItemIDs) - len(failed), "failed": failed})
+		default:
+			respondError(w, http.StatusBadRequest, fmt.Errorf("unknown action %q", payload.Action))
+		}
 	})
 	r.Get("/api/subtitles/{libraryItemId}", func(w http.ResponseWriter, r *http.Request) {
 		if subtitleSvc == nil {

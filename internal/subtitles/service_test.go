@@ -61,6 +61,10 @@ func (r *repoStub) DeleteSubtitleFile(ctx context.Context, subtitleID int64) (da
 	return r.deletedGroup, nil
 }
 
+func (r *repoStub) ListSubtitleLibrary(ctx context.Context, filter database.SubtitleLibraryFilter) (database.SubtitleLibraryPage, error) {
+	return database.SubtitleLibraryPage{}, nil
+}
+
 type providerStub struct {
 	search   []ProviderCandidate
 	body     []byte

@@ -19,6 +19,7 @@ import type {
   DiscoverSearchResult,
   SubtitleFile,
   SubtitleCandidate,
+  SubtitleLibraryPage,
   BlocklistItem,
   BlocklistMutation,
   LibraryDetail,
@@ -204,6 +205,22 @@ export const api = {
   },
   deleteSubtitle: (subtitleID: number) =>
     request<{ status: string; subtitleFileId: number }>(`/api/subtitle-files/${subtitleID}`, { method: 'DELETE' }),
+  subtitleLibrary: (opts?: { page?: number; pageSize?: number; q?: string; mediaType?: string; missingOnly?: boolean }) => {
+    const p = new URLSearchParams();
+    if (opts?.page) p.set('page', String(opts.page));
+    if (opts?.pageSize) p.set('pageSize', String(opts.pageSize));
+    if (opts?.q) p.set('q', opts.q);
+    if (opts?.mediaType && opts.mediaType !== 'all') p.set('mediaType', opts.mediaType);
+    if (opts?.missingOnly) p.set('missingOnly', 'true');
+    const query = p.toString();
+    return request<SubtitleLibraryPage>(query ? `/api/subtitles?${query}` : '/api/subtitles');
+  },
+  bulkSubtitleAction: (action: 'search' | 'delete', libraryItemIds: number[], languages?: string[]) =>
+    request<{ queued?: boolean; status?: string; count: number }>('/api/subtitles/bulk', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, libraryItemIds, languages })
+    }),
   metrics: () => request<Record<string, number>>('/api/metrics'),
   listProfiles: () => request<{ profiles: QualityProfile[] }>('/api/profiles'),
   saveProfile: (p: QualityProfile) => request<QualityProfile>('/api/profiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) }),

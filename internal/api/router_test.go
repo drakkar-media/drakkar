@@ -458,6 +458,14 @@ func (s *subtitleStub) DeleteSubtitle(ctx context.Context, subtitleID int64) err
 	return nil
 }
 
+func (s *subtitleStub) DeleteAllForItem(ctx context.Context, libraryItemID int64) error {
+	return nil
+}
+
+func (s *subtitleStub) ListLibraryState(ctx context.Context, filter database.SubtitleLibraryFilter) (database.SubtitleLibraryPage, error) {
+	return database.SubtitleLibraryPage{}, nil
+}
+
 func TestCancelNZBEndpoint(t *testing.T) {
 	queueSvc := queue.NewService(queue.NewMemoryRepository(), nzb.NewImporter(t.TempDir(), 1024*1024))
 	item, err := queueSvc.ImportNZB(context.Background(), "dune.nzb", strings.NewReader(sampleNZB))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
 func (db *DB) ListSubtitleFiles(ctx context.Context, libraryItemID int64) ([]SubtitleFileSummary, error) {
@@ -223,6 +224,115 @@ func (db *DB) ReplaceSubtitleFiles(ctx context.Context, libraryItemID int64, pro
 		return err
 	}
 	return nil
+}
+
+// ListSubtitleLibrary returns a paged, filterable view of subtitle state
+// across every available library item (movies and individual TV episodes),
+// for the library-wide subtitle manager page.
+func (db *DB) ListSubtitleLibrary(ctx context.Context, filter SubtitleLibraryFilter) (SubtitleLibraryPage, error) {
+	page := filter.Page
+	if page < 1 {
+		page = 1
+	}
+	pageSize := filter.PageSize
+	if pageSize < 1 || pageSize > 200 {
+		pageSize = 50
+	}
+	search := strings.TrimSpace(filter.Search)
+	mediaType := strings.TrimSpace(filter.MediaType)
+
+	var total int
+	if err := db.SQL.QueryRowContext(ctx, `
+		select count(*)
+		from library_items li
+		left join episodes e on e.id = li.episode_id
+		left join tv_shows tv on tv.id = e.tv_show_id
+		left join lateral (
+			select array_agg(distinct language) as languages
+			from subtitle_files sf
+			where sf.library_item_id = li.id
+		) sf on true
+		where li.available
+		  and ($1 = '' or li.media_type = $1)
+		  and ($2 = '' or li.title ilike '%' || $2 || '%' or coalesce(tv.title, '') ilike '%' || $2 || '%')
+		  and (not $3 or coalesce(array_length(sf.languages, 1), 0) = 0)`,
+		mediaType, search, filter.MissingOnly,
+	).Scan(&total); err != nil {
+		return SubtitleLibraryPage{}, err
+	}
+
+	rows, err := db.SQL.QueryContext(ctx, `
+		select
+			li.id,
+			li.media_type,
+			li.title,
+			coalesce(tv.title, ''),
+			coalesce(e.season_number, 0),
+			coalesce(e.episode_number, 0),
+			li.available,
+			coalesce(sf.languages, array[]::text[]),
+			coalesce(sc.candidate_count, 0),
+			li.requested_at
+		from library_items li
+		left join episodes e on e.id = li.episode_id
+		left join tv_shows tv on tv.id = e.tv_show_id
+		left join lateral (
+			select array_agg(distinct language order by language) as languages
+			from subtitle_files sf
+			where sf.library_item_id = li.id
+		) sf on true
+		left join lateral (
+			select count(*) as candidate_count
+			from subtitle_candidates sc
+			where sc.library_item_id = li.id
+		) sc on true
+		where li.available
+		  and ($1 = '' or li.media_type = $1)
+		  and ($2 = '' or li.title ilike '%' || $2 || '%' or coalesce(tv.title, '') ilike '%' || $2 || '%')
+		  and (not $3 or coalesce(array_length(sf.languages, 1), 0) = 0)
+		order by li.media_type, coalesce(tv.title, li.title), e.season_number, e.episode_number, li.id
+		limit $4 offset $5`,
+		mediaType, search, filter.MissingOnly, pageSize, (page-1)*pageSize,
+	)
+	if err != nil {
+		return SubtitleLibraryPage{}, err
+	}
+	defer rows.Close()
+
+	var items []SubtitleLibraryRow
+	for rows.Next() {
+		var item SubtitleLibraryRow
+		if err := rows.Scan(
+			&item.LibraryItemID,
+			&item.MediaType,
+			&item.Title,
+			&item.ShowTitle,
+			&item.SeasonNumber,
+			&item.EpisodeNumber,
+			&item.Available,
+			pgTextArrayScan(&item.Languages),
+			&item.CandidateCount,
+			&item.RequestedAt,
+		); err != nil {
+			return SubtitleLibraryPage{}, err
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return SubtitleLibraryPage{}, err
+	}
+
+	totalPages := (total + pageSize - 1) / pageSize
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	return SubtitleLibraryPage{
+		Items:      items,
+		Page:       page,
+		PageSize:   pageSize,
+		Total:      total,
+		TotalPages: totalPages,
+	}, nil
 }
 
 func (db *DB) DeleteSubtitleFile(ctx context.Context, subtitleID int64) (SubtitleDeleteGroup, error) {

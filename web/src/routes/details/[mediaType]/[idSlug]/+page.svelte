@@ -34,6 +34,14 @@
   let loading = true;
   let working = false;
   let activeKey = '';
+
+  type EpisodeSubtitleState = {
+    loading: boolean;
+    files: SubtitleFile[];
+    candidates: SubtitleCandidate[];
+  };
+  let expandedEpisodeId: number | null = null;
+  let episodeSubtitles: Record<number, EpisodeSubtitleState> = {};
   // Guards against a slower earlier navigation's response landing after a
   // faster later one's and overwriting the newer page's data (e.g. quickly
   // clicking through several poster cards in a row).
@@ -285,6 +293,71 @@
     }
   }
 
+  async function deleteSubtitleFile(subtitleID: number) {
+    working = true;
+    try {
+      await api.deleteSubtitle(subtitleID);
+      toastSuccess('subtitle deleted');
+      await loadDetail();
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : String(error));
+    } finally {
+      working = false;
+    }
+  }
+
+  async function loadEpisodeSubtitles(epLibraryItemId: number) {
+    episodeSubtitles = { ...episodeSubtitles, [epLibraryItemId]: { loading: true, files: [], candidates: [] } };
+    try {
+      const [filesResult, candidatesResult] = await Promise.all([
+        api.subtitles(epLibraryItemId),
+        api.subtitleCandidates(epLibraryItemId)
+      ]);
+      episodeSubtitles = {
+        ...episodeSubtitles,
+        [epLibraryItemId]: { loading: false, files: filesResult.items ?? [], candidates: candidatesResult.items ?? [] }
+      };
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : String(error));
+      episodeSubtitles = { ...episodeSubtitles, [epLibraryItemId]: { loading: false, files: [], candidates: [] } };
+    }
+  }
+
+  function toggleEpisodeSubtitles(epLibraryItemId: number) {
+    if (expandedEpisodeId === epLibraryItemId) {
+      expandedEpisodeId = null;
+      return;
+    }
+    expandedEpisodeId = epLibraryItemId;
+    if (!episodeSubtitles[epLibraryItemId]) void loadEpisodeSubtitles(epLibraryItemId);
+  }
+
+  async function downloadEpisodeSubtitle(epLibraryItemId: number, candidateID: number) {
+    working = true;
+    try {
+      await api.downloadSubtitleCandidate(candidateID);
+      toastSuccess('subtitle downloaded');
+      await loadEpisodeSubtitles(epLibraryItemId);
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : String(error));
+    } finally {
+      working = false;
+    }
+  }
+
+  async function deleteEpisodeSubtitle(epLibraryItemId: number, subtitleID: number) {
+    working = true;
+    try {
+      await api.deleteSubtitle(subtitleID);
+      toastSuccess('subtitle deleted');
+      await loadEpisodeSubtitles(epLibraryItemId);
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : String(error));
+    } finally {
+      working = false;
+    }
+  }
+
   async function updateQualityProfile(nextValue: string) {
     if (!libraryMatch) return;
     const parsedProfileId = nextValue ? Number(nextValue) : null;
@@ -435,10 +508,10 @@
                             {#if episode.status === 'available'}
                               <button
                                 class="ep-sub-btn"
-                                title="Download subtitle for this episode"
+                                title="Manage subtitles for this episode"
                                 disabled={working}
-                                on:click={() => runSubtitleSearch(epId)}
-                              >🌐 Subs</button>
+                                on:click={() => toggleEpisodeSubtitles(epId)}
+                              ><Languages size={11} /> Subs</button>
                               <button
                                 class="ep-sub-btn ep-reset-btn"
                                 title="Reset this episode"
@@ -449,6 +522,53 @@
                           {/if}
                         </div>
                       </div>
+                      {#if episode.libraryItemId && expandedEpisodeId === episode.libraryItemId}
+                        {@const epId = episode.libraryItemId}
+                        {@const state = episodeSubtitles[epId]}
+                        <div class="episode-subs">
+                          {#if !state || state.loading}
+                            <div class="empty-side">Loading subtitles…</div>
+                          {:else}
+                            {#if state.files.length > 0}
+                              <div class="stack-list">
+                                {#each state.files as file}
+                                  <div class="stack-item">
+                                    <div>
+                                      <strong>{file.language.toUpperCase()}</strong>
+                                      <span>{file.provider}</span>
+                                    </div>
+                                    <Button kind="ghost" on:click={() => deleteEpisodeSubtitle(epId, file.id)} disabled={working}>
+                                      <Trash2 size={13} />
+                                    </Button>
+                                  </div>
+                                {/each}
+                              </div>
+                            {:else}
+                              <div class="empty-side">No published subtitles for this episode.</div>
+                            {/if}
+                            {#if state.candidates.length > 0}
+                              <div class="stack-list">
+                                {#each state.candidates.slice(0, 5) as candidate}
+                                  <div class="stack-item candidate">
+                                    <div>
+                                      <strong>{candidate.language.toUpperCase()} · {candidate.provider}</strong>
+                                      <span>{candidate.releaseName || candidate.title}</span>
+                                    </div>
+                                    <Button kind="secondary" on:click={() => downloadEpisodeSubtitle(epId, candidate.id)} disabled={working}>
+                                      <Languages size={13} />
+                                      Get
+                                    </Button>
+                                  </div>
+                                {/each}
+                              </div>
+                            {/if}
+                            <Button kind="secondary" on:click={() => runSubtitleSearch(epId).then(() => loadEpisodeSubtitles(epId))} disabled={working}>
+                              <Search size={13} />
+                              Search Subtitles
+                            </Button>
+                          {/if}
+                        </div>
+                      {/if}
                     {/each}
                   </div>
                 </details>
@@ -569,7 +689,10 @@
 
         {#if libraryMatch}
           <section class="panel">
-            <h2>Subtitles</h2>
+            <div class="panel-head">
+              <h2>Subtitles</h2>
+              <a class="link-btn ghost" href="/subtitles">Manager</a>
+            </div>
             {#if subtitles.length > 0}
               <div class="stack-list">
                 {#each subtitles as subtitle}
@@ -578,18 +701,16 @@
                       <strong>{subtitle.language.toUpperCase()}</strong>
                       <span>{subtitle.provider}</span>
                     </div>
-                    <StatusPill tone="neutral">published</StatusPill>
+                    <Button kind="ghost" on:click={() => deleteSubtitleFile(subtitle.id)} disabled={working}>
+                      <Trash2 size={14} />
+                    </Button>
                   </div>
                 {/each}
               </div>
             {:else}
               <div class="empty-side">No published subtitles yet.</div>
             {/if}
-          </section>
-
-          {#if subtitleCandidates.length > 0}
-            <section class="panel">
-              <h2>Subtitle Candidates</h2>
+            {#if subtitleCandidates.length > 0}
               <div class="stack-list">
                 {#each subtitleCandidates.slice(0, 8) as candidate}
                   <div class="stack-item candidate">
@@ -604,8 +725,8 @@
                   </div>
                 {/each}
               </div>
-            </section>
-          {/if}
+            {/if}
+          </section>
 
           {#if grabHistory.length > 0}
             <section class="panel">
@@ -741,6 +862,17 @@
   }
   .link-btn.secondary {
     background: hsl(0 0% 100% / 0.05); color: hsl(var(--foreground));
+  }
+  .link-btn.ghost {
+    min-height: 28px; padding: 0 10px; font-size: 12px;
+    color: hsl(var(--muted-foreground)); border-color: transparent;
+  }
+  .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .panel-head h2 { margin: 0; }
+  .episode-subs {
+    padding: 10px 12px 12px 30px; margin: -4px 0 6px;
+    border-left: 2px solid hsl(0 0% 100% / 0.08);
+    display: grid; gap: 8px;
   }
   .grid { display: grid; grid-template-columns: minmax(0,1.7fr) minmax(300px,0.8fr); gap: 20px; align-items: start; }
   .main, .side { display: grid; gap: 18px; }

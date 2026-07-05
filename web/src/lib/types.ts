@@ -457,6 +457,27 @@ export type SubtitleCandidate = {
   createdAt: string;
 };
 
+export type SubtitleLibraryRow = {
+  libraryItemId: number;
+  mediaType: string;
+  title: string;
+  showTitle?: string;
+  seasonNumber?: number;
+  episodeNumber?: number;
+  available: boolean;
+  languages: string[];
+  candidateCount: number;
+  requestedAt: string;
+};
+
+export type SubtitleLibraryPage = {
+  items: SubtitleLibraryRow[];
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+};
+
 export type BlocklistItem = {
   id: number;
   key: string;

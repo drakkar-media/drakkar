@@ -400,6 +400,35 @@ type StoredNZBDocument struct {
 	XML               []byte
 }
 
+type SubtitleLibraryFilter struct {
+	MediaType   string
+	Search      string
+	MissingOnly bool
+	Page        int
+	PageSize    int
+}
+
+type SubtitleLibraryRow struct {
+	LibraryItemID  int64     `json:"libraryItemId"`
+	MediaType      string    `json:"mediaType"`
+	Title          string    `json:"title"`
+	ShowTitle      string    `json:"showTitle,omitempty"`
+	SeasonNumber   int       `json:"seasonNumber,omitempty"`
+	EpisodeNumber  int       `json:"episodeNumber,omitempty"`
+	Available      bool      `json:"available"`
+	Languages      []string  `json:"languages"`
+	CandidateCount int       `json:"candidateCount"`
+	RequestedAt    time.Time `json:"requestedAt"`
+}
+
+type SubtitleLibraryPage struct {
+	Items      []SubtitleLibraryRow `json:"items"`
+	Page       int                  `json:"page"`
+	PageSize   int                  `json:"pageSize"`
+	Total      int                  `json:"total"`
+	TotalPages int                  `json:"totalPages"`
+}
+
 type SubtitleDeleteGroup struct {
 	LibraryItemID int64
 	Provider      string

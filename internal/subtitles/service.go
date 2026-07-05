@@ -41,6 +41,7 @@ type Repository interface {
 	ReplaceSubtitleFiles(ctx context.Context, libraryItemID int64, provider, language string, paths []string) error
 	ReplaceSubtitleCandidates(ctx context.Context, libraryItemID int64, provider string, candidates []database.SubtitleCandidateRecord) error
 	DeleteSubtitleFile(ctx context.Context, subtitleID int64) (database.SubtitleDeleteGroup, error)
+	ListSubtitleLibrary(ctx context.Context, filter database.SubtitleLibraryFilter) (database.SubtitleLibraryPage, error)
 }
 
 type Provider interface {
@@ -238,6 +239,26 @@ func (s *Service) DeleteSubtitle(ctx context.Context, subtitleID int64) error {
 		}
 	}
 	return nil
+}
+
+// DeleteAllForItem removes every subtitle file (across all providers and
+// languages) for a single library item — used by the bulk-delete action on
+// the library-wide subtitle manager page.
+func (s *Service) DeleteAllForItem(ctx context.Context, libraryItemID int64) error {
+	files, err := s.repo.ListSubtitleFiles(ctx, libraryItemID)
+	if err != nil {
+		return err
+	}
+	for _, file := range files {
+		if err := s.DeleteSubtitle(ctx, file.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) ListLibraryState(ctx context.Context, filter database.SubtitleLibraryFilter) (database.SubtitleLibraryPage, error) {
+	return s.repo.ListSubtitleLibrary(ctx, filter)
 }
 
 func (s *Service) RepublishStoredSubtitles(ctx context.Context, libraryItemID int64) error {
