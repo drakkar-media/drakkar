@@ -265,6 +265,24 @@ func checkVFSContainerMagic(path string) error {
 	if !strings.Contains(path, "/content/") {
 		return nil
 	}
+	// Rclone's VFS cache for the content subtree can briefly lag right after
+	// a fresh publish (RefreshPath is fire-and-forget and non-fatal), making
+	// a just-published, perfectly good file read back as empty/EOF once. A
+	// couple of short retries absorbs that window without masking a genuine
+	// zero-byte/corrupt file, which will still fail every one of these.
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		if lastErr = readContainerHeader(path); lastErr == nil {
+			return nil
+		}
+	}
+	return lastErr
+}
+
+func readContainerHeader(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("open: %w", err)

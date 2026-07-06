@@ -100,6 +100,12 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 				return err
 			}
 			_ = p.rclone.RefreshPath(ctx, filepath.Dir(libraryPath))
+			// Also refresh the content directory the symlink points into —
+			// rclone's VFS caches that subtree independently of the library
+			// directory. Without this, a health check reading straight from
+			// the content path right after publish could see a stale/empty
+			// cached view and wrongly report the file as corrupt.
+			_ = p.rclone.RefreshPath(ctx, filepath.Dir(target))
 		}
 		libraryItemIDs[file.LibraryItemID] = struct{}{}
 	}
@@ -305,6 +311,12 @@ func (p *Publisher) fulfillSeasonPackEpisodes(ctx context.Context, selectedRelea
 			if symlinkErr := p.syml.Publish(libraryPath, target); symlinkErr == nil {
 				if upsertErr := p.repo.UpsertSymlinkPublication(ctx, m.LibraryItemID, virtualFileID, libraryPath, target); upsertErr == nil {
 					_ = p.rclone.RefreshPath(ctx, filepath.Dir(libraryPath))
+			// Also refresh the content directory the symlink points into —
+			// rclone's VFS caches that subtree independently of the library
+			// directory. Without this, a health check reading straight from
+			// the content path right after publish could see a stale/empty
+			// cached view and wrongly report the file as corrupt.
+			_ = p.rclone.RefreshPath(ctx, filepath.Dir(target))
 				}
 			}
 		}
