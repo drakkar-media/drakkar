@@ -797,6 +797,12 @@ func isPlayableMedia(name string, sizeBytes int64) bool {
 	}
 }
 
+// IsPlayableMediaFile is the exported form of isPlayableMedia for callers
+// outside this package (e.g. the pre-publish content validator).
+func IsPlayableMediaFile(name string, sizeBytes int64) bool {
+	return isPlayableMedia(name, sizeBytes)
+}
+
 // isSampleFilename returns true when the filename (without extension) is or
 // looks like a sample clip: exactly "sample", "sample-something",
 // "something-sample", etc. Mirrors the reSample logic in ranking.

@@ -466,6 +466,14 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		if item.SelectedRelease == nil {
 			return nil
 		}
+		if err := verifyContentBeforePublish(ctx, db, rt, *item.SelectedRelease, logger); err != nil {
+			logger.Warn().
+				Err(err).
+				Int64("selectedReleaseId", *item.SelectedRelease).
+				Int64("libraryItemId", item.LibraryItemID).
+				Msg("pre-publish validation failed — rejecting release and searching for next candidate")
+			return workflowSvc.FailAndBlocklistRelease(ctx, *item.SelectedRelease, "pre-publish validation: "+err.Error())
+		}
 		if err := publicationSvc.PublishSelectedRelease(ctx, *item.SelectedRelease); err != nil {
 			return err
 		}
