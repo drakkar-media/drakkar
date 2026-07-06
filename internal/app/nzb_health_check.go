@@ -73,6 +73,9 @@ func isTransientHealthCheckErr(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return true
 	}
+	if errors.Is(err, errContainerHeaderUnreadable) {
+		return true
+	}
 	msg := err.Error()
 	return strings.Contains(msg, "status 430") || strings.Contains(msg, "i/o timeout")
 }
@@ -88,9 +91,18 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 	logger.Info().Int("count", len(candidates)).Bool("force", force).Msg("health check: scanning deep-check candidates")
 	resetSeen := make(map[int64]struct{})
 	repairedSeen := make(map[int64]struct{})
-	for _, c := range candidates {
+	for i, c := range candidates {
 		if ctx.Err() != nil {
 			break
+		}
+		if i > 0 {
+			// Pace deep checks so a large batch (e.g. a manually-triggered
+			// full-library sweep) can't fire enough concurrent NNTP requests
+			// to trip the provider's rate limiting — that throttling showed
+			// up as generic FUSE read EOFs, not recognizable NNTP errors,
+			// and caused a wave of false "corrupt content" verdicts across
+			// completely unrelated releases within the same few seconds.
+			time.Sleep(500 * time.Millisecond)
 		}
 		result.ScannedRows++
 		// symlinkOK only proves the symlink resolves into the VFS content
@@ -164,6 +176,19 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 			// segment is already cached from StrictCheckFirstSegments.
 			if magicErr := checkVFSContainerMagic(c.TargetPath); magicErr != nil {
 				err = fmt.Errorf("invalid video container: %w", magicErr)
+				if isTransientHealthCheckErr(err) {
+					// Couldn't even get the header bytes (open/read failure) —
+					// inconclusive, not proof of corruption. A batch of these
+					// hitting simultaneously across unrelated titles is the
+					// signature of NNTP provider throttling from the health
+					// check's own request volume, not simultaneous corruption.
+					logger.Warn().
+						Int64("libraryItemId", c.LibraryItemID).
+						Str("title", c.Title).
+						Err(err).
+						Msg("health check: container header unreadable — skipping, will retry next pass")
+					continue
+				}
 			} else {
 				_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
 				continue
@@ -261,6 +286,14 @@ func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workfl
 // cause Plex to report "Video: none / Audio: none".
 // Non-VFS paths (no "/content/" segment) are skipped — they don't go through
 // the NNTP stack and are always valid.
+// errContainerHeaderUnreadable means the header bytes themselves could not be
+// obtained (open/read failure) — this is inconclusive about the file's
+// actual content and can be caused by NNTP provider throttling or a
+// momentarily stale VFS cache entry, not just genuine corruption. Callers
+// should treat it like a transient error (retry next pass) rather than
+// blocklisting a release on the strength of it alone.
+var errContainerHeaderUnreadable = errors.New("container header unreadable")
+
 func checkVFSContainerMagic(path string) error {
 	if !strings.Contains(path, "/content/") {
 		return nil
@@ -285,7 +318,7 @@ func checkVFSContainerMagic(path string) error {
 func readContainerHeader(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("open: %w", err)
+		return fmt.Errorf("%w: open: %v", errContainerHeaderUnreadable, err)
 	}
 	defer f.Close()
 	// 30-second deadline so a hung FUSE read doesn't block the health check.
@@ -293,7 +326,7 @@ func readContainerHeader(path string) error {
 	buf := make([]byte, 12)
 	n, err := io.ReadAtLeast(f, buf, 4)
 	if err != nil {
-		return fmt.Errorf("read header: %w", err)
+		return fmt.Errorf("%w: read header: %v", errContainerHeaderUnreadable, err)
 	}
 	return validateVideoContainerHeader(buf[:n])
 }
