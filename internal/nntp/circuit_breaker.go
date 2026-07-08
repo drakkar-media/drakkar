@@ -13,23 +13,32 @@ import (
 // article/content is actually missing or corrupt.
 var ErrProviderCircuitOpen = errors.New("provider circuit open — recent throttling, cooling down")
 
-// breakerTripThreshold/breakerBaseCooldown/breakerMaxCooldown mirror nzbdav's
-// ProviderCircuitBreaker (Clients/Usenet/Connections/ProviderCircuitBreaker.cs):
-// trip after 3 consecutive throttle-like failures, cool down starting at 60s
-// and doubling on each further trip up to a 5-minute cap, full reset on the
-// next success. This exists specifically so that when a provider starts
-// returning "status 430" under load, Drakkar backs off that provider instead
-// of continuing to hammer it at full concurrency — which is what turns a
-// brief throttle blip into a sustained storm that makes every verification
-// read inconclusive.
+// breakerTripThreshold/breakerBaseCooldown/breakerMaxCooldown started out as
+// a direct port of nzbdav's ProviderCircuitBreaker (trip after 3, cool down
+// 60s doubling to a 5-minute cap). Live traffic showed that model doesn't
+// fit Drakkar: with many concurrent calibration/verification goroutines
+// sharing one provider, a single sub-second hiccup produces dozens of
+// "failures" almost simultaneously (observed: 87 in one second), blowing
+// past a threshold of 3 instantly and then locking every caller out for a
+// full minute+ even though the same logs showed the provider serving 40-80
+// successful requests within the following few seconds. The provider's real
+// failure pattern is brief multi-second blips, not sustained outages, so the
+// threshold must be high enough to absorb a concurrency burst and the
+// cooldown short enough to match how fast it actually recovers.
+// failureWindow bounds what counts as "consecutive" — a failure more than
+// this long after the previous one starts a fresh streak instead of
+// extending an old one, so failures that trickle in slowly over minutes
+// don't get misread as one continuous outage.
 const (
-	breakerTripThreshold = 3
-	breakerBaseCooldown  = 60 * time.Second
-	breakerMaxCooldown   = 5 * time.Minute
+	breakerTripThreshold = 15
+	breakerBaseCooldown  = 3 * time.Second
+	breakerMaxCooldown   = 30 * time.Second
+	failureWindow        = 2 * time.Second
 )
 
 type breakerState struct {
 	consecutiveFailures int
+	lastFailureAt       time.Time
 	disabledUntil       time.Time
 	cooldown            time.Duration
 }
@@ -73,16 +82,23 @@ func (b *providerCircuitBreaker) RecordFailure(name string, err error) {
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	now := time.Now()
 	st := b.state[name]
 	if st == nil {
 		st = &breakerState{cooldown: breakerBaseCooldown}
 		b.state[name] = st
 	}
+	if !st.lastFailureAt.IsZero() && now.Sub(st.lastFailureAt) > failureWindow {
+		// Gap since the last failure was long enough that this isn't a
+		// continuation of the same burst — start counting fresh.
+		st.consecutiveFailures = 0
+	}
+	st.lastFailureAt = now
 	st.consecutiveFailures++
 	if st.consecutiveFailures < breakerTripThreshold {
 		return
 	}
-	st.disabledUntil = time.Now().Add(st.cooldown)
+	st.disabledUntil = now.Add(st.cooldown)
 	if st.cooldown < breakerMaxCooldown {
 		st.cooldown *= 2
 		if st.cooldown > breakerMaxCooldown {

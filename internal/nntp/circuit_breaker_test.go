@@ -84,6 +84,30 @@ func TestProviderCircuitBreakerCooldownDoublesAndCaps(t *testing.T) {
 	}
 }
 
+// TestProviderCircuitBreakerDoesNotAccumulateStaleFailures guards against the
+// regression found on live traffic: with many concurrent goroutines sharing
+// one provider, a single sub-second hiccup can produce dozens of failures at
+// once, and separately, occasional failures trickling in slowly over a long
+// period must not be misread as one continuous outage. Only a failure within
+// failureWindow of the last one should extend the streak.
+func TestProviderCircuitBreakerDoesNotAccumulateStaleFailures(t *testing.T) {
+	b := newProviderCircuitBreaker()
+	throttle := errors.New("unexpected BODY status 430")
+	for i := 0; i < breakerTripThreshold-1; i++ {
+		b.RecordFailure("p1", throttle)
+	}
+	if !b.Allow("p1") {
+		t.Fatal("breaker should not have tripped yet")
+	}
+	// Simulate a long gap since the last failure — old failures should no
+	// longer count toward the threshold.
+	b.state["p1"].lastFailureAt = time.Now().Add(-2 * failureWindow)
+	b.RecordFailure("p1", throttle)
+	if !b.Allow("p1") {
+		t.Fatal("a failure after a long gap should restart the streak, not complete it")
+	}
+}
+
 func TestProviderCircuitBreakerUnknownProviderIsAllowed(t *testing.T) {
 	b := newProviderCircuitBreaker()
 	if !b.Allow("never-seen") {
