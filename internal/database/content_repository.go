@@ -4,8 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -478,18 +476,25 @@ func (db *DB) loadStoredRarSpans(ctx context.Context, virtualFileID int64) ([]st
 	}
 
 	spans := buildStoredRarSpans(sources, ranges)
-	if spanFileSize(spans) == virtualFileSize {
+	size := spanFileSize(spans)
+	if size == virtualFileSize {
 		return spans, nil
 	}
-	fmt.Fprintf(os.Stderr, "DEBUG loadStoredRarSpans mismatch: vfID=%d spanSize=%d expectedSize=%d numRanges=%d numSources=%d numSpans=%d\n",
-		virtualFileID, spanFileSize(spans), virtualFileSize, len(ranges), len(sources), len(spans))
-	// DB-stored archive_ranges didn't produce a size match — the reconstructed
-	// spans have a gap (e.g. a volume that failed to map to its NZB source),
-	// so serving them would silently break reads at the gap. Return nil so the
-	// caller falls back to message-ID-based span computation. NNTP-based
-	// continuation-offset detection is intentionally not done here — it makes
-	// network requests that would block every VFS cache miss during a Plex
-	// library scan. That detection belongs in archive inspection at import time.
+	if size > virtualFileSize {
+		// Overshoot: archive_ranges mapped more bytes than the entry's actual
+		// unpacked size (e.g. a header-parsed packed size that included a few
+		// bytes of RAR container overhead per volume). The leading bytes are
+		// still correctly positioned, so trim the tail back to the true
+		// boundary instead of discarding an otherwise-valid reconstruction.
+		return truncateSpans(spans, virtualFileSize), nil
+	}
+	// Undershoot: the reconstructed spans have a gap (e.g. a volume that
+	// failed to map to its NZB source), so serving them would silently break
+	// reads at the gap. Return nil so the caller falls back to
+	// message-ID-based span computation. NNTP-based continuation-offset
+	// detection is intentionally not done here — it makes network requests
+	// that would block every VFS cache miss during a Plex library scan. That
+	// detection belongs in archive inspection at import time.
 	return nil, nil
 }
 
@@ -541,4 +546,20 @@ func spanFileSize(spans []stream.SegmentSpan) int64 {
 		}
 	}
 	return end
+}
+
+// truncateSpans drops or clips spans so the total coverage is exactly size.
+// spans must be sorted by Start (buildStoredRarSpans already sorts them).
+func truncateSpans(spans []stream.SegmentSpan, size int64) []stream.SegmentSpan {
+	out := make([]stream.SegmentSpan, 0, len(spans))
+	for _, span := range spans {
+		if span.Start >= size {
+			break
+		}
+		if span.End > size {
+			span.End = size
+		}
+		out = append(out, span)
+	}
+	return out
 }

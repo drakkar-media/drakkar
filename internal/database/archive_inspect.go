@@ -121,7 +121,14 @@ func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName
 	if len(archive.Volumes) > 1 {
 		for i := range entries {
 			e := &entries[i]
-			if e.CompressionMethod == "m0" && e.SizeBytes > e.PackedSizeBytes {
+			// Store method (m0) means packed and unpacked are the same bytes —
+			// assignArchiveRanges below walks PackedSizeBytes to build ranges,
+			// and virtual_files.size_bytes (the promised content length used
+			// everywhere downstream) is SizeBytes. When a header-parsed
+			// PackedSizeBytes disagrees with SizeBytes under store, trust
+			// SizeBytes so the walked ranges don't overshoot (or undershoot)
+			// the real content boundary and fail stored_rar layout validation.
+			if e.CompressionMethod == "m0" && e.SizeBytes != e.PackedSizeBytes {
 				e.PackedSizeBytes = e.SizeBytes
 			}
 		}
