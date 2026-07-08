@@ -477,6 +477,7 @@ func (db *DB) loadStoredRarSpans(ctx context.Context, virtualFileID int64) ([]st
 
 	spans := buildStoredRarSpans(sources, ranges)
 	size := spanFileSize(spans)
+	println("DEBUG loadStoredRarSpans vfID", virtualFileID, "spanSize", size, "expectedSize", virtualFileSize, "numRanges", len(ranges), "numSources", len(sources), "numSpans", len(spans))
 	if size == virtualFileSize {
 		return spans, nil
 	}

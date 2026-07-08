@@ -263,6 +263,9 @@ func (f *virtualFile) Read(p []byte) (int, error) {
 		p = p[:remaining]
 	}
 	n, err := f.vf.ReadAt(f.ctx, p, f.pos)
+	if err != nil && err != io.EOF {
+		fmt.Fprintf(os.Stderr, "DEBUG dav read error: name=%s pos=%d n=%d err=%v\n", f.fi.Name(), f.pos, n, err)
+	}
 	if n > 0 {
 		f.pos += int64(n)
 		f.hasRead = true
