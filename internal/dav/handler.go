@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"os"
@@ -264,7 +265,7 @@ func (f *virtualFile) Read(p []byte) (int, error) {
 	}
 	n, err := f.vf.ReadAt(f.ctx, p, f.pos)
 	if err != nil && err != io.EOF {
-		println("DEBUG dav read error name=", f.fi.Name(), "pos=", f.pos, "n=", n, "err=", err.Error())
+		slog.Debug("dav read error", "name", f.fi.Name(), "pos", f.pos, "n", n, "err", err)
 	}
 	if n > 0 {
 		f.pos += int64(n)

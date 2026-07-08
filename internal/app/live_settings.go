@@ -9,6 +9,7 @@ import (
 	"github.com/hjongedijk/drakkar/internal/api"
 	"github.com/hjongedijk/drakkar/internal/config"
 	"github.com/hjongedijk/drakkar/internal/hydra"
+	"github.com/hjongedijk/drakkar/internal/observability"
 	"github.com/hjongedijk/drakkar/internal/workflow"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
@@ -301,6 +302,7 @@ func (c *liveSettingsController) ApplySettings(_ context.Context, cfg config.Set
 	if c == nil {
 		return nil
 	}
+	observability.SetGlobalLevel(observability.Level(cfg.Logging.Level))
 	if c.hydraClient != nil {
 		c.hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)
 	}

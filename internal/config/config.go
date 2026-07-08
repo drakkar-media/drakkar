@@ -48,6 +48,13 @@ type Settings struct {
 	Indexer       IndexerConfig       `json:"indexer"`
 	Notifications NotificationsConfig `json:"notifications"`
 	Rclone        RcloneConfig        `json:"rclone"`
+	Logging       LoggingConfig       `json:"logging"`
+}
+
+// LoggingConfig controls the runtime log verbosity, hot-reloadable without a
+// restart. Level accepts "trace", "debug", "info" (default), "warn", "error".
+type LoggingConfig struct {
+	Level string `json:"level"`
 }
 
 // RcloneConfig holds optional rclone remote control settings.
@@ -324,6 +331,9 @@ func applyDefaults(cfg *Settings) {
 	}
 	if len(cfg.Subtitles.Languages) == 0 {
 		cfg.Subtitles.Languages = []string{"en"}
+	}
+	if cfg.Logging.Level == "" {
+		cfg.Logging.Level = "info"
 	}
 }
 

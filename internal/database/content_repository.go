@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -500,14 +501,54 @@ func (db *DB) loadStoredRarSpans(ctx context.Context, virtualFileID int64) ([]st
 		// boundary instead of discarding an otherwise-valid reconstruction.
 		return truncateSpans(spans, virtualFileSize), nil
 	}
-	// Undershoot: the reconstructed spans have a gap (e.g. a volume that
-	// failed to map to its NZB source), so serving them would silently break
-	// reads at the gap. Return nil so the caller falls back to
-	// message-ID-based span computation. NNTP-based continuation-offset
-	// detection is intentionally not done here — it makes network requests
-	// that would block every VFS cache miss during a Plex library scan. That
-	// detection belongs in archive inspection at import time.
+	// Undershoot: archive_ranges only covers a prefix of the volumes (e.g. a
+	// header-parsed packed size far smaller than the real archive caused
+	// import-time range assignment to stop after the first volume or two,
+	// never reaching the rest). Reconstruct the missing volumes' ranges from
+	// the full volume list using the standard RAR continuation convention
+	// (each continuation volume's file data starts at its own offset 0)
+	// rather than falling back to a single-nzb_file computation that can
+	// never cover a multi-volume archive's true size.
+	volumes, err := db.loadStoredRarVolumes(ctx, selectedReleaseID)
+	if err != nil {
+		return nil, err
+	}
+	if reconstructed := reconstructStoredRarRanges(sources, volumes, startVolumePath, startArchiveOffset, nil, virtualFileSize); reconstructed != nil {
+		if rebuilt := buildStoredRarSpans(sources, reconstructed); spanFileSize(rebuilt) == virtualFileSize {
+			return rebuilt, nil
+		}
+	}
+	// Still no match — return nil so the caller falls back to message-ID-based
+	// span computation (correct only for single-volume direct_nzb-shaped
+	// entries, but no worse than what could be reconstructed here).
+	slog.Debug("loadStoredRarSpans: could not reconstruct a matching layout",
+		"virtualFileID", virtualFileID, "spanSize", size, "expectedSize", virtualFileSize,
+		"numRanges", len(ranges), "numSources", len(sources), "numVolumes", len(volumes))
 	return nil, nil
+}
+
+// loadStoredRarVolumes returns every RAR volume for a release, ordered by
+// volume_index, regardless of whether archive_ranges has a row for it yet.
+func (db *DB) loadStoredRarVolumes(ctx context.Context, selectedReleaseID int64) ([]storedRarVolumeMeta, error) {
+	rows, err := db.SQL.QueryContext(ctx, `
+		SELECT av.path, av.volume_index
+		FROM archive_volumes av
+		JOIN archives a ON a.id = av.archive_id
+		WHERE a.selected_release_id = $1
+		ORDER BY av.volume_index ASC`, selectedReleaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var volumes []storedRarVolumeMeta
+	for rows.Next() {
+		var v storedRarVolumeMeta
+		if err := rows.Scan(&v.Path, &v.VolumeIndex); err != nil {
+			return nil, err
+		}
+		volumes = append(volumes, v)
+	}
+	return volumes, rows.Err()
 }
 
 // InvalidateVFCacheForNZBFile clears all cached virtual-file entries so that

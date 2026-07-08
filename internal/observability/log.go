@@ -57,8 +57,21 @@ func NewWithFile(w io.Writer, level Level, logsDir string) zerolog.Logger {
 		}
 	}
 
+	zerolog.SetGlobalLevel(parseLevel(level))
+	// No .Level() call here: that would pin this logger (and everything
+	// derived from it via .With()) to a fixed level, making SetGlobalLevel
+	// below a no-op for it. Leaving it unset means the effective level
+	// always tracks the global level, so it can be changed at runtime
+	// (see SetGlobalLevel) without restarting the process.
 	logger := zerolog.New(out).With().Timestamp().Str("service", "drakkar").Logger()
-	return logger.Level(parseLevel(level))
+	return logger
+}
+
+// SetGlobalLevel changes the effective log verbosity for every logger
+// created via New/NewWithFile, without needing a restart. Invalid levels
+// fall back to info.
+func SetGlobalLevel(level Level) {
+	zerolog.SetGlobalLevel(parseLevel(level))
 }
 
 // Recover logs and swallows a panic in a long-lived background goroutine so
