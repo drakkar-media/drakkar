@@ -92,20 +92,32 @@ func buildStoredRarSpans(sources map[string]storedRarNZBSource, ranges []storedR
 	var (
 		out           []stream.SegmentSpan
 		nextSegmentID int64
+		cumulative    int64
 	)
 	for _, item := range ranges {
 		source, ok := sources[strings.ToLower(strings.TrimSpace(item.VolumePath))]
 		if !ok {
 			continue
 		}
+		// Place each volume's reconstructed spans by chaining on the actual
+		// length computeSpans derives from its segment data, not the stored
+		// item.EntryOffset. EntryOffset was persisted at import time from a
+		// separate RAR-header-based volume-capacity calculation that can
+		// drift from the true decoded byte count (e.g. it used the raw
+		// encoded volume size rather than the decoded content size), which
+		// otherwise leaves the placed spans with a gap or overlap at every
+		// volume boundary.
 		spans := computeSpans(source.MessageIDs, source.DecodedSegmentSize, source.LastDecodedSize, item.ArchiveOffset, item.LengthBytes)
+		volumeStart := cumulative
+		volumeLen := spanFileSize(spans)
 		for _, span := range spans {
-			span.Start += item.EntryOffset
-			span.End += item.EntryOffset
+			span.Start += volumeStart
+			span.End += volumeStart
 			span.SegmentID = nextSegmentID
 			nextSegmentID++
 			out = append(out, span)
 		}
+		cumulative = volumeStart + volumeLen
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Start != out[j].Start {
