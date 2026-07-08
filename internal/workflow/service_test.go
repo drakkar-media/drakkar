@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,6 +48,7 @@ type repoStub struct {
 	requeued        []int64
 	stored          database.StoredNZBDocument
 	restoredGroup   []int64
+	calibrateFn     func(context.Context, int64) error
 	movieMeta       struct {
 		libraryItemID int64
 		tmdbID        int64
@@ -402,7 +404,10 @@ func (r *repoStub) ListPublishedDirectNzbSegments(_ context.Context) ([]database
 func (r *repoStub) TouchQueueItemSearched(_ context.Context, _ int64) error {
 	return nil
 }
-func (r *repoStub) CalibrateNZBOffsets(_ context.Context, _ int64) error {
+func (r *repoStub) CalibrateNZBOffsets(ctx context.Context, id int64) error {
+	if r.calibrateFn != nil {
+		return r.calibrateFn(ctx, id)
+	}
 	return nil
 }
 
@@ -2442,4 +2447,83 @@ func (f *sequenceFetcher) Fetch(ctx context.Context, rawURL string) (string, []b
 		f.index++
 	}
 	return result.fileName, result.raw, result.err
+}
+
+func TestCalibrateImportedDocumentBestEffortAsyncDedupes(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	var calls atomic.Int32
+	repo := &repoStub{
+		calibrateFn: func(_ context.Context, id int64) error {
+			if id != 42 {
+				t.Errorf("unexpected nzb document id %d", id)
+			}
+			if calls.Add(1) == 1 {
+				select {
+				case started <- struct{}{}:
+				default:
+				}
+				<-release
+			}
+			return nil
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+
+	start := time.Now()
+	service.calibrateImportedDocumentBestEffort(42)
+	service.calibrateImportedDocumentBestEffort(42)
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("calibration scheduling blocked for %s", elapsed)
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("background calibration did not start")
+	}
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) && calls.Load() < 1 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected one in-flight calibration, got %d", got)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		service.calibrateImportedDocumentBestEffort(42)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("duplicate calibration schedule blocked while first run was in flight")
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected duplicate schedule to be deduped, got %d calls", got)
+	}
+
+	close(release)
+
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := service.calibrateInflight.Load(int64(42)); !ok {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, ok := service.calibrateInflight.Load(int64(42)); ok {
+		t.Fatal("calibration inflight marker was not cleared")
+	}
+
+	service.calibrateImportedDocumentBestEffort(42)
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && calls.Load() < 2 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("expected calibration to be schedulable again after completion, got %d calls", got)
+	}
 }

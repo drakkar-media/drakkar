@@ -170,11 +170,12 @@ type Service struct {
 
 	// searchInflight deduplicates concurrent SearchLibrary calls for the same
 	// library item ID (O-05). Keyed by int64 library item ID.
-	searchInflight  sync.Map
-	recentURLMu     sync.Mutex
-	recentURLHits   map[string]time.Time
-	searchAttemptMu sync.Mutex
-	searchAttempts  map[string]searchAttemptRecord
+	searchInflight    sync.Map
+	calibrateInflight sync.Map
+	recentURLMu       sync.Mutex
+	recentURLHits     map[string]time.Time
+	searchAttemptMu   sync.Mutex
+	searchAttempts    map[string]searchAttemptRecord
 
 	// TTL caches for policy data, guarded by profileCacheMu (O-04).
 	// These are loaded from the DB at most once per 5 minutes.
@@ -186,6 +187,10 @@ type Service struct {
 	indexerPolicyCacheAt time.Time
 	tierSizeCache        map[string]map[string][2]int
 	tierSizeCacheAt      map[string]time.Time
+
+	// calibrateSem bounds background NZB offset calibration so imports never
+	// wait on it and the DB still avoids an unbounded fan-out.
+	calibrateSem chan struct{}
 }
 
 type WorkQueueStatus struct {
@@ -274,6 +279,8 @@ const (
 	selectedResumeCooldown      = 5 * time.Minute
 	selectedURLCooldown         = 30 * time.Minute
 	searchRequestCooldown       = 20 * time.Minute
+	asyncCalibrateBudget        = 2 * time.Minute
+	asyncCalibrateWorkers       = 2
 )
 
 type searchAttemptRecord struct {
@@ -429,6 +436,7 @@ func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service 
 		importSem:      make(chan struct{}, 2), // kept for ImportNZBFromPush only
 		downloader:     newDownloadDispatcher(),
 		dispatchC:      make(chan struct{}, 1),
+		calibrateSem:   make(chan struct{}, asyncCalibrateWorkers),
 		recentURLHits:  make(map[string]time.Time),
 		searchAttempts: make(map[string]searchAttemptRecord),
 	}
@@ -539,6 +547,27 @@ func (s *Service) SetQueuePolicyProvider(provider QueuePolicyProvider) {
 
 func (s *Service) SetLogger(l zerolog.Logger) {
 	s.logger = l
+}
+
+func (s *Service) calibrateImportedDocumentBestEffort(nzbDocumentID int64) {
+	if s == nil || nzbDocumentID <= 0 {
+		return
+	}
+	if _, loaded := s.calibrateInflight.LoadOrStore(nzbDocumentID, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		defer s.calibrateInflight.Delete(nzbDocumentID)
+		if s.calibrateSem != nil {
+			s.calibrateSem <- struct{}{}
+			defer func() { <-s.calibrateSem }()
+		}
+		calCtx, cancel := context.WithTimeout(context.Background(), asyncCalibrateBudget)
+		defer cancel()
+		if calErr := s.repo.CalibrateNZBOffsets(calCtx, nzbDocumentID); calErr != nil {
+			s.logger.Warn().Err(calErr).Int64("nzbDocumentID", nzbDocumentID).Msg("calibrate: yEnc offset background repair failed")
+		}
+	}()
 }
 
 func (s *Service) ListRequests(ctx context.Context) ([]database.MediaRequestSummary, error) {
@@ -2100,9 +2129,7 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 		return result, nil, err
 	}
 	if item.NZBDocumentID != nil {
-		if calErr := s.repo.CalibrateNZBOffsets(ctx, *item.NZBDocumentID); calErr != nil {
-			s.logger.Warn().Err(calErr).Int64("nzbDocumentID", *item.NZBDocumentID).Msg("calibrate: yEnc offset prefetch failed")
-		}
+		s.calibrateImportedDocumentBestEffort(*item.NZBDocumentID)
 	}
 	if err := s.repo.SetImportedNZBIndexed(ctx, item.QueueItemID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2763,9 +2790,7 @@ func (s *Service) importSelectedRelease(ctx context.Context, current database.Re
 		return s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
 	}
 	if item.NZBDocumentID != nil {
-		if calErr := s.repo.CalibrateNZBOffsets(ctx, *item.NZBDocumentID); calErr != nil {
-			s.logger.Warn().Err(calErr).Int64("nzbDocumentID", *item.NZBDocumentID).Msg("calibrate: yEnc offset prefetch failed")
-		}
+		s.calibrateImportedDocumentBestEffort(*item.NZBDocumentID)
 	}
 	if err := s.repo.SetImportedNZBIndexed(ctx, item.QueueItemID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {

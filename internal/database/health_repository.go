@@ -245,12 +245,12 @@ func (db *DB) ListDeepHealthCandidates(ctx context.Context, limit int) ([]DeepHe
 		        WHERE nf.nzb_document_id = nd.id
 		          AND lower(nf.subject) LIKE '%.par2%'
 		    ) AS has_par2,
-		    sr.id AS selected_release_id
+		    vf.selected_release_id AS selected_release_id
 		FROM symlink_publications sp
+		JOIN virtual_files vf ON vf.id = sp.virtual_file_id
 		JOIN library_items li ON li.id = sp.library_item_id
 		JOIN queue_items qi ON qi.library_item_id = sp.library_item_id
-		JOIN selected_releases sr ON sr.id = qi.selected_release_id
-		JOIN nzb_documents nd ON nd.selected_release_id = sr.id
+		JOIN nzb_documents nd ON nd.selected_release_id = vf.selected_release_id
 		WHERE li.available = true
 		  AND qi.state IN ('available', 'degraded')
 		ORDER BY sp.library_item_id ASC, qi.id DESC`

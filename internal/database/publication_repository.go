@@ -373,7 +373,36 @@ func (db *DB) ListPendingRepublishTargets(ctx context.Context) ([]PendingRepubli
 		      select 1 from symlink_publications sp
 		      where sp.library_item_id = library_items.id
 		  )
+		union
+		-- Items marked available whose current selected release already has
+		-- virtual files, but none of the existing symlink publications point
+		-- at that current release anymore.
+		select li.id
+		from library_items li
+		join lateral (
+		    select qi.selected_release_id, qi.state
+		    from queue_items qi
+		    where qi.library_item_id = li.id
+		    order by qi.id desc
+		    limit 1
+		) q on true
+		where li.available = true
+		  and q.state in ($4, $5)
+		  and q.selected_release_id is not null
+		  and exists (
+		      select 1
+		      from virtual_files vf
+		      where vf.selected_release_id = q.selected_release_id
+		  )
+		  and not exists (
+		      select 1
+		      from symlink_publications sp
+		      join virtual_files vf on vf.id = sp.virtual_file_id
+		      where sp.library_item_id = li.id
+		        and vf.selected_release_id = q.selected_release_id
+		  )
 		order by library_item_id asc`, QueuePreflight, QueuePublishing, QueueIndexing,
+		QueueAvailable, QueueDegraded,
 	)
 	if err != nil {
 		return nil, err

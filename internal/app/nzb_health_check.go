@@ -155,7 +155,7 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 		if c.NZBDocumentID <= 0 {
 			continue
 		}
-		checkCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		checkCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 		err := db.StrictCheckFirstSegments(checkCtx, c.NZBDocumentID)
 		cancel()
 		if err != nil && isTransientHealthCheckErr(err) {
@@ -172,23 +172,23 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 		if err == nil {
 			// Also validate the video container magic bytes. Files named .mkv/.mp4
 			// that are actually stubs/extras produce "Video: none / Audio: none" in
-			// Plex. Reading 12 bytes from the VFS path is cheap — the first NNTP
-			// segment is already cached from StrictCheckFirstSegments.
-			if magicErr := checkVFSContainerMagic(c.TargetPath); magicErr != nil {
-				err = fmt.Errorf("invalid video container: %w", magicErr)
-				if isTransientHealthCheckErr(err) {
-					// Couldn't even get the header bytes (open/read failure) —
-					// inconclusive, not proof of corruption. A batch of these
-					// hitting simultaneously across unrelated titles is the
-					// signature of NNTP provider throttling from the health
-					// check's own request volume, not simultaneous corruption.
+			// Plex. For an already-published item we give the VFS header read a much
+			// longer retry window than the cheap single check above; if the header
+			// still never becomes readable after that, the file is not fit for
+			// playback and should be replaced by the next candidate.
+			magicCtx, magicCancel := context.WithTimeout(ctx, 45*time.Second)
+			magicErr := waitForReadableVideoContainer(magicCtx, c.TargetPath, 6, 5*time.Second)
+			magicCancel()
+			if magicErr != nil {
+				if isTransientHealthCheckErr(magicErr) {
 					logger.Warn().
 						Int64("libraryItemId", c.LibraryItemID).
 						Str("title", c.Title).
-						Err(err).
-						Msg("health check: container header unreadable — skipping, will retry next pass")
+						Err(magicErr).
+						Msg("health check: transient container-read error — skipping, will retry next pass")
 					continue
 				}
+				err = fmt.Errorf("invalid video container: %w", magicErr)
 			} else {
 				_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
 				continue
@@ -279,13 +279,6 @@ func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workfl
 	return result, nil
 }
 
-// checkVFSContainerMagic reads the first 12 bytes of a VFS-served file and
-// validates that they carry a recognised video container signature (MKV/WebM,
-// MP4/MOV, or AVI). Files with a .mkv/.mp4 extension that are actually stubs,
-// extras, or corrupt placeholders will have wrong or empty magic bytes and
-// cause Plex to report "Video: none / Audio: none".
-// Non-VFS paths (no "/content/" segment) are skipped — they don't go through
-// the NNTP stack and are always valid.
 // errContainerHeaderUnreadable means the header bytes themselves could not be
 // obtained (open/read failure) — this is inconclusive about the file's
 // actual content and can be caused by NNTP provider throttling or a
@@ -293,27 +286,6 @@ func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workfl
 // should treat it like a transient error (retry next pass) rather than
 // blocklisting a release on the strength of it alone.
 var errContainerHeaderUnreadable = errors.New("container header unreadable")
-
-func checkVFSContainerMagic(path string) error {
-	if !strings.Contains(path, "/content/") {
-		return nil
-	}
-	// Rclone's VFS cache for the content subtree can briefly lag right after
-	// a fresh publish (RefreshPath is fire-and-forget and non-fatal), making
-	// a just-published, perfectly good file read back as empty/EOF once. A
-	// couple of short retries absorbs that window without masking a genuine
-	// zero-byte/corrupt file, which will still fail every one of these.
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			time.Sleep(2 * time.Second)
-		}
-		if lastErr = readContainerHeader(path); lastErr == nil {
-			return nil
-		}
-	}
-	return lastErr
-}
 
 func readContainerHeader(path string) error {
 	f, err := os.Open(path)
