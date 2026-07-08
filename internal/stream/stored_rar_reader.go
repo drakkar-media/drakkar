@@ -142,13 +142,15 @@ func validateStoredRarSpans(spans []SegmentSpan, size int64) error {
 		return ErrStoredRarLayoutInvalid
 	}
 	expectedStart := int64(0)
-	for _, span := range spans {
+	for i, span := range spans {
 		if span.Start != expectedStart || span.End <= span.Start {
+			println("DEBUG validateStoredRarSpans break at index", i, "of", len(spans), "span.Start", span.Start, "span.End", span.End, "expectedStart", expectedStart, "size", size)
 			return ErrStoredRarLayoutInvalid
 		}
 		expectedStart = span.End
 	}
 	if expectedStart != size {
+		println("DEBUG validateStoredRarSpans final mismatch expectedStart", expectedStart, "size", size)
 		return ErrStoredRarLayoutInvalid
 	}
 	return nil
