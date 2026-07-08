@@ -40,6 +40,7 @@ type StatSource interface {
 type FallbackSource struct {
 	sources []NamedArticleSource
 	retries int
+	breaker *providerCircuitBreaker
 }
 
 func NewFallbackSource(sources []NamedArticleSource, retries int) *FallbackSource {
@@ -62,6 +63,7 @@ func NewFallbackSource(sources []NamedArticleSource, retries int) *FallbackSourc
 	return &FallbackSource{
 		sources: filtered,
 		retries: retries,
+		breaker: newProviderCircuitBreaker(),
 	}
 }
 
@@ -81,14 +83,21 @@ func (s *FallbackSource) BodyPriority(ctx context.Context, messageID string, pri
 			}
 		}
 		for _, source := range s.sources {
+			name := sourceName(source)
+			if !s.breaker.Allow(name) {
+				failures = append(failures, fmt.Errorf("%s attempt %d: %w", name, attempt+1, ErrProviderCircuitOpen))
+				continue
+			}
 			body, err := fetchArticleBody(ctx, source.Source, messageID, priority)
 			if err == nil {
+				s.breaker.RecordSuccess(name)
 				return body, nil
 			}
+			s.breaker.RecordFailure(name, err)
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			failures = append(failures, fmt.Errorf("%s attempt %d: %w", sourceName(source), attempt+1, err))
+			failures = append(failures, fmt.Errorf("%s attempt %d: %w", name, attempt+1, err))
 		}
 	}
 	return nil, errors.Join(failures...)
@@ -106,14 +115,21 @@ func (s *FallbackSource) Stat(ctx context.Context, messageID string) error {
 			}
 		}
 		for _, source := range s.sources {
+			name := sourceName(source)
+			if !s.breaker.Allow(name) {
+				failures = append(failures, fmt.Errorf("%s attempt %d: %w", name, attempt+1, ErrProviderCircuitOpen))
+				continue
+			}
 			err := fetchArticleStat(ctx, source.Source, messageID)
 			if err == nil {
+				s.breaker.RecordSuccess(name)
 				return nil
 			}
+			s.breaker.RecordFailure(name, err)
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			failures = append(failures, fmt.Errorf("%s attempt %d: %w", sourceName(source), attempt+1, err))
+			failures = append(failures, fmt.Errorf("%s attempt %d: %w", name, attempt+1, err))
 		}
 	}
 	return errors.Join(failures...)

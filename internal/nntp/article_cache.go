@@ -2,6 +2,7 @@ package nntp
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
@@ -126,6 +127,9 @@ func (e articleNotFoundError) Error() string {
 func classifyCacheableError(err error) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
+	}
+	if errors.Is(err, ErrProviderCircuitOpen) {
+		return throttleTTL, true
 	}
 	msg := err.Error()
 	switch {

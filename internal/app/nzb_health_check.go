@@ -77,7 +77,7 @@ func isTransientHealthCheckErr(err error) bool {
 		return true
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "status 430") || strings.Contains(msg, "i/o timeout")
+	return strings.Contains(msg, "status 430") || strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "provider circuit open")
 }
 
 func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, publicationSvc *library.Publisher, logger zerolog.Logger, limit int, force bool) (maintenance.Result, error) {
