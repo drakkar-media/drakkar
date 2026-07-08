@@ -479,12 +479,14 @@ func (db *DB) loadStoredRarSpans(ctx context.Context, virtualFileID int64) ([]st
 	if spanFileSize(spans) == virtualFileSize {
 		return spans, nil
 	}
-	// DB-stored archive_ranges didn't produce a size match; return nil so the
+	// DB-stored archive_ranges didn't produce a size match — the reconstructed
+	// spans have a gap (e.g. a volume that failed to map to its NZB source),
+	// so serving them would silently break reads at the gap. Return nil so the
 	// caller falls back to message-ID-based span computation. NNTP-based
 	// continuation-offset detection is intentionally not done here — it makes
 	// network requests that would block every VFS cache miss during a Plex
 	// library scan. That detection belongs in archive inspection at import time.
-	return spans, nil
+	return nil, nil
 }
 
 // InvalidateVFCacheForNZBFile clears all cached virtual-file entries so that
