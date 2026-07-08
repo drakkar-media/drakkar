@@ -512,27 +512,37 @@ func (db *DB) loadStoredRarSpans(ctx context.Context, virtualFileID int64) ([]st
 	if err != nil {
 		return nil, err
 	}
-	// Try the standard convention first (each continuation volume's file data
-	// starts at its own offset 0) — correct for simple single-file splits and
-	// free of network cost.
-	if reconstructed := reconstructStoredRarRanges(sources, volumes, startVolumePath, startArchiveOffset, nil, virtualFileSize); reconstructed != nil {
-		if rebuilt := buildStoredRarSpans(sources, reconstructed); spanFileSize(rebuilt) == virtualFileSize {
-			return rebuilt, nil
-		}
-	}
-	// That assumption doesn't always hold — a multi-entry season-pack RAR can
-	// have a non-zero per-volume header before EVERY continuation volume's
-	// data (observed: 181 bytes on every volume, not just the first). Getting
-	// this wrong doesn't fail loudly: the reconstruction still looks valid
-	// (contiguous, right total size) but reads misaligned garbage bytes. This
-	// fallback is already the rare, exceptional path (normal archive_ranges
-	// data didn't match), so the network cost of measuring the real offsets
-	// is justified here even though it's avoided on the hot path.
+	// Measure the real per-volume continuation offset via NNTP before falling
+	// back to assuming it's 0. A multi-entry season-pack RAR can have a
+	// non-zero per-volume header before EVERY continuation volume's data
+	// (observed: 181 bytes on every volume, not just the first) — and
+	// getting this wrong doesn't fail loudly: reconstructStoredRarRanges
+	// will happily consume MORE volumes to make up the shortfall from a
+	// wrong (too-small) offset assumption, so the total size still matches
+	// even though every byte read back is misaligned garbage. Matching
+	// virtualFileSize alone can never catch that, so the offset-0 guess
+	// below must not be tried first — it would "succeed" on the wrong data.
+	// This fallback is already the rare, exceptional path (normal
+	// archive_ranges data didn't match), so the network cost of measuring
+	// the real offsets is justified here even though it's avoided on the
+	// hot path.
 	if continuationOffsets := db.detectStoredRarContinuationOffsets(ctx, sources, volumes, startVolumePath); len(continuationOffsets) > 0 {
 		if reconstructed := reconstructStoredRarRanges(sources, volumes, startVolumePath, startArchiveOffset, continuationOffsets, virtualFileSize); reconstructed != nil {
 			if rebuilt := buildStoredRarSpans(sources, reconstructed); spanFileSize(rebuilt) == virtualFileSize {
+				slog.Debug("loadStoredRarSpans: reconstructed using measured continuation offsets",
+					"virtualFileID", virtualFileID, "numOffsetsDetected", len(continuationOffsets))
 				return rebuilt, nil
 			}
+		}
+	}
+	// No continuation headers detected (e.g. simple single-file split RAR
+	// where continuation volumes genuinely start at offset 0, or fetching
+	// failed) — try the standard convention.
+	if reconstructed := reconstructStoredRarRanges(sources, volumes, startVolumePath, startArchiveOffset, nil, virtualFileSize); reconstructed != nil {
+		if rebuilt := buildStoredRarSpans(sources, reconstructed); spanFileSize(rebuilt) == virtualFileSize {
+			slog.Debug("loadStoredRarSpans: reconstructed assuming offset-0 continuation volumes",
+				"virtualFileID", virtualFileID)
+			return rebuilt, nil
 		}
 	}
 	// Still no match — return nil so the caller falls back to message-ID-based
