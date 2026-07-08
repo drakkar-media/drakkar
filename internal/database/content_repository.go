@@ -489,7 +489,6 @@ func (db *DB) loadStoredRarSpans(ctx context.Context, virtualFileID int64) ([]st
 
 	spans := buildStoredRarSpans(sources, ranges)
 	size := spanFileSize(spans)
-	println("DEBUG loadStoredRarSpans vfID", virtualFileID, "spanSize", size, "expectedSize", virtualFileSize, "numRanges", len(ranges), "numSources", len(sources), "numSpans", len(spans))
 	if size == virtualFileSize {
 		return spans, nil
 	}
@@ -499,9 +498,7 @@ func (db *DB) loadStoredRarSpans(ctx context.Context, virtualFileID int64) ([]st
 		// bytes of RAR container overhead per volume). The leading bytes are
 		// still correctly positioned, so trim the tail back to the true
 		// boundary instead of discarding an otherwise-valid reconstruction.
-		trimmed := truncateSpans(spans, virtualFileSize)
-		println("DEBUG truncateSpans result vfID", virtualFileID, "trimmedSize", spanFileSize(trimmed), "trimmedLen", len(trimmed), "firstStart", trimmed[0].Start, "firstEnd", trimmed[0].End)
-		return trimmed, nil
+		return truncateSpans(spans, virtualFileSize), nil
 	}
 	// Undershoot: the reconstructed spans have a gap (e.g. a volume that
 	// failed to map to its NZB source), so serving them would silently break
