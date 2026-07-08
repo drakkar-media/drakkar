@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -479,6 +481,8 @@ func (db *DB) loadStoredRarSpans(ctx context.Context, virtualFileID int64) ([]st
 	if spanFileSize(spans) == virtualFileSize {
 		return spans, nil
 	}
+	fmt.Fprintf(os.Stderr, "DEBUG loadStoredRarSpans mismatch: vfID=%d spanSize=%d expectedSize=%d numRanges=%d numSources=%d numSpans=%d\n",
+		virtualFileID, spanFileSize(spans), virtualFileSize, len(ranges), len(sources), len(spans))
 	// DB-stored archive_ranges didn't produce a size match — the reconstructed
 	// spans have a gap (e.g. a volume that failed to map to its NZB source),
 	// so serving them would silently break reads at the gap. Return nil so the
