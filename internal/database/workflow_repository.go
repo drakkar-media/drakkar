@@ -1059,7 +1059,12 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 			candidate.SizeBytes,
 			nullTime(candidate.PostedAt),
 			candidate.Resolution,
-			candidate.Explanations,
+			func() []string {
+				if candidate.Explanations == nil {
+					return []string{}
+				}
+				return candidate.Explanations
+			}(),
 			func() []string {
 				if candidate.CompatibilityWarnings == nil {
 					return []string{}
