@@ -34,7 +34,12 @@ func (h *ZerologSlogHandler) Enabled(_ context.Context, level slog.Level) bool {
 	default:
 		zl = zerolog.DebugLevel
 	}
-	return h.logger.GetLevel() <= zl
+	// Check the live global level, not h.logger.GetLevel(): New/NewWithFile
+	// deliberately never calls .Level() on the base logger (so
+	// SetGlobalLevel can change verbosity at runtime — see log.go), which
+	// leaves GetLevel() stuck at zerolog's static per-logger default and
+	// blind to any later SetGlobalLevel call.
+	return zerolog.GlobalLevel() <= zl
 }
 
 func (h *ZerologSlogHandler) Handle(_ context.Context, r slog.Record) error {
