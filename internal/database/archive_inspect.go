@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -204,6 +205,7 @@ func inspectRARWithRetries(ctx context.Context, file ImportedNZBFile, fetcher st
 			return nil, normalizeArchiveFetchError(err)
 		}
 		entries, err := inspectRARPrefix(prefix)
+		slog.Debug("archive inspect: header prefix attempt", "file", file.FileName, "limit", limit, "err", err)
 		if err == nil || !shouldRetryRARInspect(err) || limit == available {
 			return entries, err
 		}

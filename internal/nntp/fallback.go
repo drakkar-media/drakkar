@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -89,6 +90,7 @@ func (s *FallbackSource) BodyPriority(ctx context.Context, messageID string, pri
 				continue
 			}
 			body, err := fetchArticleBody(ctx, source.Source, messageID, priority)
+			slog.Debug("fallback: article fetch attempt", "provider", name, "messageID", messageID, "attempt", attempt+1, "ok", err == nil)
 			if err == nil {
 				s.breaker.RecordSuccess(name)
 				return body, nil

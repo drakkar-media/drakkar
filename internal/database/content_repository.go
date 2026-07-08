@@ -98,6 +98,7 @@ func buildStoredRarSpans(sources map[string]storedRarNZBSource, ranges []storedR
 	for _, item := range ranges {
 		source, ok := sources[strings.ToLower(strings.TrimSpace(item.VolumePath))]
 		if !ok {
+			slog.Debug("stored_rar spans: volume source not found, skipping range", "volumePath", item.VolumePath)
 			continue
 		}
 		// Place each volume's reconstructed spans by chaining on the actual
@@ -505,17 +506,33 @@ func (db *DB) loadStoredRarSpans(ctx context.Context, virtualFileID int64) ([]st
 	// header-parsed packed size far smaller than the real archive caused
 	// import-time range assignment to stop after the first volume or two,
 	// never reaching the rest). Reconstruct the missing volumes' ranges from
-	// the full volume list using the standard RAR continuation convention
-	// (each continuation volume's file data starts at its own offset 0)
-	// rather than falling back to a single-nzb_file computation that can
-	// never cover a multi-volume archive's true size.
+	// the full volume list rather than falling back to a single-nzb_file
+	// computation that can never cover a multi-volume archive's true size.
 	volumes, err := db.loadStoredRarVolumes(ctx, selectedReleaseID)
 	if err != nil {
 		return nil, err
 	}
+	// Try the standard convention first (each continuation volume's file data
+	// starts at its own offset 0) — correct for simple single-file splits and
+	// free of network cost.
 	if reconstructed := reconstructStoredRarRanges(sources, volumes, startVolumePath, startArchiveOffset, nil, virtualFileSize); reconstructed != nil {
 		if rebuilt := buildStoredRarSpans(sources, reconstructed); spanFileSize(rebuilt) == virtualFileSize {
 			return rebuilt, nil
+		}
+	}
+	// That assumption doesn't always hold — a multi-entry season-pack RAR can
+	// have a non-zero per-volume header before EVERY continuation volume's
+	// data (observed: 181 bytes on every volume, not just the first). Getting
+	// this wrong doesn't fail loudly: the reconstruction still looks valid
+	// (contiguous, right total size) but reads misaligned garbage bytes. This
+	// fallback is already the rare, exceptional path (normal archive_ranges
+	// data didn't match), so the network cost of measuring the real offsets
+	// is justified here even though it's avoided on the hot path.
+	if continuationOffsets := db.detectStoredRarContinuationOffsets(ctx, sources, volumes, startVolumePath); len(continuationOffsets) > 0 {
+		if reconstructed := reconstructStoredRarRanges(sources, volumes, startVolumePath, startArchiveOffset, continuationOffsets, virtualFileSize); reconstructed != nil {
+			if rebuilt := buildStoredRarSpans(sources, reconstructed); spanFileSize(rebuilt) == virtualFileSize {
+				return rebuilt, nil
+			}
 		}
 	}
 	// Still no match — return nil so the caller falls back to message-ID-based

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"os"
@@ -2392,12 +2393,14 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 	candidates := make([]database.SearchCandidateRecord, 0, len(results))
 	for _, result := range results {
 		if result.Passworded {
+			slog.Debug("search candidate filtered", "title", result.Title, "reason", "passworded")
 			continue
 		}
 		// Minimum Age: skip releases posted too recently (Sonarr/Radarr behaviour).
 		if limits.MinimumAgeMinutes > 0 && !result.PublishedAt.IsZero() {
 			age := now.Sub(result.PublishedAt)
 			if age < time.Duration(limits.MinimumAgeMinutes)*time.Minute {
+				slog.Debug("search candidate filtered", "title", result.Title, "reason", "min_age", "ageMinutes", age.Minutes())
 				continue
 			}
 		}
@@ -2405,11 +2408,13 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 		if limits.RetentionDays > 0 && !result.PublishedAt.IsZero() {
 			cutoff := now.AddDate(0, 0, -limits.RetentionDays)
 			if result.PublishedAt.Before(cutoff) {
+				slog.Debug("search candidate filtered", "title", result.Title, "reason", "retention", "postedAt", result.PublishedAt)
 				continue
 			}
 		}
 		// Maximum Size: reject oversized releases.
 		if limits.MaximumSizeMB > 0 && result.SizeBytes > int64(limits.MaximumSizeMB)*1024*1024 {
+			slog.Debug("search candidate filtered", "title", result.Title, "reason", "max_size", "sizeBytes", result.SizeBytes)
 			continue
 		}
 		// Episode mismatch: reject candidates belonging to a different episode.
@@ -2441,6 +2446,8 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 			isRestartInterruption := strings.Contains(lr, "interrupted_by_restart") || strings.Contains(lr, "stale_worker")
 			isTemporaryQuota := strings.Contains(lr, "status 403")
 			if !isRestartInterruption && !isTemporaryQuota {
+				slog.Debug("search candidate durably rejected", "title", result.Title,
+					"failureCount", known.FailureCount, "lastFailureReason", known.LastFailureReason)
 				candidates = append(candidates, database.SearchCandidateRecord{
 					Title:             result.Title,
 					ExternalURL:       result.Link,

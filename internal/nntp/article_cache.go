@@ -3,6 +3,7 @@ package nntp
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -84,6 +85,7 @@ func (s *CachedFallbackSource) isMissing(messageID string) bool {
 }
 
 func (s *CachedFallbackSource) markMissing(messageID string, ttl time.Duration) {
+	slog.Debug("article cache: marking missing", "messageID", messageID, "ttl", ttl)
 	s.mu.Lock()
 	s.missing[messageID] = time.Now().Add(ttl)
 	s.mu.Unlock()

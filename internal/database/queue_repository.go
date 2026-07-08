@@ -812,7 +812,8 @@ func isSampleFilename(name string) bool {
 		strings.HasPrefix(base, "sample-") ||
 		strings.HasPrefix(base, "sample_") ||
 		strings.HasSuffix(base, "-sample") ||
-		strings.HasSuffix(base, "_sample")
+		strings.HasSuffix(base, "_sample") ||
+		strings.HasSuffix(base, ".sample")
 }
 
 func (db *DB) applyImportPolicies(ctx context.Context, imported ImportedNZB) ImportedNZB {

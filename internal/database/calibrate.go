@@ -126,6 +126,7 @@ func (db *DB) PreflightCheckFirstSegments(ctx context.Context, nzbDocumentID int
 				})
 				return
 			}
+			slog.Debug("preflight: segment reachable", "messageID", pair.first)
 			if pair.last != pair.first {
 				if err := checker.Exists(checkCtx, pair.last); err != nil {
 					errOnce.Do(func() {

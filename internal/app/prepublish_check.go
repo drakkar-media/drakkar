@@ -33,6 +33,8 @@ func verifyContentBeforePublish(ctx context.Context, db *database.DB, rt config.
 	}
 	for _, e := range entries {
 		if !database.IsPlayableMediaFile(e.FileName, e.SizeBytes) {
+			logger.Debug().Str("file", e.FileName).Int64("sizeBytes", e.SizeBytes).
+				Msg("pre-publish check: skipping non-playable file")
 			continue
 		}
 		target := filepath.Join(rt.FuseMountPath, "content", e.Path)
@@ -45,6 +47,8 @@ func verifyContentBeforePublish(ctx context.Context, db *database.DB, rt config.
 			if !errors.Is(err, errContainerHeaderUnreadable) {
 				return err
 			}
+		} else {
+			logger.Debug().Str("file", e.FileName).Msg("pre-publish check: container header valid")
 		}
 	}
 	return nil

@@ -146,10 +146,13 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 		if !strings.Contains(c.TargetPath, "/content/") {
 			// Not a VFS-backed symlink (e.g. completed-symlinks) — nothing to
 			// deep-validate; a resolving symlink is the whole health signal.
+			logger.Debug().Int64("libraryItemId", c.LibraryItemID).Str("targetPath", c.TargetPath).
+				Msg("health check: non-VFS symlink, skipping deep validation")
 			_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
 			continue
 		}
 		if !force && !shouldRunDeepHealthCheck(now, c) {
+			logger.Debug().Int64("libraryItemId", c.LibraryItemID).Msg("health check: skipping — not due yet")
 			continue
 		}
 		if c.NZBDocumentID <= 0 {
@@ -190,6 +193,8 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 				}
 				err = fmt.Errorf("invalid video container: %w", magicErr)
 			} else {
+				logger.Debug().Int64("libraryItemId", c.LibraryItemID).Str("title", c.Title).
+					Msg("health check: passed — segments and container valid")
 				_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
 				continue
 			}

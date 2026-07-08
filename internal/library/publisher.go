@@ -84,6 +84,9 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 			file.SeasonNumber > 0 && file.EpisodeNumber > 0 && len(files) > 1 {
 			fs, fe := database.ParseEpisodeFromFilename(file.FileName)
 			if fs > 0 && fe > 0 && (fs != file.SeasonNumber || fe != file.EpisodeNumber) {
+				slog.Debug("publish: skipping file — belongs to different episode",
+					"file", file.FileName, "expectedSeason", file.SeasonNumber, "expectedEpisode", file.EpisodeNumber,
+					"parsedSeason", fs, "parsedEpisode", fe)
 				libraryItemIDs[file.LibraryItemID] = struct{}{}
 				continue
 			}
@@ -99,6 +102,7 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 			if err := p.repo.UpsertSymlinkPublication(ctx, file.LibraryItemID, file.VirtualFileID, libraryPath, target); err != nil {
 				return err
 			}
+			slog.Debug("publish: symlink published", "libraryPath", libraryPath, "target", target, "virtualFileId", file.VirtualFileID)
 			_ = p.rclone.RefreshPath(ctx, filepath.Dir(libraryPath))
 			// Also refresh the content directory the symlink points into —
 			// rclone's VFS caches that subtree independently of the library

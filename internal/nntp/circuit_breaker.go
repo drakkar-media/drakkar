@@ -2,6 +2,7 @@ package nntp
 
 import (
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -63,13 +64,20 @@ func (b *providerCircuitBreaker) Allow(name string) bool {
 	if st == nil {
 		return true
 	}
-	return !time.Now().Before(st.disabledUntil)
+	allowed := !time.Now().Before(st.disabledUntil)
+	if !allowed {
+		slog.Debug("circuit breaker: request blocked", "provider", name, "disabledUntil", st.disabledUntil)
+	}
+	return allowed
 }
 
 // RecordSuccess fully resets the breaker for this provider.
 func (b *providerCircuitBreaker) RecordSuccess(name string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if _, had := b.state[name]; had {
+		slog.Debug("circuit breaker: reset on success", "provider", name)
+	}
 	delete(b.state, name)
 }
 
@@ -95,10 +103,13 @@ func (b *providerCircuitBreaker) RecordFailure(name string, err error) {
 	}
 	st.lastFailureAt = now
 	st.consecutiveFailures++
+	slog.Debug("circuit breaker: failure recorded", "provider", name,
+		"consecutiveFailures", st.consecutiveFailures, "threshold", breakerTripThreshold)
 	if st.consecutiveFailures < breakerTripThreshold {
 		return
 	}
 	st.disabledUntil = now.Add(st.cooldown)
+	slog.Debug("circuit breaker: tripped", "provider", name, "cooldown", st.cooldown, "disabledUntil", st.disabledUntil)
 	if st.cooldown < breakerMaxCooldown {
 		st.cooldown *= 2
 		if st.cooldown > breakerMaxCooldown {
