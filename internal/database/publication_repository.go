@@ -101,9 +101,13 @@ func (db *DB) UpsertSymlinkPublication(ctx context.Context, libraryItemID, virtu
 }
 
 func (db *DB) MarkReleaseAvailable(ctx context.Context, selectedReleaseID int64) error {
+	// Clear failure_reason too: without this, an item that failed on an
+	// earlier candidate and later succeeded on a different one keeps
+	// showing that old error on the frontend indefinitely, even though the
+	// item is fine — it just looks like something is still broken.
 	_, err := db.SQL.ExecContext(ctx, `
 		update queue_items
-		set state = $2, updated_at = now()
+		set state = $2, failure_reason = '', updated_at = now()
 		where selected_release_id = $1`, selectedReleaseID, QueueAvailable,
 	)
 	if err != nil {
