@@ -215,6 +215,12 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	if err != nil {
 		return err
 	}
+	// ApplySettings (which also does this) only runs on a live PUT
+	// /api/settings update, never on startup load — without this, every
+	// restart would silently reset back to the LevelInfo the initial logger
+	// was constructed with in main.go, ignoring whatever logging.level was
+	// already persisted in settings.json.
+	observability.SetGlobalLevel(observability.Level(cfg.Logging.Level))
 	if err := ensureRcloneConf(rt.SettingsPath); err != nil {
 		logger.Warn().Err(err).Msg("could not auto-create rclone.conf")
 	}
