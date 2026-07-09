@@ -1438,7 +1438,9 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 				}
 				if userAction == policy.QueueActionRemoveBlocklistAndSearch {
 					hydraCallCount++
-					if _, err := s.SearchLibrary(ctx, target.LibraryItemID); err == nil {
+					_, err := s.SearchLibrary(ctx, target.LibraryItemID)
+					_ = s.repo.TouchQueueItemSearched(ctx, target.LibraryItemID)
+					if err == nil {
 						result.Retried++
 					} else {
 						result.Failed++
@@ -1450,7 +1452,9 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 					continue
 				}
 				hydraCallCount++
-				if _, err := s.SearchLibrary(ctx, target.LibraryItemID); err == nil {
+				_, err := s.SearchLibrary(ctx, target.LibraryItemID)
+				_ = s.repo.TouchQueueItemSearched(ctx, target.LibraryItemID)
+				if err == nil {
 					result.Retried++
 				} else {
 					result.Failed++
@@ -1479,7 +1483,9 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, ttl); err != nil {
 				s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("bulk retry: blocklist failed")
 			}
-			if sr, err := s.SearchLibrary(ctx, target.LibraryItemID); err == nil && sr.SelectedReleaseID != nil {
+			sr, err := s.SearchLibrary(ctx, target.LibraryItemID)
+			_ = s.repo.TouchQueueItemSearched(ctx, target.LibraryItemID)
+			if err == nil && sr.SelectedReleaseID != nil {
 				result.Retried++
 			} else {
 				result.Failed++

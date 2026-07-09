@@ -827,7 +827,19 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]Fai
 		left join release_candidates rc on rc.id = sr.release_candidate_id
 		where li.available = false
 		  and (
-		    q.state = $1
+		    -- Failed items needing a fresh Hydra search (ActionSearchAgain /
+		    -- ActionBlocklistAndSearch) are throttled by the same 1h
+		    -- last_searched_at cooldown as the backlog scheduler — without this,
+		    -- a small set of permanently-unresolvable items (retention expired,
+		    -- quality profile too strict, etc.) gets re-searched every 10-minute
+		    -- housekeeping pass forever, burning the shared Hydra rate limit that
+		    -- genuinely-pending items are waiting on. Restart/stale-worker
+		    -- interruptions are cheap (no Hydra call) and stay immediate.
+		    (q.state = $1 and (
+		        q.failure_reason in ('interrupted_by_restart', 'stale_worker')
+		        or q.last_searched_at is null
+		        or q.last_searched_at < now() - interval '1 hour'
+		    ))
 		    or (q.state = $2 and q.selected_release_id is not null and q.updated_at < now() - interval '2 minutes')
 		  )
 		  -- Skip TV episodes that haven't aired yet; mirrors ListPendingLibrarySearchTargets.
