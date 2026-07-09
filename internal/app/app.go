@@ -177,7 +177,7 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 		{ID: taskArticleHealthCheck, Label: "Article Health Check", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskStorageMaintenance, Label: "Storage Maintenance", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskContentMaintenance, Label: "Content Maintenance", Group: "Indexing", Interval: "6h", Automated: true, LastRunState: "idle"},
-		{ID: taskBacklogSearch, Label: "Backlog Search", Group: "Indexing", Interval: "30m", Automated: true, LastRunState: "idle"},
+		{ID: taskBacklogSearch, Label: "Backlog Search", Group: "Indexing", Interval: "15m", Automated: true, LastRunState: "idle"},
 	}
 	for i := range defs {
 		if runAt, ok := lastRuns[defs[i].ID]; ok {
@@ -900,7 +900,14 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	})
 	startRecurringWithStartupDelay(taskStorageMaintenance, 6*time.Hour, 10*time.Minute, runStorageMaintenance)
 	startRecurringWithStartupDelay(taskContentMaintenance, 6*time.Hour, 20*time.Minute, runContentMaintenance)
-	startRecurring(taskBacklogSearch, 30*time.Minute, true, runBacklogSearch)
+	// A cycle only takes ~9 minutes at the safe per-call search pace (2s
+	// delay, ~260 deduped targets/cycle), so a 30-minute interval left ~20
+	// minutes idle per cycle. Halved to close most of that gap without
+	// removing it entirely — daily indexer API quotas are the actual
+	// constraint here, not this scheduling interval, and there's no
+	// visibility into where those caps are, so this is a deliberately
+	// moderate change rather than running cycles back-to-back.
+	startRecurring(taskBacklogSearch, 15*time.Minute, true, runBacklogSearch)
 
 	webdavServer := &http.Server{
 		Addr:              rt.WebDAVAddress,
