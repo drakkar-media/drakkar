@@ -566,7 +566,15 @@ func (s *Service) calibrateImportedDocumentBestEffort(nzbDocumentID int64) {
 		calCtx, cancel := context.WithTimeout(context.Background(), asyncCalibrateBudget)
 		defer cancel()
 		if calErr := s.repo.CalibrateNZBOffsets(calCtx, nzbDocumentID); calErr != nil {
-			s.logger.Warn().Err(calErr).Int64("nzbDocumentID", nzbDocumentID).Msg("calibrate: yEnc offset background repair failed")
+			if errors.Is(calErr, sql.ErrNoRows) {
+				// Benign race: the candidate this document belonged to was
+				// abandoned (blocklisted/reset) and its nzb_files cascade-deleted
+				// out from under this best-effort background calibration.
+				// Nothing to repair for a release nobody is using anymore.
+				s.logger.Debug().Int64("nzbDocumentID", nzbDocumentID).Msg("calibrate: document deleted before background repair finished (release abandoned) — skipping")
+			} else {
+				s.logger.Warn().Err(calErr).Int64("nzbDocumentID", nzbDocumentID).Msg("calibrate: yEnc offset background repair failed")
+			}
 		}
 	}()
 }
