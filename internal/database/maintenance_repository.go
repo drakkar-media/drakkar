@@ -94,6 +94,51 @@ func (db *DB) PruneStaleReleaseCandidates(ctx context.Context, olderThan time.Du
 	}
 }
 
+// PruneOrphanedSelectedReleases deletes selected_releases rows that no
+// queue_item points to anymore — leftover from a candidate that was
+// abandoned (moved on to search again) via a path that didn't call
+// FailSelectedReleaseAndPromoteNext/ResetLibraryItemState to clean up
+// properly (e.g. a crash mid-attempt). Each orphan's virtual_files/
+// archives/nzb_documents cascade-delete automatically via their FK to
+// selected_releases, so this is the single place that needs to run.
+// Excludes any selected_release still backing an active symlink_publication
+// (via its virtual_files), even if no queue_item currently points to it —
+// deleting that would break a working publish.
+func (db *DB) PruneOrphanedSelectedReleases(ctx context.Context, olderThan time.Duration) (int64, error) {
+	cutoff := time.Now().UTC().Add(-olderThan)
+	const batchSize = 2000
+	var total int64
+	for {
+		res, err := db.SQL.ExecContext(ctx, `
+			delete from selected_releases
+			where id in (
+				select sr.id
+				from selected_releases sr
+				where sr.created_at < $1
+				  and not exists (
+					select 1 from queue_items q where q.selected_release_id = sr.id
+				  )
+				  and not exists (
+					select 1 from virtual_files vf
+					join symlink_publications sp on sp.virtual_file_id = vf.id
+					where vf.selected_release_id = sr.id
+				  )
+				limit $2
+			)`, cutoff, batchSize)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n < batchSize {
+			return total, nil
+		}
+	}
+}
+
 func (db *DB) ListMaintenanceCursors(ctx context.Context) ([]MaintenanceCursorEntry, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select task_name, cursor, updated_at

@@ -802,6 +802,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		} else if result.DeletedRows > 0 {
 			logger.Info().Int("deletedRows", result.DeletedRows).Msg("monitoring: pruned stale release candidates")
 		}
+		if result, err := maintenanceSvc.PruneOrphanedSelectedReleases(ctx); err != nil {
+			logger.Error().Err(err).Msg("monitoring: orphaned selected-release prune error")
+		} else if result.DeletedRows > 0 {
+			logger.Info().Int("deletedRows", result.DeletedRows).Msg("monitoring: pruned orphaned selected releases")
+		}
 		if result, err := cacheSvc.Prune(ctx); err != nil {
 			logger.Error().Err(err).Msg("monitoring: cache prune error")
 		} else {

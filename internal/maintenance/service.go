@@ -15,11 +15,20 @@ type Repository interface {
 	DeleteSymlinkPublication(ctx context.Context, publicationID int64) error
 	TouchMaintenanceCursor(ctx context.Context, taskName string, cursor string) error
 	PruneStaleReleaseCandidates(ctx context.Context, olderThan time.Duration) (int64, error)
+	PruneOrphanedSelectedReleases(ctx context.Context, olderThan time.Duration) (int64, error)
 }
 
 // releaseCandidateRetention is how long an unselected, unreferenced
 // release_candidates row is kept before it's eligible for pruning.
 const releaseCandidateRetention = 14 * 24 * time.Hour
+
+// orphanedSelectedReleaseRetention is deliberately much shorter than
+// releaseCandidateRetention: an orphaned selected_releases row represents
+// actually-downloaded content (cascades to virtual_files/archives/
+// nzb_documents) sitting unused on disk/in the DB, not just search metadata.
+// 1 hour gives generous margin over the longest legitimate in-flight window
+// elsewhere in the codebase (the 90-minute download-stale timeout).
+const orphanedSelectedReleaseRetention = time.Hour
 
 type Service struct {
 	repo    Repository
@@ -97,6 +106,20 @@ func (s *Service) RemoveOrphanedCompletedSymlinks(ctx context.Context) (Result, 
 func (s *Service) PruneStaleReleaseCandidates(ctx context.Context) (Result, error) {
 	deleted, err := s.repo.PruneStaleReleaseCandidates(ctx, releaseCandidateRetention)
 	result := Result{TaskName: "stale-release-candidates", DeletedRows: int(deleted)}
+	if err != nil {
+		return result, err
+	}
+	return result, s.repo.TouchMaintenanceCursor(ctx, result.TaskName, time.Now().UTC().Format(time.RFC3339))
+}
+
+// PruneOrphanedSelectedReleases deletes selected_releases rows that no
+// queue_item points to anymore (candidates abandoned via a path that didn't
+// clean up properly), freeing the downloaded content and DB rows they
+// cascade to. Never touches a selected_release still backing an active
+// symlink_publication.
+func (s *Service) PruneOrphanedSelectedReleases(ctx context.Context) (Result, error) {
+	deleted, err := s.repo.PruneOrphanedSelectedReleases(ctx, orphanedSelectedReleaseRetention)
+	result := Result{TaskName: "orphaned-selected-releases", DeletedRows: int(deleted)}
 	if err != nil {
 		return result, err
 	}
