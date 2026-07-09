@@ -20,7 +20,7 @@ func TestProviderCircuitBreakerTripsOnlyOnThrottleLikeErrors(t *testing.T) {
 
 func TestProviderCircuitBreakerTripsAfterThresholdThrottleFailures(t *testing.T) {
 	b := newProviderCircuitBreaker()
-	throttle := errors.New("unexpected BODY status 430")
+	throttle := errors.New("i/o timeout")
 	for i := 0; i < breakerTripThreshold-1; i++ {
 		b.RecordFailure("p1", throttle)
 	}
@@ -35,7 +35,7 @@ func TestProviderCircuitBreakerTripsAfterThresholdThrottleFailures(t *testing.T)
 
 func TestProviderCircuitBreakerSuccessFullyResets(t *testing.T) {
 	b := newProviderCircuitBreaker()
-	throttle := errors.New("unexpected BODY status 430")
+	throttle := errors.New("i/o timeout")
 	for i := 0; i < breakerTripThreshold; i++ {
 		b.RecordFailure("p1", throttle)
 	}
@@ -58,7 +58,7 @@ func TestProviderCircuitBreakerSuccessFullyResets(t *testing.T) {
 
 func TestProviderCircuitBreakerCooldownDoublesAndCaps(t *testing.T) {
 	b := newProviderCircuitBreaker()
-	throttle := errors.New("unexpected BODY status 430")
+	throttle := errors.New("i/o timeout")
 
 	trip := func() *breakerState {
 		for i := 0; i < breakerTripThreshold; i++ {
@@ -92,7 +92,7 @@ func TestProviderCircuitBreakerCooldownDoublesAndCaps(t *testing.T) {
 // failureWindow of the last one should extend the streak.
 func TestProviderCircuitBreakerDoesNotAccumulateStaleFailures(t *testing.T) {
 	b := newProviderCircuitBreaker()
-	throttle := errors.New("unexpected BODY status 430")
+	throttle := errors.New("i/o timeout")
 	for i := 0; i < breakerTripThreshold-1; i++ {
 		b.RecordFailure("p1", throttle)
 	}
@@ -115,14 +115,21 @@ func TestProviderCircuitBreakerUnknownProviderIsAllowed(t *testing.T) {
 	}
 }
 
-func TestIsThrottleLikeErrRecognisesCircuitOpenAndStatus430(t *testing.T) {
+// TestIsThrottleLikeErrExcludesArticleMissing locks in that status 430/423
+// are NOT throttle-like: per RFC 3977 and Newshosting's own support docs,
+// both mean the specific article is confirmed gone, not a provider-health
+// signal. Only genuine connection/timing errors should trip the breaker.
+func TestIsThrottleLikeErrExcludesArticleMissing(t *testing.T) {
 	cases := []struct {
 		err  error
 		want bool
 	}{
 		{nil, false},
 		{errors.New("article not found"), false},
-		{errors.New("Newshosting attempt 1: unexpected BODY status 430"), true},
+		{errors.New("Newshosting attempt 1: unexpected BODY status 430"), false},
+		{errors.New("status 423"), false},
+		{errors.New("i/o timeout"), true},
+		{errors.New("connection reset"), true},
 		{ErrProviderCircuitOpen, true},
 		{fmt.Errorf("provider1 attempt 1: %w", ErrProviderCircuitOpen), true},
 	}

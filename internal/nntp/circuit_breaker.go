@@ -129,10 +129,19 @@ func (b *providerCircuitBreaker) RecordFailure(name string, err error) {
 
 // isThrottleLikeErr reports whether err looks like transient provider
 // throttling/rate-limiting/connection trouble rather than a permanent,
-// article-specific failure. Mirrors the "status 430" bucket in
-// classifyCacheableError (article_cache.go) — deliberately narrow, since
-// over-matching here would let genuinely-missing content quietly disable a
-// perfectly healthy provider.
+// article-specific failure.
+//
+// Status 430 (and 423) are deliberately NOT included here. Per RFC 3977 and
+// Newshosting's own support docs (support.newshosting.com), both codes mean
+// "no such article" — the specific article is gone (past retention or
+// removed, e.g. a takedown), a property of that article, not of the
+// provider's health. Earlier code treated 430 as ambiguous based on an
+// observed pattern of many failures followed by many successes within
+// seconds; in hindsight that's exactly what a mix of some-genuinely-missing,
+// some-genuinely-present articles looks like under concurrent checking, not
+// a provider recovering from a throttle. Counting it here would let a batch
+// of candidates that reference dead articles (unrelated to real provider
+// health) trip the breaker and block healthy requests too.
 func isThrottleLikeErr(err error) bool {
 	if err == nil {
 		return false
@@ -141,8 +150,7 @@ func isThrottleLikeErr(err error) bool {
 		return true
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "status 430") ||
-		strings.Contains(msg, "i/o timeout") ||
+	return strings.Contains(msg, "i/o timeout") ||
 		strings.Contains(msg, "deadline exceeded") ||
 		strings.Contains(msg, "connection reset") ||
 		strings.Contains(msg, "connection refused") ||

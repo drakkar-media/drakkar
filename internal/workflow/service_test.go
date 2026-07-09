@@ -1218,30 +1218,41 @@ func TestLargestFileFirstSegmentFallsBackWhenOnlySupportFilesExist(t *testing.T)
 	}
 }
 
+// Per RFC 3977 and Newshosting's own support docs, "article missing"/status
+// 430/423 mean the specific article is confirmed gone — that's the clearest
+// signal to reject this candidate and try the next one, not something to
+// shrug off as advisory. Only genuine connection/timing errors, where the
+// article's actual status is unknown, should be treated as advisory.
 func TestShouldIgnoreEarlyPreflightFailure(t *testing.T) {
-	if !shouldIgnoreEarlyPreflightFailure(errors.New("Newshosting attempt 1: article missing")) {
-		t.Fatal("expected article missing to be advisory-only for early preflight")
+	if shouldIgnoreEarlyPreflightFailure(errors.New("Newshosting attempt 1: article missing")) {
+		t.Fatal("article missing is a confirmed-gone signal, must not be advisory-only")
 	}
-	if !shouldIgnoreEarlyPreflightFailure(errors.New("article not found (cached): abc@host")) {
-		t.Fatal("expected cached article-not-found to be advisory-only for early preflight")
+	if shouldIgnoreEarlyPreflightFailure(errors.New("article not found (cached): abc@host")) {
+		t.Fatal("cached article-not-found is a confirmed-gone signal, must not be advisory-only")
 	}
 	if shouldIgnoreEarlyPreflightFailure(errors.New("yenc crc mismatch")) {
 		t.Fatal("crc mismatch should stay fatal for early preflight")
 	}
+	if !shouldIgnoreEarlyPreflightFailure(errors.New("i/o timeout")) {
+		t.Fatal("a genuine connection timeout is ambiguous and should be advisory-only")
+	}
 }
 
 func TestShouldIgnorePreflightFailure(t *testing.T) {
-	if !shouldIgnorePreflightFailure(errors.New("preflight: first segment unavailable: article not found (cached)")) {
-		t.Fatal("expected preflight article-not-found to be advisory-only")
+	if shouldIgnorePreflightFailure(errors.New("preflight: first segment unavailable: article not found (cached)")) {
+		t.Fatal("article-not-found is a confirmed-gone signal, must not be advisory-only")
 	}
-	if !shouldIgnorePreflightFailure(errors.New("preflight: first segment unavailable: Newshosting attempt 1: article missing")) {
-		t.Fatal("expected preflight article-missing to be advisory-only")
+	if shouldIgnorePreflightFailure(errors.New("preflight: first segment unavailable: Newshosting attempt 1: article missing")) {
+		t.Fatal("article-missing is a confirmed-gone signal, must not be advisory-only")
 	}
 	if shouldIgnorePreflightFailure(errors.New("strict health: first segment unavailable: yenc crc mismatch")) {
 		t.Fatal("strict health crc mismatch should stay fatal")
 	}
 	if shouldIgnorePreflightFailure(errors.New("preflight: first segment unavailable: yenc crc mismatch")) {
 		t.Fatal("preflight crc mismatch should stay fatal")
+	}
+	if !shouldIgnorePreflightFailure(errors.New("preflight: first segment unavailable: i/o timeout")) {
+		t.Fatal("a genuine connection timeout is ambiguous and should be advisory-only")
 	}
 }
 

@@ -2294,17 +2294,39 @@ func isEarlyProbeSupportFile(name string) bool {
 		strings.HasSuffix(stem, "_sample")
 }
 
+// shouldIgnoreEarlyPreflightFailure reports whether a preflight failure is
+// ambiguous enough to continue the import anyway rather than reject this
+// candidate outright. "Article missing"/status 430/423 are deliberately NOT
+// included: per RFC 3977 and Newshosting's own support docs, those mean the
+// specific article is confirmed gone (past retention or removed) — that's
+// the clearest possible signal to reject this candidate and try the next
+// one, not a reason to shrug and import anyway. An earlier version of this
+// function treated 430 as ambiguous under the (incorrect) assumption that
+// it could just be transient throttling; see isThrottleLikeErr in
+// internal/nntp/circuit_breaker.go for the full explanation of why that
+// assumption didn't hold up. Only genuine connection/timing issues, where
+// we can't actually tell whether the article is there, get a pass here.
 func shouldIgnoreEarlyPreflightFailure(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(strings.TrimSpace(err.Error()))
-	return strings.Contains(msg, "article missing") ||
+	if strings.Contains(msg, "article missing") ||
 		strings.Contains(msg, "article not found") ||
 		strings.Contains(msg, "status 430") ||
-		strings.Contains(msg, " 430")
+		strings.Contains(msg, "status 423") {
+		return false
+	}
+	return strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "provider circuit open")
 }
 
+// shouldIgnorePreflightFailure mirrors shouldIgnoreEarlyPreflightFailure for
+// the later preflight checkpoint (see that function's comment for why 430
+// is treated as definitive rather than ambiguous).
 func shouldIgnorePreflightFailure(err error) bool {
 	if err == nil {
 		return false
@@ -2313,10 +2335,17 @@ func shouldIgnorePreflightFailure(err error) bool {
 	if !strings.HasPrefix(msg, "preflight:") {
 		return false
 	}
-	return strings.Contains(msg, "article missing") ||
+	if strings.Contains(msg, "article missing") ||
 		strings.Contains(msg, "article not found") ||
 		strings.Contains(msg, "status 430") ||
-		strings.Contains(msg, " 430")
+		strings.Contains(msg, "status 423") {
+		return false
+	}
+	return strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "provider circuit open")
 }
 
 // dedupeSearchResults removes true duplicates — the same release reported more

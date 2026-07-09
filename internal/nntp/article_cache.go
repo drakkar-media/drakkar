@@ -121,11 +121,14 @@ func (e articleNotFoundError) Error() string {
 }
 
 // classifyCacheableError decides whether an error is worth short-circuiting
-// on repeat fetches, and for how long. Status 430 is NOT treated as a
-// definitive "article missing" signal — this provider (like others) also
-// returns 430 for a transient connection/transfer-limit throttle, and
-// conflating the two caused releases to be permanently blacklisted for a
-// throttle blip (fixed repeatedly on the queue/download path already).
+// on repeat fetches, and for how long. Status 430 (like 423) IS treated as a
+// definitive "article missing" signal: per RFC 3977 and Newshosting's own
+// support docs, both codes mean the specific article is gone (past
+// retention or removed) — a property of that article, not the provider.
+// An earlier version of this code treated 430 as ambiguous/transient based
+// on a misread pattern (see isThrottleLikeErr in circuit_breaker.go for the
+// full explanation); that caused genuinely-dead articles to be retried
+// instead of cached as missing.
 func classifyCacheableError(err error) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
@@ -135,9 +138,8 @@ func classifyCacheableError(err error) (time.Duration, bool) {
 	}
 	msg := err.Error()
 	switch {
-	case strings.Contains(msg, "status 430"):
-		return throttleTTL, true
-	case strings.Contains(msg, "status 423"), // no such group
+	case strings.Contains(msg, "status 430"), // no such article
+		strings.Contains(msg, "status 423"), // no such article/group
 		strings.Contains(msg, "article not found"):
 		return missingArticleTTL, true
 	default:

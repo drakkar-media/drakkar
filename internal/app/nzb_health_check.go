@@ -69,15 +69,30 @@ func shouldRunDeepHealthCheck(now time.Time, item database.DeepHealthCandidate) 
 // condition (timeout, cancellation, NNTP throttle) rather than genuine
 // content corruption/unavailability, so callers can avoid blocklisting a
 // perfectly good release over a provider hiccup.
+// isTransientHealthCheckErr reports whether err is a connection/timing issue
+// worth retrying, versus a definitive verdict on the content itself.
+//
+// Status 430 is NOT transient: per RFC 3977 and Newshosting's own support
+// docs, it means the specific article is gone (past retention or removed),
+// a property of that article, not of the provider's health — it should
+// blocklist like any other confirmed-bad content, not retry forever.
+// errContainerHeaderUnreadable is checked by its wrapped message text rather
+// than unconditionally, since it wraps whatever the underlying read error
+// was (including a genuine 430) and unconditionally calling it transient
+// meant a permanently-dead article behind a container-read failure would
+// never get blocklisted.
 func isTransientHealthCheckErr(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return true
 	}
+	msg := err.Error()
+	if strings.Contains(msg, "status 430") {
+		return false
+	}
 	if errors.Is(err, errContainerHeaderUnreadable) {
 		return true
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "status 430") || strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "provider circuit open")
+	return strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "provider circuit open")
 }
 
 func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, publicationSvc *library.Publisher, logger zerolog.Logger, limit int, force bool) (maintenance.Result, error) {
