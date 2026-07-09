@@ -22,6 +22,15 @@ type SegmentChecker interface {
 
 type segmentPair struct{ first, last string }
 
+// loadNZBFirstLastSegmentPairs returns a single representative pair — the
+// first segment of the first qualifying file and the last segment of the
+// last qualifying file — rather than one pair per file. Checking every
+// volume of a multi-part RAR (routinely 90+ files) meant up to 8 concurrent
+// NNTP checks per candidate, for every candidate a busy backlog cycle tried;
+// that's the burst that was tripping the provider circuit breaker. A Usenet
+// post propagates as a whole, so confirming its first and last piece are
+// both reachable is a reasonable reachability signal without walking every
+// file in between.
 func (db *DB) loadNZBFirstLastSegmentPairs(ctx context.Context, nzbDocumentID int64) ([]segmentPair, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT
@@ -30,12 +39,13 @@ func (db *DB) loadNZBFirstLastSegmentPairs(ctx context.Context, nzbDocumentID in
 		    nf.message_ids[array_length(nf.message_ids, 1)]
 		FROM nzb_files nf
 		WHERE nf.nzb_document_id = $1
-		  AND array_length(nf.message_ids, 1) > 0`, nzbDocumentID)
+		  AND array_length(nf.message_ids, 1) > 0
+		ORDER BY nf.id ASC`, nzbDocumentID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var pairs []segmentPair
+	var qualifying []segmentPair
 	for rows.Next() {
 		var subject string
 		var p segmentPair
@@ -45,9 +55,18 @@ func (db *DB) loadNZBFirstLastSegmentPairs(ctx context.Context, nzbDocumentID in
 		if !shouldValidateNZBSubject(subject) {
 			continue
 		}
-		pairs = append(pairs, p)
+		qualifying = append(qualifying, p)
 	}
-	return pairs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(qualifying) == 0 {
+		return nil, nil
+	}
+	return []segmentPair{{
+		first: qualifying[0].first,
+		last:  qualifying[len(qualifying)-1].last,
+	}}, nil
 }
 
 func shouldValidateNZBSubject(subject string) bool {

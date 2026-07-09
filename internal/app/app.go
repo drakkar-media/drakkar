@@ -337,15 +337,21 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)
 	workflowSvc := workflow.NewService(db, seerrClient, hydraClient)
 	// importWorkers = number of concurrent downloads, each with ~10 NNTP connections.
-	// 15 connections → 1 worker; 30 → 3 workers; capped at 4.
+	// Cap raised 4->8: the old cap of 4 meant a 100-connection plan only ever
+	// used 40 connections for imports (10/worker x 4) regardless of how much
+	// headroom was actually available — the connection increase couldn't help
+	// because this ceiling, not connection count, was the bottleneck. 8 still
+	// leaves real headroom under a 100-connection plan for concurrent
+	// streaming reads (see streamingPriorityPercent) rather than using
+	// everything for backlog imports.
 	importWorkers := 1
 	if maxDownloadConnections > 0 {
 		importWorkers = maxDownloadConnections / 10
 		if importWorkers < 1 {
 			importWorkers = 1
 		}
-		if importWorkers > 4 {
-			importWorkers = 4
+		if importWorkers > 8 {
+			importWorkers = 8
 		}
 		workflowSvc.SetImportConcurrency(importWorkers) // keeps importSem sized for ImportNZBFromPush
 	}
