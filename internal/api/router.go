@@ -1598,7 +1598,16 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 				slog.Error("cache prune background", "err", err)
 				return
 			}
-			publishMutation("cache.prune", map[string]any{"deletedFiles": result.DeletedFiles, "deletedBytes": result.DeletedBytes})
+			publishMutation("cache.prune", map[string]any{
+				"root":         result.Root,
+				"filesBefore":  result.FilesBefore,
+				"filesAfter":   result.FilesAfter,
+				"bytesBefore":  result.BytesBefore,
+				"bytesAfter":   result.BytesAfter,
+				"deletedFiles": result.DeletedFiles,
+				"deletedBytes": result.DeletedBytes,
+				"limitBytes":   result.LimitBytes,
+			})
 		}()
 		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
 	})

@@ -59,8 +59,13 @@
     errorMessage = '';
     infoMessage = '';
     try {
-      const result = await api.searchPendingLibrary();
-      infoMessage = `processed=${result.processed} searched=${result.searched} selected=${result.selected} failed=${result.failed}`;
+      // The backend responds immediately with {queued: true} and does the
+      // actual work in a background goroutine — the real processed/searched/
+      // selected/failed counts arrive later via a 'library.search_pending'
+      // event (handled in onMount below), not on this response. Reading
+      // those fields directly off this result was always undefined.
+      await api.searchPendingLibrary();
+      infoMessage = 'Search queued — processing in background…';
       toastSuccess(infoMessage);
       await loadRequests();
     } catch (error) {
@@ -99,7 +104,11 @@
 
   onMount(() => {
     void loadRequests();
-    const unsubscribe = subscribeEvents(() => {
+    const unsubscribe = subscribeEvents((event) => {
+      if (event?.kind === 'library.search_pending') {
+        const e = event as Record<string, unknown>;
+        toastSuccess(`Search Pending complete: processed ${e.processed}, searched ${e.searched}, selected ${e.selected}, failed ${e.failed}`);
+      }
       if (!working) {
         void loadRequests();
       }

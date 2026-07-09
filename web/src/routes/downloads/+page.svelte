@@ -171,9 +171,13 @@
   }
 
   async function processPending() {
+    // Backend responds immediately with {queued: true} and does the real
+    // work in a background goroutine — actual processed/selected counts
+    // arrive later via a 'library.search_pending' event (see onMount below),
+    // not on this response. Reading those fields here was always undefined.
     await runAction(() => api.searchPendingLibrary(), {
       setWorking: (v) => (working = v),
-      successMessage: (result) => `Processed ${result.processed}, selected ${result.selected}`,
+      successMessage: () => 'Search queued — processing in background…',
       afterSuccess: load
     });
   }
@@ -236,7 +240,11 @@
 
   onMount(() => {
     void load();
-    const unsub = subscribeEvents(() => {
+    const unsub = subscribeEvents((event) => {
+      if (event?.kind === 'library.search_pending') {
+        const e = event as Record<string, unknown>;
+        toastSuccess(`Search Pending complete: processed ${e.processed}, selected ${e.selected}`);
+      }
       if (!working) void refreshItems();
     });
     const timer = window.setInterval(() => {

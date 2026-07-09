@@ -47,7 +47,19 @@
     ? releaseCandidates.filter((c) => c.title.toLowerCase().includes(autoFilterText.trim().toLowerCase()))
     : releaseCandidates;
   let loading = true;
-  let working = false;
+  // Per-action busy tracking, keyed by what the action targets (e.g.
+  // `reset-42`, `ep-subtitle-download-7-13`). Replaces a single shared
+  // `working` boolean that used to gate every button on the page — with
+  // that flag, clicking "Search" on one episode disabled the "Get subtitle"
+  // button on a completely different episode (or the season/top-level
+  // actions) for the duration of the unrelated request.
+  let busy: Record<string, boolean> = {};
+  function isBusy(key: string): boolean {
+    return !!busy[key];
+  }
+  function setBusy(key: string, value: boolean) {
+    busy = { ...busy, [key]: value };
+  }
   let activeKey = '';
 
   type EpisodeSubtitleState = {
@@ -257,7 +269,7 @@
   }
 
   async function pickRelease(candidate: ReleaseItem, isRetry = false) {
-    working = true;
+    if (!isRetry) setBusy('pick-release', true);
     try {
       await api.selectRelease(candidate.releaseCandidateId);
       showReleasePicker = false;
@@ -285,7 +297,7 @@
       }
       toastError(message);
     } finally {
-      working = false;
+      if (!isRetry) setBusy('pick-release', false);
     }
   }
 
@@ -337,7 +349,8 @@
 
   async function resetItem(targetLibraryItemId: number, label: string) {
     if (!confirm(`Reset "${label}"?\n\nThis removes the symlink and re-queues the item from scratch.`)) return;
-    working = true;
+    const key = `reset-${targetLibraryItemId}`;
+    setBusy(key, true);
     try {
       await api.resetLibraryItem(targetLibraryItemId);
       await loadDetail();
@@ -345,13 +358,13 @@
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy(key, false);
     }
   }
 
   async function runRepublish() {
     if (!libraryMatch) return;
-    working = true;
+    setBusy('republish', true);
     try {
       await api.republishLibrary(libraryMatch.id);
       toastSuccess('republished library item');
@@ -359,27 +372,29 @@
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy('republish', false);
     }
   }
 
   async function runSubtitleSearch(forLibraryItemId?: number) {
     const itemId = forLibraryItemId ?? libraryMatch?.id;
     if (!itemId) return;
-    working = true;
+    const key = `subtitle-search-${itemId}`;
+    setBusy(key, true);
     try {
       await api.searchSubtitles(itemId, ['nl', 'en']);
       toastSuccess('Searching subtitles in background...');
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy(key, false);
     }
   }
 
   async function requestSeason(seasonNumber: number, seasonLabel: string) {
     if (!detail?.tmdbId) return;
-    working = true;
+    const key = `season-request-${seasonNumber}`;
+    setBusy(key, true);
     try {
       const result = await api.requestMedia(detail.tmdbId, 'tv', [seasonNumber]);
       toastSuccess(`Requested ${seasonLabel} — ${result.created} item(s) added`);
@@ -387,13 +402,13 @@
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy(key, false);
     }
   }
 
   async function prioritizeMissingForShow() {
     if (!localDetail?.tvShowId) return;
-    working = true;
+    setBusy('prioritize-missing', true);
     try {
       const result = await api.prioritizeTVShowMissing(localDetail.tvShowId);
       toastSuccess(`Prioritized show — queued ${result.queued}, created ${result.itemsCreated}`);
@@ -401,13 +416,14 @@
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy('prioritize-missing', false);
     }
   }
 
   async function downloadSubtitle(candidateID: number) {
     if (!libraryMatch) return;
-    working = true;
+    const key = `subtitle-download-${candidateID}`;
+    setBusy(key, true);
     try {
       await api.downloadSubtitleCandidate(candidateID);
       toastSuccess('subtitle downloaded');
@@ -415,12 +431,13 @@
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy(key, false);
     }
   }
 
   async function deleteSubtitleFile(subtitleID: number) {
-    working = true;
+    const key = `subtitle-delete-${subtitleID}`;
+    setBusy(key, true);
     try {
       await api.deleteSubtitle(subtitleID);
       toastSuccess('subtitle deleted');
@@ -428,7 +445,7 @@
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy(key, false);
     }
   }
 
@@ -459,7 +476,8 @@
   }
 
   async function downloadEpisodeSubtitle(epLibraryItemId: number, candidateID: number) {
-    working = true;
+    const key = `ep-subtitle-download-${epLibraryItemId}-${candidateID}`;
+    setBusy(key, true);
     try {
       await api.downloadSubtitleCandidate(candidateID);
       toastSuccess('subtitle downloaded');
@@ -467,12 +485,13 @@
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy(key, false);
     }
   }
 
   async function deleteEpisodeSubtitle(epLibraryItemId: number, subtitleID: number) {
-    working = true;
+    const key = `ep-subtitle-delete-${epLibraryItemId}-${subtitleID}`;
+    setBusy(key, true);
     try {
       await api.deleteSubtitle(subtitleID);
       toastSuccess('subtitle deleted');
@@ -480,7 +499,7 @@
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy(key, false);
     }
   }
 
@@ -488,7 +507,7 @@
     if (!libraryMatch) return;
     const parsedProfileId = nextValue ? Number(nextValue) : null;
     const nextProfileId = parsedProfileId != null && Number.isFinite(parsedProfileId) ? parsedProfileId : null;
-    working = true;
+    setBusy('quality-profile', true);
     try {
       await api.setLibraryProfile(libraryMatch.id, nextProfileId);
       activeProfileId = nextProfileId;
@@ -497,7 +516,7 @@
       toastError(error instanceof Error ? error.message : String(error));
       await loadDetail();
     } finally {
-      working = false;
+      setBusy('quality-profile', false);
     }
   }
 </script>
@@ -537,31 +556,31 @@
           {#if detail.overview}<p>{detail.overview}</p>{/if}
           <div class="action-row">
             {#if libraryMatch}
-              <Button kind="secondary" on:click={runLocalSearch} disabled={working}>
+              <Button kind="secondary" on:click={runLocalSearch}>
                 <Search size={15} />
                 {libraryMatch.available ? 'Find Upgrade' : localDetail?.tvShowId ? 'Search Show' : 'Search'}
               </Button>
               {#if localDetail?.tvShowId && (libraryMatch.missingCount ?? 0) > 0}
-                <Button kind="secondary" on:click={prioritizeMissingForShow} disabled={working}>
+                <Button kind="secondary" on:click={prioritizeMissingForShow} disabled={isBusy('prioritize-missing')}>
                   <Download size={15} />
                   Prioritize Missing
                 </Button>
               {/if}
-              <Button kind="secondary" on:click={() => runSubtitleSearch()} disabled={working}>
+              <Button kind="secondary" on:click={() => runSubtitleSearch()} disabled={isBusy(`subtitle-search-${libraryMatch.id}`)}>
                 <Languages size={15} />
                 Subs
               </Button>
-              <Button kind="secondary" on:click={runRepublish} disabled={working}>
+              <Button kind="secondary" on:click={runRepublish} disabled={isBusy('republish')}>
                 <RotateCcw size={15} />
                 Republish
               </Button>
-              <Button kind="ghost" on:click={() => resetItem(libraryMatch!.id, detail?.title ?? 'this item')} disabled={working}>
+              <Button kind="ghost" on:click={() => resetItem(libraryMatch!.id, detail?.title ?? 'this item')} disabled={isBusy(`reset-${libraryMatch.id}`)}>
                 <Trash2 size={15} />
                 Reset
               </Button>
             {/if}
             <a class="link-btn secondary" href="/search">Back To Search</a>
-            <Button kind="ghost" on:click={loadDetail} disabled={working || loading}>
+            <Button kind="ghost" on:click={loadDetail} disabled={loading}>
               <RefreshCw size={15} />
               Refresh
             </Button>
@@ -598,17 +617,25 @@
                     <div class="summary-meta">
                       {season.availableCount}/{season.episodeCount} available · {season.missingCount} missing
                       {#if season.missingCount > 0 && detail?.tmdbId}
-                        <button
+                        <!-- role="button" span, not a real <button>: a <summary> is itself
+                             interactive content (toggles the parent <details>), and nesting
+                             another interactive element inside it is invalid HTML — some
+                             browsers/extensions can mis-time the stopPropagation and trigger
+                             both actions. A span can't be interactive content, so this keeps
+                             the exact same click behavior/position without the invalid nesting. -->
+                        <span
                           class="ep-sub-btn"
-                          type="button"
+                          role="button"
+                          tabindex="0"
+                          aria-disabled={isBusy(`season-request-${season.seasonNumber}`)}
                           aria-label={`Request ${season.name} in Seerr`}
                           title={`Request ${season.name} in Seerr`}
-                          disabled={working}
-                          on:click|preventDefault|stopPropagation={() => requestSeason(season.seasonNumber, season.name)}
+                          on:click|preventDefault|stopPropagation={() => !isBusy(`season-request-${season.seasonNumber}`) && requestSeason(season.seasonNumber, season.name)}
+                          on:keydown|preventDefault|stopPropagation={(e) => { if (!isBusy(`season-request-${season.seasonNumber}`) && (e.key === 'Enter' || e.key === ' ')) requestSeason(season.seasonNumber, season.name); }}
                         >
                           <Download size={11} />
                           Request
-                        </button>
+                        </span>
                       {/if}
                     </div>
                   </summary>
@@ -628,20 +655,18 @@
                             <button
                               class="ep-sub-btn"
                               title="Search releases for this episode (includes season packs)"
-                              disabled={working}
                               on:click={() => runEpisodeSearch(epId, episode.seasonNumber, episode.episodeNumber, episode.title)}
                             ><Search size={11} /> Search</button>
                             {#if episode.status === 'available'}
                               <button
                                 class="ep-sub-btn"
                                 title="Manage subtitles for this episode"
-                                disabled={working}
                                 on:click={() => toggleEpisodeSubtitles(epId)}
                               ><Languages size={11} /> Subs</button>
                               <button
                                 class="ep-sub-btn ep-reset-btn"
                                 title="Reset this episode"
-                                disabled={working}
+                                disabled={isBusy(`reset-${epId}`)}
                                 on:click={() => resetItem(epId, `S${String(episode.seasonNumber).padStart(2,'0')}E${String(episode.episodeNumber).padStart(2,'0')} ${episode.title}`)}
                               ><Trash2 size={11} /></button>
                             {/if}
@@ -663,7 +688,7 @@
                                       <strong>{file.language.toUpperCase()}</strong>
                                       <span>{file.provider}</span>
                                     </div>
-                                    <Button kind="ghost" on:click={() => deleteEpisodeSubtitle(epId, file.id)} disabled={working}>
+                                    <Button kind="ghost" on:click={() => deleteEpisodeSubtitle(epId, file.id)} disabled={isBusy(`ep-subtitle-delete-${epId}-${file.id}`)}>
                                       <Trash2 size={13} />
                                     </Button>
                                   </div>
@@ -680,7 +705,7 @@
                                       <strong>{candidate.language.toUpperCase()} · {candidate.provider}</strong>
                                       <span>{candidate.releaseName || candidate.title}</span>
                                     </div>
-                                    <Button kind="secondary" on:click={() => downloadEpisodeSubtitle(epId, candidate.id)} disabled={working}>
+                                    <Button kind="secondary" on:click={() => downloadEpisodeSubtitle(epId, candidate.id)} disabled={isBusy(`ep-subtitle-download-${epId}-${candidate.id}`)}>
                                       <Languages size={13} />
                                       Get
                                     </Button>
@@ -688,7 +713,7 @@
                                 {/each}
                               </div>
                             {/if}
-                            <Button kind="secondary" on:click={() => runSubtitleSearch(epId).then(() => loadEpisodeSubtitles(epId))} disabled={working}>
+                            <Button kind="secondary" on:click={() => runSubtitleSearch(epId).then(() => loadEpisodeSubtitles(epId))} disabled={isBusy(`subtitle-search-${epId}`)}>
                               <Search size={13} />
                               Search Subtitles
                             </Button>
@@ -762,7 +787,7 @@
               <select
                 id="profile-select"
                 value={activeProfileId == null ? '' : String(activeProfileId)}
-                disabled={working || profiles.length === 0}
+                disabled={isBusy('quality-profile') || profiles.length === 0}
                 on:change={(e) => updateQualityProfile((e.currentTarget as HTMLSelectElement).value)}
               >
                 <option value="">Default profile</option>
@@ -827,7 +852,7 @@
                       <strong>{subtitle.language.toUpperCase()}</strong>
                       <span>{subtitle.provider}</span>
                     </div>
-                    <Button kind="ghost" on:click={() => deleteSubtitleFile(subtitle.id)} disabled={working}>
+                    <Button kind="ghost" on:click={() => deleteSubtitleFile(subtitle.id)} disabled={isBusy(`subtitle-delete-${subtitle.id}`)}>
                       <Trash2 size={14} />
                     </Button>
                   </div>
@@ -844,7 +869,7 @@
                       <strong>{candidate.language.toUpperCase()} · {candidate.provider}</strong>
                       <span>{candidate.releaseName || candidate.title}</span>
                     </div>
-                    <Button kind="secondary" on:click={() => downloadSubtitle(candidate.id)} disabled={working}>
+                    <Button kind="secondary" on:click={() => downloadSubtitle(candidate.id)} disabled={isBusy(`subtitle-download-${candidate.id}`)}>
                       <Languages size={14} />
                       Get
                     </Button>
@@ -1037,7 +1062,7 @@
                       </div>
                     </details>
                   {/if}
-                  <Button kind={c.selected ? 'primary' : 'secondary'} on:click={() => pickRelease(c)} disabled={working}>
+                  <Button kind={c.selected ? 'primary' : 'secondary'} on:click={() => pickRelease(c)} disabled={isBusy('pick-release')}>
                     <Download size={14} />
                     {c.selected ? 'Re-grab' : 'Download'}
                   </Button>
@@ -1129,6 +1154,17 @@
   .stack-item span {
     margin-top: 4px; color: hsl(var(--muted-foreground)); font-size: 12px;
   }
+  /* Release-name/candidate text (e.g. "Show.Name.S01E04.1080p.WEB-DL-GROUP")
+     is one long unbroken token with no spaces, so as a flex child its default
+     min-content width is the full string width — with no min-width: 0 here,
+     the row (and its Button, pushed by justify-content: space-between) was
+     rendered past the panel's edge instead of truncating. */
+  .stack-item.candidate > div { min-width: 0; overflow: hidden; }
+  .stack-item.candidate strong,
+  .stack-item.candidate span {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .stack-item.candidate > :global(.button) { flex-shrink: 0; }
   .candidate { align-items: flex-start; }
   .stat-grid span, .kv span, .summary-meta, .person-card span { color: hsl(var(--muted-foreground)); font-size: 12px; }
   .season-stack, .episode-list { display: grid; gap: 12px; }
@@ -1155,6 +1191,9 @@
     font-size: 11px; cursor: pointer; flex-shrink: 0;
   }
   .ep-sub-btn:hover { background: hsl(var(--primary) / 0.15); color: hsl(var(--primary)); border-color: hsl(var(--primary) / 0.3); }
+  /* Only relevant to the summary "Request" span (role="button"), which uses
+     aria-disabled since a <span> has no native disabled attribute/styling. */
+  .ep-sub-btn[aria-disabled='true'] { opacity: 0.5; pointer-events: none; }
   .ep-reset-btn:hover { background: hsl(0 70% 50% / 0.15); color: hsl(0 70% 60%); border-color: hsl(0 70% 50% / 0.3); }
   .media-strip { padding-bottom: 4px; }
   .person-slot { width: 146px; flex: 0 0 auto; }

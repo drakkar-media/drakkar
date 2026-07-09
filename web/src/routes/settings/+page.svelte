@@ -214,12 +214,17 @@
     // === Operations (individually-triggered via API) ===
     { id: 'retry_failed_queue',       label: 'Retry Failed Queue',       description: 'Immediately retry all failed queue items using current fallback policy.',                  group: 'Operations', interval: '—',    manual: true,  run: async () => { const r = await api.retryFailedQueue();          return `processed ${r.processed}, retried ${r.retried}`; } },
     { id: 'search_upgrades',          label: 'Search Quality Upgrades',  description: 'Re-search available items whose quality profile allows a better release.',                  group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.searchUpgrades();                       return 'started in background'; } },
-    { id: 'fill_missing_episodes',    label: 'Fill Missing Episodes',    description: 'Use TMDB episode lists to create library items for episodes not yet tracked.',              group: 'Operations', interval: '—',    manual: true,  run: async () => { const r = await api.fillMissingEpisodes();        return `processed ${r.showsProcessed} shows, created ${r.itemsCreated} new items`; } },
+    // fill_missing_episodes/cache_prune/backfill_metadata/seerr_push_library all
+    // respond immediately with {queued: true} and do the real work in a
+    // background goroutine — the real counts arrive later via a
+    // 'library.*'/'cache.*' event (see onMount below), not on this response.
+    // Reading result fields here was always undefined.
+    { id: 'fill_missing_episodes',    label: 'Fill Missing Episodes',    description: 'Use TMDB episode lists to create library items for episodes not yet tracked.',              group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.fillMissingEpisodes();                   return 'started in background'; } },
     { id: 'republish_pending',        label: 'Republish Pending',        description: 'Republish library items with a selected release but no current symlink.',                  group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.republishPendingLibrary();               return 'started in background'; } },
     { id: 'reset_orphaned_available', label: 'Reset Orphaned Available', description: 'Reset available items with no symlink back to pending for re-search.',                     group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.resetOrphanedAvailableItems();           return 'started in background'; } },
-    { id: 'cache_prune',              label: 'Prune Block Cache',        description: 'Delete oldest decoded articles from the disk cache.',                                      group: 'Operations', interval: '—',    manual: true,  run: async () => { const r = await api.pruneCache();                  return `deleted ${r.deletedFiles} files`; } },
-    { id: 'backfill_metadata',        label: 'Backfill Metadata',        description: 'Re-enrich movies and TV shows with new TMDB fields.',                                      group: 'Operations', interval: '—',    manual: true,  run: async () => { const r = await api.backfillMetadata();            return `enriched ${r.enriched} items`; } },
-    { id: 'seerr_push_library',       label: 'Push Library to Seerr',    description: 'Push library items missing from Seerr as new requests.',                                  group: 'Operations', interval: '—',    manual: true,  run: async () => { const r = await api.pushMissingToSeerr();          return `movies ${r.moviesPushed}, shows ${r.showsPushed}`; } },
+    { id: 'cache_prune',              label: 'Prune Block Cache',        description: 'Delete oldest decoded articles from the disk cache.',                                      group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.pruneCache();                            return 'started in background'; } },
+    { id: 'backfill_metadata',        label: 'Backfill Metadata',        description: 'Re-enrich movies and TV shows with new TMDB fields.',                                      group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.backfillMetadata();                      return 'started in background'; } },
+    { id: 'seerr_push_library',       label: 'Push Library to Seerr',    description: 'Push library items missing from Seerr as new requests.',                                  group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.pushMissingToSeerr();                    return 'started in background'; } },
   ];
 
   async function loadTaskSchedules() {
@@ -816,10 +821,15 @@
   // storage_maintenance scheduled task (every 6h). No individual API endpoints remain.
 
   async function pruneCache() {
+    // Backend responds immediately with {queued: true} and prunes in a
+    // background goroutine — the real stats (previously expected directly
+    // off this call, which made lastCachePrune/the toast always show
+    // "undefined") arrive later via the 'cache.prune' event handled in
+    // onMount below, which populates lastCachePrune itself.
     working = true;
     try {
-      lastCachePrune = await api.pruneCache();
-      toastSuccess(`Cache pruned: ${lastCachePrune.deletedFiles} files removed`);
+      await api.pruneCache();
+      toastSuccess('Cache prune queued — processing in background…');
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -861,7 +871,22 @@
     void loadBlockRules();
     void loadIndexerPolicies();
     void loadSubtitleProfiles();
-    const unsub = subscribeEvents(() => { if (!working) void loadAll(); });
+    const backgroundTaskToasts: Record<string, (e: Record<string, unknown>) => string> = {
+      'library.fill_missing_episodes': (e) => `Fill Missing Episodes complete: processed ${e.showsProcessed} shows, created ${e.itemsCreated} new items`,
+      'cache.prune': (e) => `Prune Block Cache complete: deleted ${e.deletedFiles} files`,
+      'library.backfill_metadata': (e) => `Backfill Metadata complete: enriched ${e.enriched} items`,
+      'library.push_library': (e) => `Push Library to Seerr complete: movies ${e.moviesPushed}, shows ${e.showsPushed}`
+    };
+    const unsub = subscribeEvents((event) => {
+      const kind = event?.kind as string | undefined;
+      if (kind === 'cache.prune') {
+        lastCachePrune = event as unknown as typeof lastCachePrune;
+      }
+      if (kind && backgroundTaskToasts[kind]) {
+        toastSuccess(backgroundTaskToasts[kind](event as Record<string, unknown>));
+      }
+      if (!working) void loadAll();
+    });
     const timer = window.setInterval(() => void loadAll(), 30000);
     const taskTimer = window.setInterval(() => void loadTaskSchedules(), 30000);
     return () => {
