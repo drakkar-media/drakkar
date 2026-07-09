@@ -26,12 +26,21 @@ var ErrProviderCircuitOpen = errors.New("provider circuit open — recent thrott
 // failure pattern is brief multi-second blips, not sustained outages, so the
 // threshold must be high enough to absorb a concurrency burst and the
 // cooldown short enough to match how fast it actually recovers.
+// Raised again 15→40: the periodic backlog-search batch (many BullMQ workers
+// each running a multi-file preflight check, itself fanning out up to 8
+// concurrent per-file NNTP checks) produces a legitimately larger worst-case
+// concurrent burst than the calibration-goroutine pattern this was last
+// tuned for (observed: 374 requests piling up against an already-tripped
+// breaker within about a second of the batch firing) — at 15, that burst
+// tripped the breaker on every single batch cycle, blocking that whole
+// cycle's candidates together and making every item in the batch look like
+// it had no viable release.
 // failureWindow bounds what counts as "consecutive" — a failure more than
 // this long after the previous one starts a fresh streak instead of
 // extending an old one, so failures that trickle in slowly over minutes
 // don't get misread as one continuous outage.
 const (
-	breakerTripThreshold = 15
+	breakerTripThreshold = 40
 	breakerBaseCooldown  = 3 * time.Second
 	breakerMaxCooldown   = 30 * time.Second
 	failureWindow        = 2 * time.Second
