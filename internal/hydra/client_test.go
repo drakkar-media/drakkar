@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hjongedijk/drakkar/internal/config"
 )
@@ -328,5 +331,53 @@ func TestSearchPaginates(t *testing.T) {
 	// 100 results from page 0 + 1 result from page 1
 	if len(results) != searchPageSize+1 {
 		t.Fatalf("expected %d results, got %d", searchPageSize+1, len(results))
+	}
+}
+
+// TestConcurrentSearchesShareRateLimit verifies that raising maxConcurrentSearches
+// does not increase the request rate hitting NZBHydra2: first-page call timestamps
+// must still be spaced by at least searchInterval apart, because throttle() paces
+// off a single shared clock (lastCall) rather than one clock per concurrency slot.
+func TestConcurrentSearchesShareRateLimit(t *testing.T) {
+	const delay = 100 * time.Millisecond
+
+	var mu sync.Mutex
+	var callTimes []time.Time
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		callTimes = append(callTimes, time.Now())
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(config.ServiceConfig{URL: server.URL, APIKey: "abc"})
+	client.SetSearchDelay(delay)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			_, err := client.Search(context.Background(), SearchRequest{Query: fmt.Sprintf("Show%d", n)})
+			if err != nil {
+				t.Error(err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(callTimes) != 3 {
+		t.Fatalf("expected 3 requests, got %d", len(callTimes))
+	}
+	sort.Slice(callTimes, func(i, j int) bool { return callTimes[i].Before(callTimes[j]) })
+	for i := 1; i < len(callTimes); i++ {
+		gap := callTimes[i].Sub(callTimes[i-1])
+		if gap < delay-10*time.Millisecond {
+			t.Fatalf("requests %d and %d fired only %s apart, want >= ~%s (concurrency must not bypass shared rate limit)", i-1, i, gap, delay)
+		}
 	}
 }

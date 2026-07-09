@@ -110,12 +110,14 @@ func NewClient(cfg config.ServiceConfig) *Client {
 	if feedMaxResults <= 0 {
 		feedMaxResults = 1200
 	}
-	// 1 concurrent search matches Sonarr/Radarr's strictly sequential per-indexer
-	// behaviour. Radarr/Sonarr process missing items one at a time with a 2-second
-	// rate limit between requests (HttpIndexerBase.RateLimit = TimeSpan.FromSeconds(2)).
-	// When Hydra is configured as a single indexer, this means exactly 1 in-flight
-	// Hydra request at any time.
-	const maxConcurrentSearches = 1
+	// 3 concurrent searches: each *arr app (Radarr, Sonarr, ...) independently
+	// enforces its own 2-second per-indexer rate limit (HttpIndexerBase.RateLimit),
+	// not a global one — running Radarr+Sonarr together against the same
+	// NZBHydra2 instance already produces 2+ concurrent requests in practice.
+	// NZBHydra2 itself also applies its own per-indexer pacing toward the real
+	// Usenet indexers, so this client-side cap only needs to bound Drakkar's own
+	// worker pool, not re-implement indexer rate limiting from scratch.
+	const maxConcurrentSearches = 3
 	return &Client{
 		baseURL: strings.TrimRight(cfg.URL, "/"),
 		apiKey:  cfg.APIKey,
