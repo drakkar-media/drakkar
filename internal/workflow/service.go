@@ -271,7 +271,19 @@ type QueueManageResult struct {
 	SearchCandidateCnt int    `json:"searchCandidateCount,omitempty"`
 }
 
-const pendingQueueBatchSize = 1000 // process up to 1000 items per scheduler tick
+// pendingQueueBatchSize caps how many missing items get a fresh Hydra search
+// per 15-minute backlog tick. Each item can issue up to 2 Hydra searches
+// (tier1 + tier2), and NZBHydra2 fans each one out to every configured
+// indexer -- after the per-season dedup was removed so every missing episode
+// gets searched instead of one representative per season, this cap was the
+// only thing still bounding total query volume, and 1000 was high enough to
+// exhaust a real indexer's (NZB Finder) hourly/daily API quota within a few
+// cycles, triggering repeated 429s. 250 restores roughly the same per-cycle
+// volume as before that fix. This still rotates fairly through every missing
+// item over time (ListPendingLibrarySearchTargets orders oldest-updated
+// first), so nothing is permanently starved the way the old per-season
+// representative was -- it just bounds how much gets searched per tick.
+const pendingQueueBatchSize = 250
 
 const (
 	defaultInlineFallbackDepth  = 3
