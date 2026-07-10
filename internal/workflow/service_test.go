@@ -1689,7 +1689,12 @@ func TestSearchPendingLibraryDispatchesSelectedAndQueuesSearchItems(t *testing.T
 	}
 }
 
-func TestSearchPendingLibraryQueuesOnlyOneEpisodePerShowPerTick(t *testing.T) {
+// TestSearchPendingLibraryQueuesEveryMissingEpisode verifies every missing
+// episode gets its own search turn each cycle, matching Sonarr's
+// EpisodeSearchService (searches every missing episode/group, not a rotating
+// per-season representative). Season-pack request dedup is handled separately
+// and independently by ShouldAttemptSeasonPack's own cooldown.
+func TestSearchPendingLibraryQueuesEveryMissingEpisode(t *testing.T) {
 	repo := &repoStub{
 		pending: []database.PendingLibrarySearchTarget{
 			{LibraryItemID: 1, MediaType: "episode", TVShowID: 500},
@@ -1706,14 +1711,16 @@ func TestSearchPendingLibraryQueuesOnlyOneEpisodePerShowPerTick(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Processed != 3 || result.Searched != 3 {
-		t.Fatalf("expected one search per show plus non-episode item, got %+v", result)
+	if result.Processed != 5 || result.Searched != 5 {
+		t.Fatalf("expected every missing item to be searched, got %+v", result)
 	}
-	if got := service.WorkQueue.Depth(context.Background()); got != 3 {
-		t.Fatalf("expected workqueue depth 3, got %d", got)
+	if got := service.WorkQueue.Depth(context.Background()); got != 5 {
+		t.Fatalf("expected workqueue depth 5, got %d", got)
 	}
-	if result.ProcessedItems[0] != 1 || result.ProcessedItems[1] != 4 || result.ProcessedItems[2] != 5 {
-		t.Fatalf("unexpected processed items %+v", result.ProcessedItems)
+	for i, id := range []int64{1, 2, 3, 4, 5} {
+		if result.ProcessedItems[i] != id {
+			t.Fatalf("unexpected processed items %+v", result.ProcessedItems)
+		}
 	}
 }
 

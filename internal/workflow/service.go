@@ -1117,25 +1117,21 @@ func (s *Service) filterPendingSearchTargets(targets []database.PendingLibrarySe
 	}
 	selectedTargets := make([]database.PendingLibrarySearchTarget, 0, len(targets))
 	searchTargets := make([]database.PendingLibrarySearchTarget, 0, len(targets))
-	// Sonarr/Radarr group missing episodes by show+season: one search per season,
-	// not one per episode. The season pack attempt inside the BullMQ worker covers
-	// all missing episodes from that season in a single Hydra2 query.
-	type showSeason struct {
-		tvShowID int64
-		season   int
-	}
-	seenShowSeasons := make(map[showSeason]bool)
+	// Every missing episode gets its own search turn each cycle (matches Sonarr's
+	// EpisodeSearchService, which searches every missing episode/group, not a
+	// rotating representative). An earlier version deduped to one episode per
+	// show+season per cycle to avoid redundant season-pack queries, but that
+	// starved every other episode in a season indefinitely — with e.g. 24
+	// missing episodes in one season, 23 of them would never get an individual
+	// search turn unless they happened to be picked as "the" representative.
+	// Season-pack request de-duplication is already handled correctly and
+	// independently by ShouldAttemptSeasonPack's own per-(show,season)
+	// exponential-backoff cooldown (searchLibraryOnceWithMode -> trySeasonPack),
+	// so this batch-level dedup was redundant for that purpose anyway.
 	for _, target := range targets {
 		if target.SelectedReleaseID > 0 || target.Selected {
 			selectedTargets = append(selectedTargets, target)
 			continue
-		}
-		if strings.EqualFold(target.MediaType, "episode") && target.TVShowID > 0 {
-			key := showSeason{target.TVShowID, target.SeasonNumber}
-			if seenShowSeasons[key] {
-				continue
-			}
-			seenShowSeasons[key] = true
 		}
 		searchTargets = append(searchTargets, target)
 		if len(searchTargets) >= pendingQueueBatchSize {
