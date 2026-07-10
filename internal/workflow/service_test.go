@@ -198,6 +198,10 @@ func (r *repoStub) ReplaceSearchCandidates(ctx context.Context, libraryItemID in
 	return &value, nil
 }
 
+func (r *repoStub) PromoteExistingCandidate(ctx context.Context, libraryItemID int64) (*int64, error) {
+	return nil, nil
+}
+
 func (r *repoStub) MarkLibrarySearchFailed(ctx context.Context, libraryItemID int64, reason string) error {
 	r.searchFailed = append(r.searchFailed, fmt.Sprintf("%d:%s", libraryItemID, reason))
 	return nil
@@ -1714,7 +1718,7 @@ func TestSearchPendingLibraryQueuesOnlyOneEpisodePerShowPerTick(t *testing.T) {
 }
 
 func TestDispatchAutomaticPendingOnlyResumesSelectedItems(t *testing.T) {
-	now := time.Now().Add(-selectedResumeCooldown - time.Minute)
+	now := time.Now()
 	repo := &repoStub{
 		pending: []database.PendingLibrarySearchTarget{
 			{LibraryItemID: 1, Selected: true, SelectedReleaseID: 101, State: database.QueueRequested, UpdatedAt: now},
@@ -1746,21 +1750,17 @@ func TestShouldDispatchSelectedTargetAllowsFreshSelectedFallback(t *testing.T) {
 	}
 }
 
-func TestShouldDispatchSelectedTargetCooldownsRequestedResume(t *testing.T) {
+func TestShouldDispatchSelectedTargetImmediatelyDispatchesRequestedSelection(t *testing.T) {
 	now := time.Now()
 	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
 	target := database.PendingLibrarySearchTarget{
 		LibraryItemID:     42,
 		SelectedReleaseID: 303,
 		State:             database.QueueRequested,
-		UpdatedAt:         now.Add(-selectedResumeCooldown + time.Minute),
+		UpdatedAt:         now,
 	}
-	if service.shouldDispatchSelectedTarget(target, now) {
-		t.Fatal("expected recent requested+selected resume item to stay in cooldown")
-	}
-	target.UpdatedAt = now.Add(-selectedResumeCooldown - time.Minute)
 	if !service.shouldDispatchSelectedTarget(target, now) {
-		t.Fatal("expected older requested+selected resume item to dispatch after cooldown")
+		t.Fatal("expected requested item with a selected release to dispatch immediately")
 	}
 }
 
@@ -1774,7 +1774,7 @@ func TestShouldDispatchSelectedTargetBlocksRecentlyDispatchedSameURL(t *testing.
 		SelectedReleaseID: 303,
 		ExternalURL:       rawURL,
 		State:             database.QueueRequested,
-		UpdatedAt:         now.Add(-selectedResumeCooldown - time.Minute),
+		UpdatedAt:         now,
 	}
 	if service.shouldDispatchSelectedTarget(target, now) {
 		t.Fatal("expected same external_url to stay in cooldown")

@@ -1130,6 +1130,88 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 	return selectedReleaseID, nil
 }
 
+// PromoteExistingCandidate selects the best still-usable candidate already
+// stored for a library item (left over from a prior search whose result was
+// later reset — e.g. a failed download or a health-check rollback — without a
+// follow-up search ever replacing it) and promotes it to selected, exactly as
+// ReplaceSearchCandidates would have done had this candidate been part of a
+// fresh batch. Returns nil if no such candidate exists.
+//
+// This exists because ReplaceSearchCandidates only runs when a fresh Hydra
+// search actually produces a result; if every query for an item gets skipped
+// (recent-duplicate dedup, indexer hiccup, etc.) a perfectly good, unselected
+// candidate from an earlier search can sit untouched indefinitely — the item
+// never re-selects it and never gets a chance to replace it either.
+func (db *DB) PromoteExistingCandidate(ctx context.Context, libraryItemID int64) (*int64, error) {
+	tx, err := db.SQL.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var (
+		releaseCandidateID int64
+		title              string
+		indexerName        string
+		score              int
+		resolution         string
+	)
+	if err = tx.QueryRowContext(ctx, `
+		select rc.id, rc.title, rc.indexer_name, rc.score, rc.resolution
+		from release_candidates rc
+		where rc.library_item_id = $1
+		  and rc.rejected = false
+		  and rc.selected = false
+		  and not exists (select 1 from selected_releases sr where sr.release_candidate_id = rc.id)
+		order by rc.score desc, rc.id asc
+		limit 1
+		for update`, libraryItemID,
+	).Scan(&releaseCandidateID, &title, &indexerName, &score, &resolution); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = nil
+			return nil, tx.Rollback()
+		}
+		return nil, err
+	}
+
+	var selectedReleaseID int64
+	if err = tx.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, libraryItemID, releaseCandidateID,
+	).Scan(&selectedReleaseID); err != nil {
+		return nil, err
+	}
+	if _, err = tx.ExecContext(ctx, `
+		update release_candidates set selected = true where id = $1`, releaseCandidateID,
+	); err != nil {
+		return nil, err
+	}
+	if _, err = tx.ExecContext(ctx, `
+		insert into grab_history (library_item_id, release_candidate_id, title, indexer_name, score, resolution)
+		values ($1, $2, $3, $4, $5, $6)`,
+		libraryItemID, releaseCandidateID, title, indexerName, score, resolution,
+	); err != nil {
+		return nil, err
+	}
+	if _, err = tx.ExecContext(ctx, `
+		update queue_items
+		set state = $2, selected_release_id = $3, failure_reason = '', updated_at = now()
+		where library_item_id = $1`, libraryItemID, QueueSelected, selectedReleaseID,
+	); err != nil {
+		return nil, err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &selectedReleaseID, nil
+}
+
 func (db *DB) GetGrabHistory(ctx context.Context, libraryItemID int64) ([]GrabHistoryEntry, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT id, library_item_id, release_candidate_id, title, indexer_name, score, resolution, grabbed_at
@@ -1856,16 +1938,21 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		return nil, fmt.Errorf("fail/insert-fr (rc=%d): %w", releaseCandidateID, err)
 	}
 
-	// Collect blocklist keys for ALL failures (matches Sonarr: blocklist on any
-	// download failure). Hard rejects are permanent; soft failures get a 7-day TTL
-	// so the same NZB isn't retried immediately but can resurface if re-uploaded.
+	// Collect blocklist keys only for reasons that policy allows us to persist.
+	// The main fail/promote path used to bypass shouldPersistBlocklistReason and
+	// wrote transient failures (stale indexer result IDs, temporary XML fetch
+	// errors, advisory preflight misses, etc.) into the shared blocklist. That
+	// poisoned future searches so large candidate sets came back "all rejected"
+	// even when nothing had actually proven the release family bad.
+	// Hard rejects are permanent; persistent soft failures get a 7-day TTL so
+	// the same NZB isn't retried immediately but can resurface later.
 	// Inserts happen after commit to avoid row-lock contention.
 	var pendingBlocklistKeys []string
 	pendingBlocklistTTL := 0 // 0 = permanent
 	if !hardReject {
 		pendingBlocklistTTL = 7 // soft failure: 7-day TTL
 	}
-	if strings.TrimSpace(externalURL) != "" {
+	if shouldPersistBlocklistReason(reason) && strings.TrimSpace(externalURL) != "" {
 		var title, indexerName string
 		var sizeBytes int64
 		var postedAt time.Time

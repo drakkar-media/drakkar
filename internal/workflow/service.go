@@ -65,6 +65,7 @@ type Repository interface {
 	ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) error
 	RequeueSelectedRelease(ctx context.Context, queueItemID int64) error
 	ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord) (*int64, error)
+	PromoteExistingCandidate(ctx context.Context, libraryItemID int64) (*int64, error)
 	InsertManualReleaseCandidate(ctx context.Context, libraryItemID int64, title, externalURL, indexerName, resolution string, sizeBytes int64, score int) (int64, error)
 	MarkLibrarySearchFailed(ctx context.Context, libraryItemID int64, reason string) error
 	GetSelectedReleaseSummary(ctx context.Context, selectedReleaseID int64) (database.ReleaseSummary, error)
@@ -277,7 +278,6 @@ const (
 	busyInlineFallbackDepth     = 1
 	fastLaneInlineFallbackDepth = 3
 	busyQueueDepthThreshold     = 150
-	selectedResumeCooldown      = 5 * time.Minute
 	selectedURLCooldown         = 30 * time.Minute
 	searchRequestCooldown       = 20 * time.Minute
 	asyncCalibrateBudget        = 2 * time.Minute
@@ -1168,7 +1168,7 @@ func (s *Service) shouldDispatchSelectedTarget(target database.PendingLibrarySea
 		}
 		s.recentURLMu.Unlock()
 	}
-	return now.Sub(target.UpdatedAt) >= selectedResumeCooldown
+	return true
 }
 
 func (s *Service) markSelectedReleaseURLDispatched(rawURL string, now time.Time) {
@@ -1678,6 +1678,20 @@ func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID i
 		searchTier(plan.Tier2, false) // title-based: verify title
 		if err != nil {
 			return SearchResult{}, err
+		}
+	}
+	// A fresh search that finds nothing (every request skipped by dedup, indexer
+	// hiccup, etc.) never calls ReplaceSearchCandidates, so it can leave a
+	// perfectly good, unselected candidate from an earlier search — e.g. one
+	// orphaned by a later reset/health-check rollback — sitting untouched
+	// forever. Before giving up, try to promote that existing candidate rather
+	// than requiring an identical fresh Hydra result to reappear.
+	if selectedReleaseID == nil && len(combinedCandidates) == 0 {
+		if promoted, promoteErr := s.repo.PromoteExistingCandidate(ctx, libraryItemID); promoteErr == nil && promoted != nil {
+			s.logger.Info().Int64("libraryItemId", libraryItemID).Str("title", input.Title).Msg("workqueue: promoted existing unselected candidate")
+			selectedReleaseID = promoted
+		} else if promoteErr != nil {
+			s.logger.Warn().Err(promoteErr).Int64("libraryItemId", libraryItemID).Msg("workqueue: promote existing candidate failed")
 		}
 	}
 	if selectedReleaseID == nil && len(combinedCandidates) == 0 && lastSearchErr != nil {

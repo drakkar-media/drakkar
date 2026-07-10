@@ -21,7 +21,6 @@ func TestIsPlayableMedia(t *testing.T) {
 	}
 }
 
-
 func TestIsHardRejectReason(t *testing.T) {
 	if isHardRejectReason("archive_video_not_found") {
 		t.Fatal("archive_video_not_found should stay retryable")
@@ -73,6 +72,15 @@ func TestShouldPersistBlocklistReason(t *testing.T) {
 	}
 	if shouldPersistBlocklistReason("context deadline exceeded") {
 		t.Fatal("transient failure should not persist in blocklist")
+	}
+	if shouldPersistBlocklistReason("parse nzb xml: expected element type <nzb> but have <error>") {
+		t.Fatal("indexer XML error should not persist in blocklist")
+	}
+	if shouldPersistBlocklistReason("indexer error 300: Invalid or outdated search result ID") {
+		t.Fatal("stale indexer result IDs should not persist in blocklist")
+	}
+	if shouldPersistBlocklistReason("short archive header fetch") {
+		t.Fatal("short archive header fetch should not persist in blocklist")
 	}
 }
 

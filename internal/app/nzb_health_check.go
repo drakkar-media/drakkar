@@ -203,6 +203,31 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 			magicCancel()
 			if magicErr != nil {
 				if isTransientHealthCheckErr(magicErr) {
+					if publicationSvc != nil {
+						logger.Warn().
+							Int64("libraryItemId", c.LibraryItemID).
+							Str("title", c.Title).
+							Err(magicErr).
+							Msg("health check: transient container-read error — re-publishing item before retry")
+						if republishErr := publicationSvc.RepublishLibraryItem(ctx, c.LibraryItemID); republishErr != nil {
+							logger.Warn().Err(republishErr).Int64("libraryItemId", c.LibraryItemID).Msg("health check: transient container-read republish failed")
+						} else {
+							retryCtx, retryCancel := context.WithTimeout(ctx, 45*time.Second)
+							retryErr := waitForReadableVideoContainer(retryCtx, c.TargetPath, 6, 5*time.Second)
+							retryCancel()
+							if retryErr == nil {
+								logger.Info().Int64("libraryItemId", c.LibraryItemID).Str("title", c.Title).
+									Msg("health check: transient container-read recovered after re-publish")
+								_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
+								if _, exists := repairedSeen[c.LibraryItemID]; !exists {
+									repairedSeen[c.LibraryItemID] = struct{}{}
+									result.RepairedItems++
+								}
+								continue
+							}
+							magicErr = retryErr
+						}
+					}
 					logger.Warn().
 						Int64("libraryItemId", c.LibraryItemID).
 						Str("title", c.Title).
