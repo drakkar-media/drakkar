@@ -1192,8 +1192,11 @@ func searchRequestFingerprint(libraryItemID int64, request hydra.SearchRequest) 
 	)
 }
 
-func (s *Service) shouldSkipSearchRequest(libraryItemID int64, request hydra.SearchRequest, now time.Time) bool {
+func (s *Service) shouldSkipSearchRequest(ctx context.Context, libraryItemID int64, request hydra.SearchRequest, now time.Time) bool {
 	if s == nil {
+		return false
+	}
+	if isForceSearch(ctx) {
 		return false
 	}
 	key := searchRequestFingerprint(libraryItemID, request)
@@ -1249,6 +1252,31 @@ func withCompletionFastLane(ctx context.Context) context.Context {
 
 func isCompletionFastLane(ctx context.Context) bool {
 	value, _ := ctx.Value(completionFastLaneKey{}).(bool)
+	return value
+}
+
+type forceSearchKey struct{}
+
+// withForceSearch marks a context so shouldSkipSearchRequest never applies the
+// in-memory dedup cooldown. Used by user-initiated "Search Again"/"Search Now"
+// endpoints: that cache exists to stop the automated backlog scheduler from
+// hammering Hydra with identical requests, but a user clicking a search
+// button expects it to actually search, not silently no-op because the same
+// item happened to be touched by the backlog (or a previous click) minutes
+// earlier -- Sonarr/Radarr never gate manual/interactive searches this way.
+func withForceSearch(ctx context.Context) context.Context {
+	return context.WithValue(ctx, forceSearchKey{}, true)
+}
+
+// WithForceSearch marks a context so a subsequent SearchLibrary call bypasses
+// the in-memory search-request dedup cooldown. Callers: user-initiated manual
+// search endpoints only (see withForceSearch for why).
+func WithForceSearch(ctx context.Context) context.Context {
+	return withForceSearch(ctx)
+}
+
+func isForceSearch(ctx context.Context) bool {
+	value, _ := ctx.Value(forceSearchKey{}).(bool)
 	return value
 }
 
@@ -1626,7 +1654,7 @@ func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID i
 		req := searchRequirements(input)
 		req.TrustSource = trustSource
 		for _, candidateRequest := range tierRequests {
-			if s.shouldSkipSearchRequest(libraryItemID, candidateRequest, time.Now()) {
+			if s.shouldSkipSearchRequest(ctx, libraryItemID, candidateRequest, time.Now()) {
 				s.logger.Debug().
 					Int64("libraryItemId", libraryItemID).
 					Str("query", searchRequestLabel(candidateRequest)).
@@ -1762,7 +1790,7 @@ func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearc
 	)
 	profilePrefs := s.profilePreferencesForItem(ctx, libraryItemID, "episode")
 	for _, req := range packRequests {
-		if s.shouldSkipSearchRequest(libraryItemID, req, time.Now()) {
+		if s.shouldSkipSearchRequest(ctx, libraryItemID, req, time.Now()) {
 			continue
 		}
 		results, err := s.searchHydraWithRetry(ctx, req)

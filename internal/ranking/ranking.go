@@ -870,8 +870,8 @@ const (
 // to match "DC's Legends of Tomorrow" (one franchise-prefix word difference).
 // Leading articles ("the", "a", "an") are stripped and retried from both sides.
 func containsNormalized(title, required string) bool {
-	cWords := strings.Fields(normalizeText(title))
-	rWords := strings.Fields(normalizeText(required))
+	cWords := mergeApostropheSTokens(strings.Fields(normalizeText(title)))
+	rWords := mergeApostropheSTokens(strings.Fields(normalizeText(required)))
 	if titlesWordMatch(cWords, rWords) {
 		return true
 	}
@@ -916,6 +916,29 @@ func titlesWordMatch(cWords, rWords []string) bool {
 		}
 	}
 	return false
+}
+
+// mergeApostropheSTokens merges a standalone "s" token into the immediately
+// preceding token. Some release groups scene-encode a possessive apostrophe as
+// a literal ".s." separator (e.g. "Grey.s.Anatomy.S02E01...-TARDiS"), which
+// normalizeText's separator-to-space conversion of "." splits into three
+// tokens ("grey","s","anatomy") -- but the same title's apostrophe is deleted
+// with no space by normalizeText ("Grey's Anatomy" -> "greys anatomy"), so the
+// two encodings never produced the same tokens and titlesWordMatch's exact
+// per-token comparison rejected an otherwise-correct match as wrong_title.
+// Applied symmetrically to both sides, so unrelated cases where a genuine lone
+// "s" token appears from other punctuation (e.g. "S.H.I.E.L.D." splitting to
+// "s h i e l d" on both the candidate and required title) still line up.
+func mergeApostropheSTokens(words []string) []string {
+	out := make([]string, 0, len(words))
+	for _, w := range words {
+		if w == "s" && len(out) > 0 {
+			out[len(out)-1] += "s"
+			continue
+		}
+		out = append(out, w)
+	}
+	return out
 }
 
 func isLeadingArticle(word string) bool {

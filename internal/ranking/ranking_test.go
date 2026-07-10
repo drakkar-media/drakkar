@@ -339,6 +339,10 @@ func TestTitleMatchRegressions(t *testing.T) {
 		{"dcs-legends", "DCs.Legends.of.Tomorrow.2016.S06.1080p", "DC's Legends of Tomorrow", true},
 		// Marvels prefix allowed
 		{"marvels-agents", "Marvels.Agents.of.S.H.I.E.L.D.S01E01.1080p", "Agents of S.H.I.E.L.D.", true},
+		// Scene ".s." possessive-apostrophe convention must match the same show
+		{"greys-anatomy-dot-s", "Grey.s.Anatomy.S02E01.MULTi.VFi.1080p.WEBRip.EAC3.5.1.H265-TARDiS", "Grey's Anatomy", true},
+		{"marvels-punisher-dot-s", "Marvel.s.The.Punisher.S01E01.720p.WEB-DL", "Marvel's The Punisher", true},
+		{"mothers-pride-dot-s", "Mother.s.Pride.S01E01.HDTV.x264", "Mother's Pride", true},
 		// Leading "The" stripped from candidate
 		{"the-batman", "The.Batman.2022.1080p.BluRay", "Batman", true},
 		// Leading "The" stripped from required

@@ -637,7 +637,94 @@ func (db *DB) GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (L
 		pgTextArrayScan(&item.AlternateTitles),
 		&item.RuntimeMinutes,
 	)
+	if err != nil {
+		return item, err
+	}
+	item.AlternateTitles, err = db.filterAmbiguousAlternateTitles(ctx, item.AlternateTitles, item.TVShowID, item.MovieTMDBID)
 	return item, err
+}
+
+// firstNormalizedWord returns the lowercased first word of a title, splitting
+// on the same separator characters ranking.normalizeText treats as word
+// boundaries (space, colon, hyphen, etc). Used only to detect ambiguous
+// single-word alternate titles below -- it doesn't need to be a byte-for-byte
+// match of ranking's tokenizer, just consistent enough to catch "Daredevil"
+// as the first word of "Daredevil: Born Again".
+func firstNormalizedWord(s string) string {
+	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", ":", " ", ";", " ", ",", " ", "'", "")
+	fields := strings.Fields(strings.ToLower(replacer.Replace(s)))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+// filterAmbiguousAlternateTitles drops single-word alternate titles that
+// prefix-match some OTHER catalogued show/movie's title (e.g. TMDB lists a
+// bare "Daredevil" alternate title for "Marvel's Daredevil" (2015), but
+// "Daredevil: Born Again" (2025) is a separately catalogued show whose title
+// also starts with the word "Daredevil"). Single-word titles are matched by
+// titlesWordMatch's prefix-tolerant comparison against the FULL candidate
+// release title, so a bare alias like "Daredevil" trivially matches any
+// release whose title starts with that word regardless of what show it
+// actually belongs to -- unlike a multi-word alias ("Marvel's Daredevil"),
+// which still requires the rest of the words to line up too. Multi-word
+// alternate titles are left untouched; this only removes the single-word
+// ambiguous ones. Fetches all other shows/movies once and compares in Go
+// (rather than SQL LIKE/regex) so title text can't be misinterpreted as a
+// wildcard/regex pattern.
+func (db *DB) filterAmbiguousAlternateTitles(ctx context.Context, titles []string, excludeTVShowID, excludeMovieTMDBID int64) ([]string, error) {
+	hasSingleWord := false
+	for _, title := range titles {
+		if len(strings.Fields(title)) == 1 {
+			hasSingleWord = true
+			break
+		}
+	}
+	if !hasSingleWord {
+		return titles, nil
+	}
+
+	rows, err := db.SQL.QueryContext(ctx, `
+		select title from tv_shows where id != $1
+		union all
+		select unnest(alternative_titles) from tv_shows where id != $1
+		union all
+		select title from movies where tmdb_id != $2
+		union all
+		select unnest(alternative_titles) from movies where tmdb_id != $2`,
+		excludeTVShowID, excludeMovieTMDBID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	otherFirstWords := make(map[string]struct{})
+	for rows.Next() {
+		var otherTitle string
+		if err := rows.Scan(&otherTitle); err != nil {
+			return nil, err
+		}
+		if w := firstNormalizedWord(otherTitle); w != "" {
+			otherFirstWords[w] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]string, 0, len(titles))
+	for _, title := range titles {
+		if len(strings.Fields(title)) != 1 {
+			out = append(out, title)
+			continue
+		}
+		if _, ambiguous := otherFirstWords[firstNormalizedWord(title)]; ambiguous {
+			continue
+		}
+		out = append(out, title)
+	}
+	return out, nil
 }
 
 func (db *DB) GetQueueRetryTarget(ctx context.Context, queueItemID int64) (QueueRetryTarget, error) {
@@ -1178,6 +1265,20 @@ func (db *DB) PromoteExistingCandidate(ctx context.Context, libraryItemID int64)
 		return nil, err
 	}
 
+	// Every sibling selection function (ReplaceSearchCandidates,
+	// SelectReleaseCandidate, promoteRetryCandidate, RejectReleaseCandidate,
+	// FailSelectedReleaseAndPromoteNext) deletes any existing selected_releases
+	// row for this library item before inserting the new one, since the table
+	// has no unique constraint on library_item_id to enforce that invariant at
+	// the schema level. This was the one path that skipped it, letting
+	// orphaned rows from a prior selection accumulate indefinitely.
+	if err = preDeleteVFRByLibraryItem(ctx, tx, libraryItemID); err != nil {
+		return nil, err
+	}
+	if _, err = tx.ExecContext(ctx, `delete from selected_releases where library_item_id = $1`, libraryItemID); err != nil {
+		return nil, err
+	}
+
 	var selectedReleaseID int64
 	if err = tx.QueryRowContext(ctx, `
 		insert into selected_releases (library_item_id, release_candidate_id)
@@ -1372,13 +1473,24 @@ func (db *DB) GetSelectedReleaseSummary(ctx context.Context, selectedReleaseID i
 	return item, nil
 }
 
+// GetLatestSelectedReleaseSummaryByLibraryItem returns the release currently
+// selected for a library item, or nil if none is currently active.
+//
+// This joins against queue_items.selected_release_id rather than just
+// grabbing the newest selected_releases row for the item: selected_releases
+// has no unique constraint on library_item_id, so stale/orphaned rows from a
+// prior selection (e.g. a reset, a rejected candidate, or the season-pack
+// fulfillment duplicate-row bug) can linger after queue_items has moved on.
+// Trusting "any row exists" instead of "the row queue_items still points to"
+// caused ProcessLibraryItem to skip a fresh search and resubmit an
+// already-rejected release for a 'failed' item instead of searching again.
 func (db *DB) GetLatestSelectedReleaseSummaryByLibraryItem(ctx context.Context, libraryItemID int64) (*ReleaseSummary, error) {
 	var selectedReleaseID int64
 	err := db.SQL.QueryRowContext(ctx, `
 		select sr.id
 		from selected_releases sr
-		where sr.library_item_id = $1
-		order by sr.id desc
+		join queue_items q on q.library_item_id = sr.library_item_id
+		where sr.library_item_id = $1 and q.selected_release_id = sr.id
 		limit 1`, libraryItemID,
 	).Scan(&selectedReleaseID)
 	if err != nil {
@@ -2095,9 +2207,6 @@ func isFKViolation(err error) bool {
 
 func isHardRejectReason(reason string) bool {
 	r := strings.TrimSpace(strings.ToLower(reason))
-	if isRetryablePreflightReason(r) {
-		return false
-	}
 	if isPermanentArchiveRejectReason(r) {
 		return true
 	}
@@ -2107,17 +2216,20 @@ func isHardRejectReason(reason string) bool {
 		strings.Contains(r, "all zero bytes") {
 		return true
 	}
-	// Missing/expired articles are permanent — NNTP doesn't bring them back.
-	// 430 = connection/transfer limit exceeded (throttle) — transient, NOT permanent.
-	// MUST check 430 first: throttled failures carry "nntp_article_unavailable" as
-	// a prefix but are transient (the article still exists on the server).
-	if strings.Contains(r, "status 430") {
-		return false
-	}
+	// NNTP 430/423 mean "no such article" per RFC 3977 and Newshosting's own
+	// support docs — the article is confirmed gone (past retention or removed),
+	// not a transient throttle, regardless of whether it surfaced via STAT
+	// ("article missing"), BODY ("status 430"), or a health-check re-fetch
+	// ("article not found"). See isThrottleLikeErr in
+	// internal/nntp/circuit_breaker.go for why the throttle assumption didn't
+	// hold up; this used to carve out "status 430" as transient here too,
+	// contradicting that conclusion.
 	if strings.Contains(r, "missing_articles") ||
 		strings.Contains(r, "nntp_article_unavailable") ||
 		strings.Contains(r, "article missing") ||
 		strings.Contains(r, "article not found") ||
+		strings.Contains(r, "status 430") ||
+		strings.Contains(r, "status 423") ||
 		strings.Contains(r, "crc mismatch") {
 		return true
 	}
@@ -2130,9 +2242,6 @@ func isHardRejectReason(reason string) bool {
 
 func shouldPersistBlocklistReason(reason string) bool {
 	r := strings.TrimSpace(strings.ToLower(reason))
-	if isRetryablePreflightReason(r) {
-		return false
-	}
 	if isPermanentArchiveRejectReason(r) || strings.HasPrefix(r, "manual_") {
 		return true
 	}
@@ -2144,6 +2253,8 @@ func shouldPersistBlocklistReason(reason string) bool {
 	}
 	if strings.Contains(r, "article missing") ||
 		strings.Contains(r, "article not found") ||
+		strings.Contains(r, "status 430") ||
+		strings.Contains(r, "status 423") ||
 		strings.Contains(r, "crc mismatch") {
 		return true
 	}
@@ -2158,17 +2269,6 @@ func isPermanentArchiveRejectReason(reason string) bool {
 	default:
 		return false
 	}
-}
-
-func isRetryablePreflightReason(reason string) bool {
-	r := strings.TrimSpace(strings.ToLower(reason))
-	if !(strings.HasPrefix(r, "early preflight:") ||
-		strings.HasPrefix(r, "preflight:")) {
-		return false
-	}
-	return strings.Contains(r, "article missing") ||
-		strings.Contains(r, "article not found") ||
-		strings.Contains(r, "430")
 }
 
 func blocklistKeyForExternalURL(rawURL string) string {

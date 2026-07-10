@@ -305,26 +305,41 @@ func (db *DB) FulfillEpisodeLibraryItem(ctx context.Context, libraryItemID, sour
 		return err
 	}
 
+	// This is meant to be idempotent -- fulfilling an episode that's already
+	// fulfilled should just mark it available and stop, not create another
+	// selected_release row. That used to rely on "ON CONFLICT DO NOTHING",
+	// but selected_releases has no unique constraint on library_item_id for
+	// it to conflict against, so the insert always succeeded and created a
+	// fresh row on every call (every RebuildPublications pass on every
+	// process start, every repeat season-pack search): 94.5% of the table
+	// ended up being dead duplicate rows this way, and thousands of episodes'
+	// live queue_items.selected_release_id pointer ended up referencing
+	// whichever duplicate happened to be inserted last -- sometimes one with
+	// no virtual_files at all, sometimes a genuinely redundant re-download.
+	// Checking for an existing row explicitly (rather than relying on a
+	// constraint that doesn't exist) restores the originally-intended
+	// no-op-if-already-fulfilled behavior without a schema change.
+	var alreadyFulfilled bool
+	if err := tx.QueryRowContext(ctx, `
+		SELECT EXISTS(SELECT 1 FROM selected_releases WHERE library_item_id = $1)`,
+		libraryItemID).Scan(&alreadyFulfilled); err != nil {
+		return err
+	}
+	if alreadyFulfilled {
+		if err := markLibraryItemAvailable(ctx, tx, libraryItemID); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+
 	// Insert a new selected_release row for this episode.
 	var newSelectedReleaseID int64
 	err = tx.QueryRowContext(ctx, `
 		INSERT INTO selected_releases (release_candidate_id, library_item_id)
 		VALUES ($1, $2)
-		ON CONFLICT DO NOTHING
 		RETURNING id`, releaseCandidateID, libraryItemID).Scan(&newSelectedReleaseID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		// A real DB error (connection drop, constraint violation, etc.) —
-		// do not treat this the same as "row already exists" below, or the
-		// episode gets marked available with no selected_release/queue_item
-		// backing it.
+	if err != nil {
 		return err
-	}
-	if err != nil || newSelectedReleaseID == 0 {
-		// Already selected — run available updates within the open transaction.
-		if err := markLibraryItemAvailable(ctx, tx, libraryItemID); err != nil {
-			return err
-		}
-		return tx.Commit()
 	}
 
 	// Update the virtual file to also reference this selected release.

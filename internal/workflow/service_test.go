@@ -2545,3 +2545,29 @@ func TestCalibrateImportedDocumentBestEffortAsyncDedupes(t *testing.T) {
 		t.Fatalf("expected calibration to be schedulable again after completion, got %d calls", got)
 	}
 }
+
+// TestForceSearchBypassesDedupCooldown verifies WithForceSearch lets a
+// user-initiated re-search through even when an identical request was just
+// remembered as skippable -- without it, "Search Again"/"Search Now" clicked
+// twice in quick succession would silently no-op (see shouldSkipSearchRequest).
+func TestForceSearchBypassesDedupCooldown(t *testing.T) {
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
+	req := hydraSearchRequestForTest()
+	now := time.Now()
+
+	if service.shouldSkipSearchRequest(context.Background(), 1, req, now) {
+		t.Fatal("first request should never be skipped")
+	}
+	service.rememberSearchRequest(1, req, "empty", now)
+
+	if !service.shouldSkipSearchRequest(context.Background(), 1, req, now) {
+		t.Fatal("identical request within cooldown should be skipped for a normal (automated) caller")
+	}
+	if service.shouldSkipSearchRequest(WithForceSearch(context.Background()), 1, req, now) {
+		t.Fatal("WithForceSearch should bypass the dedup cooldown for manual search callers")
+	}
+}
+
+func hydraSearchRequestForTest() hydra.SearchRequest {
+	return hydra.SearchRequest{MediaType: "movie", Query: "Test Movie", TMDBID: 123}
+}

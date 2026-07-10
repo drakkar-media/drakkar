@@ -5,6 +5,24 @@ import (
 	"time"
 )
 
+func TestFirstNormalizedWord(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"Daredevil", "daredevil"},
+		{"Daredevil: Born Again", "daredevil"},
+		{"Daredevil - Born Again", "daredevil"},
+		{"Grey's Anatomy", "greys"},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := firstNormalizedWord(tc.in); got != tc.want {
+			t.Errorf("firstNormalizedWord(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestIsPlayableMedia(t *testing.T) {
 	large := int64(200 * 1024 * 1024) // 200 MB — clearly a real video
 	if !isPlayableMedia("Dune.mkv", large) {
@@ -31,11 +49,11 @@ func TestIsHardRejectReason(t *testing.T) {
 	if !isHardRejectReason(" Archive_Encrypted ") {
 		t.Fatal("expected permanent archive reject to be hard")
 	}
-	if isHardRejectReason("early preflight: Newshosting attempt 1: article missing") {
-		t.Fatal("early preflight article missing should stay retryable")
+	if !isHardRejectReason("early preflight: Newshosting attempt 1: article missing") {
+		t.Fatal("article missing (430) is confirmed gone per RFC 3977 -- must be a hard reject even at early preflight")
 	}
-	if isHardRejectReason("preflight: first segment unavailable: article not found (cached)") {
-		t.Fatal("preflight article-missing should stay retryable")
+	if !isHardRejectReason("preflight: first segment unavailable: article not found (cached)") {
+		t.Fatal("article not found is confirmed gone per RFC 3977 -- must be a hard reject even at preflight")
 	}
 	if !isHardRejectReason("strict health: first segment abc unavailable: yenc crc mismatch") {
 		t.Fatal("expected crc mismatch to be hard")
@@ -58,11 +76,11 @@ func TestShouldPersistBlocklistReason(t *testing.T) {
 	if !shouldPersistBlocklistReason(" manual_reject ") {
 		t.Fatal("expected manual reject to persist in blocklist")
 	}
-	if shouldPersistBlocklistReason("early preflight: Newshosting attempt 1: article missing") {
-		t.Fatal("early preflight article missing should not persist in blocklist")
+	if !shouldPersistBlocklistReason("early preflight: Newshosting attempt 1: article missing") {
+		t.Fatal("article missing (430) is confirmed permanent -- must persist in blocklist even at early preflight")
 	}
-	if shouldPersistBlocklistReason("preflight: first segment unavailable: article not found (cached)") {
-		t.Fatal("preflight article-missing should not persist in blocklist")
+	if !shouldPersistBlocklistReason("preflight: first segment unavailable: article not found (cached)") {
+		t.Fatal("article not found is confirmed permanent -- must persist in blocklist even at preflight")
 	}
 	if !shouldPersistBlocklistReason("strict health: first segment abc unavailable: yenc crc mismatch") {
 		t.Fatal("expected crc mismatch to persist in blocklist")

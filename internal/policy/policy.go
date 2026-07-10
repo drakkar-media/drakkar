@@ -82,7 +82,7 @@ func Classify(reason string) FailureKey {
 		strings.Contains(r, "status 423") ||
 		strings.Contains(r, "article not found") ||
 		strings.Contains(r, "nntp_article_unavailable") ||
-		strings.Contains(r, "missing article"):
+		strings.Contains(r, "article missing"):
 		return KeyMissingArticles
 
 	case strings.Contains(r, "unsupported_archive") ||

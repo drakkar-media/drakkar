@@ -789,14 +789,15 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	}
 
 	// storage_maintenance: library cleanup then cache prune, every 6h.
+	// The cheap DB-only orphan prunes run unconditionally, regardless of
+	// backlog load: they're plain DELETE queries, not filesystem scans, so
+	// they don't compete with active downloads/imports the way the
+	// filesystem-heavy steps below do. Gating them on backlog load meant the
+	// only cleanup pass for orphaned selected_releases rows was silently
+	// skipped for days at a time exactly when chronic backlog made orphan
+	// accumulation worst -- a safety net that only worked when the system
+	// didn't need it.
 	runStorageMaintenance := func() {
-		if skip, reason := shouldSkipNonCriticalMaintenance(taskStorageMaintenance); skip {
-			logger.Info().Str("task", taskStorageMaintenance).Str("reason", reason).Msg("scheduler: skipping non-critical task")
-			return
-		}
-		_, _ = maintenanceSvc.RemoveOrphanedContent(ctx)
-		_, _ = maintenanceSvc.RemoveBrokenMediaSymlinks(ctx)
-		_, _ = maintenanceSvc.RemoveOrphanedCompletedSymlinks(ctx)
 		if result, err := maintenanceSvc.PruneStaleReleaseCandidates(ctx); err != nil {
 			logger.Error().Err(err).Msg("monitoring: release candidate prune error")
 		} else if result.DeletedRows > 0 {
@@ -807,6 +808,13 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		} else if result.DeletedRows > 0 {
 			logger.Info().Int("deletedRows", result.DeletedRows).Msg("monitoring: pruned orphaned selected releases")
 		}
+		if skip, reason := shouldSkipNonCriticalMaintenance(taskStorageMaintenance); skip {
+			logger.Info().Str("task", taskStorageMaintenance).Str("reason", reason).Msg("scheduler: skipping non-critical (filesystem-heavy) storage maintenance")
+			return
+		}
+		_, _ = maintenanceSvc.RemoveOrphanedContent(ctx)
+		_, _ = maintenanceSvc.RemoveBrokenMediaSymlinks(ctx)
+		_, _ = maintenanceSvc.RemoveOrphanedCompletedSymlinks(ctx)
 		if result, err := cacheSvc.Prune(ctx); err != nil {
 			logger.Error().Err(err).Msg("monitoring: cache prune error")
 		} else {

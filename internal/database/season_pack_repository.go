@@ -56,15 +56,27 @@ func (db *DB) ShouldAttemptSeasonPack(ctx context.Context, tvShowID int64, seaso
 }
 
 // RecordSeasonPackAttempt upserts the attempt counter and timestamp.
+//
+// A successful selection resets the counter instead of incrementing it: the
+// cooldown escalation exists to back off from a season that keeps failing to
+// find a pack, not to punish one that keeps successfully finding new/better
+// packs (e.g. as a season airs incrementally). Without this, a show whose
+// season-pack search legitimately succeeds every time still climbs the same
+// 6h -> 24h -> 3d -> 7d ladder as one that never succeeds, delaying pickup of
+// newly-aired episodes for no reason tied to actual failure.
 func (db *DB) RecordSeasonPackAttempt(ctx context.Context, tvShowID int64, season int, outcome string) error {
+	initialCount := 1
+	if outcome == SeasonPackOutcomeSelected {
+		initialCount = 0
+	}
 	_, err := db.SQL.ExecContext(ctx, `
 		INSERT INTO season_pack_attempts (tv_show_id, season_number, last_attempt_at, attempt_count, last_outcome)
-		VALUES ($1, $2, now(), 1, $3)
+		VALUES ($1, $2, now(), $4, $3)
 		ON CONFLICT (tv_show_id, season_number) DO UPDATE
 		    SET last_attempt_at = now(),
-		        attempt_count   = season_pack_attempts.attempt_count + 1,
+		        attempt_count   = CASE WHEN $3 = 'selected' THEN 0 ELSE season_pack_attempts.attempt_count + 1 END,
 		        last_outcome    = $3`,
-		tvShowID, season, outcome)
+		tvShowID, season, outcome, initialCount)
 	return err
 }
 

@@ -171,7 +171,7 @@ func DecisionKeyForReason(reason string) string {
 	r := strings.ToLower(strings.TrimSpace(reason))
 	switch {
 	// ── Drakkar-native: article/download failures ─────────────────────────
-	case strings.Contains(r, "missing article"),
+	case strings.Contains(r, "article missing"),
 		strings.Contains(r, "430"),
 		strings.Contains(r, "nntp_article_unavailable"):
 		return "missingArticles"

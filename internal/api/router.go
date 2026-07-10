@@ -867,7 +867,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		// Start search in background; return existing candidates immediately so the
 		// release picker opens without waiting for the full NZB search round-trip.
 		go func() {
-			search, searchErr := workflowSvc.SearchLibrary(context.Background(), libraryItemID)
+			search, searchErr := workflowSvc.SearchLibrary(workflow.WithForceSearch(context.Background()), libraryItemID)
 			if searchErr != nil {
 				slog.Warn("search replacements background", "library_item_id", libraryItemID, "err", searchErr)
 			}
@@ -1365,7 +1365,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		go func() {
-			result, err := workflowSvc.SearchLibrary(context.Background(), id)
+			result, err := workflowSvc.SearchLibrary(workflow.WithForceSearch(context.Background()), id)
 			if err != nil {
 				slog.Warn("search library background", "library_item_id", id, "err", err)
 				return
