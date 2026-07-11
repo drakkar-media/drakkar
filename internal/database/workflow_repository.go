@@ -2216,6 +2216,21 @@ func isHardRejectReason(reason string) bool {
 	if isPermanentArchiveRejectReason(r) {
 		return true
 	}
+	// "too_many_failures" is the synthetic reason promoteNextAfterFailureDepth
+	// passes here once a candidate's own failure_count already hit the giveup
+	// threshold (workflow/service.go: `next.FailureCount >= 5`) -- the whole
+	// point of tracking that count is to eventually give up on the candidate,
+	// but since this string never matched any of the checks below, hardReject
+	// stayed false forever and the candidate was simply re-incremented and
+	// left eligible for selection again. That produced an unbounded retry
+	// storm cycling through the same handful of candidates thousands of times
+	// (one live case: 6,700+ recorded failures for a single movie, still
+	// actively looping multiple times per second and re-fetching NZBs from
+	// the indexer each pass -- see the NZB Finder duplicate-download abuse
+	// warning this was traced from).
+	if strings.Contains(r, "too_many_failures") {
+		return true
+	}
 	if strings.Contains(r, "invalid media payload") ||
 		strings.Contains(r, "file header does not match") ||
 		strings.Contains(r, "returned no readable bytes") ||
