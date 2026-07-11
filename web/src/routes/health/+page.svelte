@@ -160,7 +160,7 @@
     const debouncedLoad = debounce(() => void load(), 500);
     return subscribeEvents((event) => {
       if (event?.kind === 'health.check') {
-        toastSuccess(`Checked ${event.checked} — ${event.healthy} healthy`);
+        toastSuccess(`Checked ${event.checked ?? 0} — ${event.healthy ?? 0} healthy`);
         checking = false;
       }
       if (event?.kind === 'library.republish_pending') {

@@ -912,8 +912,8 @@
       'library.republish_pending': (e) => `Republish Pending complete: processed ${e.processed}, republished ${e.republished}, failed ${e.failed}`,
       'library.reset_orphaned': (e) => `Reset Orphaned Available complete: found ${e.found}, reset ${e.reset}, failed ${e.failed}`,
       'health.check': (e) => `Symlink Health Check complete: checked ${e.checked}, healthy ${e.healthy}`,
-      'queue.retry_failed': (e) => `Retry Failed Queue complete: retried ${e.retried}, failed ${e.failed}`,
-      'requests.sync': (e) => `Sync Seerr Requests complete: seen ${e.seen}, created ${e.created}`
+      'queue.retry_failed': (e) => `Retry Failed Queue complete: retried ${e.retried ?? 0}, failed ${e.failed ?? 0}`,
+      'requests.sync': (e) => `Sync Seerr Requests complete: seen ${e.seen ?? 0}, created ${e.created ?? 0}`
     };
     // The Tasks tab's status pill/result line for fire-and-forget "Operations"
     // tasks was permanently frozen at the literal string "started in
@@ -931,8 +931,8 @@
       'library.republish_pending': { taskId: 'republish_pending', detail: (e) => `processed ${e.processed}, republished ${e.republished}, failed ${e.failed}` },
       'library.reset_orphaned': { taskId: 'reset_orphaned_available', detail: (e) => `found ${e.found}, reset ${e.reset}, failed ${e.failed}` },
       'health.check': { taskId: 'health_check', detail: (e) => `checked ${e.checked}, healthy ${e.healthy}` },
-      'queue.retry_failed': { taskId: 'retry_failed_queue', detail: (e) => `retried ${e.retried}, failed ${e.failed}` },
-      'requests.sync': { taskId: 'seerr_sync', detail: (e) => `seen ${e.seen}, created ${e.created}` }
+      'queue.retry_failed': { taskId: 'retry_failed_queue', detail: (e) => `retried ${e.retried ?? 0}, failed ${e.failed ?? 0}` },
+      'requests.sync': { taskId: 'seerr_sync', detail: (e) => `seen ${e.seen ?? 0}, created ${e.created ?? 0}` }
     };
     const debouncedLoadAll = debounce(() => void loadAll(), 500);
     const unsub = subscribeEvents((event) => {

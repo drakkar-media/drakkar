@@ -173,7 +173,7 @@
     if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
     await runAction(() => api.bulkQueueAction(selectedFailedIds, action), {
       setWorking: (v) => setBusy(`manage-selected-${action}`, v),
-      successMessage: (result) => `${result.retried} handled, ${result.failed} failed`,
+      successMessage: (result) => `${result.retried ?? 0} handled, ${result.failed ?? 0} failed`,
       afterSuccess: async () => {
         selectedHistoryIds = new Set();
         await load();
@@ -259,11 +259,11 @@
       }
       if (event?.kind === 'queue.retry_failed') {
         const e = event as Record<string, unknown>;
-        toastSuccess(`Retry Failed complete: retried ${e.retried}, failed ${e.failed}`);
+        toastSuccess(`Retry Failed complete: retried ${e.retried ?? 0}, failed ${e.failed ?? 0}`);
       }
       if (event?.kind === 'queue.failed_action') {
         const e = event as Record<string, unknown>;
-        toastSuccess(`${String(e.action).replaceAll('_', ' ')} complete: ${e.retried} handled, ${e.failed} failed`);
+        toastSuccess(`${String(e.action).replaceAll('_', ' ')} complete: ${e.retried ?? 0} handled, ${e.failed ?? 0} failed`);
       }
       if (!anyBusy()) debouncedRefresh();
     });

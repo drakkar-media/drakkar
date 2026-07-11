@@ -117,7 +117,7 @@
       }
       if (event?.kind === 'requests.sync') {
         const e = event as Record<string, unknown>;
-        toastSuccess(`Sync complete: seen ${e.seen}, created ${e.created}`);
+        toastSuccess(`Sync complete: seen ${e.seen ?? 0}, created ${e.created ?? 0}`);
       }
       if (!working) {
         debouncedLoadRequests();

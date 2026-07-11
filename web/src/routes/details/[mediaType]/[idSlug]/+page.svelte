@@ -210,7 +210,7 @@
         void loadEpisodeSubtitles(event.libraryItemId);
       }
       if (event.kind === 'tv.prioritize_missing' && event.tvShowId === localDetail?.tvShowId) {
-        toastSuccess(`Prioritized show — queued ${event.queued}, created ${event.itemsCreated}`);
+        toastSuccess(`Prioritized show — queued ${event.queued ?? 0}, created ${event.itemsCreated ?? 0}`);
         void loadDetail();
       }
     });

@@ -111,8 +111,8 @@
     'cache.prune':                  (e) => `Cache Prune: deleted ${e.deletedFiles} files`,
     'maintenance.nzb_health_check': (e) => `NZB Health Check: scanned ${e.scannedRows}, reset ${e.resetItems}`,
     'health.check':                 (e) => `Symlink Health Check: checked ${e.checked}, healthy ${e.healthy}`,
-    'queue.retry_failed':           (e) => `Retry Failed Queue: retried ${e.retried}, failed ${e.failed}`,
-    'requests.sync':                (e) => `Sync Seerr Requests: seen ${e.seen}, created ${e.created}`,
+    'queue.retry_failed':           (e) => `Retry Failed Queue: retried ${e.retried ?? 0}, failed ${e.failed ?? 0}`,
+    'requests.sync':                (e) => `Sync Seerr Requests: seen ${e.seen ?? 0}, created ${e.created ?? 0}`,
   };
 
   // Every fire-and-forget "Operations" task's row was permanently stuck
@@ -130,8 +130,8 @@
     'library.fill_missing_episodes': { taskId: 'fill_missing_episodes',    detail: (e) => `processed ${e.showsProcessed} shows, created ${e.itemsCreated} items` },
     'cache.prune':                   { taskId: 'cache_prune',              detail: (e) => `deleted ${e.deletedFiles} files` },
     'health.check':                  { taskId: 'health_check',             detail: (e) => `checked ${e.checked}, healthy ${e.healthy}` },
-    'queue.retry_failed':            { taskId: 'retry_failed_queue',       detail: (e) => `retried ${e.retried}, failed ${e.failed}` },
-    'requests.sync':                 { taskId: 'seerr_sync',               detail: (e) => `seen ${e.seen}, created ${e.created}` },
+    'queue.retry_failed':            { taskId: 'retry_failed_queue',       detail: (e) => `retried ${e.retried ?? 0}, failed ${e.failed ?? 0}` },
+    'requests.sync':                 { taskId: 'seerr_sync',               detail: (e) => `seen ${e.seen ?? 0}, created ${e.created ?? 0}` },
   };
 
   onMount(() => {
