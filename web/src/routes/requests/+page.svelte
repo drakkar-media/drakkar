@@ -43,8 +43,11 @@
     errorMessage = '';
     infoMessage = '';
     try {
-      const result = await api.syncRequests();
-      infoMessage = `sync seen=${result.seen} created=${result.created}`;
+      // Backend responds immediately with {queued: true} and syncs in a
+      // background goroutine — the real seen/created counts arrive later via
+      // a 'requests.sync' event (handled in onMount below).
+      await api.syncRequests();
+      infoMessage = 'Sync started in background';
       toastSuccess(infoMessage);
       await loadRequests();
     } catch (error) {
@@ -111,6 +114,10 @@
       if (event?.kind === 'library.search_pending') {
         const e = event as Record<string, unknown>;
         toastSuccess(`Search Pending complete: processed ${e.processed}, searched ${e.searched}, selected ${e.selected}, failed ${e.failed}`);
+      }
+      if (event?.kind === 'requests.sync') {
+        const e = event as Record<string, unknown>;
+        toastSuccess(`Sync complete: seen ${e.seen}, created ${e.created}`);
       }
       if (!working) {
         debouncedLoadRequests();

@@ -208,7 +208,7 @@
   // Task IDs match backend task scheduler IDs (internal/app/app.go ListTaskSchedules).
   const taskDefs: TaskDef[] = [
     // === Indexing (automated) ===
-    { id: 'seerr_sync',          label: 'Sync Seerr Requests',   description: 'Import new and updated requests from Seerr.',                                                      group: 'Indexing',   interval: '10m',  manual: true,  run: async () => { const r = await api.syncRequests();        return `seen ${r.seen}, created ${r.created}`; } },
+    { id: 'seerr_sync',          label: 'Sync Seerr Requests',   description: 'Import new and updated requests from Seerr.',                                                      group: 'Indexing',   interval: '10m',  manual: true,  run: async () => { await api.syncRequests();                  return 'started in background'; } },
     { id: 'pending_queue_push',  label: 'Dispatch Pending Queue', description: 'Push pending library items into the bounded background work queue.',                               group: 'Indexing',   interval: '30s',  manual: false, run: async () => '' },
     { id: 'hydra_recent_tv',     label: 'Recent TV Feed',         description: 'Fetch Hydra recent-TV RSS feed and index new TV releases.',                                        group: 'Indexing',   interval: 'RSS',  manual: false, run: async () => '' },
     { id: 'hydra_recent_movie',  label: 'Recent Movie Feed',      description: 'Fetch Hydra recent-movie RSS feed and index new movie releases.',                                  group: 'Indexing',   interval: 'RSS',  manual: false, run: async () => '' },
@@ -223,7 +223,7 @@
     { id: 'article_health_check',label: 'Article Health Check',   description: 'Probe first NNTP segment of every direct-NZB item. Resets items with expired or missing articles.',group:'Maintenance',interval: '6h',   manual: false, run: async () => '' },
     { id: 'storage_maintenance', label: 'Storage Maintenance',    description: 'Remove orphaned VFS content, broken media symlinks, and prune the block cache. Runs every 6 h.',  group: 'Maintenance',interval: '6h',   manual: false, run: async () => '' },
     // === Operations (individually-triggered via API) ===
-    { id: 'retry_failed_queue',       label: 'Retry Failed Queue',       description: 'Immediately retry all failed queue items using current fallback policy.',                  group: 'Operations', interval: '—',    manual: true,  run: async () => { const r = await api.retryFailedQueue();          return `processed ${r.processed}, retried ${r.retried}`; } },
+    { id: 'retry_failed_queue',       label: 'Retry Failed Queue',       description: 'Immediately retry all failed queue items using current fallback policy.',                  group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.retryFailedQueue();                    return 'started in background'; } },
     { id: 'search_upgrades',          label: 'Search Quality Upgrades',  description: 'Re-search available items whose quality profile allows a better release.',                  group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.searchUpgrades();                       return 'started in background'; } },
     // fill_missing_episodes/cache_prune/backfill_metadata/seerr_push_library all
     // respond immediately with {queued: true} and do the real work in a
@@ -911,7 +911,9 @@
       'library.search_pending': (e) => `Backlog Search complete: processed ${e.processed}, searched ${e.searched}, selected ${e.selected}, failed ${e.failed}`,
       'library.republish_pending': (e) => `Republish Pending complete: processed ${e.processed}, republished ${e.republished}, failed ${e.failed}`,
       'library.reset_orphaned': (e) => `Reset Orphaned Available complete: found ${e.found}, reset ${e.reset}, failed ${e.failed}`,
-      'health.check': (e) => `Symlink Health Check complete: checked ${e.checked}, healthy ${e.healthy}`
+      'health.check': (e) => `Symlink Health Check complete: checked ${e.checked}, healthy ${e.healthy}`,
+      'queue.retry_failed': (e) => `Retry Failed Queue complete: retried ${e.retried}, failed ${e.failed}`,
+      'requests.sync': (e) => `Sync Seerr Requests complete: seen ${e.seen}, created ${e.created}`
     };
     // The Tasks tab's status pill/result line for fire-and-forget "Operations"
     // tasks was permanently frozen at the literal string "started in
@@ -928,7 +930,9 @@
       'library.search_pending': { taskId: 'backlog_search', detail: (e) => `processed ${e.processed}, searched ${e.searched}, selected ${e.selected}, failed ${e.failed}` },
       'library.republish_pending': { taskId: 'republish_pending', detail: (e) => `processed ${e.processed}, republished ${e.republished}, failed ${e.failed}` },
       'library.reset_orphaned': { taskId: 'reset_orphaned_available', detail: (e) => `found ${e.found}, reset ${e.reset}, failed ${e.failed}` },
-      'health.check': { taskId: 'health_check', detail: (e) => `checked ${e.checked}, healthy ${e.healthy}` }
+      'health.check': { taskId: 'health_check', detail: (e) => `checked ${e.checked}, healthy ${e.healthy}` },
+      'queue.retry_failed': { taskId: 'retry_failed_queue', detail: (e) => `retried ${e.retried}, failed ${e.failed}` },
+      'requests.sync': { taskId: 'seerr_sync', detail: (e) => `seen ${e.seen}, created ${e.created}` }
     };
     const debouncedLoadAll = debounce(() => void loadAll(), 500);
     const unsub = subscribeEvents((event) => {

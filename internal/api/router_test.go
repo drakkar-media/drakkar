@@ -672,10 +672,15 @@ func TestWorkflowEndpoints(t *testing.T) {
 		t.Fatalf("unexpected requests response %d %s", requestsRec.Code, requestsRec.Body.String())
 	}
 
+	// /api/requests/sync and /api/discover/request both run SyncRequests's
+	// reconciliation in the background now (it scales with Seerr's entire
+	// non-declined request history), so the HTTP response only confirms the
+	// work was queued -- the real seen/created counts arrive via the
+	// "requests.sync" SSE event, not the response body.
 	syncReq := httptest.NewRequest(http.MethodPost, "/api/requests/sync", nil)
 	syncRec := httptest.NewRecorder()
 	router.ServeHTTP(syncRec, syncReq)
-	if syncRec.Code != http.StatusAccepted || !strings.Contains(syncRec.Body.String(), `"created":1`) {
+	if syncRec.Code != http.StatusAccepted || !strings.Contains(syncRec.Body.String(), `"queued":true`) {
 		t.Fatalf("unexpected sync response %d %s", syncRec.Code, syncRec.Body.String())
 	}
 
@@ -700,10 +705,13 @@ func TestWorkflowEndpoints(t *testing.T) {
 		t.Fatalf("unexpected retry response %d %s", retryRec.Code, retryRec.Body.String())
 	}
 
+	// RetryFailedQueue can issue up to 100 sequential synchronous Hydra
+	// searches, so this now runs in the background too -- see the comment on
+	// /api/queue/retry-failed in router.go.
 	retryAllReq := httptest.NewRequest(http.MethodPost, "/api/queue/retry-failed", nil)
 	retryAllRec := httptest.NewRecorder()
 	router.ServeHTTP(retryAllRec, retryAllReq)
-	if retryAllRec.Code != http.StatusAccepted || !strings.Contains(retryAllRec.Body.String(), `"processed":3`) {
+	if retryAllRec.Code != http.StatusAccepted || !strings.Contains(retryAllRec.Body.String(), `"queued":true`) {
 		t.Fatalf("unexpected bulk retry response %d %s", retryAllRec.Code, retryAllRec.Body.String())
 	}
 

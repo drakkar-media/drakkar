@@ -538,13 +538,20 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		result, err := workflowSvc.RetryFailedQueue(workflow.WithAsyncDownload(r.Context()))
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		publishMutation("queue.retry_failed", map[string]any{"processed": result.Processed, "retried": result.Retried, "failed": result.Failed})
-		respondJSON(w, http.StatusAccepted, result)
+		// Backgrounded: this can issue up to 100 sequential synchronous
+		// NZBHydra2 searches (see maxHydraCalls in RetryFailedQueue), which ran
+		// long enough inline to risk a reverse-proxy timeout on a large failed
+		// queue. Reports the real result via the "queue.retry_failed" SSE event.
+		go func() {
+			defer observability.Recover("queue-retry-failed")
+			result, err := workflowSvc.RetryFailedQueue(workflow.WithAsyncDownload(context.Background()))
+			if err != nil {
+				slog.Error("retry failed queue background", "err", err)
+				return
+			}
+			publishMutation("queue.retry_failed", map[string]any{"processed": result.Processed, "retried": result.Retried, "failed": result.Failed})
+		}()
+		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
 	})
 	r.Post("/api/queue/{id}/action", func(w http.ResponseWriter, r *http.Request) {
 		if workflowSvc == nil {
@@ -608,13 +615,22 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
-		result, err := workflowSvc.ManageFailedQueue(workflow.WithAsyncDownload(r.Context()), body.Action)
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		publishMutation("queue.failed_action", map[string]any{"action": body.Action, "processed": result.Processed, "retried": result.Retried, "failed": result.Failed})
-		respondJSON(w, http.StatusAccepted, result)
+		// Backgrounded: ManageFailedQueue loads every failed queue_items row
+		// with no limit (unlike RetryFailedQueue's 500-row/100-search caps) and,
+		// for remove_blocklist_and_search, issues one synchronous NZBHydra2
+		// search per row — ran long enough inline to risk a reverse-proxy
+		// timeout. Reports the real result via the "queue.failed_action" event.
+		action := body.Action
+		go func() {
+			defer observability.Recover("queue-failed-action")
+			result, err := workflowSvc.ManageFailedQueue(workflow.WithAsyncDownload(context.Background()), action)
+			if err != nil {
+				slog.Error("manage failed queue background", "action", action, "err", err)
+				return
+			}
+			publishMutation("queue.failed_action", map[string]any{"action": action, "processed": result.Processed, "retried": result.Retried, "failed": result.Failed})
+		}()
+		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true, "action": action})
 	})
 	r.Post("/api/queue/clear-failed", func(w http.ResponseWriter, r *http.Request) {
 		if workflowSvc == nil {
@@ -960,15 +976,19 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			}()
 			respondJSON(w, http.StatusAccepted, map[string]any{"queued": true, "action": "search", "count": len(ids)})
 		case "delete":
-			var failed []int64
-			for _, id := range payload.LibraryItemIDs {
-				if err := subtitleSvc.DeleteAllForItem(r.Context(), id); err != nil {
-					slog.Warn("bulk subtitle delete", "library_item_id", id, "err", err)
-					failed = append(failed, id)
+			ids := payload.LibraryItemIDs
+			go func() {
+				defer observability.Recover("subtitles-bulk-delete")
+				var failed []int64
+				for _, id := range ids {
+					if err := subtitleSvc.DeleteAllForItem(context.Background(), id); err != nil {
+						slog.Warn("bulk subtitle delete", "library_item_id", id, "err", err)
+						failed = append(failed, id)
+					}
 				}
-			}
-			publishMutation("subtitle.delete", map[string]any{"libraryItemIds": payload.LibraryItemIDs})
-			respondJSON(w, http.StatusOK, map[string]any{"status": "deleted", "count": len(payload.LibraryItemIDs) - len(failed), "failed": failed})
+				publishMutation("subtitle.delete", map[string]any{"libraryItemIds": ids, "count": len(ids) - len(failed), "failed": failed})
+			}()
+			respondJSON(w, http.StatusAccepted, map[string]any{"queued": true, "action": "delete", "count": len(ids)})
 		default:
 			respondError(w, http.StatusBadRequest, fmt.Errorf("unknown action %q", payload.Action))
 		}
@@ -1280,13 +1300,22 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		result, err := workflowSvc.SyncRequests(r.Context())
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		publishMutation("requests.sync", map[string]any{"seen": result.Seen, "created": result.Created})
-		respondJSON(w, http.StatusAccepted, result)
+		// Backgrounded: for every season-type Seerr request, SyncRequests makes
+		// synchronous TMDB calls per season with no dedup against
+		// already-imported seasons — the identical call is already backgrounded
+		// from the Seerr webhook handler above ("Trigger a sync in the
+		// background so this request returns fast"); the manual "sync now"
+		// route was left synchronous. Reports the real result via SSE.
+		go func() {
+			defer observability.Recover("requests-sync")
+			result, err := workflowSvc.SyncRequests(context.Background())
+			if err != nil {
+				slog.Error("sync requests background", "err", err)
+				return
+			}
+			publishMutation("requests.sync", map[string]any{"seen": result.Seen, "created": result.Created})
+		}()
+		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
 	})
 	r.Post("/api/requests/push-library", func(w http.ResponseWriter, r *http.Request) {
 		if workflowSvc == nil {
@@ -1309,12 +1338,21 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		result, err := workflowSvc.SyncPlexDetectedShows(r.Context())
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		respondJSON(w, http.StatusOK, result)
+		// Backgrounded: loops every Seerr-partial show issuing a synchronous
+		// Seerr API call per item (plus a full SyncRequests reconciliation
+		// pass) — the same call already runs hourly as a background scheduled
+		// task (see taskSyncPlexDetected in app.go) precisely because it's too
+		// slow for inline/request-time execution.
+		go func() {
+			defer observability.Recover("requests-sync-plex-detected")
+			result, err := workflowSvc.SyncPlexDetectedShows(context.Background())
+			if err != nil {
+				slog.Error("sync plex detected background", "err", err)
+				return
+			}
+			publishMutation("requests.sync_plex_detected", map[string]any{"found": result.Found, "requested": result.Requested, "skipped": result.Skipped})
+		}()
+		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
 	})
 	r.Post("/api/discover/request", func(w http.ResponseWriter, r *http.Request) {
 		if workflowSvc == nil {
@@ -1338,6 +1376,25 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			result, err = workflowSvc.CreateSeerrSeasonRequest(r.Context(), body.TmdbID, body.Seasons)
 		} else {
 			result, err = workflowSvc.CreateSeerrRequest(r.Context(), body.MediaType, body.TmdbID)
+		}
+		if errors.Is(err, workflow.ErrSeerrSyncPending) {
+			// The Seerr request itself was created successfully; reconciling it
+			// into a library item didn't finish within its internal budget
+			// (CreateSeerrRequest/CreateSeerrSeasonRequest scale with Seerr's
+			// entire non-declined request history). Finish the sync in the
+			// background and report the real result via the same
+			// "requests.sync" SSE event the fast path publishes below.
+			go func() {
+				defer observability.Recover("discover-request-sync-continuation")
+				bgResult, bgErr := workflowSvc.SyncRequests(context.Background())
+				if bgErr != nil {
+					slog.Error("discover request sync continuation", "err", bgErr)
+					return
+				}
+				publishMutation("requests.sync", map[string]any{"seen": bgResult.Seen, "created": bgResult.Created})
+			}()
+			respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
+			return
 		}
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, err)
@@ -1393,13 +1450,19 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
-		result, err := workflowSvc.PrioritizeTVShowMissing(r.Context(), id)
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		publishMutation("tv.prioritize_missing", map[string]any{"tvShowId": id, "queued": result.Queued, "itemsCreated": result.ItemsCreated})
-		respondJSON(w, http.StatusAccepted, result)
+		// Backgrounded: loops every season of the show making a synchronous
+		// TMDB call each (its sibling /search handler above is already
+		// backgrounded the same way). Reports the real result via SSE.
+		go func() {
+			defer observability.Recover("tv-prioritize-missing")
+			result, err := workflowSvc.PrioritizeTVShowMissing(context.Background(), id)
+			if err != nil {
+				slog.Error("prioritize tv show missing background", "tv_show_id", id, "err", err)
+				return
+			}
+			publishMutation("tv.prioritize_missing", map[string]any{"tvShowId": id, "queued": result.Queued, "itemsCreated": result.ItemsCreated})
+		}()
+		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
 	})
 	r.Post("/api/library/{id}/reset", func(w http.ResponseWriter, r *http.Request) {
 		if workflowSvc == nil {
@@ -1946,8 +2009,21 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
 			return
 		}
-		candidates, err := workflowSvc.ManualSearch(r.Context(), q)
+		// Unlike the other search endpoints (SearchLibrary, SearchUpgrades,
+		// etc., all fixed to run in the background) manual search must stay
+		// synchronous -- the user is waiting on the actual results to pick
+		// one. A broad query can page through NZBHydra2 up to searchMaxPages
+		// times at up to 30s per page, so bound it well under a typical
+		// reverse-proxy timeout and fail fast with a clear error instead of
+		// hanging until the proxy kills the connection with an opaque 524.
+		searchCtx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+		defer cancel()
+		candidates, err := workflowSvc.ManualSearch(searchCtx, q)
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				respondError(w, http.StatusGatewayTimeout, errors.New("manual search timed out — try a narrower query"))
+				return
+			}
 			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -2141,11 +2217,20 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("plex not configured"))
 			return
 		}
-		if err := plexClient.RefreshSection(r.Context(), ""); err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		respondJSON(w, http.StatusOK, map[string]any{"status": "refreshed"})
+		// Backgrounded: refreshes every Plex library section sequentially, one
+		// synchronous HTTP call each (15s client timeout) -- the automated
+		// post-publish pipeline already runs this identical call in its own
+		// goroutine with a bounded timeout for the same reason (a slow/flaky
+		// Plex server shouldn't block the caller).
+		go func() {
+			defer observability.Recover("plex-refresh")
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := plexClient.RefreshSection(ctx, ""); err != nil {
+				slog.Warn("plex refresh background", "err", err)
+			}
+		}()
+		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
 	})
 	r.Get("/api/plex/libraries", func(w http.ResponseWriter, r *http.Request) {
 		if plexClient == nil || !plexClient.Enabled() {

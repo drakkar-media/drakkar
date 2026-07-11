@@ -753,6 +753,23 @@ func (s *Service) syncSeasonRequest(ctx context.Context, req seerr.Request) (int
 	return created, ids, nil
 }
 
+// ErrSeerrSyncPending is returned by CreateSeerrRequest/CreateSeerrSeasonRequest
+// when the Seerr request itself was created successfully but reconciling it
+// into a library item didn't finish within seerrRequestSyncBudget. Callers
+// should treat this as an accepted request, not a failure -- the caller is
+// expected to trigger SyncRequests again (e.g. in the background) to finish
+// the reconciliation; the periodic scheduled sync will also pick it up.
+var ErrSeerrSyncPending = errors.New("seerr request created; library sync still in progress")
+
+// seerrRequestSyncBudget bounds the reconcile-into-library-item step of
+// CreateSeerrRequest/CreateSeerrSeasonRequest. SyncRequests scales with
+// Seerr's entire non-declined request history (which only grows over an
+// install's lifetime), so without a bound a request-creation call could block
+// its caller for as long as that full reconciliation takes. This budget is
+// independent of the caller's own context so it isn't affected by whatever
+// deadline (if any) the HTTP handler's request context happens to carry.
+const seerrRequestSyncBudget = 20 * time.Second
+
 func (s *Service) CreateSeerrRequest(ctx context.Context, mediaType string, tmdbID int64) (SyncResult, error) {
 	if s == nil || s.seerr == nil {
 		return SyncResult{}, fmt.Errorf("seerr client unavailable")
@@ -760,7 +777,7 @@ func (s *Service) CreateSeerrRequest(ctx context.Context, mediaType string, tmdb
 	if err := s.seerr.CreateRequest(ctx, mediaType, tmdbID); err != nil {
 		return SyncResult{}, err
 	}
-	return s.syncRequestsWithRetry(ctx)
+	return s.syncAfterSeerrRequest()
 }
 
 func (s *Service) CreateSeerrSeasonRequest(ctx context.Context, tmdbID int64, seasons []int) (SyncResult, error) {
@@ -773,7 +790,20 @@ func (s *Service) CreateSeerrSeasonRequest(ctx context.Context, tmdbID int64, se
 	if err := s.seerr.CreateTVSeasonRequest(ctx, tmdbID, seasons); err != nil {
 		return SyncResult{}, err
 	}
-	return s.syncRequestsWithRetry(ctx)
+	return s.syncAfterSeerrRequest()
+}
+
+func (s *Service) syncAfterSeerrRequest() (SyncResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), seerrRequestSyncBudget)
+	defer cancel()
+	result, err := s.syncRequestsWithRetry(ctx)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return SyncResult{}, ErrSeerrSyncPending
+		}
+		return SyncResult{}, err
+	}
+	return result, nil
 }
 
 type PushMissingToSeerrResult struct {

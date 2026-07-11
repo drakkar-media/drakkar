@@ -94,7 +94,7 @@
     if (typeof window !== 'undefined' && !window.confirm('Delete all subtitles for this item?')) return;
     await runAction(() => api.bulkSubtitleAction('delete', [id]), {
       setWorking: (v) => setBusy(`delete-${id}`, v),
-      successMessage: () => 'Subtitles deleted',
+      successMessage: () => 'Subtitle deletion queued',
       afterSuccess: load
     });
   }
@@ -105,7 +105,7 @@
     if (action === 'delete' && typeof window !== 'undefined' && !window.confirm(`Delete all subtitles for ${ids.length} selected item(s)?`)) return;
     await runAction(() => api.bulkSubtitleAction(action, ids), {
       setWorking: (v) => setBusy(`bulk-${action}`, v),
-      successMessage: (result) => (action === 'search' ? `Queued search for ${result.count} item(s)` : `Deleted subtitles for ${result.count} item(s)`),
+      successMessage: (result) => (action === 'search' ? `Queued search for ${result.count} item(s)` : `Queued deletion for ${result.count} item(s)`),
       afterSuccess: async () => {
         selected = new Set();
         await load();

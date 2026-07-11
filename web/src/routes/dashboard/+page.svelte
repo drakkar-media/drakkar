@@ -39,7 +39,7 @@
     const mediaType = (item.mediaType === 'tv' || item.mediaType === 'episode') ? 'tv' : 'movie';
     try {
       const result = await api.requestMedia(item.tmdbId, mediaType);
-      toastSuccess(`Requested — ${result.created} item(s) added`);
+      toastSuccess(result.queued ? 'Requested — finishing up in background' : `Requested — ${result.created} item(s) added`);
       void loadAll();
     } catch (err) {
       toastError(err instanceof Error ? err.message : String(err));

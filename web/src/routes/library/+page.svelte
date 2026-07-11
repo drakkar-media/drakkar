@@ -47,7 +47,7 @@
   async function syncRequests() {
     await runAction(() => api.syncRequests(), {
       setWorking: (v) => (working = v),
-      successMessage: (r) => `Synced — ${r.created} new`,
+      successMessage: () => 'Sync started in background — results will appear via SSE',
       afterSuccess: loadLibrary
     });
   }
@@ -103,6 +103,10 @@
       if (event?.kind === 'library.search_pending') {
         const e = event as Record<string, unknown>;
         toastSuccess(`Search Pending complete: searched ${e.searched}, selected ${e.selected}`);
+      }
+      if (event?.kind === 'requests.sync') {
+        const e = event as Record<string, unknown>;
+        toastSuccess(`Sync complete: seen ${e.seen}, created ${e.created}`);
       }
       if (!working) debouncedLoadLibrary();
     });

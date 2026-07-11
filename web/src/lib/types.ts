@@ -195,13 +195,6 @@ export type BulkSearchResult = {
   failedItems?: number[];
 };
 
-export type PrioritizeTVShowResult = {
-  tvShowId: number;
-  episodesFound: number;
-  itemsCreated: number;
-  queued: number;
-};
-
 export type BulkRepublishResult = {
   processed: number;
   republished: number;

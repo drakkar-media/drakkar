@@ -38,7 +38,6 @@ import type {
   BlockTestResult,
   IndexerPolicy,
   SubtitleProfile,
-  PrioritizeTVShowResult,
   ReleaseActionResult,
   DeletedCount,
   QueuedResult
@@ -108,12 +107,12 @@ export const api = {
       body: JSON.stringify({ queueItemIds, action })
     }),
   failedQueueAction: (action: string) =>
-    request<BulkQueueRetryResult>('/api/queue/failed/action', {
+    request<QueuedResult>('/api/queue/failed/action', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action })
     }),
-  retryFailedQueue: () => request<BulkQueueRetryResult>('/api/queue/retry-failed', { method: 'POST' }),
+  retryFailedQueue: () => request<QueuedResult>('/api/queue/retry-failed', { method: 'POST' }),
   clearFailedQueue: () => request<{ cleared: number }>('/api/queue/clear-failed', { method: 'POST' }),
   requests: () => request<{ requests: RequestItem[] }>('/api/requests'),
   setRequestProfile: (requestID: number, profileId: number | null) =>
@@ -148,7 +147,7 @@ export const api = {
     return request<{ items: BlocklistItem[]; page: number; pageSize: number; total: number; totalPages: number }>(`/api/blocklist?${p.toString()}`);
   },
   blocklistStats: () => request<{ total: number; active: number; expired: number; byReason: Record<string, number> }>('/api/blocklist/stats'),
-  syncRequests: () => request<{ seen: number; created: number }>('/api/requests/sync', { method: 'POST' }),
+  syncRequests: () => request<QueuedResult>('/api/requests/sync', { method: 'POST' }),
   pushMissingToSeerr: () => request<QueuedResult>('/api/requests/push-library', { method: 'POST' }),
   searchPendingLibrary: () => request<QueuedResult>('/api/library/search-pending', { method: 'POST' }),
   searchUpgrades: () => request<{ checked: number; upgraded: number; failed: number }>('/api/library/search-upgrades', { method: 'POST' }),
@@ -269,7 +268,7 @@ export const api = {
   },
   // Plex integration
   plexTest: () => request<{ ok: boolean; serverName?: string; libraries?: { key: string; title: string; type: string }[]; error?: string }>('/api/plex/test', { method: 'POST' }),
-  plexRefresh: () => request<{ status: string }>('/api/plex/refresh', { method: 'POST' }),
+  plexRefresh: () => request<QueuedResult>('/api/plex/refresh', { method: 'POST' }),
   plexLibraries: () => request<{ libraries: { key: string; title: string; type: string }[] }>('/api/plex/libraries'),
   plexOauthStart: () => request<{ pinId: number; code: string; authUrl: string; clientIdentifier: string }>('/api/plex/oauth/start', { method: 'POST' }),
   plexOauthPoll: (pinId: number) => request<{ authorized: boolean; token?: string }>('/api/plex/oauth/poll', {
@@ -291,9 +290,12 @@ export const api = {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url })
   }),
-  // Request media via Seerr then sync to library
+  // Request media via Seerr then sync to library. Usually resolves with the
+  // real seen/created counts, but on a very large Seerr request history the
+  // sync step can fall back to {queued: true} and finish in the background
+  // -- the real counts then arrive via the "requests.sync" SSE event.
   requestMedia: (tmdbId: number, mediaType: 'movie' | 'tv', seasons?: number[]) =>
-    request<{ seen: number; created: number }>('/api/discover/request', {
+    request<{ seen?: number; created?: number; queued?: boolean }>('/api/discover/request', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tmdbId, mediaType, seasons })
@@ -392,7 +394,7 @@ export const api = {
       body: JSON.stringify({ mode })
     }),
   prioritizeTVShowMissing: (tvShowId: number) =>
-    request<PrioritizeTVShowResult>(`/api/tv-shows/${tvShowId}/prioritize-missing`, { method: 'POST' }),
+    request<QueuedResult>(`/api/tv-shows/${tvShowId}/prioritize-missing`, { method: 'POST' }),
   // Auth
   me: () => request<User>('/api/auth/me'),
   // Uses a raw fetch rather than request(): logging out must always clear

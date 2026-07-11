@@ -121,7 +121,7 @@
   async function retryAll() {
     await runAction(() => api.retryFailedQueue(), {
       setWorking: (v) => setBusy('retry-all', v),
-      successMessage: (result) => `Retried ${result.retried}`,
+      successMessage: () => 'Retry Failed Queue started in background',
       afterSuccess: load
     });
   }
@@ -158,7 +158,7 @@
     if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
     await runAction(() => api.failedQueueAction(action), {
       setWorking: (v) => setBusy(`manage-all-${action}`, v),
-      successMessage: (result) => `${result.retried} handled, ${result.failed} failed`,
+      successMessage: () => `${action.replaceAll('_', ' ')} started in background`,
       afterSuccess: load
     });
   }
@@ -256,6 +256,14 @@
       if (event?.kind === 'library.search_pending') {
         const e = event as Record<string, unknown>;
         toastSuccess(`Search Pending complete: processed ${e.processed}, selected ${e.selected}`);
+      }
+      if (event?.kind === 'queue.retry_failed') {
+        const e = event as Record<string, unknown>;
+        toastSuccess(`Retry Failed complete: retried ${e.retried}, failed ${e.failed}`);
+      }
+      if (event?.kind === 'queue.failed_action') {
+        const e = event as Record<string, unknown>;
+        toastSuccess(`${String(e.action).replaceAll('_', ' ')} complete: ${e.retried} handled, ${e.failed} failed`);
       }
       if (!anyBusy()) debouncedRefresh();
     });

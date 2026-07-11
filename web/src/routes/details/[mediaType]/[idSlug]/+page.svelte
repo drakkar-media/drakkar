@@ -209,6 +209,10 @@
       if (event.kind === 'subtitle.search' && typeof event.libraryItemId === 'number' && event.libraryItemId in episodeSubtitles) {
         void loadEpisodeSubtitles(event.libraryItemId);
       }
+      if (event.kind === 'tv.prioritize_missing' && event.tvShowId === localDetail?.tvShowId) {
+        toastSuccess(`Prioritized show — queued ${event.queued}, created ${event.itemsCreated}`);
+        void loadDetail();
+      }
     });
   });
 
@@ -379,7 +383,7 @@
     if (!tmdbId) return;
     await runAction(() => api.requestMedia(tmdbId, 'tv', [seasonNumber]), {
       setWorking: (v) => setBusy(`season-request-${seasonNumber}`, v),
-      successMessage: (result) => `Requested ${seasonLabel} — ${result.created} item(s) added`,
+      successMessage: (result) => (result.queued ? `Requested ${seasonLabel} — finishing up in background` : `Requested ${seasonLabel} — ${result.created} item(s) added`),
       afterSuccess: loadDetail
     });
   }
@@ -389,8 +393,7 @@
     if (!tvShowId) return;
     await runAction(() => api.prioritizeTVShowMissing(tvShowId), {
       setWorking: (v) => setBusy('prioritize-missing', v),
-      successMessage: (result) => `Prioritized show — queued ${result.queued}, created ${result.itemsCreated}`,
-      afterSuccess: loadDetail
+      successMessage: () => 'Prioritizing missing episodes in background'
     });
   }
 

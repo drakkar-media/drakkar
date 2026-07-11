@@ -33,7 +33,7 @@
   // "Operations" group = individually-triggerable via API, no corresponding scheduled entry.
   const tasks: TaskDef[] = [
     // === Indexing (automated) ===
-    { id: 'seerr_sync',        label: 'Sync Seerr Requests',   description: 'Import new and updated requests from Seerr.',                                                       group: 'Indexing',   interval: '10m',  manual: true,  run: async () => { const r = await api.syncRequests();        return `seen ${r.seen}, created ${r.created}`; } },
+    { id: 'seerr_sync',        label: 'Sync Seerr Requests',   description: 'Import new and updated requests from Seerr.',                                                       group: 'Indexing',   interval: '10m',  manual: true,  run: async () => { await api.syncRequests();                  return 'started in background'; } },
     { id: 'pending_queue_push',label: 'Dispatch Pending Queue', description: 'Push pending library items into the bounded background work queue.',                                group: 'Indexing',   interval: '30s',  manual: false, run: async () => '' },
     { id: 'hydra_recent_tv',   label: 'Recent TV Feed',         description: 'Fetch Hydra recent-TV RSS feed and index new TV releases.',                                         group: 'Indexing',   interval: 'RSS',  manual: false, run: async () => '' },
     { id: 'hydra_recent_movie',label: 'Recent Movie Feed',      description: 'Fetch Hydra recent-movie RSS feed and index new movie releases.',                                   group: 'Indexing',   interval: 'RSS',  manual: false, run: async () => '' },
@@ -48,7 +48,7 @@
     { id: 'article_health_check',label: 'Article Health Check', description: 'Probe first NNTP segment of every direct-NZB item. Resets items with expired or missing articles.',group: 'Maintenance',interval: '6h',   manual: false, run: async () => '' },
     { id: 'storage_maintenance',label: 'Storage Maintenance',   description: 'Remove orphaned VFS content, broken media symlinks, and prune the block cache. Runs every 6 h.',   group: 'Maintenance',interval: '6h',   manual: false, run: async () => '' },
     // === Operations (individually-triggered via API) ===
-    { id: 'retry_failed_queue',       label: 'Retry Failed Queue',          description: 'Immediately retry all failed queue items using current fallback policy.',               group: 'Operations', interval: '—',    manual: true,  run: async () => { const r = await api.retryFailedQueue();          return `processed ${r.processed}, retried ${r.retried}`; } },
+    { id: 'retry_failed_queue',       label: 'Retry Failed Queue',          description: 'Immediately retry all failed queue items using current fallback policy.',               group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.retryFailedQueue();                    return 'started in background'; } },
     { id: 'search_upgrades',          label: 'Search Quality Upgrades',     description: 'Re-search available items whose quality profile allows a better release.',               group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.searchUpgrades();                       return 'started in background'; } },
     { id: 'fill_missing_episodes',    label: 'Fill Missing Episodes',       description: 'Use TMDB episode lists to create library items for episodes not yet tracked.',           group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.fillMissingEpisodes();        return 'started in background'; } },
     { id: 'republish_pending',        label: 'Republish Pending',           description: 'Republish library items with a selected release but no current symlink.',               group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.republishPendingLibrary();               return 'started in background'; } },
@@ -111,6 +111,8 @@
     'cache.prune':                  (e) => `Cache Prune: deleted ${e.deletedFiles} files`,
     'maintenance.nzb_health_check': (e) => `NZB Health Check: scanned ${e.scannedRows}, reset ${e.resetItems}`,
     'health.check':                 (e) => `Symlink Health Check: checked ${e.checked}, healthy ${e.healthy}`,
+    'queue.retry_failed':           (e) => `Retry Failed Queue: retried ${e.retried}, failed ${e.failed}`,
+    'requests.sync':                (e) => `Sync Seerr Requests: seen ${e.seen}, created ${e.created}`,
   };
 
   // Every fire-and-forget "Operations" task's row was permanently stuck
@@ -128,6 +130,8 @@
     'library.fill_missing_episodes': { taskId: 'fill_missing_episodes',    detail: (e) => `processed ${e.showsProcessed} shows, created ${e.itemsCreated} items` },
     'cache.prune':                   { taskId: 'cache_prune',              detail: (e) => `deleted ${e.deletedFiles} files` },
     'health.check':                  { taskId: 'health_check',             detail: (e) => `checked ${e.checked}, healthy ${e.healthy}` },
+    'queue.retry_failed':            { taskId: 'retry_failed_queue',       detail: (e) => `retried ${e.retried}, failed ${e.failed}` },
+    'requests.sync':                 { taskId: 'seerr_sync',               detail: (e) => `seen ${e.seen}, created ${e.created}` },
   };
 
   onMount(() => {
