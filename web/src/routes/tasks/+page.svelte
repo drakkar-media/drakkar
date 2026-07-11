@@ -43,7 +43,7 @@
     // === Publishing (automated) ===
     { id: 'publishing_maintenance', label: 'Publishing Maintenance', description: 'Republish pending library items and reset orphaned available items. Runs every 30 min.',      group: 'Publishing', interval: '30m',  manual: false, run: async () => '' },
     // === Maintenance (automated + manual) ===
-    { id: 'health_check',      label: 'Symlink Health Check',   description: 'Verify published symlinks still point to valid VFS targets.',                                       group: 'Maintenance',interval: '15m',  manual: true,  run: async () => { const r = await api.runHealthCheck();      return `checked ${r.checked}, healthy ${r.healthy}`; } },
+    { id: 'health_check',      label: 'Symlink Health Check',   description: 'Verify published symlinks still point to valid VFS targets.',                                       group: 'Maintenance',interval: '15m',  manual: true,  run: async () => { await api.runHealthCheck();                 return 'started in background'; } },
     { id: 'nzb_health_check',  label: 'Deep NZB Article Check', description: 'Full NNTP article scan — probes segments, resets missing-article or sample-only publications.',    group: 'Maintenance',interval: '168h', manual: false, run: async () => '' },
     { id: 'article_health_check',label: 'Article Health Check', description: 'Probe first NNTP segment of every direct-NZB item. Resets items with expired or missing articles.',group: 'Maintenance',interval: '6h',   manual: false, run: async () => '' },
     { id: 'storage_maintenance',label: 'Storage Maintenance',   description: 'Remove orphaned VFS content, broken media symlinks, and prune the block cache. Runs every 6 h.',   group: 'Maintenance',interval: '6h',   manual: false, run: async () => '' },
@@ -110,6 +110,7 @@
     'library.fill_missing_episodes':(e) => `Fill Episodes: processed ${e.showsProcessed} shows, created ${e.itemsCreated} items`,
     'cache.prune':                  (e) => `Cache Prune: deleted ${e.deletedFiles} files`,
     'maintenance.nzb_health_check': (e) => `NZB Health Check: scanned ${e.scannedRows}, reset ${e.resetItems}`,
+    'health.check':                 (e) => `Symlink Health Check: checked ${e.checked}, healthy ${e.healthy}`,
   };
 
   // Every fire-and-forget "Operations" task's row was permanently stuck
@@ -126,6 +127,7 @@
     'library.backfill_metadata':     { taskId: 'backfill_metadata',        detail: (e) => `enriched ${e.enriched} items` },
     'library.fill_missing_episodes': { taskId: 'fill_missing_episodes',    detail: (e) => `processed ${e.showsProcessed} shows, created ${e.itemsCreated} items` },
     'cache.prune':                   { taskId: 'cache_prune',              detail: (e) => `deleted ${e.deletedFiles} files` },
+    'health.check':                  { taskId: 'health_check',             detail: (e) => `checked ${e.checked}, healthy ${e.healthy}` },
   };
 
   onMount(() => {

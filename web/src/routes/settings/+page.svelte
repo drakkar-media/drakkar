@@ -218,7 +218,7 @@
     // === Publishing (automated) ===
     { id: 'publishing_maintenance', label: 'Publishing Maintenance', description: 'Republish pending library items and reset orphaned available items. Runs every 30 min.',       group: 'Publishing', interval: '30m',  manual: false, run: async () => '' },
     // === Maintenance (automated + manual) ===
-    { id: 'health_check',        label: 'Symlink Health Check',   description: 'Verify published symlinks still point to valid VFS targets.',                                      group: 'Maintenance',interval: '15m',  manual: true,  run: async () => { const r = await api.runHealthCheck();      return `checked ${r.checked}, healthy ${r.healthy}`; } },
+    { id: 'health_check',        label: 'Symlink Health Check',   description: 'Verify published symlinks still point to valid VFS targets.',                                      group: 'Maintenance',interval: '15m',  manual: true,  run: async () => { await api.runHealthCheck();                 return 'started in background'; } },
     { id: 'nzb_health_check',    label: 'Deep NZB Article Check', description: 'Full NNTP article scan — probes segments, resets missing-article or sample-only publications.',   group: 'Maintenance',interval: '168h', manual: false, run: async () => '' },
     { id: 'article_health_check',label: 'Article Health Check',   description: 'Probe first NNTP segment of every direct-NZB item. Resets items with expired or missing articles.',group:'Maintenance',interval: '6h',   manual: false, run: async () => '' },
     { id: 'storage_maintenance', label: 'Storage Maintenance',    description: 'Remove orphaned VFS content, broken media symlinks, and prune the block cache. Runs every 6 h.',  group: 'Maintenance',interval: '6h',   manual: false, run: async () => '' },
@@ -910,7 +910,8 @@
       'library.search_upgrades': (e) => `Search Quality Upgrades complete: checked ${e.checked}, upgraded ${e.upgraded}, failed ${e.failed}`,
       'library.search_pending': (e) => `Backlog Search complete: processed ${e.processed}, searched ${e.searched}, selected ${e.selected}, failed ${e.failed}`,
       'library.republish_pending': (e) => `Republish Pending complete: processed ${e.processed}, republished ${e.republished}, failed ${e.failed}`,
-      'library.reset_orphaned': (e) => `Reset Orphaned Available complete: found ${e.found}, reset ${e.reset}, failed ${e.failed}`
+      'library.reset_orphaned': (e) => `Reset Orphaned Available complete: found ${e.found}, reset ${e.reset}, failed ${e.failed}`,
+      'health.check': (e) => `Symlink Health Check complete: checked ${e.checked}, healthy ${e.healthy}`
     };
     // The Tasks tab's status pill/result line for fire-and-forget "Operations"
     // tasks was permanently frozen at the literal string "started in
@@ -926,7 +927,8 @@
       'library.search_upgrades': { taskId: 'search_upgrades', detail: (e) => `checked ${e.checked}, upgraded ${e.upgraded}, failed ${e.failed}` },
       'library.search_pending': { taskId: 'backlog_search', detail: (e) => `processed ${e.processed}, searched ${e.searched}, selected ${e.selected}, failed ${e.failed}` },
       'library.republish_pending': { taskId: 'republish_pending', detail: (e) => `processed ${e.processed}, republished ${e.republished}, failed ${e.failed}` },
-      'library.reset_orphaned': { taskId: 'reset_orphaned_available', detail: (e) => `found ${e.found}, reset ${e.reset}, failed ${e.failed}` }
+      'library.reset_orphaned': { taskId: 'reset_orphaned_available', detail: (e) => `found ${e.found}, reset ${e.reset}, failed ${e.failed}` },
+      'health.check': { taskId: 'health_check', detail: (e) => `checked ${e.checked}, healthy ${e.healthy}` }
     };
     const debouncedLoadAll = debounce(() => void loadAll(), 500);
     const unsub = subscribeEvents((event) => {

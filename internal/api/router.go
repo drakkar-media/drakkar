@@ -1681,25 +1681,35 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 	})
 	r.Post("/api/health/check", func(w http.ResponseWriter, r *http.Request) {
 		if healthRepo == nil {
-			respondJSON(w, http.StatusOK, map[string]any{"checked": 0, "healthy": 0})
+			respondJSON(w, http.StatusOK, map[string]any{"queued": true})
 			return
 		}
-		entries, err := healthRepo.ListHealthEntries(r.Context())
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		var checked, healthy int
-		for _, e := range entries {
-			isOK := database.CheckSymlinkHealth(e.LibraryPath, e.TargetPath)
-			_ = healthRepo.RecordHealthCheck(r.Context(), e.ID, isOK)
-			checked++
-			if isOK {
-				healthy++
+		// Runs in the background and reports back via the "health.check" SSE
+		// event: a full scan is one filesystem check per published symlink
+		// (11,000+ on a large library), which synchronously held the HTTP
+		// response open long enough to exceed the Cloudflare proxy's request
+		// timeout (524) for this specific button, even though the identical
+		// scheduled background scan never had that problem.
+		go func() {
+			defer observability.Recover("health-check")
+			ctx := context.Background()
+			entries, err := healthRepo.ListHealthEntries(ctx)
+			if err != nil {
+				slog.Error("health check background", "err", err)
+				return
 			}
-		}
-		publishMutation("health.check", map[string]any{"checked": checked, "healthy": healthy})
-		respondJSON(w, http.StatusOK, map[string]any{"checked": checked, "healthy": healthy})
+			var checked, healthy int
+			for _, e := range entries {
+				isOK := database.CheckSymlinkHealth(e.LibraryPath, e.TargetPath)
+				_ = healthRepo.RecordHealthCheck(ctx, e.ID, isOK)
+				checked++
+				if isOK {
+					healthy++
+				}
+			}
+			publishMutation("health.check", map[string]any{"checked": checked, "healthy": healthy})
+		}()
+		respondJSON(w, http.StatusOK, map[string]any{"queued": true})
 	})
 	r.Get("/api/health/consistency", func(w http.ResponseWriter, r *http.Request) {
 		if healthRepo == nil {

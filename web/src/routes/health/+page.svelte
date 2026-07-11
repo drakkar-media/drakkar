@@ -91,12 +91,16 @@
   async function runCheck() {
     checking = true;
     try {
-      const result = await api.runHealthCheck();
-      toastSuccess(`Checked ${result.checked} — ${result.healthy} healthy`);
-      await load();
+      // Backend responds immediately with {queued: true} and scans in a
+      // background goroutine — a full scan is one filesystem check per
+      // published symlink (11,000+ on this library), which used to run
+      // synchronously in the request and could exceed the Cloudflare proxy's
+      // timeout. The real checked/healthy counts arrive via the 'health.check'
+      // event handled in onMount below, which also resets `checking`.
+      await api.runHealthCheck();
+      toastSuccess('Health check started in background');
     } catch (err) {
       toastError(err instanceof Error ? err.message : String(err));
-    } finally {
       checking = false;
     }
   }
@@ -155,6 +159,10 @@
     void load();
     const debouncedLoad = debounce(() => void load(), 500);
     return subscribeEvents((event) => {
+      if (event?.kind === 'health.check') {
+        toastSuccess(`Checked ${event.checked} — ${event.healthy} healthy`);
+        checking = false;
+      }
       if (event?.kind === 'library.republish_pending') {
         toastSuccess(`Republish Pending complete: processed ${event.processed}, republished ${event.republished}, failed ${event.failed}`);
         republishing = false;
