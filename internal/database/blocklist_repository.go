@@ -203,7 +203,7 @@ func (db *DB) enrichBlocklistSignature(ctx context.Context, item *BlocklistItemS
 		left join selected_releases sr on sr.release_candidate_id = rc.id
 		where ($1 = '' or lower(trim(rc.indexer_name)) = $1)
 		  and ($2 < 0 or coalesce(rc.size_bytes, 0) / (1024 * 1024) = $2)
-		  and ($3::date is null or rc.posted_at::date = $3::date)
+		  and ($3::date is null or (rc.posted_at at time zone 'UTC')::date = ($3 at time zone 'UTC')::date)
 		order by sr.id desc nulls last, rc.id desc`, indexerKey, sizeBucket, dateBucket)
 	if err != nil {
 		return err

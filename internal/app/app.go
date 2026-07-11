@@ -265,7 +265,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			continue
 		}
 		client := nntp.NewArticleClient(provider)
-		pooled := nntp.NewPooledSource(client.NewSession, provider.MaxConnections)
+		pooled := nntp.NewPooledSource(ctx, client.NewSession, provider.MaxConnections)
 		pooledSources = append(pooledSources, pooled)
 		articleSources = append(articleSources, nntp.NamedArticleSource{
 			Name:   provider.Name,
@@ -285,7 +285,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		// Wrap with a 24-hour missing-article cache so known-expired (430) IDs
 		// are never re-fetched from NNTP within the TTL window.
 		cachedFallback := nntp.NewCachedFallbackSource(fallback)
-		scheduled := nntp.NewScheduledSource(cachedFallback, maxDownloadConnections*3, maxDownloadConnections*8)
+		scheduled := nntp.NewScheduledSource(ctx, cachedFallback, maxDownloadConnections*3, maxDownloadConnections*8)
 		// No separate background budget (matches nzbdav behaviour) — all priorities share the pool
 		diskDecoded := nntp.NewDiskCachedDecodedSource(scheduled, rt.BlockCachePath, rt.DiskCacheLimitBytes)
 		decoded := nntp.NewCachedDecodedSource(diskDecoded, rt.MemoryHotCacheMaxBytes)

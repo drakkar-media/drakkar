@@ -130,7 +130,9 @@
 
   onMount(() => {
     void loadSchedules();
-    const t = window.setInterval(() => void loadSchedules(), 30000);
+    const t = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void loadSchedules();
+    }, 30000);
     const unsub = subscribeEvents((event) => {
       if (!event) return;
       const fmt = backgroundKinds[event.kind as string];

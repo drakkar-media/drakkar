@@ -10,6 +10,7 @@
   import { api, subscribeEvents } from '$lib/api';
   import { dateTime, sentence } from '$lib/format';
   import { toastError, toastSuccess } from '$lib/toast';
+  import { debounce } from '$lib/debounce';
   import type { QualityProfile, RequestItem, Status } from '$lib/types';
 
   let status: Status | null = null;
@@ -102,6 +103,8 @@
     }
   }
 
+  const debouncedLoadRequests = debounce(() => void loadRequests(), 500);
+
   onMount(() => {
     void loadRequests();
     const unsubscribe = subscribeEvents((event) => {
@@ -110,10 +113,12 @@
         toastSuccess(`Search Pending complete: processed ${e.processed}, searched ${e.searched}, selected ${e.selected}, failed ${e.failed}`);
       }
       if (!working) {
-        void loadRequests();
+        debouncedLoadRequests();
       }
     });
-    const timer = window.setInterval(() => void loadRequests(), 30000);
+    const timer = window.setInterval(() => {
+      if (!working && document.visibilityState === 'visible') void loadRequests();
+    }, 30000);
     return () => {
       window.clearInterval(timer);
       unsubscribe();

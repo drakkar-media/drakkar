@@ -10,6 +10,8 @@
   import StatusPill from '$lib/components/StatusPill.svelte';
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
+  import { runAction } from '$lib/actions';
+  import { debounce } from '$lib/debounce';
   import type { SubtitleLibraryRow } from '$lib/types';
 
   let items: SubtitleLibraryRow[] = [];
@@ -81,53 +83,41 @@
   }
 
   async function searchOne(id: number) {
-    setBusy(`search-${id}`, true);
-    try {
-      await api.searchSubtitles(id, []);
-      toastSuccess('Subtitle search queued');
-      await load();
-    } catch (err) {
-      toastError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(`search-${id}`, false);
-    }
+    await runAction(() => api.searchSubtitles(id, []), {
+      setWorking: (v) => setBusy(`search-${id}`, v),
+      successMessage: () => 'Subtitle search queued',
+      afterSuccess: load
+    });
   }
 
   async function deleteOne(id: number) {
     if (typeof window !== 'undefined' && !window.confirm('Delete all subtitles for this item?')) return;
-    setBusy(`delete-${id}`, true);
-    try {
-      await api.bulkSubtitleAction('delete', [id]);
-      toastSuccess('Subtitles deleted');
-      await load();
-    } catch (err) {
-      toastError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(`delete-${id}`, false);
-    }
+    await runAction(() => api.bulkSubtitleAction('delete', [id]), {
+      setWorking: (v) => setBusy(`delete-${id}`, v),
+      successMessage: () => 'Subtitles deleted',
+      afterSuccess: load
+    });
   }
 
   async function bulkAction(action: 'search' | 'delete') {
     if (selectedCount === 0) return;
     const ids = Array.from(selected);
     if (action === 'delete' && typeof window !== 'undefined' && !window.confirm(`Delete all subtitles for ${ids.length} selected item(s)?`)) return;
-    setBusy(`bulk-${action}`, true);
-    try {
-      const result = await api.bulkSubtitleAction(action, ids);
-      toastSuccess(action === 'search' ? `Queued search for ${result.count} item(s)` : `Deleted subtitles for ${result.count} item(s)`);
-      selected = new Set();
-      await load();
-    } catch (err) {
-      toastError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy(`bulk-${action}`, false);
-    }
+    await runAction(() => api.bulkSubtitleAction(action, ids), {
+      setWorking: (v) => setBusy(`bulk-${action}`, v),
+      successMessage: (result) => (action === 'search' ? `Queued search for ${result.count} item(s)` : `Deleted subtitles for ${result.count} item(s)`),
+      afterSuccess: async () => {
+        selected = new Set();
+        await load();
+      }
+    });
   }
 
   onMount(() => {
     void load();
+    const debouncedLoad = debounce(() => void load(), 500);
     const unsub = subscribeEvents(() => {
-      if (!anyBusy()) void load();
+      if (!anyBusy()) debouncedLoad();
     });
     return unsub;
   });

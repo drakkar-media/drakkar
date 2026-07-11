@@ -18,6 +18,7 @@
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
   import { bytes as fmtBytes } from '$lib/format';
+  import { debounce } from '$lib/debounce';
   import type { IntegrationProbeReport, Status } from '$lib/types';
 
   type ServiceCard = {
@@ -137,8 +138,9 @@
 
   onMount(() => {
     void load();
+    const debouncedLoad = debounce(() => void load(), 500);
     return subscribeEvents(() => {
-      if (!probing) void load();
+      if (!probing) debouncedLoad();
     });
   });
 </script>

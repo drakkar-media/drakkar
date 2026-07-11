@@ -23,7 +23,7 @@ func (s *fakeSession) Close() error                                     { return
 func TestPooledSourceReusesSessions(t *testing.T) {
 	var created atomic.Int32
 	var calls atomic.Int32
-	source := NewPooledSource(func(ctx context.Context) (BodySession, error) {
+	source := NewPooledSource(context.Background(), func(ctx context.Context) (BodySession, error) {
 		created.Add(1)
 		return &fakeSession{calls: &calls}, nil
 	}, 2)
@@ -47,7 +47,7 @@ func TestPooledSourceReusesSessions(t *testing.T) {
 
 func TestPooledSourceCapsOpenSessions(t *testing.T) {
 	var created atomic.Int32
-	source := NewPooledSource(func(ctx context.Context) (BodySession, error) {
+	source := NewPooledSource(context.Background(), func(ctx context.Context) (BodySession, error) {
 		created.Add(1)
 		return &fakeSession{calls: &atomic.Int32{}}, nil
 	}, 2)

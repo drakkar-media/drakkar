@@ -78,6 +78,7 @@
 
   async function deleteProfile(p: QualityProfile) {
     if (!p.id || p.isDefault || deleting) return;
+    if (typeof window !== 'undefined' && !window.confirm(`Delete profile "${p.name}"?`)) return;
     deleting = true;
     try {
       await api.deleteProfile(p.id);
@@ -163,13 +164,13 @@
               <div class="ordered-row">
                 <span class="rank">{i + 1}</span>
                 <span class="ordered-value">{res}</span>
-                <button type="button" class="rank-btn" on:click={() => { selected = { ...selected!, resolutions: moveUp(selected!.resolutions, i) }; }} disabled={i === 0}>
+                <button type="button" class="rank-btn" aria-label={`Move ${res} up`} on:click={() => { selected = { ...selected!, resolutions: moveUp(selected!.resolutions, i) }; }} disabled={i === 0}>
                   <ChevronUp size={13} />
                 </button>
-                <button type="button" class="rank-btn" on:click={() => { selected = { ...selected!, resolutions: moveDown(selected!.resolutions, i) }; }} disabled={i === selected.resolutions.length - 1}>
+                <button type="button" class="rank-btn" aria-label={`Move ${res} down`} on:click={() => { selected = { ...selected!, resolutions: moveDown(selected!.resolutions, i) }; }} disabled={i === selected.resolutions.length - 1}>
                   <ChevronDown size={13} />
                 </button>
-                <button type="button" class="rank-btn remove" on:click={() => { selected = { ...selected!, resolutions: selected!.resolutions.filter(v => v !== res) }; }}>✕</button>
+                <button type="button" class="rank-btn remove" aria-label={`Remove ${res}`} on:click={() => { selected = { ...selected!, resolutions: selected!.resolutions.filter(v => v !== res) }; }}>✕</button>
               </div>
             {/each}
             <div class="chip-row">
@@ -188,9 +189,9 @@
               <div class="ordered-row">
                 <span class="rank">{i + 1}</span>
                 <span class="ordered-value">{src}</span>
-                <button type="button" class="rank-btn" on:click={() => { selected = { ...selected!, sources: moveUp(selected!.sources, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
-                <button type="button" class="rank-btn" on:click={() => { selected = { ...selected!, sources: moveDown(selected!.sources, i) }; }} disabled={i === selected.sources.length - 1}><ChevronDown size={13} /></button>
-                <button type="button" class="rank-btn remove" on:click={() => { selected = { ...selected!, sources: selected!.sources.filter(v => v !== src) }; }}>✕</button>
+                <button type="button" class="rank-btn" aria-label={`Move ${src} up`} on:click={() => { selected = { ...selected!, sources: moveUp(selected!.sources, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
+                <button type="button" class="rank-btn" aria-label={`Move ${src} down`} on:click={() => { selected = { ...selected!, sources: moveDown(selected!.sources, i) }; }} disabled={i === selected.sources.length - 1}><ChevronDown size={13} /></button>
+                <button type="button" class="rank-btn remove" aria-label={`Remove ${src}`} on:click={() => { selected = { ...selected!, sources: selected!.sources.filter(v => v !== src) }; }}>✕</button>
               </div>
             {/each}
             <div class="chip-row">
@@ -209,9 +210,9 @@
               <div class="ordered-row">
                 <span class="rank">{i + 1}</span>
                 <span class="ordered-value">{c}</span>
-                <button type="button" class="rank-btn" on:click={() => { selected = { ...selected!, codecs: moveUp(selected!.codecs, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
-                <button type="button" class="rank-btn" on:click={() => { selected = { ...selected!, codecs: moveDown(selected!.codecs, i) }; }} disabled={i === selected.codecs.length - 1}><ChevronDown size={13} /></button>
-                <button type="button" class="rank-btn remove" on:click={() => { selected = { ...selected!, codecs: selected!.codecs.filter(v => v !== c) }; }}>✕</button>
+                <button type="button" class="rank-btn" aria-label={`Move ${c} up`} on:click={() => { selected = { ...selected!, codecs: moveUp(selected!.codecs, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
+                <button type="button" class="rank-btn" aria-label={`Move ${c} down`} on:click={() => { selected = { ...selected!, codecs: moveDown(selected!.codecs, i) }; }} disabled={i === selected.codecs.length - 1}><ChevronDown size={13} /></button>
+                <button type="button" class="rank-btn remove" aria-label={`Remove ${c}`} on:click={() => { selected = { ...selected!, codecs: selected!.codecs.filter(v => v !== c) }; }}>✕</button>
               </div>
             {/each}
             <div class="chip-row">
@@ -232,9 +233,9 @@
               <div class="ordered-row">
                 <span class="rank">{i + 1}</span>
                 <span class="ordered-value">{a}</span>
-                <button type="button" class="rank-btn" on:click={() => { selected = { ...selected!, audioFormats: moveUp(selected!.audioFormats, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
-                <button type="button" class="rank-btn" on:click={() => { selected = { ...selected!, audioFormats: moveDown(selected!.audioFormats, i) }; }} disabled={i === selected.audioFormats.length - 1}><ChevronDown size={13} /></button>
-                <button type="button" class="rank-btn remove" on:click={() => { selected = { ...selected!, audioFormats: selected!.audioFormats.filter(v => v !== a) }; }}>✕</button>
+                <button type="button" class="rank-btn" aria-label={`Move ${a} up`} on:click={() => { selected = { ...selected!, audioFormats: moveUp(selected!.audioFormats, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
+                <button type="button" class="rank-btn" aria-label={`Move ${a} down`} on:click={() => { selected = { ...selected!, audioFormats: moveDown(selected!.audioFormats, i) }; }} disabled={i === selected.audioFormats.length - 1}><ChevronDown size={13} /></button>
+                <button type="button" class="rank-btn remove" aria-label={`Remove ${a}`} on:click={() => { selected = { ...selected!, audioFormats: selected!.audioFormats.filter(v => v !== a) }; }}>✕</button>
               </div>
             {/each}
             <div class="chip-row">
@@ -253,9 +254,9 @@
               <div class="ordered-row">
                 <span class="rank">{i + 1}</span>
                 <span class="ordered-value">{h}</span>
-                <button type="button" class="rank-btn" on:click={() => { selected = { ...selected!, hdrFormats: moveUp(selected!.hdrFormats, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
-                <button type="button" class="rank-btn" on:click={() => { selected = { ...selected!, hdrFormats: moveDown(selected!.hdrFormats, i) }; }} disabled={i === selected.hdrFormats.length - 1}><ChevronDown size={13} /></button>
-                <button type="button" class="rank-btn remove" on:click={() => { selected = { ...selected!, hdrFormats: selected!.hdrFormats.filter(v => v !== h) }; }}>✕</button>
+                <button type="button" class="rank-btn" aria-label={`Move ${h} up`} on:click={() => { selected = { ...selected!, hdrFormats: moveUp(selected!.hdrFormats, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
+                <button type="button" class="rank-btn" aria-label={`Move ${h} down`} on:click={() => { selected = { ...selected!, hdrFormats: moveDown(selected!.hdrFormats, i) }; }} disabled={i === selected.hdrFormats.length - 1}><ChevronDown size={13} /></button>
+                <button type="button" class="rank-btn remove" aria-label={`Remove ${h}`} on:click={() => { selected = { ...selected!, hdrFormats: selected!.hdrFormats.filter(v => v !== h) }; }}>✕</button>
               </div>
             {/each}
             <div class="chip-row">

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"sync"
 
 	"github.com/hjongedijk/drakkar/internal/cache"
 	"github.com/hjongedijk/drakkar/internal/metrics"
@@ -16,8 +15,11 @@ type DiskCachedDecodedSource struct {
 	source       ArticleSource
 	cache        *cache.FileCache
 	singleflight *cache.SingleFlight
-	infoMu       sync.Mutex
-	partInfo     map[string]yenc.PartInfo
+	// partInfo companions the on-disk decoded body cache, which has no size
+	// cap of its own (bounded by maxBytes on disk, not entry count) — an
+	// unbounded map here would otherwise grow forever across a long-running
+	// process. Bounded the same way as CachedDecodedSource's infoCache.
+	partInfo *cache.ByteLRU
 }
 
 func NewDiskCachedDecodedSource(source ArticleSource, root string, maxBytes int64) *DiskCachedDecodedSource {
@@ -25,7 +27,7 @@ func NewDiskCachedDecodedSource(source ArticleSource, root string, maxBytes int6
 		source:       source,
 		cache:        cache.NewFileCache(root, maxBytes),
 		singleflight: cache.NewSingleFlight(),
-		partInfo:     make(map[string]yenc.PartInfo),
+		partInfo:     cache.NewByteLRU(infoCacheMaxBytes),
 	}
 }
 
@@ -117,16 +119,15 @@ func (s *DiskCachedDecodedSource) fetchRaw(ctx context.Context, messageID string
 }
 
 func (s *DiskCachedDecodedSource) lookupPartInfo(messageID string) (yenc.PartInfo, bool) {
-	s.infoMu.Lock()
-	defer s.infoMu.Unlock()
-	info, ok := s.partInfo[messageID]
-	return info, ok
+	raw, ok := s.partInfo.Get(messageID)
+	if !ok {
+		return yenc.PartInfo{}, false
+	}
+	return decodePartInfo(raw)
 }
 
 func (s *DiskCachedDecodedSource) storePartInfo(messageID string, info yenc.PartInfo) {
-	s.infoMu.Lock()
-	defer s.infoMu.Unlock()
-	s.partInfo[messageID] = info
+	s.partInfo.Put(messageID, encodePartInfo(info))
 }
 
 func (s *DiskCachedDecodedSource) Stat(ctx context.Context, messageID string) error {

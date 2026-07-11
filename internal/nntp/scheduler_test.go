@@ -25,7 +25,7 @@ func (s *orderedSource) Body(ctx context.Context, messageID string) ([]byte, err
 
 func TestScheduledSourcePrioritizesHighQueue(t *testing.T) {
 	src := &orderedSource{wait: 20 * time.Millisecond}
-	scheduler := NewScheduledSource(src, 1, 8)
+	scheduler := NewScheduledSource(context.Background(), src, 1, 8)
 
 	done := make(chan struct{}, 3)
 	go func() {

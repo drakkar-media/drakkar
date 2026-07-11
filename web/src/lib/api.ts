@@ -1,5 +1,6 @@
 import { browser } from '$app/environment';
 import { goto } from '$app/navigation';
+import type { BackgroundTaskEvent } from '$lib/events';
 import type {
   LibraryItem,
   LibraryPage,
@@ -37,7 +38,10 @@ import type {
   BlockTestResult,
   IndexerPolicy,
   SubtitleProfile,
-  PrioritizeTVShowResult
+  PrioritizeTVShowResult,
+  ReleaseActionResult,
+  DeletedCount,
+  QueuedResult
 } from '$lib/types';
 
 function baseURL() {
@@ -65,6 +69,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       if (typeof json?.error === 'string') message = json.error;
     } catch { /* not JSON — use raw text */ }
     throw new Error(message);
+  }
+  if (response.status === 204) {
+    return undefined as T;
   }
   return (await response.json()) as T;
 }
@@ -142,8 +149,8 @@ export const api = {
   },
   blocklistStats: () => request<{ total: number; active: number; expired: number; byReason: Record<string, number> }>('/api/blocklist/stats'),
   syncRequests: () => request<{ seen: number; created: number }>('/api/requests/sync', { method: 'POST' }),
-  pushMissingToSeerr: () => request<{ queued: boolean }>('/api/requests/push-library', { method: 'POST' }),
-  searchPendingLibrary: () => request<{ queued: boolean }>('/api/library/search-pending', { method: 'POST' }),
+  pushMissingToSeerr: () => request<QueuedResult>('/api/requests/push-library', { method: 'POST' }),
+  searchPendingLibrary: () => request<QueuedResult>('/api/library/search-pending', { method: 'POST' }),
   searchUpgrades: () => request<{ checked: number; upgraded: number; failed: number }>('/api/library/search-upgrades', { method: 'POST' }),
   searchLibrary: (libraryItemID: number) =>
     request<{ candidateCount: number; selectedReleaseId?: number }>(`/api/library/${libraryItemID}/search`, { method: 'POST' }),
@@ -158,20 +165,20 @@ export const api = {
   republishPendingLibrary: () => request<BulkRepublishResult>('/api/library/republish-pending', { method: 'POST' }),
   resetOrphanedAvailableItems: () => request<{ found: number; reset: number; failed: number }>('/api/library/reset-orphaned-available', { method: 'POST' }),
   selectRelease: (releaseCandidateID: number) =>
-    request<{ releaseCandidateId: number; action: string; selectedReleaseId?: number }>(`/api/releases/${releaseCandidateID}/select`, { method: 'POST' }),
+    request<ReleaseActionResult>(`/api/releases/${releaseCandidateID}/select`, { method: 'POST' }),
   rejectRelease: (releaseCandidateID: number, reason = 'manual_reject') =>
-    request<{ releaseCandidateId: number; action: string; selectedReleaseId?: number }>(`/api/releases/${releaseCandidateID}/reject`, {
+    request<ReleaseActionResult>(`/api/releases/${releaseCandidateID}/reject`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ reason })
     }),
   restoreRelease: (releaseCandidateID: number) =>
-    request<{ releaseCandidateId: number; action: string; selectedReleaseId?: number }>(`/api/releases/${releaseCandidateID}/restore`, { method: 'POST' }),
+    request<ReleaseActionResult>(`/api/releases/${releaseCandidateID}/restore`, { method: 'POST' }),
   skipRelease: (releaseCandidateID: number) =>
-    request<{ releaseCandidateId: number; action: string; selectedReleaseId?: number }>(`/api/releases/${releaseCandidateID}/skip`, { method: 'POST' }),
+    request<ReleaseActionResult>(`/api/releases/${releaseCandidateID}/skip`, { method: 'POST' }),
   nzbHealthCheck: () =>
     request<MaintenanceResult>('/api/maintenance/nzb-health-check', { method: 'POST' }),
-  pruneCache: () => request<{ queued: boolean }>('/api/cache/prune', { method: 'POST' }),
+  pruneCache: () => request<QueuedResult>('/api/cache/prune', { method: 'POST' }),
   clearBlocklist: (id: number) => request<{ status: string; blocklistItemId: number }>(`/api/blocklist/${id}`, { method: 'DELETE' }),
   clearAllBlocklist: () => request<{ cleared: number }>('/api/blocklist', { method: 'DELETE' }),
   clearBlocklistByReason: (reason: string) => request<{ cleared: number }>(`/api/blocklist?reason=${encodeURIComponent(reason)}`, { method: 'DELETE' }),
@@ -225,7 +232,7 @@ export const api = {
   metrics: () => request<Record<string, number>>('/api/metrics'),
   listProfiles: () => request<{ profiles: QualityProfile[] }>('/api/profiles'),
   saveProfile: (p: QualityProfile) => request<QualityProfile>('/api/profiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) }),
-  deleteProfile: (id: number) => request<{ deleted: number }>(`/api/profiles/${id}`, { method: 'DELETE' }),
+  deleteProfile: (id: number) => request<DeletedCount>(`/api/profiles/${id}`, { method: 'DELETE' }),
   listQualityDefinitions: () => request<{ definitions: QualityDefinition[] }>('/api/quality-definitions'),
   updateQualityDefinition: (d: QualityDefinition) => request<QualityDefinition>(`/api/quality-definitions/${d.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(d) }),
   taskSchedules: () => request<{ items: TaskSchedule[] }>('/api/tasks/schedules'),
@@ -247,8 +254,8 @@ export const api = {
   healthEntries: () => request<{ items: { id: number; libraryItemId: number; libraryPath: string; targetPath: string; createdAt: string; lastCheckedAt?: string; healthOk?: boolean }[] }>('/api/health/entries'),
   healthConsistency: () => request<{ items: { libraryItemId: number; title: string; mediaType: string; queueState: string }[] }>('/api/health/consistency'),
   runHealthCheck: () => request<{ checked: number; healthy: number }>('/api/health/check', { method: 'POST' }),
-  backfillMetadata: () => request<{ queued: boolean }>('/api/library/backfill-metadata', { method: 'POST' }),
-  fillMissingEpisodes: () => request<{ queued: boolean }>('/api/library/fill-missing-episodes', { method: 'POST' }),
+  backfillMetadata: () => request<QueuedResult>('/api/library/backfill-metadata', { method: 'POST' }),
+  fillMissingEpisodes: () => request<QueuedResult>('/api/library/fill-missing-episodes', { method: 'POST' }),
   logs: (opts?: { limit?: number; level?: string }) => {
     const params = new URLSearchParams();
     if (opts?.limit) params.set('limit', String(opts.limit));
@@ -295,7 +302,7 @@ export const api = {
   manualSearch: (query: string, kind: 'movie' | 'tv' | 'all' = 'all') =>
     request<{ items: ManualSearchItem[] }>(`/api/search/manual?q=${encodeURIComponent(query)}&kind=${kind}`),
   manualImportRelease: (libraryItemID: number, item: ManualSearchItem) =>
-    request<{ releaseCandidateId: number; action: string; selectedReleaseId?: number }>(`/api/library/${libraryItemID}/manual-import`, {
+    request<ReleaseActionResult>(`/api/library/${libraryItemID}/manual-import`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -346,7 +353,7 @@ export const api = {
   updateReleaseBlockRule: (r: ReleaseBlockRule) =>
     request<ReleaseBlockRule>(`/api/release-block-rules/${r.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(r) }),
   deleteReleaseBlockRule: (id: number) =>
-    request<{ deleted: number }>(`/api/release-block-rules/${id}`, { method: 'DELETE' }),
+    request<DeletedCount>(`/api/release-block-rules/${id}`, { method: 'DELETE' }),
   testReleaseBlockRule: (title: string, mediaType: string) =>
     request<BlockTestResult>('/api/release-block-rules/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title, mediaType }) }),
   // Custom formats
@@ -356,7 +363,7 @@ export const api = {
   updateCustomFormat: (f: CustomFormat) =>
     request<CustomFormat>(`/api/custom-formats/${f.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(f) }),
   deleteCustomFormat: (id: number) =>
-    request<{ deleted: number }>(`/api/custom-formats/${id}`, { method: 'DELETE' }),
+    request<DeletedCount>(`/api/custom-formats/${id}`, { method: 'DELETE' }),
   importCustomFormats: (formats: CustomFormat[]) =>
     request<{ imported: number; total: number }>('/api/custom-formats/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(formats) }),
   importReleaseBlockRules: (rules: ReleaseBlockRule[]) =>
@@ -368,7 +375,7 @@ export const api = {
   updateIndexerPolicy: (p: IndexerPolicy) =>
     request<IndexerPolicy>(`/api/indexer-policies/${p.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) }),
   deleteIndexerPolicy: (id: number) =>
-    request<{ deleted: number }>(`/api/indexer-policies/${id}`, { method: 'DELETE' }),
+    request<DeletedCount>(`/api/indexer-policies/${id}`, { method: 'DELETE' }),
   // Subtitle profiles
   listSubtitleProfiles: () => request<{ items: SubtitleProfile[] }>('/api/subtitle-profiles'),
   createSubtitleProfile: (p: SubtitleProfile) =>
@@ -376,7 +383,7 @@ export const api = {
   updateSubtitleProfile: (p: SubtitleProfile) =>
     request<SubtitleProfile>(`/api/subtitle-profiles/${p.id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(p) }),
   deleteSubtitleProfile: (id: number) =>
-    request<{ deleted: number }>(`/api/subtitle-profiles/${id}`, { method: 'DELETE' }),
+    request<DeletedCount>(`/api/subtitle-profiles/${id}`, { method: 'DELETE' }),
   // TV show monitoring mode
   setTVShowMonitoring: (tvShowId: number, mode: string) =>
     request<{ tvShowId: number; mode: string }>(`/api/tv-shows/${tvShowId}/monitoring`, {
@@ -388,6 +395,9 @@ export const api = {
     request<PrioritizeTVShowResult>(`/api/tv-shows/${tvShowId}/prioritize-missing`, { method: 'POST' }),
   // Auth
   me: () => request<User>('/api/auth/me'),
+  // Uses a raw fetch rather than request(): logging out must always clear
+  // local session state even if the server call fails (already-expired
+  // session, network blip) — request() throwing here would skip that.
   logout: () => fetch(`${baseURL()}/api/auth/logout`, { method: 'POST' }),
   listApiTokens: () => request<APIToken[]>('/api/auth/tokens'),
   createApiToken: (name: string, expiresAt?: string | null) =>
@@ -396,21 +406,23 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, expiresAt: expiresAt || '' })
     }),
-  deleteApiToken: (id: number) =>
-    fetch(`${baseURL()}/api/auth/tokens/${id}`, { method: 'DELETE' }),
+  deleteApiToken: (id: number) => request<void>(`/api/auth/tokens/${id}`, { method: 'DELETE' }),
   // User management
   listUsers: () => request<User[]>('/api/users'),
   createUser: (username: string, password: string, role = 'admin') =>
     request<User>('/api/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password, role }) }),
-  deleteUser: (id: number) =>
-    fetch(`${baseURL()}/api/users/${id}`, { method: 'DELETE' }),
+  deleteUser: (id: number) => request<void>(`/api/users/${id}`, { method: 'DELETE' }),
   changePassword: (id: number, password: string) =>
-    fetch(`${baseURL()}/api/users/${id}/password`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) }),
+    request<void>(`/api/users/${id}/password`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password })
+    }),
   // Setup
   setupStatus: () => request<{ required: boolean }>('/api/setup/status'),
 };
 
-export function subscribeEvents(onMessage: (event?: Record<string, unknown>) => void): () => void {
+export function subscribeEvents(onMessage: (event?: BackgroundTaskEvent) => void): () => void {
   if (!browser) {
     return () => {};
   }

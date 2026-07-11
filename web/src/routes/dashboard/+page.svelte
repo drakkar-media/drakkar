@@ -13,6 +13,7 @@
   import { detailsHref } from '$lib/detailsHref';
   import { toastError, toastSuccess } from '$lib/toast';
   import { bytes as fmt } from '$lib/format';
+  import { debounce } from '$lib/debounce';
   import type { DashboardHome, LibraryItem, Status } from '$lib/types';
 
   let home: DashboardHome | null = null;
@@ -20,6 +21,7 @@
   let loading = true;
   let heroIndex = 0;
   let heroTimer: number;
+  let heroCarouselKey = '';
 
   async function loadAll() {
     loading = true;
@@ -45,6 +47,14 @@
   }
 
   function startCarousel(items: LibraryItem[]) {
+    // Skip the restart when the trending set is unchanged — loadAll() reruns
+    // on every SSE message and 120s poll tick, and without this guard each
+    // rerun cleared+restarted the timer, resetting the 7s countdown so the
+    // carousel could go long stretches without ever auto-advancing.
+    const key = items.map((item) => item.id).join(',');
+    if (key === heroCarouselKey) return;
+    heroCarouselKey = key;
+    heroIndex = 0;
     clearInterval(heroTimer);
     if (items.length > 1) {
       heroTimer = window.setInterval(() => {
@@ -53,10 +63,14 @@
     }
   }
 
+  const debouncedLoadAll = debounce(() => void loadAll(), 500);
+
   onMount(() => {
     void loadAll();
-    const unsub = subscribeEvents(() => void loadAll());
-    const t = window.setInterval(() => void loadAll(), 120000);
+    const unsub = subscribeEvents(() => debouncedLoadAll());
+    const t = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void loadAll();
+    }, 120000);
     return () => { window.clearInterval(t); window.clearInterval(heroTimer); unsub(); };
   });
 

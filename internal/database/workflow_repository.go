@@ -1534,6 +1534,79 @@ func (db *DB) GetStoredNZBDocument(ctx context.Context, selectedReleaseID int64)
 	return item, nil
 }
 
+// activatedCandidateInfo carries the release metadata SelectReleaseCandidate
+// needs for its blocklist-purge step. It is nil for automatic retry
+// promotion (promoteRetryCandidate), which activates a candidate that was
+// already known not to be rejected/blocklisted.
+type activatedCandidateInfo struct {
+	title       string
+	externalURL string
+	indexerName string
+	sizeBytes   int64
+	postedAt    time.Time
+}
+
+// activateReleaseCandidate runs the transaction steps shared by
+// SelectReleaseCandidate (manual pick) and promoteRetryCandidate (automatic
+// retry promotion): clear the item's current selection, activate the given
+// candidate, insert its selected_releases row, and requeue the item. When
+// info is non-nil (manual selection only) it also clears any prior
+// rejection on the candidate and purges blocklist entries matching the
+// release's signature, so a user-selected release is never immediately
+// re-blocked by its own past rejection.
+func activateReleaseCandidate(ctx context.Context, tx *sql.Tx, libraryItemID, releaseCandidateID int64, info *activatedCandidateInfo) (int64, error) {
+	if err := preDeleteVFRByLibraryItem(ctx, tx, libraryItemID); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		delete from selected_releases
+		where library_item_id = $1`, libraryItemID,
+	); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		update release_candidates
+		set selected = false
+		where library_item_id = $1`, libraryItemID,
+	); err != nil {
+		return 0, err
+	}
+	activateQuery := `update release_candidates set selected = true where id = $1`
+	if info != nil {
+		activateQuery = `update release_candidates set selected = true, rejected = false, reject_reason = '' where id = $1`
+	}
+	if _, err := tx.ExecContext(ctx, activateQuery, releaseCandidateID); err != nil {
+		return 0, err
+	}
+	if info != nil && strings.TrimSpace(info.externalURL) != "" {
+		for _, key := range blocklistKeysForRelease(info.title, info.externalURL, info.indexerName, info.sizeBytes, info.postedAt) {
+			if _, err := tx.ExecContext(ctx, `
+				delete from blocklist_items
+				where key = $1`, key,
+			); err != nil {
+				return 0, err
+			}
+		}
+	}
+
+	var selectedReleaseID int64
+	if err := tx.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, libraryItemID, releaseCandidateID,
+	).Scan(&selectedReleaseID); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		update queue_items
+		set state = $2, failure_reason = '', selected_release_id = $3, updated_at = now()
+		where library_item_id = $1`, libraryItemID, QueueSelected, selectedReleaseID,
+	); err != nil {
+		return 0, err
+	}
+	return selectedReleaseID, nil
+}
+
 func (db *DB) SelectReleaseCandidate(ctx context.Context, releaseCandidateID int64) (*ReleaseSummary, error) {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
@@ -1547,17 +1620,13 @@ func (db *DB) SelectReleaseCandidate(ctx context.Context, releaseCandidateID int
 
 	var (
 		libraryItemID int64
-		title         string
-		externalURL   string
-		indexerName   string
-		sizeBytes     int64
-		postedAt      time.Time
+		info          activatedCandidateInfo
 	)
 	if err = tx.QueryRowContext(ctx, `
 		select library_item_id, title, coalesce(external_url, ''), coalesce(indexer_name, ''), coalesce(size_bytes, 0), coalesce(posted_at, to_timestamp(0))
 		from release_candidates
 		where id = $1`, releaseCandidateID,
-	).Scan(&libraryItemID, &title, &externalURL, &indexerName, &sizeBytes, &postedAt); err != nil {
+	).Scan(&libraryItemID, &info.title, &info.externalURL, &info.indexerName, &info.sizeBytes, &info.postedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			_ = tx.Rollback()
 			err = nil
@@ -1566,53 +1635,8 @@ func (db *DB) SelectReleaseCandidate(ctx context.Context, releaseCandidateID int
 		return nil, err
 	}
 
-	if err = preDeleteVFRByLibraryItem(ctx, tx, libraryItemID); err != nil {
-		return nil, err
-	}
-	if _, err = tx.ExecContext(ctx, `
-		delete from selected_releases
-		where library_item_id = $1`, libraryItemID,
-	); err != nil {
-		return nil, err
-	}
-	if _, err = tx.ExecContext(ctx, `
-		update release_candidates
-		set selected = false
-		where library_item_id = $1`, libraryItemID,
-	); err != nil {
-		return nil, err
-	}
-	if _, err = tx.ExecContext(ctx, `
-		update release_candidates
-		set selected = true, rejected = false, reject_reason = ''
-		where id = $1`, releaseCandidateID,
-	); err != nil {
-		return nil, err
-	}
-	if strings.TrimSpace(externalURL) != "" {
-		for _, key := range blocklistKeysForRelease(title, externalURL, indexerName, sizeBytes, postedAt) {
-			if _, err = tx.ExecContext(ctx, `
-				delete from blocklist_items
-				where key = $1`, key,
-			); err != nil {
-				return nil, err
-			}
-		}
-	}
-
-	var selectedReleaseID int64
-	if err = tx.QueryRowContext(ctx, `
-		insert into selected_releases (library_item_id, release_candidate_id)
-		values ($1, $2)
-		returning id`, libraryItemID, releaseCandidateID,
-	).Scan(&selectedReleaseID); err != nil {
-		return nil, err
-	}
-	if _, err = tx.ExecContext(ctx, `
-		update queue_items
-		set state = $2, failure_reason = '', selected_release_id = $3, updated_at = now()
-		where library_item_id = $1`, libraryItemID, QueueSelected, selectedReleaseID,
-	); err != nil {
+	selectedReleaseID, err := activateReleaseCandidate(ctx, tx, libraryItemID, releaseCandidateID, &info)
+	if err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -1671,43 +1695,8 @@ func (db *DB) promoteRetryCandidate(ctx context.Context, libraryItemID int64, ex
 		return nil, err
 	}
 
-	if err = preDeleteVFRByLibraryItem(ctx, tx, libraryItemID); err != nil {
-		return nil, err
-	}
-	if _, err = tx.ExecContext(ctx, `
-		delete from selected_releases
-		where library_item_id = $1`, libraryItemID,
-	); err != nil {
-		return nil, err
-	}
-	if _, err = tx.ExecContext(ctx, `
-		update release_candidates
-		set selected = false
-		where library_item_id = $1`, libraryItemID,
-	); err != nil {
-		return nil, err
-	}
-	if _, err = tx.ExecContext(ctx, `
-		update release_candidates
-		set selected = true
-		where id = $1`, releaseCandidateID,
-	); err != nil {
-		return nil, err
-	}
-
-	var selectedReleaseID int64
-	if err = tx.QueryRowContext(ctx, `
-		insert into selected_releases (library_item_id, release_candidate_id)
-		values ($1, $2)
-		returning id`, libraryItemID, releaseCandidateID,
-	).Scan(&selectedReleaseID); err != nil {
-		return nil, err
-	}
-	if _, err = tx.ExecContext(ctx, `
-		update queue_items
-		set state = $2, failure_reason = '', selected_release_id = $3, updated_at = now()
-		where library_item_id = $1`, libraryItemID, QueueSelected, selectedReleaseID,
-	); err != nil {
+	selectedReleaseID, err := activateReleaseCandidate(ctx, tx, libraryItemID, releaseCandidateID, nil)
+	if err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -2296,19 +2285,28 @@ func blocklistKeyForExternalURL(rawURL string) string {
 	return "external_url:" + strings.TrimSpace(rawURL)
 }
 
+// sizeDateBuckets computes the (sizeBucket, dateBucket) pair shared by every
+// release-signature blocklist key variant (signature/family/pattern), so a
+// same-size, same-day release matches consistently across all of them even
+// though each variant normalizes the title text differently.
+func sizeDateBuckets(sizeBytes int64, postedAt time.Time) (sizeBucket, dateBucket string) {
+	sizeBucket = "0"
+	if sizeBytes > 0 {
+		sizeBucket = fmt.Sprintf("%d", sizeBytes/(1024*1024))
+	}
+	dateBucket = "none"
+	if !postedAt.IsZero() {
+		dateBucket = postedAt.UTC().Format("2006-01-02")
+	}
+	return sizeBucket, dateBucket
+}
+
 func blocklistReleaseSignatureKey(title, indexerName string, sizeBytes int64, postedAt time.Time) string {
 	normalizedTitle := normalizeReleaseTitle(title)
 	if normalizedTitle == "" {
 		return ""
 	}
-	sizeBucket := "0"
-	if sizeBytes > 0 {
-		sizeBucket = fmt.Sprintf("%d", sizeBytes/(1024*1024))
-	}
-	dateBucket := "none"
-	if !postedAt.IsZero() {
-		dateBucket = postedAt.UTC().Format("2006-01-02")
-	}
+	sizeBucket, dateBucket := sizeDateBuckets(sizeBytes, postedAt)
 	indexerBucket := normalizeReleaseTitle(indexerName)
 	return "release_signature:" + strings.Join([]string{
 		normalizedTitle,
@@ -2323,14 +2321,7 @@ func blocklistReleaseFamilyKey(title string, sizeBytes int64, postedAt time.Time
 	if normalizedTitle == "" {
 		return ""
 	}
-	sizeBucket := "0"
-	if sizeBytes > 0 {
-		sizeBucket = fmt.Sprintf("%d", sizeBytes/(1024*1024))
-	}
-	dateBucket := "none"
-	if !postedAt.IsZero() {
-		dateBucket = postedAt.UTC().Format("2006-01-02")
-	}
+	sizeBucket, dateBucket := sizeDateBuckets(sizeBytes, postedAt)
 	return "release_family:" + strings.Join([]string{
 		normalizedTitle,
 		sizeBucket,
@@ -2343,14 +2334,7 @@ func blocklistReleasePatternKey(title string, sizeBytes int64, postedAt time.Tim
 	if pattern == "" {
 		return ""
 	}
-	sizeBucket := "0"
-	if sizeBytes > 0 {
-		sizeBucket = fmt.Sprintf("%d", sizeBytes/(1024*1024))
-	}
-	dateBucket := "none"
-	if !postedAt.IsZero() {
-		dateBucket = postedAt.UTC().Format("2006-01-02")
-	}
+	sizeBucket, dateBucket := sizeDateBuckets(sizeBytes, postedAt)
 	return "release_pattern:" + strings.Join([]string{
 		pattern,
 		sizeBucket,

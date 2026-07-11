@@ -140,7 +140,7 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 	if isNew && len(libraryItemIDs) == 1 {
 		for triggeringID := range libraryItemIDs {
 			if err := p.repo.CreateSeasonPackEpisodeItems(ctx, selectedReleaseID, triggeringID); err != nil {
-				_ = err // non-fatal
+				slog.Warn("publish: failed to create season pack episode items", "library_item_id", triggeringID, "err", err)
 			}
 			p.fulfillSeasonPackEpisodes(ctx, selectedReleaseID, triggeringID, files)
 		}
@@ -315,16 +315,19 @@ func (p *Publisher) fulfillSeasonPackEpisodes(ctx context.Context, selectedRelea
 			if symlinkErr := p.syml.Publish(libraryPath, target); symlinkErr == nil {
 				if upsertErr := p.repo.UpsertSymlinkPublication(ctx, m.LibraryItemID, virtualFileID, libraryPath, target); upsertErr == nil {
 					_ = p.rclone.RefreshPath(ctx, filepath.Dir(libraryPath))
-			// Also refresh the content directory the symlink points into —
-			// rclone's VFS caches that subtree independently of the library
-			// directory. Without this, a health check reading straight from
-			// the content path right after publish could see a stale/empty
-			// cached view and wrongly report the file as corrupt.
-			_ = p.rclone.RefreshPath(ctx, filepath.Dir(target))
+					// Also refresh the content directory the symlink points into —
+					// rclone's VFS caches that subtree independently of the library
+					// directory. Without this, a health check reading straight from
+					// the content path right after publish could see a stale/empty
+					// cached view and wrongly report the file as corrupt.
+					_ = p.rclone.RefreshPath(ctx, filepath.Dir(target))
 				}
 			}
 		}
-		_ = p.repo.FulfillEpisodeLibraryItem(ctx, m.LibraryItemID, selectedReleaseID, virtualFileID)
+		if err := p.repo.FulfillEpisodeLibraryItem(ctx, m.LibraryItemID, selectedReleaseID, virtualFileID); err != nil {
+			slog.Warn("season pack: failed to fulfill episode library item", "library_item_id", m.LibraryItemID, "err", err)
+			continue
+		}
 		slog.Debug("season pack: fulfilled episode",
 			"library_item_id", m.LibraryItemID,
 			"season", m.SeasonNumber, "episode", m.EpisodeNumber,

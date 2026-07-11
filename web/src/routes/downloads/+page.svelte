@@ -16,6 +16,7 @@
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
   import { runAction } from '$lib/actions';
+  import { debounce } from '$lib/debounce';
   import type { QueueItem, WorkQueueStatus } from '$lib/types';
 
   let uploading = false;
@@ -126,6 +127,7 @@
   }
 
   async function clearFailed() {
+    if (typeof window !== 'undefined' && !window.confirm('Clear all failed queue items? This removes their retry history.')) return;
     await runAction(() => api.clearFailedQueue(), {
       setWorking: (v) => setBusy('clear-failed', v),
       successMessage: (result) => `Cleared ${result.cleared} failed item${result.cleared === 1 ? '' : 's'}`,
@@ -249,15 +251,16 @@
 
   onMount(() => {
     void load();
+    const debouncedRefresh = debounce(() => void refreshItems(), 500);
     const unsub = subscribeEvents((event) => {
       if (event?.kind === 'library.search_pending') {
         const e = event as Record<string, unknown>;
         toastSuccess(`Search Pending complete: processed ${e.processed}, selected ${e.selected}`);
       }
-      if (!anyBusy()) void refreshItems();
+      if (!anyBusy()) debouncedRefresh();
     });
     const timer = window.setInterval(() => {
-      if (!anyBusy()) void refreshItems();
+      if (!anyBusy() && document.visibilityState === 'visible') void refreshItems();
     }, 15000);
     return () => {
       window.clearInterval(timer);
@@ -313,19 +316,15 @@
       class="upload-input"
       disabled={uploading}
       on:change={async (e) => {
-        const file = (e.currentTarget as HTMLInputElement).files?.[0];
+        const input = e.currentTarget as HTMLInputElement;
+        const file = input.files?.[0];
         if (!file) return;
-        uploading = true;
-        try {
-          await api.addNzb(file);
-          toastSuccess(`${file.name} queued`);
-          await load();
-        } catch (err) {
-          toastError(err instanceof Error ? err.message : String(err));
-        } finally {
-          uploading = false;
-          (e.currentTarget as HTMLInputElement).value = '';
-        }
+        await runAction(() => api.addNzb(file), {
+          setWorking: (v) => (uploading = v),
+          successMessage: () => `${file.name} queued`,
+          afterSuccess: load
+        });
+        input.value = '';
       }}
     />
   </label>
@@ -357,17 +356,14 @@
 <form class="url-row" on:submit|preventDefault={async () => {
   const url = nzbUrl.trim();
   if (!url) return;
-  addingUrl = true;
-  try {
-    await api.addNzbUrl(url);
-    toastSuccess('NZB queued from URL');
-    nzbUrl = '';
-    await load();
-  } catch (err) {
-    toastError(err instanceof Error ? err.message : String(err));
-  } finally {
-    addingUrl = false;
-  }
+  await runAction(() => api.addNzbUrl(url), {
+    setWorking: (v) => (addingUrl = v),
+    successMessage: () => 'NZB queued from URL',
+    afterSuccess: async () => {
+      nzbUrl = '';
+      await load();
+    }
+  });
 }}>
   <div class="url-input-wrap">
     <Link size={14} />

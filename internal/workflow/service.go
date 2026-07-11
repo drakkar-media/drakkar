@@ -193,6 +193,11 @@ type Service struct {
 	// calibrateSem bounds background NZB offset calibration so imports never
 	// wait on it and the DB still avoids an unbounded fan-out.
 	calibrateSem chan struct{}
+
+	// tmdbEnrichSem bounds concurrent background TMDB enrichment goroutines
+	// spawned from SyncRequests/syncSeasonRequest, which otherwise fan out one
+	// goroutine per pending Seerr request with no cap on simultaneous TMDB calls.
+	tmdbEnrichSem chan struct{}
 }
 
 type WorkQueueStatus struct {
@@ -294,6 +299,7 @@ const (
 	searchRequestCooldown       = 20 * time.Minute
 	asyncCalibrateBudget        = 2 * time.Minute
 	asyncCalibrateWorkers       = 2
+	tmdbEnrichWorkers           = 5
 )
 
 type searchAttemptRecord struct {
@@ -450,6 +456,7 @@ func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service 
 		downloader:     newDownloadDispatcher(),
 		dispatchC:      make(chan struct{}, 1),
 		calibrateSem:   make(chan struct{}, asyncCalibrateWorkers),
+		tmdbEnrichSem:  make(chan struct{}, tmdbEnrichWorkers),
 		recentURLHits:  make(map[string]time.Time),
 		searchAttempts: make(map[string]searchAttemptRecord),
 	}
@@ -621,6 +628,10 @@ func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 			lid, tmdbID := libraryItemID, request.TMDBID
 			go func() {
 				defer observability.Recover("enrich-movie-request")
+				if s.tmdbEnrichSem != nil {
+					s.tmdbEnrichSem <- struct{}{}
+					defer func() { <-s.tmdbEnrichSem }()
+				}
 				enrichCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				_ = s.enrichMovieRequest(enrichCtx, lid, tmdbID)
@@ -662,6 +673,10 @@ func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 			lid, tmdbID, tvdbID, epTitle := libraryItemID, request.TMDBID, request.TVDBID, request.EpisodeTitle
 			go func() {
 				defer observability.Recover("enrich-episode-request")
+				if s.tmdbEnrichSem != nil {
+					s.tmdbEnrichSem <- struct{}{}
+					defer func() { <-s.tmdbEnrichSem }()
+				}
 				enrichCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
 				_ = s.enrichEpisodeRequest(enrichCtx, lid, tmdbID, tvdbID, epTitle)
@@ -726,6 +741,10 @@ func (s *Service) syncSeasonRequest(ctx context.Context, req seerr.Request) (int
 		tmdbID, tvdbID := req.TMDBID, req.TVDBID
 		go func() {
 			defer observability.Recover("enrich-episode-request")
+			if s.tmdbEnrichSem != nil {
+				s.tmdbEnrichSem <- struct{}{}
+				defer func() { <-s.tmdbEnrichSem }()
+			}
 			enrichCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			_ = s.enrichEpisodeRequest(enrichCtx, ids[0], tmdbID, tvdbID, "")
@@ -1004,31 +1023,6 @@ func (s *Service) PushLibraryItemsToQueue(ids []int64, priority int) {
 		seen[id] = struct{}{}
 		s.WorkQueue.Push(ctx, id, priority)
 	}
-}
-
-func (s *Service) SearchPendingBatch(ctx context.Context, limit int) (BulkSearchResult, error) {
-	targets, err := s.repo.ListPendingLibrarySearchTargets(ctx)
-	if err != nil {
-		return BulkSearchResult{}, err
-	}
-	if limit > 0 && len(targets) > limit {
-		targets = targets[:limit]
-	}
-	result := BulkSearchResult{Processed: len(targets)}
-	for _, target := range targets {
-		result.ProcessedItems = append(result.ProcessedItems, target.LibraryItemID)
-		search, err := s.SearchLibrary(ctx, target.LibraryItemID)
-		if err != nil {
-			result.Failed++
-			result.FailedItems = append(result.FailedItems, target.LibraryItemID)
-			continue
-		}
-		result.Searched++
-		if search.SelectedReleaseID != nil {
-			result.Selected++
-		}
-	}
-	return result, nil
 }
 
 func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, error) {
@@ -1427,6 +1421,72 @@ func (s *Service) ClearFailedQueue(ctx context.Context) (int, error) {
 	return s.repo.ClearFailedQueueItems(ctx)
 }
 
+// retryQueueDecision names which recovery path RetryFailedQueue takes for a
+// single failed queue item. It is decided purely from policy settings and
+// the target's own fields (no I/O, no Hydra-call-budget bookkeeping), split
+// out of RetryFailedQueue's loop so the tangled user-policy-vs-hardcoded-
+// matrix branching is unit testable without a repo/Hydra stub. Execution —
+// the actual Hydra/repo calls, per-run Hydra call budget, and result
+// counters — stays in RetryFailedQueue itself: the two "blocklist and
+// search" paths below (retryPolicyRemoveBlocklistAndSearch vs
+// retryMatrixBlocklistAndSearch) have real, pre-existing differences in
+// their execution (one clears the selected release before searching, the
+// other doesn't; their success conditions differ too), so they are kept as
+// distinct decisions rather than merged into one.
+type retryQueueDecision int
+
+const (
+	retryPolicyRemoveBlocklistAndSearch retryQueueDecision = iota
+	retryPolicyRemoveAndBlocklist
+	retryPolicySearchAgain
+	retryPolicyRemove
+	retryPolicyDoNothing
+	retryMatrixBlocklistAndSearch
+	retryMatrixDoNothing
+	retryMatrixRestartRequeue
+	retryMatrixRetryQueueItem
+)
+
+func decideRetryQueueAction(settings policy.Settings, target database.FailedQueueRetryTarget) retryQueueDecision {
+	userAction := policy.ActionForReason(settings, target.FailureReason)
+	if userAction != policy.QueueActionDoNothing &&
+		!(target.HasSelectedRelease && target.CandidateFailureCount == 0) {
+		switch userAction {
+		case policy.QueueActionRemoveBlocklistAndSearch:
+			return retryPolicyRemoveBlocklistAndSearch
+		case policy.QueueActionRemoveAndBlocklist:
+			return retryPolicyRemoveAndBlocklist
+		case policy.QueueActionSearchAgain:
+			return retryPolicySearchAgain
+		case policy.QueueActionRemove:
+			return retryPolicyRemove
+		}
+		return retryPolicyDoNothing
+	}
+
+	// Fall back to the hardcoded recovery matrix for failure reasons that
+	// have no user-configured policy entry.
+	action := policy.DecideFromReason(target.FailureReason)
+	// Escalate ActionRetryLater to blocklist+search after 3 failures on the
+	// same candidate, preventing an infinite throttle-retry loop.
+	if action == policy.ActionRetryLater && target.CandidateFailureCount >= 3 {
+		action = policy.ActionBlocklistAndSearch
+	}
+	switch action {
+	case policy.ActionBlocklistAndSearch:
+		return retryMatrixBlocklistAndSearch
+	case policy.ActionDoNothing:
+		return retryMatrixDoNothing
+	}
+
+	isRestartInterruption := strings.Contains(strings.ToLower(target.FailureReason), "interrupted_by_restart") ||
+		strings.Contains(strings.ToLower(target.FailureReason), "stale_worker")
+	if isRestartInterruption && target.HasSelectedRelease && target.CandidateFailureCount == 0 {
+		return retryMatrixRestartRequeue
+	}
+	return retryMatrixRetryQueueItem
+}
+
 func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, error) {
 	// Fetch up to 500 items: restart-interrupted items (stale_worker, interrupted_by_restart)
 	// don't call Hydra and are much faster to process. Hydra calls are capped at 100
@@ -1452,66 +1512,54 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 	for _, target := range targets {
 		result.ProcessedQueues = append(result.ProcessedQueues, target.QueueItemID)
 
-		// User-configured policy takes precedence over the hardcoded matrix,
-		// EXCEPT for items that already have a valid selected release: those
-		// should be retried via RetryQueueItem (NZB re-fetch) rather than
-		// discarding the release and doing a fresh NZBHydra2 search.
-		userAction := policy.ActionForReason(settings, target.FailureReason)
-		if userAction != policy.QueueActionDoNothing &&
-			!(target.HasSelectedRelease && target.CandidateFailureCount == 0) {
-			switch userAction {
-			case policy.QueueActionRemoveBlocklistAndSearch, policy.QueueActionRemoveAndBlocklist:
-				if hydraCallCount >= maxHydraCalls && userAction == policy.QueueActionRemoveBlocklistAndSearch {
-					continue // skip Hydra-dependent items when cap is reached
-				}
-				if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, ttl); err != nil {
-					s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: blocklist failed")
-				}
-				if err := s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID); err != nil {
-					result.Failed++
-					result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-					continue
-				}
-				if userAction == policy.QueueActionRemoveBlocklistAndSearch {
-					hydraCallCount++
-					_, err := s.SearchLibrary(ctx, target.LibraryItemID)
-					_ = s.repo.TouchQueueItemSearched(ctx, target.LibraryItemID)
-					if err == nil {
-						result.Retried++
-					} else {
-						result.Failed++
-						result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-					}
-				}
-			case policy.QueueActionSearchAgain:
-				if hydraCallCount >= maxHydraCalls {
-					continue
-				}
-				hydraCallCount++
-				_, err := s.SearchLibrary(ctx, target.LibraryItemID)
-				_ = s.repo.TouchQueueItemSearched(ctx, target.LibraryItemID)
-				if err == nil {
-					result.Retried++
-				} else {
-					result.Failed++
-					result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-				}
-			case policy.QueueActionRemove:
-				_ = s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID)
+		switch decideRetryQueueAction(settings, target) {
+		case retryPolicyRemoveBlocklistAndSearch:
+			if hydraCallCount >= maxHydraCalls {
+				continue // skip Hydra-dependent items when cap is reached
 			}
-			continue
-		}
-
-		// Fall back to the hardcoded recovery matrix for failure reasons
-		// that have no user-configured policy entry.
-		action := policy.DecideFromReason(target.FailureReason)
-		// Escalate ActionRetryLater to blocklist+search after 3 failures on the
-		// same candidate, preventing an infinite throttle-retry loop.
-		if action == policy.ActionRetryLater && target.CandidateFailureCount >= 3 {
-			action = policy.ActionBlocklistAndSearch
-		}
-		switch action {
-		case policy.ActionBlocklistAndSearch:
+			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, ttl); err != nil {
+				s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: blocklist failed")
+			}
+			if err := s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID); err != nil {
+				result.Failed++
+				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+				continue
+			}
+			hydraCallCount++
+			_, err := s.SearchLibrary(ctx, target.LibraryItemID)
+			_ = s.repo.TouchQueueItemSearched(ctx, target.LibraryItemID)
+			if err == nil {
+				result.Retried++
+			} else {
+				result.Failed++
+				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+			}
+		case retryPolicyRemoveAndBlocklist:
+			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, ttl); err != nil {
+				s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: blocklist failed")
+			}
+			if err := s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID); err != nil {
+				result.Failed++
+				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+			}
+		case retryPolicySearchAgain:
+			if hydraCallCount >= maxHydraCalls {
+				continue
+			}
+			hydraCallCount++
+			_, err := s.SearchLibrary(ctx, target.LibraryItemID)
+			_ = s.repo.TouchQueueItemSearched(ctx, target.LibraryItemID)
+			if err == nil {
+				result.Retried++
+			} else {
+				result.Failed++
+				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+			}
+		case retryPolicyRemove:
+			_ = s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID)
+		case retryPolicyDoNothing:
+			// no-op: policy explicitly says leave this item alone.
+		case retryMatrixBlocklistAndSearch:
 			if hydraCallCount >= maxHydraCalls {
 				continue
 			}
@@ -1527,16 +1575,9 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 				result.Failed++
 				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
 			}
-			continue
-		case policy.ActionDoNothing:
-			continue
-		default:
-			// ActionSearchAgain, ActionRetryLater (under cap) → standard retry flow.
-		}
-
-		isRestartInterruption := strings.Contains(strings.ToLower(target.FailureReason), "interrupted_by_restart") ||
-			strings.Contains(strings.ToLower(target.FailureReason), "stale_worker")
-		if isRestartInterruption && target.HasSelectedRelease && target.CandidateFailureCount == 0 {
+		case retryMatrixDoNothing:
+			// no-op: hardcoded matrix says leave this item alone.
+		case retryMatrixRestartRequeue:
 			if err := s.repo.RequeueSelectedRelease(ctx, target.QueueItemID); err != nil {
 				s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: RequeueSelectedRelease failed")
 				result.Failed++
@@ -1544,16 +1585,15 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 				continue
 			}
 			result.Retried++
-			continue
+		case retryMatrixRetryQueueItem:
+			if _, err := s.RetryQueueItem(ctx, target.QueueItemID); err != nil {
+				s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: RetryQueueItem failed")
+				result.Failed++
+				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+				continue
+			}
+			result.Retried++
 		}
-
-		if _, err := s.RetryQueueItem(ctx, target.QueueItemID); err != nil {
-			s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: RetryQueueItem failed")
-			result.Failed++
-			result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-			continue
-		}
-		result.Retried++
 	}
 	return result, nil
 }
@@ -1935,6 +1975,34 @@ func (s *Service) syncRequestsWithRetry(ctx context.Context) (SyncResult, error)
 	return lastResult, nil
 }
 
+// transientServerErrorSubstrings match 5xx-class server errors and
+// connection-level failures that generally clear up on retry. Shared by
+// classifySearchFailureReason's "search_unavailable" case (Hydra search
+// failures) and isRetryableSeerrSyncFailure (Seerr sync failures) so the two
+// retry classifiers can't silently drift apart on what counts as transient.
+var transientServerErrorSubstrings = []string{
+	"status 500", "status 502", "status 503", "status 504",
+	"status 520", "status 521", "status 522", "status 523",
+	"cloudflare unavailable", "connection refused", "no such host", "server misbehaving",
+}
+
+// transientGatewayTimeoutSubstrings match gateway/edge timeout-flavored
+// errors, distinct from the plain "timeout"/"deadline exceeded" check every
+// caller already does directly. Shared the same way as
+// transientServerErrorSubstrings above.
+var transientGatewayTimeoutSubstrings = []string{
+	"status 524", "cloudflare timeout", "gateway timeout",
+}
+
+func containsAnySubstring(message string, substrings []string) bool {
+	for _, substr := range substrings {
+		if strings.Contains(message, substr) {
+			return true
+		}
+	}
+	return false
+}
+
 func classifySearchFailureReason(err error) string {
 	if err == nil {
 		return "search_error"
@@ -1958,22 +2026,9 @@ func classifySearchFailureReason(err error) string {
 	case strings.Contains(message, "status 429"),
 		strings.Contains(message, "rate limit"):
 		return "search_rate_limited"
-	case strings.Contains(message, "status 500"),
-		strings.Contains(message, "status 502"),
-		strings.Contains(message, "status 503"),
-		strings.Contains(message, "status 504"),
-		strings.Contains(message, "status 520"),
-		strings.Contains(message, "status 521"),
-		strings.Contains(message, "status 522"),
-		strings.Contains(message, "status 523"),
-		strings.Contains(message, "cloudflare unavailable"),
-		strings.Contains(message, "connection refused"),
-		strings.Contains(message, "no such host"),
-		strings.Contains(message, "server misbehaving"):
+	case containsAnySubstring(message, transientServerErrorSubstrings):
 		return "search_unavailable"
-	case strings.Contains(message, "status 524"),
-		strings.Contains(message, "cloudflare timeout"),
-		strings.Contains(message, "gateway timeout"):
+	case containsAnySubstring(message, transientGatewayTimeoutSubstrings):
 		return "search_timeout"
 	default:
 		return "search_error"
@@ -2000,20 +2055,15 @@ func isRetryableSeerrSyncFailure(err error) bool {
 	switch {
 	case strings.Contains(message, "timeout"),
 		strings.Contains(message, "deadline exceeded"),
-		strings.Contains(message, "status 500"),
-		strings.Contains(message, "status 502"),
-		strings.Contains(message, "status 503"),
-		strings.Contains(message, "status 504"),
-		strings.Contains(message, "status 520"),
-		strings.Contains(message, "status 521"),
-		strings.Contains(message, "status 522"),
-		strings.Contains(message, "status 523"),
-		strings.Contains(message, "status 524"),
-		strings.Contains(message, "cloudflare"),
-		strings.Contains(message, "bad gateway"),
-		strings.Contains(message, "gateway timeout"),
-		strings.Contains(message, "connection refused"),
-		strings.Contains(message, "no such host"):
+		containsAnySubstring(message, transientServerErrorSubstrings),
+		containsAnySubstring(message, transientGatewayTimeoutSubstrings):
+		return true
+	// Seerr's own client wraps some errors with wording Hydra's search errors
+	// don't use — kept as extras here rather than folded into the shared
+	// lists above, to avoid widening classifySearchFailureReason's
+	// search_unavailable categorization, which is also shown to users.
+	case strings.Contains(message, "cloudflare"),
+		strings.Contains(message, "bad gateway"):
 		return true
 	default:
 		return false
@@ -3387,15 +3437,22 @@ func (s *Service) RetryQueueItem(ctx context.Context, queueItemID int64) (QueueR
 }
 
 func (s *Service) ManageQueueItem(ctx context.Context, queueItemID int64, action string) (QueueManageResult, error) {
-	target, err := s.repo.GetQueueRetryTarget(ctx, queueItemID)
-	if err != nil {
-		return QueueManageResult{}, err
-	}
 	settings := policy.DefaultSettings()
 	if s.queuePolicy != nil {
 		if loaded, loadErr := s.queuePolicy.Settings(ctx); loadErr == nil {
 			settings = loaded
 		}
+	}
+	return s.manageQueueItemWithSettings(ctx, queueItemID, action, settings)
+}
+
+// manageQueueItemWithSettings is ManageQueueItem's implementation, taking
+// already-loaded policy settings so bulk callers (ManageQueueItems,
+// ManageFailedQueue) load them once per call instead of once per item.
+func (s *Service) manageQueueItemWithSettings(ctx context.Context, queueItemID int64, action string, settings policy.Settings) (QueueManageResult, error) {
+	target, err := s.repo.GetQueueRetryTarget(ctx, queueItemID)
+	if err != nil {
+		return QueueManageResult{}, err
 	}
 	switch strings.TrimSpace(action) {
 	case string(policy.QueueActionRemove):
@@ -3438,31 +3495,24 @@ func (s *Service) ManageFailedQueue(ctx context.Context, action string) (BulkQue
 	if err != nil {
 		return BulkQueueRetryResult{}, err
 	}
-	result := BulkQueueRetryResult{Processed: len(targets)}
-	for _, target := range targets {
-		result.ProcessedQueues = append(result.ProcessedQueues, target.QueueItemID)
-		item, err := s.ManageQueueItem(ctx, target.QueueItemID, action)
-		if err != nil {
-			result.Failed++
-			result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-			continue
-		}
-		if item.Action == string(policy.QueueActionRemoveBlocklistAndSearch) {
-			if item.SelectedReleaseID != nil || item.SearchCandidateCnt > 0 {
-				result.Retried++
-			}
-			continue
-		}
-		result.Retried++
+	ids := make([]int64, len(targets))
+	for i, target := range targets {
+		ids[i] = target.QueueItemID
 	}
-	return result, nil
+	return s.ManageQueueItems(ctx, ids, action)
 }
 
 func (s *Service) ManageQueueItems(ctx context.Context, queueItemIDs []int64, action string) (BulkQueueRetryResult, error) {
+	settings := policy.DefaultSettings()
+	if s.queuePolicy != nil {
+		if loaded, loadErr := s.queuePolicy.Settings(ctx); loadErr == nil {
+			settings = loaded
+		}
+	}
 	result := BulkQueueRetryResult{Processed: len(queueItemIDs)}
 	for _, queueItemID := range queueItemIDs {
 		result.ProcessedQueues = append(result.ProcessedQueues, queueItemID)
-		item, err := s.ManageQueueItem(ctx, queueItemID, action)
+		item, err := s.manageQueueItemWithSettings(ctx, queueItemID, action, settings)
 		if err != nil {
 			result.Failed++
 			result.FailedQueues = append(result.FailedQueues, queueItemID)
@@ -3858,7 +3908,14 @@ func (s *Service) ImportNZBFromPush(ctx context.Context, content []byte, filenam
 	_ = jobName
 
 	go func() {
-		bgCtx := context.Background()
+		defer observability.Recover("sabnzbd-push-import")
+		// 10m ceiling: generous relative to preflightChecker's own internal 5m
+		// timeout (app.go) so this doesn't truncate a legitimate preflight run,
+		// while still bounding the whole chain -- every sibling fire-and-forget
+		// goroutine in this file wraps context.Background() in a timeout; this
+		// was the one exception, left fully unbounded.
+		bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
 		if err := s.repo.SetImportedNZBIndexed(bgCtx, item.QueueItemID); err != nil {
 			s.logger.Error().Err(err).Int64("queueItemId", item.QueueItemID).Msg("sabnzbd: SetImportedNZBIndexed failed")
 			return

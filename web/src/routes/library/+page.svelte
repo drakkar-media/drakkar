@@ -13,6 +13,7 @@
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
   import { runAction } from '$lib/actions';
+  import { debounce } from '$lib/debounce';
   import type { LibraryItem, LibraryPage, Status } from '$lib/types';
 
   let items: LibraryItem[] = [];
@@ -97,14 +98,17 @@
 
     void loadLibrary();
 
+    const debouncedLoadLibrary = debounce(() => void loadLibrary(), 500);
     const unsub = subscribeEvents((event) => {
       if (event?.kind === 'library.search_pending') {
         const e = event as Record<string, unknown>;
         toastSuccess(`Search Pending complete: searched ${e.searched}, selected ${e.selected}`);
       }
-      if (!working) void loadLibrary();
+      if (!working) debouncedLoadLibrary();
     });
-    const t = window.setInterval(() => void loadLibrary(), 30000);
+    const t = window.setInterval(() => {
+      if (!working && document.visibilityState === 'visible') void loadLibrary();
+    }, 30000);
     return () => { window.clearInterval(t); unsub(); };
   });
 

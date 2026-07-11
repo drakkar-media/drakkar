@@ -11,6 +11,7 @@
   import StatusPill from '$lib/components/StatusPill.svelte';
   import { api } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
+  import { runAction } from '$lib/actions';
   import type { APIToken, User } from '$lib/types';
 
   let users: User[] = [];
@@ -49,18 +50,15 @@
 
   async function createUser() {
     if (!username.trim() || password.length < 8) return;
-    setBusy('create-user', true);
-    try {
-      await api.createUser(username.trim(), password, role);
-      toastSuccess(`User ${username.trim()} created`);
+    const created = await runAction(() => api.createUser(username.trim(), password, role), {
+      setWorking: (v) => setBusy('create-user', v),
+      successMessage: () => `User ${username.trim()} created`,
+      afterSuccess: load
+    });
+    if (created) {
       username = '';
       password = '';
       role = 'admin';
-      await load();
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy('create-user', false);
     }
   }
 
@@ -70,17 +68,11 @@
       return;
     }
     if (typeof window !== 'undefined' && !window.confirm(`Delete user "${name}"?`)) return;
-    setBusy(`delete-user-${id}`, true);
-    try {
-      const res = await api.deleteUser(id);
-      if (!res.ok) throw new Error(await res.text() || 'delete failed');
-      toastSuccess(`User ${name} deleted`);
-      await load();
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(`delete-user-${id}`, false);
-    }
+    await runAction(() => api.deleteUser(id), {
+      setWorking: (v) => setBusy(`delete-user-${id}`, v),
+      successMessage: () => `User ${name} deleted`,
+      afterSuccess: load
+    });
   }
 
   async function changePassword(id: number, name: string) {
@@ -89,49 +81,39 @@
       toastError('Password must be at least 8 characters');
       return;
     }
-    setBusy(`change-password-${id}`, true);
-    try {
-      const res = await api.changePassword(id, next);
-      if (!res.ok) throw new Error(await res.text() || 'password change failed');
-      passwordDrafts = { ...passwordDrafts, [id]: '' };
-      toastSuccess(`Password updated for ${name}`);
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(`change-password-${id}`, false);
-    }
+    await runAction(() => api.changePassword(id, next), {
+      setWorking: (v) => setBusy(`change-password-${id}`, v),
+      successMessage: () => `Password updated for ${name}`,
+      afterSuccess: () => {
+        passwordDrafts = { ...passwordDrafts, [id]: '' };
+      }
+    });
   }
 
   async function createToken() {
     if (!tokenName.trim()) return;
-    setBusy('create-token', true);
-    try {
-      const created = await api.createApiToken(tokenName.trim(), tokenExpiresAt ? new Date(tokenExpiresAt).toISOString() : null);
+    const created = await runAction(
+      () => api.createApiToken(tokenName.trim(), tokenExpiresAt ? new Date(tokenExpiresAt).toISOString() : null),
+      {
+        setWorking: (v) => setBusy('create-token', v),
+        successMessage: (r) => `API token ${r.name} created`,
+        afterSuccess: load
+      }
+    );
+    if (created) {
       createdToken = created.token;
       tokenName = '';
       tokenExpiresAt = '';
-      toastSuccess(`API token ${created.name} created`);
-      await load();
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy('create-token', false);
     }
   }
 
   async function deleteToken(id: number, name: string) {
     if (typeof window !== 'undefined' && !window.confirm(`Delete API token "${name}"?`)) return;
-    setBusy(`delete-token-${id}`, true);
-    try {
-      const res = await api.deleteApiToken(id);
-      if (!res.ok) throw new Error(await res.text() || 'delete failed');
-      toastSuccess(`API token ${name} deleted`);
-      await load();
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(`delete-token-${id}`, false);
-    }
+    await runAction(() => api.deleteApiToken(id), {
+      setWorking: (v) => setBusy(`delete-token-${id}`, v),
+      successMessage: () => `API token ${name} deleted`,
+      afterSuccess: load
+    });
   }
 
   onMount(() => {

@@ -35,6 +35,7 @@ import (
 	"github.com/hjongedijk/drakkar/internal/maintenance"
 	"github.com/hjongedijk/drakkar/internal/metrics"
 	"github.com/hjongedijk/drakkar/internal/nzb"
+	"github.com/hjongedijk/drakkar/internal/observability"
 	"github.com/hjongedijk/drakkar/internal/plex"
 	"github.com/hjongedijk/drakkar/internal/policy"
 	"github.com/hjongedijk/drakkar/internal/probe"
@@ -844,6 +845,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		go func() {
+			defer observability.Recover("search-upgrades")
 			result, err := workflowSvc.SearchUpgrades(context.Background())
 			if err != nil {
 				slog.Error("search upgrades background", "err", err)
@@ -867,6 +869,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		// Start search in background; return existing candidates immediately so the
 		// release picker opens without waiting for the full NZB search round-trip.
 		go func() {
+			defer observability.Recover("library-replacements-search")
 			search, searchErr := workflowSvc.SearchLibrary(workflow.WithForceSearch(context.Background()), libraryItemID)
 			if searchErr != nil {
 				slog.Warn("search replacements background", "library_item_id", libraryItemID, "err", searchErr)
@@ -947,6 +950,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			ids := payload.LibraryItemIDs
 			languages := payload.Languages
 			go func() {
+				defer observability.Recover("subtitles-bulk-search")
 				for _, id := range ids {
 					if _, err := subtitleSvc.SearchCandidates(context.Background(), id, languages); err != nil {
 						slog.Warn("bulk subtitle search", "library_item_id", id, "err", err)
@@ -1021,6 +1025,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		languages := payload.Languages
 		go func() {
+			defer observability.Recover("subtitle-search")
 			result, err := subtitleSvc.SearchCandidates(context.Background(), libraryItemID, languages)
 			if err != nil {
 				slog.Warn("subtitle search background", "library_item_id", libraryItemID, "err", err)
@@ -1233,6 +1238,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		// Trigger a sync in the background so this request returns fast.
 		go func() {
+			defer observability.Recover("seerr-webhook-sync")
 			bgCtx := context.Background()
 			result, err := workflowSvc.SyncRequests(bgCtx)
 			if err != nil {
@@ -1288,6 +1294,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		go func() {
+			defer observability.Recover("push-missing-to-seerr")
 			result, err := workflowSvc.PushMissingLibraryItemsToSeerr(context.Background())
 			if err != nil {
 				slog.Error("push missing to seerr background", "err", err)
@@ -1345,6 +1352,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		go func() {
+			defer observability.Recover("search-pending-library")
 			result, err := workflowSvc.SearchPendingLibrary(context.Background())
 			if err != nil {
 				slog.Error("search pending background", "err", err)
@@ -1365,6 +1373,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		go func() {
+			defer observability.Recover("search-library")
 			result, err := workflowSvc.SearchLibrary(workflow.WithForceSearch(context.Background()), id)
 			if err != nil {
 				slog.Warn("search library background", "library_item_id", id, "err", err)
@@ -1533,6 +1542,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		go func() {
+			defer observability.Recover("republish-pending-library")
 			result, err := publication.RepublishPendingLibrary(context.Background())
 			if err != nil {
 				slog.Error("republish pending background", "err", err)
@@ -1548,6 +1558,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		go func() {
+			defer observability.Recover("reset-orphaned-available")
 			result, err := workflowSvc.ResetOrphanedAvailableItems(context.Background())
 			if err != nil {
 				slog.Error("reset orphaned available background", "err", err)
@@ -1563,6 +1574,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		go func() {
+			defer observability.Recover("backfill-metadata")
 			result, err := workflowSvc.BackfillMetadata(context.Background())
 			if err != nil {
 				slog.Error("backfill metadata background", "err", err)
@@ -1578,6 +1590,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		go func() {
+			defer observability.Recover("fill-missing-episodes")
 			result, err := workflowSvc.FillMissingEpisodes(context.Background())
 			if err != nil {
 				slog.Error("fill missing episodes background", "err", err)
@@ -1593,6 +1606,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		go func() {
+			defer observability.Recover("cache-prune")
 			result, err := cacheSvc.Prune(context.Background())
 			if err != nil {
 				slog.Error("cache prune background", "err", err)
@@ -1617,6 +1631,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		go func() {
+			defer observability.Recover("nzb-health-check")
 			result, err := maintenance.DeepNZBHealthCheck(context.Background())
 			if err != nil {
 				slog.Error("nzb health check background", "err", err)

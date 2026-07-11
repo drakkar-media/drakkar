@@ -8,6 +8,10 @@ import (
 )
 
 func (db *DB) ListLibraryItems(ctx context.Context) ([]LibraryItemSummary, error) {
+	// queue_items has a UNIQUE(library_item_id) constraint (migration 000044),
+	// so there is at most one row per library item -- a plain join is enough;
+	// the "latest" LATERAL/ORDER BY/LIMIT 1 pattern here predates that
+	// constraint and is now just extra planner work for the same result.
 	rows, err := db.SQL.QueryContext(ctx, `
 		select
 			li.id,
@@ -19,12 +23,7 @@ func (db *DB) ListLibraryItems(ctx context.Context) ([]LibraryItemSummary, error
 			coalesce(q.failure_reason, ''),
 			q.selected_release_id
 		from library_items li
-		left join lateral (
-			select state, failure_reason, selected_release_id
-			from queue_items
-			where library_item_id = li.id
-			order by id desc limit 1
-		) q on true
+		left join queue_items q on q.library_item_id = li.id
 		order by li.requested_at desc, li.id desc`)
 	if err != nil {
 		return nil, err

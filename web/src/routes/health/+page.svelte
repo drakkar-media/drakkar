@@ -12,6 +12,7 @@
   import StatusPill from '$lib/components/StatusPill.svelte';
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
+  import { debounce } from '$lib/debounce';
 
   type HealthSummary = { total: number; checked: number; healthy: number; neverChecked: number; consistencyIssues: number; uncalibratedNZBFiles: number };
   type HealthEntry = {
@@ -112,6 +113,7 @@
   }
 
   async function resetOrphanedAvailable() {
+    if (typeof window !== 'undefined' && !window.confirm('Reset all orphaned available items back to missing?')) return;
     resettingOrphaned = true;
     try {
       await api.resetOrphanedAvailableItems();
@@ -151,6 +153,7 @@
 
   onMount(() => {
     void load();
+    const debouncedLoad = debounce(() => void load(), 500);
     return subscribeEvents((event) => {
       if (event?.kind === 'library.republish_pending') {
         toastSuccess(`Republish Pending complete: processed ${event.processed}, republished ${event.republished}, failed ${event.failed}`);
@@ -160,7 +163,7 @@
         toastSuccess(`Reset Orphaned complete: found ${event.found}, reset ${event.reset}, failed ${event.failed}`);
         resettingOrphaned = false;
       }
-      if (!checking) void load();
+      if (!checking) debouncedLoad();
     });
   });
 </script>
@@ -317,11 +320,11 @@
       </div>
       {#if entriesPage.total > PAGE_SIZE}
         <div class="pagination">
-          <button class="page-btn" on:click={() => goPage(-1)} disabled={page === 0}>
+          <button class="page-btn" on:click={() => goPage(-1)} disabled={page === 0} aria-label="Previous page">
             <ChevronLeft size={14} />
           </button>
           <span class="page-info">{pageStart}–{pageEnd} of {entriesPage.total}</span>
-          <button class="page-btn" on:click={() => goPage(1)} disabled={page >= lastPage}>
+          <button class="page-btn" on:click={() => goPage(1)} disabled={page >= lastPage} aria-label="Next page">
             <ChevronRight size={14} />
           </button>
         </div>

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"log/slog"
 	"regexp"
 	"strconv"
 	"strings"
@@ -185,7 +186,9 @@ func (db *DB) CreateSeasonPackEpisodeItems(ctx context.Context, selectedReleaseI
 		// row created but no library_item, or library_item but no
 		// queue_item) the way the previous unguarded statement-by-statement
 		// version could.
-		_ = db.createSeasonPackEpisodeItem(ctx, tvShowID, showTitle, releaseCandidateID, season, episode)
+		if err := db.createSeasonPackEpisodeItem(ctx, tvShowID, showTitle, releaseCandidateID, season, episode); err != nil {
+			slog.Warn("season pack: failed to create episode item", "tv_show_id", tvShowID, "season", season, "episode", episode, "err", err)
+		}
 	}
 	return nil
 }

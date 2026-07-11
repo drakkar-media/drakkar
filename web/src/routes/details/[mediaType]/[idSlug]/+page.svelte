@@ -16,6 +16,7 @@
   import { idFromSlug } from '$lib/detailsHref';
   import { toastError, toastSuccess } from '$lib/toast';
   import { bytes as fmtBytes } from '$lib/format';
+  import { runAction } from '$lib/actions';
   import { onMount } from 'svelte';
   import type { DiscoverDetails, GrabHistoryEntry, LibraryDetail, LibraryItem, ManualSearchItem, QualityProfile, ReleaseItem, SubtitleCandidate, SubtitleFile } from '$lib/types';
 
@@ -252,16 +253,13 @@
 
   async function searchAgain() {
     if (!pickerLibraryItemID) return;
-    pickerSearching = true;
-    try {
-      const result = await api.replacementCandidates(pickerLibraryItemID);
-      releaseCandidates = (result.items ?? []).sort((a, b) => b.score - a.score);
-      toastSuccess('Search queued — results will update shortly');
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      pickerSearching = false;
-    }
+    await runAction(() => api.replacementCandidates(pickerLibraryItemID!), {
+      setWorking: (v) => (pickerSearching = v),
+      successMessage: () => 'Search queued — results will update shortly',
+      afterSuccess: (result) => {
+        releaseCandidates = (result.items ?? []).sort((a, b) => b.score - a.score);
+      }
+    });
   }
 
   async function runLocalSearch() {
@@ -325,136 +323,93 @@
 
   async function importManualResult(item: ManualSearchItem) {
     if (!pickerLibraryItemID) return;
-    manualImporting = true;
-    try {
-      await api.manualImportRelease(pickerLibraryItemID, item);
-      toastSuccess('Manual release imported');
-      showReleasePicker = false;
-      manualQuery = '';
-      manualResults = [];
-      await loadDetail();
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      manualImporting = false;
-    }
+    await runAction(() => api.manualImportRelease(pickerLibraryItemID!, item), {
+      setWorking: (v) => (manualImporting = v),
+      successMessage: () => 'Manual release imported',
+      afterSuccess: async () => {
+        showReleasePicker = false;
+        manualQuery = '';
+        manualResults = [];
+        await loadDetail();
+      }
+    });
   }
 
   async function uploadNzbFile(file: File) {
     if (!pickerLibraryItemID) return;
-    uploadingNzb = true;
-    try {
-      await api.manualImportUpload(pickerLibraryItemID, file);
-      toastSuccess('NZB file imported');
-      showReleasePicker = false;
-      await loadDetail();
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      uploadingNzb = false;
-    }
+    await runAction(() => api.manualImportUpload(pickerLibraryItemID!, file), {
+      setWorking: (v) => (uploadingNzb = v),
+      successMessage: () => 'NZB file imported',
+      afterSuccess: async () => {
+        showReleasePicker = false;
+        await loadDetail();
+      }
+    });
   }
 
   async function resetItem(targetLibraryItemId: number, label: string) {
     if (!confirm(`Reset "${label}"?\n\nThis removes the symlink and re-queues the item from scratch.`)) return;
-    const key = `reset-${targetLibraryItemId}`;
-    setBusy(key, true);
-    try {
-      await api.resetLibraryItem(targetLibraryItemId);
-      await loadDetail();
-      toastSuccess('Item reset — re-queued');
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(key, false);
-    }
+    await runAction(() => api.resetLibraryItem(targetLibraryItemId), {
+      setWorking: (v) => setBusy(`reset-${targetLibraryItemId}`, v),
+      successMessage: () => 'Item reset — re-queued',
+      afterSuccess: loadDetail
+    });
   }
 
   async function runRepublish() {
     if (!libraryMatch) return;
-    setBusy('republish', true);
-    try {
-      await api.republishLibrary(libraryMatch.id);
-      toastSuccess('republished library item');
-      await loadDetail();
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy('republish', false);
-    }
+    await runAction(() => api.republishLibrary(libraryMatch!.id), {
+      setWorking: (v) => setBusy('republish', v),
+      successMessage: () => 'republished library item',
+      afterSuccess: loadDetail
+    });
   }
 
   async function runSubtitleSearch(forLibraryItemId?: number) {
     const itemId = forLibraryItemId ?? libraryMatch?.id;
     if (!itemId) return;
-    const key = `subtitle-search-${itemId}`;
-    setBusy(key, true);
-    try {
-      await api.searchSubtitles(itemId, ['nl', 'en']);
-      toastSuccess('Searching subtitles in background...');
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(key, false);
-    }
+    await runAction(() => api.searchSubtitles(itemId, ['nl', 'en']), {
+      setWorking: (v) => setBusy(`subtitle-search-${itemId}`, v),
+      successMessage: () => 'Searching subtitles in background...'
+    });
   }
 
   async function requestSeason(seasonNumber: number, seasonLabel: string) {
-    if (!detail?.tmdbId) return;
-    const key = `season-request-${seasonNumber}`;
-    setBusy(key, true);
-    try {
-      const result = await api.requestMedia(detail.tmdbId, 'tv', [seasonNumber]);
-      toastSuccess(`Requested ${seasonLabel} — ${result.created} item(s) added`);
-      await loadDetail();
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(key, false);
-    }
+    const tmdbId = detail?.tmdbId;
+    if (!tmdbId) return;
+    await runAction(() => api.requestMedia(tmdbId, 'tv', [seasonNumber]), {
+      setWorking: (v) => setBusy(`season-request-${seasonNumber}`, v),
+      successMessage: (result) => `Requested ${seasonLabel} — ${result.created} item(s) added`,
+      afterSuccess: loadDetail
+    });
   }
 
   async function prioritizeMissingForShow() {
-    if (!localDetail?.tvShowId) return;
-    setBusy('prioritize-missing', true);
-    try {
-      const result = await api.prioritizeTVShowMissing(localDetail.tvShowId);
-      toastSuccess(`Prioritized show — queued ${result.queued}, created ${result.itemsCreated}`);
-      await loadDetail();
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy('prioritize-missing', false);
-    }
+    const tvShowId = localDetail?.tvShowId;
+    if (!tvShowId) return;
+    await runAction(() => api.prioritizeTVShowMissing(tvShowId), {
+      setWorking: (v) => setBusy('prioritize-missing', v),
+      successMessage: (result) => `Prioritized show — queued ${result.queued}, created ${result.itemsCreated}`,
+      afterSuccess: loadDetail
+    });
   }
 
   async function downloadSubtitle(candidateID: number) {
     if (!libraryMatch) return;
-    const key = `subtitle-download-${candidateID}`;
-    setBusy(key, true);
-    try {
-      await api.downloadSubtitleCandidate(candidateID);
-      toastSuccess('subtitle downloaded');
-      await loadDetail();
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(key, false);
-    }
+    await runAction(() => api.downloadSubtitleCandidate(candidateID), {
+      setWorking: (v) => setBusy(`subtitle-download-${candidateID}`, v),
+      successMessage: () => 'subtitle downloaded',
+      afterSuccess: loadDetail
+    });
   }
 
   async function deleteSubtitleFile(subtitleID: number) {
-    const key = `subtitle-delete-${subtitleID}`;
-    setBusy(key, true);
-    try {
-      await api.deleteSubtitle(subtitleID);
-      toastSuccess('subtitle deleted');
-      await loadDetail();
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(key, false);
-    }
+    if (typeof window !== 'undefined' && !window.confirm('Delete this subtitle file?')) return;
+    await runAction(() => api.deleteSubtitle(subtitleID), {
+      setWorking: (v) => setBusy(`subtitle-delete-${subtitleID}`, v),
+      successMessage: () => 'subtitle deleted',
+      afterSuccess: loadDetail
+    });
   }
 
   async function loadEpisodeSubtitles(epLibraryItemId: number) {
@@ -484,31 +439,20 @@
   }
 
   async function downloadEpisodeSubtitle(epLibraryItemId: number, candidateID: number) {
-    const key = `ep-subtitle-download-${epLibraryItemId}-${candidateID}`;
-    setBusy(key, true);
-    try {
-      await api.downloadSubtitleCandidate(candidateID);
-      toastSuccess('subtitle downloaded');
-      await loadEpisodeSubtitles(epLibraryItemId);
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(key, false);
-    }
+    await runAction(() => api.downloadSubtitleCandidate(candidateID), {
+      setWorking: (v) => setBusy(`ep-subtitle-download-${epLibraryItemId}-${candidateID}`, v),
+      successMessage: () => 'subtitle downloaded',
+      afterSuccess: () => loadEpisodeSubtitles(epLibraryItemId)
+    });
   }
 
   async function deleteEpisodeSubtitle(epLibraryItemId: number, subtitleID: number) {
-    const key = `ep-subtitle-delete-${epLibraryItemId}-${subtitleID}`;
-    setBusy(key, true);
-    try {
-      await api.deleteSubtitle(subtitleID);
-      toastSuccess('subtitle deleted');
-      await loadEpisodeSubtitles(epLibraryItemId);
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setBusy(key, false);
-    }
+    if (typeof window !== 'undefined' && !window.confirm('Delete this subtitle file?')) return;
+    await runAction(() => api.deleteSubtitle(subtitleID), {
+      setWorking: (v) => setBusy(`ep-subtitle-delete-${epLibraryItemId}-${subtitleID}`, v),
+      successMessage: () => 'subtitle deleted',
+      afterSuccess: () => loadEpisodeSubtitles(epLibraryItemId)
+    });
   }
 
   async function updateQualityProfile(nextValue: string) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/hjongedijk/drakkar/internal/observability"
 	"github.com/hjongedijk/drakkar/internal/stream"
 )
 
@@ -48,7 +49,7 @@ const (
 	fetchOperationStat
 )
 
-func NewScheduledSource(source ArticleSource, workers int, queueSize int) *ScheduledSource {
+func NewScheduledSource(ctx context.Context, source ArticleSource, workers int, queueSize int) *ScheduledSource {
 	if workers <= 0 {
 		workers = 1
 	}
@@ -62,7 +63,7 @@ func NewScheduledSource(source ArticleSource, workers int, queueSize int) *Sched
 		low:    make(chan fetchRequest, queueSize),
 	}
 	for range workers {
-		go s.worker()
+		go s.worker(ctx)
 	}
 	return s
 }
@@ -144,33 +145,47 @@ func (s *ScheduledSource) queue(priority stream.FetchPriority) chan fetchRequest
 	}
 }
 
-func (s *ScheduledSource) worker() {
+// worker exits when ctx is cancelled (process shutdown) instead of running
+// forever. Each request is handled through handleRequestProtected so a panic
+// from one bad fetch (e.g. an unexpected yEnc decode failure) is recovered
+// per-request rather than ending the whole worker goroutine — after a single
+// unrecovered panic, that worker would silently vanish from the pool for the
+// rest of the process lifetime.
+func (s *ScheduledSource) worker(ctx context.Context) {
 	for {
-		req := s.next()
-		// Skip cancelled requests immediately (seek happened, context cancelled).
-		// nzbdav removes cancelled waiters from the semaphore queue; we do the
-		// same here before touching the connection pool.
-		if req.ctx.Err() != nil {
-			select {
-			case req.resultCh <- fetchResult{err: req.ctx.Err()}:
-			default:
-			}
-			continue
+		req, ok := s.next(ctx)
+		if !ok {
+			return
 		}
-		var (
-			body []byte
-			err  error
-		)
-		switch req.op {
-		case fetchOperationStat:
-			err = fetchArticleStat(req.ctx, s.source, req.messageID)
-		default:
-			body, err = fetchArticleBody(req.ctx, s.source, req.messageID, req.priority)
-		}
+		s.handleRequestProtected(req)
+	}
+}
+
+func (s *ScheduledSource) handleRequestProtected(req fetchRequest) {
+	defer observability.Recover("nntp-scheduler-worker")
+	// Skip cancelled requests immediately (seek happened, context cancelled).
+	// nzbdav removes cancelled waiters from the semaphore queue; we do the
+	// same here before touching the connection pool.
+	if req.ctx.Err() != nil {
 		select {
-		case req.resultCh <- fetchResult{body: body, err: err}:
-		case <-req.ctx.Done():
+		case req.resultCh <- fetchResult{err: req.ctx.Err()}:
+		default:
 		}
+		return
+	}
+	var (
+		body []byte
+		err  error
+	)
+	switch req.op {
+	case fetchOperationStat:
+		err = fetchArticleStat(req.ctx, s.source, req.messageID)
+	default:
+		body, err = fetchArticleBody(req.ctx, s.source, req.messageID, req.priority)
+	}
+	select {
+	case req.resultCh <- fetchResult{body: body, err: err}:
+	case <-req.ctx.Done():
 	}
 }
 
@@ -180,29 +195,31 @@ func (s *ScheduledSource) QueueDepths() (interactive, readAhead, background int)
 }
 
 // next picks the highest-priority pending request, blocking until one is
-// available.  This mirrors nzbdav's PrioritizedSemaphore release order:
-// High → Medium → Low.
-func (s *ScheduledSource) next() fetchRequest {
+// available or ctx is cancelled (process shutdown, reported via ok=false).
+// This mirrors nzbdav's PrioritizedSemaphore release order: High → Medium → Low.
+func (s *ScheduledSource) next(ctx context.Context) (req fetchRequest, ok bool) {
 	for {
 		select {
 		case req := <-s.high:
-			return req
+			return req, true
 		default:
 		}
 		select {
 		case req := <-s.high:
-			return req
+			return req, true
 		case req := <-s.medium:
-			return req
+			return req, true
 		default:
 		}
 		select {
 		case req := <-s.high:
-			return req
+			return req, true
 		case req := <-s.medium:
-			return req
+			return req, true
 		case req := <-s.low:
-			return req
+			return req, true
+		case <-ctx.Done():
+			return fetchRequest{}, false
 		}
 	}
 }

@@ -39,6 +39,8 @@
   import { api, subscribeEvents } from '$lib/api';
   import { bytes, dateTime } from '$lib/format';
   import { toastError, toastSuccess } from '$lib/toast';
+  import { runAction } from '$lib/actions';
+  import { debounce } from '$lib/debounce';
   import type { BlocklistItem, BlocklistMutation, BlockTestResult, CustomFormat, FullSettings, IndexerPolicy, IntegrationProbeReport, PolicySettings, QualityDefinition, QualityProfile, ReleaseBlockRule, Status, SubtitleProfile, TaskSchedule, UsenetProvider } from '$lib/types';
 
   type SettingsTab = 'integrations' | 'providers' | 'indexers' | 'queue' | 'library' | 'rules' | 'quality' | 'formats' | 'filtering' | 'subtitle-profiles' | 'notifications' | 'logs' | 'tasks' | 'media-players' | 'system';
@@ -310,12 +312,15 @@
   }
 
   async function deleteIndexerPolicy(id: number) {
-    try {
-      await api.deleteIndexerPolicy(id);
-      indexerPolicies = indexerPolicies.filter(p => p.id !== id);
-      editingPolicy = null;
-      toastSuccess('Deleted');
-    } catch (e) { toastError(e instanceof Error ? e.message : String(e)); }
+    if (typeof window !== 'undefined' && !window.confirm('Delete this indexer policy?')) return;
+    await runAction(() => api.deleteIndexerPolicy(id), {
+      setWorking: () => {},
+      successMessage: () => 'Deleted',
+      afterSuccess: () => {
+        indexerPolicies = indexerPolicies.filter(p => p.id !== id);
+        editingPolicy = null;
+      }
+    });
   }
 
   // ── Subtitle Profiles tab state ─────────────────────────────────────────────
@@ -349,12 +354,15 @@
   }
 
   async function deleteSubtitleProfile(id: number) {
-    try {
-      await api.deleteSubtitleProfile(id);
-      subtitleProfiles = subtitleProfiles.filter(p => p.id !== id);
-      editingSubtitleProfile = null;
-      toastSuccess('Deleted');
-    } catch (e) { toastError(e instanceof Error ? e.message : String(e)); }
+    if (typeof window !== 'undefined' && !window.confirm('Delete this subtitle profile?')) return;
+    await runAction(() => api.deleteSubtitleProfile(id), {
+      setWorking: () => {},
+      successMessage: () => 'Deleted',
+      afterSuccess: () => {
+        subtitleProfiles = subtitleProfiles.filter(p => p.id !== id);
+        editingSubtitleProfile = null;
+      }
+    });
   }
 
   // ── Custom Formats tab state ────────────────────────────────────────────────
@@ -430,12 +438,15 @@
   }
 
   async function deleteBlockRule(id: number) {
-    try {
-      await api.deleteReleaseBlockRule(id);
-      blockRules = blockRules.filter(r => r.id !== id);
-      editingRule = null;
-      toastSuccess('Deleted');
-    } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
+    if (typeof window !== 'undefined' && !window.confirm('Delete this block rule?')) return;
+    await runAction(() => api.deleteReleaseBlockRule(id), {
+      setWorking: () => {},
+      successMessage: () => 'Deleted',
+      afterSuccess: () => {
+        blockRules = blockRules.filter(r => r.id !== id);
+        editingRule = null;
+      }
+    });
   }
 
   async function runBlockTest() {
@@ -473,12 +484,15 @@
   }
 
   async function deleteFormat(id: number) {
-    try {
-      await api.deleteCustomFormat(id);
-      customFormats = customFormats.filter(f => f.id !== id);
-      if (editingFormat?.id === id) editingFormat = null;
-      toastSuccess('Custom format deleted');
-    } catch (e) { toastError(e instanceof Error ? e.message : String(e)); }
+    if (typeof window !== 'undefined' && !window.confirm('Delete this custom format?')) return;
+    await runAction(() => api.deleteCustomFormat(id), {
+      setWorking: () => {},
+      successMessage: () => 'Custom format deleted',
+      afterSuccess: () => {
+        customFormats = customFormats.filter(f => f.id !== id);
+        if (editingFormat?.id === id) editingFormat = null;
+      }
+    });
   }
 
   function blankProfile(): QualityProfile {
@@ -501,13 +515,16 @@
 
   async function deleteSelectedProfile(p: QualityProfile) {
     if (!p.id || p.isDefault) return;
-    try {
-      await api.deleteProfile(p.id);
-      toastSuccess(`Profile "${p.name}" deleted`);
-      if (selectedProfile?.id === p.id) selectedProfile = null;
-      const pr = await api.listProfiles();
-      profiles = pr.profiles ?? [];
-    } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
+    if (typeof window !== 'undefined' && !window.confirm(`Delete profile "${p.name}"?`)) return;
+    await runAction(() => api.deleteProfile(p.id!), {
+      setWorking: () => {},
+      successMessage: () => `Profile "${p.name}" deleted`,
+      afterSuccess: async () => {
+        if (selectedProfile?.id === p.id) selectedProfile = null;
+        const pr = await api.listProfiles();
+        profiles = pr.profiles ?? [];
+      }
+    });
   }
 
   function profileMoveUp(arr: string[], i: number): string[] { if (i === 0) return arr; const n = [...arr]; [n[i-1], n[i]] = [n[i], n[i-1]]; return n; }
@@ -621,19 +638,28 @@
       profiles = pr.profiles;
       qualityDefs = qdRes.definitions ?? [];
       policySettings = pol;
+      // loadAll() re-runs on every SSE message and 30s poll tick, not just on
+      // an explicit refresh click. Overwriting `draft` unconditionally here
+      // used to silently discard whatever the user was mid-editing in the
+      // settings form the moment an unrelated background event fired (e.g.
+      // a cache prune or someone else's library search completing). Only
+      // replace `draft` when there's nothing unsaved to lose.
+      const hasUnsavedEdits = !!draft && !!fullSettings && JSON.stringify(draft) !== JSON.stringify(fullSettings);
       fullSettings = fs;
-      draft = cloneSettings(fs);
-      // Apply frontend defaults for fields that may be absent from older settings.json
-      if (draft && !draft.indexer) {
-        draft.indexer = { tvRssSyncIntervalMinutes: 15, movieRssSyncIntervalMinutes: 30, minimumAgeMinutes: 0, retentionDays: 0, maximumSizeMB: 0, searchDelayMs: 2000, backgroundSearchWorkers: 12 };
-      } else if (draft?.indexer && !draft.indexer.backgroundSearchWorkers) {
-        draft.indexer.backgroundSearchWorkers = 12;
-      }
-      if (draft && !draft.jellyfin) {
-        draft.jellyfin = { url: '', apiKey: '' };
-      }
-      if (draft && !draft.notifications) {
-        draft.notifications = { discordWebhookUrl: '', genericWebhookUrl: '', onGrab: false, onAvailable: true, onFailed: false };
+      if (!hasUnsavedEdits) {
+        draft = cloneSettings(fs);
+        // Apply frontend defaults for fields that may be absent from older settings.json
+        if (draft && !draft.indexer) {
+          draft.indexer = { tvRssSyncIntervalMinutes: 15, movieRssSyncIntervalMinutes: 30, minimumAgeMinutes: 0, retentionDays: 0, maximumSizeMB: 0, searchDelayMs: 2000, backgroundSearchWorkers: 12 };
+        } else if (draft?.indexer && !draft.indexer.backgroundSearchWorkers) {
+          draft.indexer.backgroundSearchWorkers = 12;
+        }
+        if (draft && !draft.jellyfin) {
+          draft.jellyfin = { url: '', apiKey: '' };
+        }
+        if (draft && !draft.notifications) {
+          draft.notifications = { discordWebhookUrl: '', genericWebhookUrl: '', onGrab: false, onAvailable: true, onFailed: false };
+        }
       }
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
@@ -830,20 +856,16 @@
   // storage_maintenance scheduled task (every 6h). No individual API endpoints remain.
 
   async function pruneCache() {
+    if (typeof window !== 'undefined' && !window.confirm('Prune the block cache now?')) return;
     // Backend responds immediately with {queued: true} and prunes in a
     // background goroutine — the real stats (previously expected directly
     // off this call, which made lastCachePrune/the toast always show
     // "undefined") arrive later via the 'cache.prune' event handled in
     // onMount below, which populates lastCachePrune itself.
-    setBusy('prune-cache', true);
-    try {
-      await api.pruneCache();
-      toastSuccess('Cache prune queued — processing in background…');
-    } catch (e) {
-      toastError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy('prune-cache', false);
-    }
+    await runAction(() => api.pruneCache(), {
+      setWorking: (v) => setBusy('prune-cache', v),
+      successMessage: () => 'Cache prune queued — processing in background…'
+    });
   }
 
   async function probeIntegrations() {
@@ -906,6 +928,7 @@
       'library.republish_pending': { taskId: 'republish_pending', detail: (e) => `processed ${e.processed}, republished ${e.republished}, failed ${e.failed}` },
       'library.reset_orphaned': { taskId: 'reset_orphaned_available', detail: (e) => `found ${e.found}, reset ${e.reset}, failed ${e.failed}` }
     };
+    const debouncedLoadAll = debounce(() => void loadAll(), 500);
     const unsub = subscribeEvents((event) => {
       const kind = event?.kind as string | undefined;
       if (kind === 'cache.prune') {
@@ -918,10 +941,14 @@
         const { taskId, detail } = backgroundTaskResultUpdates[kind];
         taskResults = { ...taskResults, [taskId]: { ok: true, detail: detail(event as Record<string, unknown>), ranAt: new Date().toISOString() } };
       }
-      if (!anyBusy()) void loadAll();
+      if (!anyBusy()) debouncedLoadAll();
     });
-    const timer = window.setInterval(() => void loadAll(), 30000);
-    const taskTimer = window.setInterval(() => void loadTaskSchedules(), 30000);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void loadAll();
+    }, 30000);
+    const taskTimer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void loadTaskSchedules();
+    }, 30000);
     return () => {
       window.clearInterval(timer);
       window.clearInterval(taskTimer);
@@ -1911,9 +1938,9 @@
                     <div class="ordered-row">
                       <span class="rank">{i+1}</span>
                       <span class="ordered-value">{res}</span>
-                      <button type="button" class="rank-btn" on:click={() => { selectedProfile = { ...selectedProfile!, resolutions: profileMoveUp(selectedProfile!.resolutions, i) }; }} disabled={i===0}><ChevronUp size={13}/></button>
-                      <button type="button" class="rank-btn" on:click={() => { selectedProfile = { ...selectedProfile!, resolutions: profileMoveDown(selectedProfile!.resolutions, i) }; }} disabled={i===selectedProfile.resolutions.length-1}><ChevronDown size={13}/></button>
-                      <button type="button" class="rank-btn remove" on:click={() => { selectedProfile = { ...selectedProfile!, resolutions: selectedProfile!.resolutions.filter(v=>v!==res) }; }}>✕</button>
+                      <button type="button" class="rank-btn" aria-label={`Move ${res} up`} on:click={() => { selectedProfile = { ...selectedProfile!, resolutions: profileMoveUp(selectedProfile!.resolutions, i) }; }} disabled={i===0}><ChevronUp size={13}/></button>
+                      <button type="button" class="rank-btn" aria-label={`Move ${res} down`} on:click={() => { selectedProfile = { ...selectedProfile!, resolutions: profileMoveDown(selectedProfile!.resolutions, i) }; }} disabled={i===selectedProfile.resolutions.length-1}><ChevronDown size={13}/></button>
+                      <button type="button" class="rank-btn remove" aria-label={`Remove ${res}`} on:click={() => { selectedProfile = { ...selectedProfile!, resolutions: selectedProfile!.resolutions.filter(v=>v!==res) }; }}>✕</button>
                     </div>
                   {/each}
                   <div class="chip-row">
@@ -1931,9 +1958,9 @@
                   {#each selectedProfile.sources as src, i}
                     <div class="ordered-row">
                       <span class="rank">{i+1}</span><span class="ordered-value">{src}</span>
-                      <button type="button" class="rank-btn" on:click={() => { selectedProfile = { ...selectedProfile!, sources: profileMoveUp(selectedProfile!.sources, i) }; }} disabled={i===0}><ChevronUp size={13}/></button>
-                      <button type="button" class="rank-btn" on:click={() => { selectedProfile = { ...selectedProfile!, sources: profileMoveDown(selectedProfile!.sources, i) }; }} disabled={i===selectedProfile.sources.length-1}><ChevronDown size={13}/></button>
-                      <button type="button" class="rank-btn remove" on:click={() => { selectedProfile = { ...selectedProfile!, sources: selectedProfile!.sources.filter(v=>v!==src) }; }}>✕</button>
+                      <button type="button" class="rank-btn" aria-label={`Move ${src} up`} on:click={() => { selectedProfile = { ...selectedProfile!, sources: profileMoveUp(selectedProfile!.sources, i) }; }} disabled={i===0}><ChevronUp size={13}/></button>
+                      <button type="button" class="rank-btn" aria-label={`Move ${src} down`} on:click={() => { selectedProfile = { ...selectedProfile!, sources: profileMoveDown(selectedProfile!.sources, i) }; }} disabled={i===selectedProfile.sources.length-1}><ChevronDown size={13}/></button>
+                      <button type="button" class="rank-btn remove" aria-label={`Remove ${src}`} on:click={() => { selectedProfile = { ...selectedProfile!, sources: selectedProfile!.sources.filter(v=>v!==src) }; }}>✕</button>
                     </div>
                   {/each}
                   <div class="chip-row">
@@ -1951,9 +1978,9 @@
                   {#each selectedProfile.codecs as c, i}
                     <div class="ordered-row">
                       <span class="rank">{i+1}</span><span class="ordered-value">{c}</span>
-                      <button type="button" class="rank-btn" on:click={() => { selectedProfile = { ...selectedProfile!, codecs: profileMoveUp(selectedProfile!.codecs, i) }; }} disabled={i===0}><ChevronUp size={13}/></button>
-                      <button type="button" class="rank-btn" on:click={() => { selectedProfile = { ...selectedProfile!, codecs: profileMoveDown(selectedProfile!.codecs, i) }; }} disabled={i===selectedProfile.codecs.length-1}><ChevronDown size={13}/></button>
-                      <button type="button" class="rank-btn remove" on:click={() => { selectedProfile = { ...selectedProfile!, codecs: selectedProfile!.codecs.filter(v=>v!==c) }; }}>✕</button>
+                      <button type="button" class="rank-btn" aria-label={`Move ${c} up`} on:click={() => { selectedProfile = { ...selectedProfile!, codecs: profileMoveUp(selectedProfile!.codecs, i) }; }} disabled={i===0}><ChevronUp size={13}/></button>
+                      <button type="button" class="rank-btn" aria-label={`Move ${c} down`} on:click={() => { selectedProfile = { ...selectedProfile!, codecs: profileMoveDown(selectedProfile!.codecs, i) }; }} disabled={i===selectedProfile.codecs.length-1}><ChevronDown size={13}/></button>
+                      <button type="button" class="rank-btn remove" aria-label={`Remove ${c}`} on:click={() => { selectedProfile = { ...selectedProfile!, codecs: selectedProfile!.codecs.filter(v=>v!==c) }; }}>✕</button>
                     </div>
                   {/each}
                   <div class="chip-row">
@@ -1973,9 +2000,9 @@
                   {#each selectedProfile.audioFormats as a, i}
                     <div class="ordered-row">
                       <span class="rank">{i+1}</span><span class="ordered-value">{a}</span>
-                      <button type="button" class="rank-btn" on:click={() => { selectedProfile = { ...selectedProfile!, audioFormats: profileMoveUp(selectedProfile!.audioFormats, i) }; }} disabled={i===0}><ChevronUp size={13}/></button>
-                      <button type="button" class="rank-btn" on:click={() => { selectedProfile = { ...selectedProfile!, audioFormats: profileMoveDown(selectedProfile!.audioFormats, i) }; }} disabled={i===selectedProfile.audioFormats.length-1}><ChevronDown size={13}/></button>
-                      <button type="button" class="rank-btn remove" on:click={() => { selectedProfile = { ...selectedProfile!, audioFormats: selectedProfile!.audioFormats.filter(v=>v!==a) }; }}>✕</button>
+                      <button type="button" class="rank-btn" aria-label={`Move ${a} up`} on:click={() => { selectedProfile = { ...selectedProfile!, audioFormats: profileMoveUp(selectedProfile!.audioFormats, i) }; }} disabled={i===0}><ChevronUp size={13}/></button>
+                      <button type="button" class="rank-btn" aria-label={`Move ${a} down`} on:click={() => { selectedProfile = { ...selectedProfile!, audioFormats: profileMoveDown(selectedProfile!.audioFormats, i) }; }} disabled={i===selectedProfile.audioFormats.length-1}><ChevronDown size={13}/></button>
+                      <button type="button" class="rank-btn remove" aria-label={`Remove ${a}`} on:click={() => { selectedProfile = { ...selectedProfile!, audioFormats: selectedProfile!.audioFormats.filter(v=>v!==a) }; }}>✕</button>
                     </div>
                   {/each}
                   <div class="chip-row">
@@ -1993,9 +2020,9 @@
                   {#each selectedProfile.hdrFormats as h, i}
                     <div class="ordered-row">
                       <span class="rank">{i+1}</span><span class="ordered-value">{h}</span>
-                      <button type="button" class="rank-btn" on:click={() => { selectedProfile = { ...selectedProfile!, hdrFormats: profileMoveUp(selectedProfile!.hdrFormats, i) }; }} disabled={i===0}><ChevronUp size={13}/></button>
-                      <button type="button" class="rank-btn" on:click={() => { selectedProfile = { ...selectedProfile!, hdrFormats: profileMoveDown(selectedProfile!.hdrFormats, i) }; }} disabled={i===selectedProfile.hdrFormats.length-1}><ChevronDown size={13}/></button>
-                      <button type="button" class="rank-btn remove" on:click={() => { selectedProfile = { ...selectedProfile!, hdrFormats: selectedProfile!.hdrFormats.filter(v=>v!==h) }; }}>✕</button>
+                      <button type="button" class="rank-btn" aria-label={`Move ${h} up`} on:click={() => { selectedProfile = { ...selectedProfile!, hdrFormats: profileMoveUp(selectedProfile!.hdrFormats, i) }; }} disabled={i===0}><ChevronUp size={13}/></button>
+                      <button type="button" class="rank-btn" aria-label={`Move ${h} down`} on:click={() => { selectedProfile = { ...selectedProfile!, hdrFormats: profileMoveDown(selectedProfile!.hdrFormats, i) }; }} disabled={i===selectedProfile.hdrFormats.length-1}><ChevronDown size={13}/></button>
+                      <button type="button" class="rank-btn remove" aria-label={`Remove ${h}`} on:click={() => { selectedProfile = { ...selectedProfile!, hdrFormats: selectedProfile!.hdrFormats.filter(v=>v!==h) }; }}>✕</button>
                     </div>
                   {/each}
                   <div class="chip-row">

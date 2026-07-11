@@ -212,14 +212,15 @@
             {#each day.entries.slice(0, 3) as entry (entry.id)}
               <button class="entry {TYPE_STYLE[entry.type === 'tv' ? 'episode' : entry.type] ?? ''}"
                 class:entry-available={entry.available}
+                title={statusLabel(entry)}
                 on:click={() => (selected = entry)}>
                 <span class="entry-title">{entry.title}</span>
                 {#if entry.available}
-                  <span class="entry-dot avail"></span>
+                  <span class="entry-dot avail" aria-hidden="true"></span>
                 {:else if entry.queueState === 'failed'}
-                  <span class="entry-dot fail"></span>
+                  <span class="entry-dot fail" aria-hidden="true"></span>
                 {:else if entry.queueState}
-                  <span class="entry-dot queued"></span>
+                  <span class="entry-dot queued" aria-hidden="true"></span>
                 {/if}
               </button>
             {/each}

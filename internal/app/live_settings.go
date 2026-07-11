@@ -80,6 +80,7 @@ func (m *recurringTaskManager) Reschedule(name string, interval time.Duration) {
 func (m *recurringTaskManager) StartWithStartupDelay(name string, interval, startupDelay time.Duration, fn func()) {
 	m.Start(name, interval, false, fn)
 	go func() {
+		defer observability.Recover(name + "-startup-delay")
 		timer := time.NewTimer(startupDelay)
 		defer timer.Stop()
 		select {
@@ -92,12 +93,22 @@ func (m *recurringTaskManager) StartWithStartupDelay(name string, interval, star
 	m.logger.Info().Str("task", name).Dur("startupDelay", startupDelay).Msg("scheduler: delayed startup task armed")
 }
 
+// runProtected recovers a panic from a single tick of a recurring task so one
+// bad run (e.g. an unexpected Hydra/TMDB/Seerr response shape) logs an error
+// instead of silently ending the task's for-loop -- or, without any recovery
+// at all, crashing the entire process and taking down every in-flight
+// download/stream with it.
+func runProtected(name string, fn func()) {
+	defer observability.Recover(name)
+	fn()
+}
+
 func (m *recurringTaskManager) startLocked(task *managedRecurringTask) {
 	runCtx, cancel := context.WithCancel(m.rootCtx)
 	task.cancel = cancel
-	go func(interval time.Duration, runOnStartup bool, fn func()) {
+	go func(name string, interval time.Duration, runOnStartup bool, fn func()) {
 		if runOnStartup {
-			fn()
+			runProtected(name, fn)
 		}
 		timer := time.NewTimer(interval)
 		defer timer.Stop()
@@ -106,11 +117,11 @@ func (m *recurringTaskManager) startLocked(task *managedRecurringTask) {
 			case <-runCtx.Done():
 				return
 			case <-timer.C:
-				fn()
+				runProtected(name, fn)
 				timer.Reset(interval)
 			}
 		}
-	}(task.interval, task.runOnStartup, task.fn)
+	}(task.name, task.interval, task.runOnStartup, task.fn)
 	m.logger.Info().Str("task", task.name).Dur("interval", task.interval).Bool("startup", task.runOnStartup).Msg("scheduler: task started")
 }
 

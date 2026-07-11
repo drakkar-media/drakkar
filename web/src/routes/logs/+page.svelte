@@ -77,7 +77,9 @@
 
   onMount(() => {
     void load();
-    const timer = window.setInterval(() => void load(), 30000);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void load();
+    }, 30000);
     return () => window.clearInterval(timer);
   });
 </script>

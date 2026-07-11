@@ -506,6 +506,24 @@ export type BlocklistItem = {
   postedAt?: string;
 };
 
+// ReleaseActionResult is the shared response shape for the release actions
+// (select/reject/restore/skip/manual-import) that mutate a release
+// candidate's selection state.
+export type ReleaseActionResult = {
+  releaseCandidateId: number;
+  action: string;
+  selectedReleaseId?: number;
+};
+
+// DeletedCount is the shared response shape for the various "delete one
+// record" endpoints (profiles, block rules, custom formats, indexer
+// policies, subtitle profiles).
+export type DeletedCount = { deleted: number };
+
+// QueuedResult is the shared response shape for endpoints that enqueue a
+// background job rather than returning a result synchronously.
+export type QueuedResult = { queued: boolean };
+
 export type BlocklistMutation = {
   key: string;
   keyType?: 'raw' | 'external_url' | 'release_signature';

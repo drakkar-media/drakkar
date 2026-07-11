@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/hjongedijk/drakkar/internal/observability"
 )
 
 // ErrArticleMissing is returned by Stat on a 430 status. Note that some
@@ -42,7 +44,7 @@ type PooledSource struct {
 	idle chan pooledSession
 }
 
-func NewPooledSource(factory SessionFactory, maxOpen int) *PooledSource {
+func NewPooledSource(ctx context.Context, factory SessionFactory, maxOpen int) *PooledSource {
 	if maxOpen <= 0 {
 		maxOpen = 1
 	}
@@ -56,18 +58,31 @@ func NewPooledSource(factory SessionFactory, maxOpen int) *PooledSource {
 		// perfectly healthy connections. See sweepOnce.
 		idle: make(chan pooledSession, maxOpen*2),
 	}
-	go p.sweepLoop()
+	go p.sweepLoop(ctx)
 	return p
 }
 
 // sweepLoop closes connections idle longer than idleTimeout.
-// Period = idleTimeout/2, matching nzbdav's SweepLoop.
-func (p *PooledSource) sweepLoop() {
+// Period = idleTimeout/2, matching nzbdav's SweepLoop. Exits when ctx is
+// cancelled (process shutdown) instead of running forever, and recovers a
+// panic from each individual sweep so one bad tick can't silently end the
+// loop and leak idle connections for the rest of the process lifetime.
+func (p *PooledSource) sweepLoop(ctx context.Context) {
 	ticker := time.NewTicker(idleTimeout / 2)
 	defer ticker.Stop()
-	for range ticker.C {
-		p.sweepOnce()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.sweepOnceProtected()
+		}
 	}
+}
+
+func (p *PooledSource) sweepOnceProtected() {
+	defer observability.Recover("nntp-pool-sweep")
+	p.sweepOnce()
 }
 
 func (p *PooledSource) sweepOnce() {
