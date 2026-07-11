@@ -25,7 +25,16 @@
   let items: QueueItem[] = [];
   let workQueue: WorkQueueStatus = { paused: false, depth: 0 };
   let loading = true;
-  let working = false;
+  let busy: Record<string, boolean> = {};
+  function isBusy(key: string): boolean {
+    return !!busy[key];
+  }
+  function setBusy(key: string, value: boolean) {
+    busy = { ...busy, [key]: value };
+  }
+  function anyBusy(): boolean {
+    return Object.values(busy).some(Boolean);
+  }
   let tab: 'queue' | 'history' = 'queue';
   let queuePage = 1;
   let historyPage = 1;
@@ -91,7 +100,7 @@
 
   async function toggleQueuePause() {
     await runAction(() => (workQueue.paused ? api.resumeQueue() : api.pauseQueue()), {
-      setWorking: (v) => (working = v),
+      setWorking: (v) => setBusy('toggle-pause', v),
       successMessage: (result) => {
         workQueue = result;
         return result.paused ? 'Background queue paused' : 'Background queue resumed';
@@ -102,7 +111,7 @@
 
   async function retryItem(id: number) {
     await runAction(() => api.retryQueue(id), {
-      setWorking: (v) => (working = v),
+      setWorking: (v) => setBusy(`retry-${id}`, v),
       successMessage: () => 'Retry queued',
       afterSuccess: load
     });
@@ -110,7 +119,7 @@
 
   async function retryAll() {
     await runAction(() => api.retryFailedQueue(), {
-      setWorking: (v) => (working = v),
+      setWorking: (v) => setBusy('retry-all', v),
       successMessage: (result) => `Retried ${result.retried}`,
       afterSuccess: load
     });
@@ -118,7 +127,7 @@
 
   async function clearFailed() {
     await runAction(() => api.clearFailedQueue(), {
-      setWorking: (v) => (working = v),
+      setWorking: (v) => setBusy('clear-failed', v),
       successMessage: (result) => `Cleared ${result.cleared} failed item${result.cleared === 1 ? '' : 's'}`,
       afterSuccess: load
     });
@@ -132,7 +141,7 @@
     };
     if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
     await runAction(() => api.queueAction(id, action), {
-      setWorking: (v) => (working = v),
+      setWorking: (v) => setBusy(`manage-${id}`, v),
       successMessage: (result) => result.action.replaceAll('_', ' '),
       afterSuccess: load
     });
@@ -146,7 +155,7 @@
     };
     if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
     await runAction(() => api.failedQueueAction(action), {
-      setWorking: (v) => (working = v),
+      setWorking: (v) => setBusy(`manage-all-${action}`, v),
       successMessage: (result) => `${result.retried} handled, ${result.failed} failed`,
       afterSuccess: load
     });
@@ -161,7 +170,7 @@
     };
     if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
     await runAction(() => api.bulkQueueAction(selectedFailedIds, action), {
-      setWorking: (v) => (working = v),
+      setWorking: (v) => setBusy(`manage-selected-${action}`, v),
       successMessage: (result) => `${result.retried} handled, ${result.failed} failed`,
       afterSuccess: async () => {
         selectedHistoryIds = new Set();
@@ -176,7 +185,7 @@
     // arrive later via a 'library.search_pending' event (see onMount below),
     // not on this response. Reading those fields here was always undefined.
     await runAction(() => api.searchPendingLibrary(), {
-      setWorking: (v) => (working = v),
+      setWorking: (v) => setBusy('process-pending', v),
       successMessage: () => 'Search queued — processing in background…',
       afterSuccess: load
     });
@@ -245,10 +254,10 @@
         const e = event as Record<string, unknown>;
         toastSuccess(`Search Pending complete: processed ${e.processed}, selected ${e.selected}`);
       }
-      if (!working) void refreshItems();
+      if (!anyBusy()) void refreshItems();
     });
     const timer = window.setInterval(() => {
-      if (!working) void refreshItems();
+      if (!anyBusy()) void refreshItems();
     }, 15000);
     return () => {
       window.clearInterval(timer);
@@ -260,11 +269,11 @@
 <svelte:head><title>Downloads — Drakkar</title></svelte:head>
 
 <PageHeader title="Downloads" subtitle="Queue, history, and active NZB processing in one place.">
-  <Button kind="secondary" on:click={load} disabled={loading || working}>
+  <Button kind="secondary" on:click={load} disabled={loading}>
     <RefreshCw size={14} />
     Refresh
   </Button>
-  <Button kind="secondary" on:click={toggleQueuePause} disabled={loading || working}>
+  <Button kind="secondary" on:click={toggleQueuePause} disabled={loading || isBusy('toggle-pause')}>
     {#if workQueue.paused}
       <Play size={14} />
       Resume Queue
@@ -273,24 +282,24 @@
       Pause Queue
     {/if}
   </Button>
-  <Button kind="secondary" on:click={processPending} disabled={working}>
+  <Button kind="secondary" on:click={processPending} disabled={isBusy('process-pending')}>
     <SearchCheck size={14} />
     Process Pending
   </Button>
   {#if failedItems.length > 0}
-    <Button kind="secondary" on:click={retryAll} disabled={working}>
+    <Button kind="secondary" on:click={retryAll} disabled={isBusy('retry-all')}>
       <RotateCcw size={14} />
       Retry Failed ({failedItems.length})
     </Button>
-    <Button kind="secondary" on:click={() => manageAllFailed('remove_and_blocklist')} disabled={working}>
+    <Button kind="secondary" on:click={() => manageAllFailed('remove_and_blocklist')} disabled={isBusy('manage-all-remove_and_blocklist')}>
       <Trash2 size={14} />
       Blocklist Failed
     </Button>
-    <Button kind="secondary" on:click={() => manageAllFailed('remove_blocklist_and_search')} disabled={working}>
+    <Button kind="secondary" on:click={() => manageAllFailed('remove_blocklist_and_search')} disabled={isBusy('manage-all-remove_blocklist_and_search')}>
       <SearchCheck size={14} />
       Blocklist + Search
     </Button>
-    <Button kind="danger" on:click={clearFailed} disabled={working}>
+    <Button kind="danger" on:click={clearFailed} disabled={isBusy('clear-failed')}>
       <Trash2 size={14} />
       Clear Failed
     </Button>
@@ -400,13 +409,13 @@
           {@const pct = stageProgress(item.state)}
           <div class="row-card">
             <div class="row-head">
-              <div>
+              <div class="row-text">
                 <div class="row-title">{item.libraryTitle}</div>
                 <div class="row-sub">
                   {item.nzbFileName ? `${item.nzbFileName} · ` : ''}{item.nzbSegmentCount} segments
                 </div>
               </div>
-              <Button kind="secondary" on:click={() => retryItem(item.queueItemId)} disabled={working}>
+              <Button kind="secondary" on:click={() => retryItem(item.queueItemId)} disabled={isBusy(`retry-${item.queueItemId}`)}>
                 <RotateCcw size={14} />
                 Retry
               </Button>
@@ -430,22 +439,22 @@
             <input
               type="checkbox"
               checked={visibleFailedHistoryIds.length > 0 && visibleFailedSelectedCount === visibleFailedHistoryIds.length}
-              disabled={visibleFailedHistoryIds.length === 0 || working}
+              disabled={visibleFailedHistoryIds.length === 0 || isBusy('manage-selected-remove_and_blocklist') || isBusy('manage-selected-remove_blocklist_and_search')}
               on:change={(e) => toggleVisibleFailedSelection((e.currentTarget as HTMLInputElement).checked)}
             />
             <span>Select visible failed ({visibleFailedHistoryIds.length})</span>
           </label>
           <div class="history-toolbar-actions">
             <StatusPill tone="neutral">{selectedFailedCount} selected</StatusPill>
-            <Button kind="secondary" on:click={() => manageSelectedFailed('remove_and_blocklist')} disabled={working || selectedFailedCount === 0}>
+            <Button kind="secondary" on:click={() => manageSelectedFailed('remove_and_blocklist')} disabled={isBusy('manage-selected-remove_and_blocklist') || selectedFailedCount === 0}>
               <Trash2 size={14} />
               Blocklist Selected
             </Button>
-            <Button kind="secondary" on:click={() => manageSelectedFailed('remove_blocklist_and_search')} disabled={working || selectedFailedCount === 0}>
+            <Button kind="secondary" on:click={() => manageSelectedFailed('remove_blocklist_and_search')} disabled={isBusy('manage-selected-remove_blocklist_and_search') || selectedFailedCount === 0}>
               <SearchCheck size={14} />
               Replace Selected
             </Button>
-            <Button kind="secondary" on:click={() => (selectedHistoryIds = new Set())} disabled={working || selectedFailedCount === 0}>
+            <Button kind="secondary" on:click={() => (selectedHistoryIds = new Set())} disabled={selectedFailedCount === 0}>
               Clear Selection
             </Button>
           </div>
@@ -469,12 +478,12 @@
                     <input
                       type="checkbox"
                       checked={selectedHistoryIds.has(item.queueItemId)}
-                      disabled={working}
+                      disabled={isBusy('manage-selected-remove_and_blocklist') || isBusy('manage-selected-remove_blocklist_and_search')}
                       on:change={(e) => toggleHistorySelection(item.queueItemId, (e.currentTarget as HTMLInputElement).checked)}
                     />
                   </label>
                 {/if}
-                <div>
+                <div class="row-text">
                   <div class="row-title">{item.libraryTitle}</div>
                   <div class="row-sub">
                     {item.nzbFileName ? `${item.nzbFileName} · ` : ''}{item.nzbSegmentCount} segments
@@ -489,15 +498,15 @@
                   </a>
                 {/if}
                 {#if item.state === 'failed'}
-                  <Button kind="secondary" on:click={() => retryItem(item.queueItemId)} disabled={working}>
+                  <Button kind="secondary" on:click={() => retryItem(item.queueItemId)} disabled={isBusy(`retry-${item.queueItemId}`)}>
                     <RotateCcw size={14} />
                     Retry
                   </Button>
-                  <Button kind="secondary" on:click={() => manageFailedItem(item.queueItemId, 'remove_and_blocklist')} disabled={working}>
+                  <Button kind="secondary" on:click={() => manageFailedItem(item.queueItemId, 'remove_and_blocklist')} disabled={isBusy(`manage-${item.queueItemId}`)}>
                     <Trash2 size={14} />
                     Blocklist
                   </Button>
-                  <Button kind="secondary" on:click={() => manageFailedItem(item.queueItemId, 'remove_blocklist_and_search')} disabled={working}>
+                  <Button kind="secondary" on:click={() => manageFailedItem(item.queueItemId, 'remove_blocklist_and_search')} disabled={isBusy(`manage-${item.queueItemId}`)}>
                     <SearchCheck size={14} />
                     Replace
                   </Button>
@@ -627,8 +636,25 @@
     gap: 12px;
   }
 
+  .row-text {
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .row-title,
+  .row-sub {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .row-title {
     font-weight: 600;
+  }
+
+  .row-head > :global(.button),
+  .history-actions {
+    flex-shrink: 0;
   }
 
   .history-main,
@@ -642,6 +668,8 @@
 
   .history-main {
     gap: 10px;
+    min-width: 0;
+    flex: 1 1 auto;
   }
 
   .history-checkbox {

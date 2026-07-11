@@ -200,6 +200,14 @@
       if (event.kind === 'subtitle.search' && event.libraryItemId === libraryMatch?.id) {
         void loadDetail();
       }
+      // Per-episode subtitle searches publish with the episode's own
+      // libraryItemId (never libraryMatch.id, which is the show/movie-level
+      // item), and loadDetail() only refreshes the show-level subtitle
+      // state, not the episodeSubtitles map -- without this branch, a
+      // completed per-episode search never reached the UI at all.
+      if (event.kind === 'subtitle.search' && typeof event.libraryItemId === 'number' && event.libraryItemId in episodeSubtitles) {
+        void loadEpisodeSubtitles(event.libraryItemId);
+      }
     });
   });
 
@@ -302,7 +310,7 @@
   }
 
   async function runManualSearch() {
-    if (!manualQuery.trim()) return;
+    if (!manualQuery.trim() || manualSearching) return;
     manualSearching = true;
     manualResults = [];
     try {
@@ -713,7 +721,7 @@
                                 {/each}
                               </div>
                             {/if}
-                            <Button kind="secondary" on:click={() => runSubtitleSearch(epId).then(() => loadEpisodeSubtitles(epId))} disabled={isBusy(`subtitle-search-${epId}`)}>
+                            <Button kind="secondary" on:click={() => runSubtitleSearch(epId)} disabled={isBusy(`subtitle-search-${epId}`)}>
                               <Search size={13} />
                               Search Subtitles
                             </Button>
@@ -948,7 +956,7 @@
                   placeholder="Search (e.g. show name S01 complete)"
                   bind:value={manualQuery}
                   disabled={manualSearching || manualImporting}
-                  on:keydown={(e) => e.key === 'Enter' && runManualSearch()}
+                  on:keydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); runManualSearch(); } }}
                 />
               </div>
               <Button kind="secondary" type="submit" disabled={manualSearching || manualImporting || !manualQuery.trim()}>

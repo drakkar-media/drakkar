@@ -172,7 +172,7 @@
     <RefreshCw size={14} />
     Refresh
   </Button>
-  <Button kind="primary" on:click={runCheck} disabled={loading || checking || republishing || resettingOrphaned}>
+  <Button kind="primary" on:click={runCheck} disabled={loading || checking}>
     <ShieldCheck size={14} />
     {checking ? 'Running…' : 'Run Health Check'}
   </Button>
@@ -229,11 +229,11 @@
         <strong> Reset Orphaned Available</strong> when the item needs to be re-queued for a fresh search and download.
       </p>
       <div class="attention-actions">
-        <Button kind="secondary" on:click={republishPending} disabled={loading || checking || republishing || resettingOrphaned}>
+        <Button kind="secondary" on:click={republishPending} disabled={loading || republishing}>
           <RefreshCw size={14} />
           {republishing ? 'Republishing…' : 'Republish Pending'}
         </Button>
-        <Button kind="primary" on:click={resetOrphanedAvailable} disabled={loading || checking || republishing || resettingOrphaned}>
+        <Button kind="primary" on:click={resetOrphanedAvailable} disabled={loading || resettingOrphaned}>
           <AlertTriangle size={14} />
           {resettingOrphaned ? 'Resetting…' : 'Reset Orphaned Available'}
         </Button>

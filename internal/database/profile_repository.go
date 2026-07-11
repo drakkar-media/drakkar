@@ -121,7 +121,55 @@ func (db *DB) GetQualityProfileByName(ctx context.Context, name string) (Quality
 	return scanProfile(row)
 }
 
+// UpsertQualityProfile creates a new profile (p.ID == 0) or updates an
+// existing one by id (p.ID > 0).
+//
+// This used to always INSERT ... ON CONFLICT (name) DO UPDATE regardless of
+// p.ID, which was never referenced at all. Renaming an existing profile (same
+// id, new name) therefore never matched the conflict target and silently
+// INSERTed a brand-new row, leaving the original untouched under its old
+// name -- and saving a *new* profile whose name happened to collide with an
+// existing one (e.g. two unrenamed "New Profile" drafts) silently overwrote
+// that unrelated profile's entire configuration. Updating by id when one is
+// present fixes both: renames update the same row, and a name collision on
+// update or create now surfaces as a real unique-constraint error instead of
+// silently merging into the wrong row.
 func (db *DB) UpsertQualityProfile(ctx context.Context, p QualityProfile) (QualityProfile, error) {
+	if p.ID > 0 {
+		row := db.SQL.QueryRowContext(ctx, `
+			UPDATE quality_profiles SET
+			    name               = $2,
+			    is_default         = $3,
+			    resolutions        = $4::text[],
+			    sources            = $5::text[],
+			    codecs             = $6::text[],
+			    languages          = $7::text[],
+			    audio_formats      = $8::text[],
+			    hdr_formats        = $9::text[],
+			    exclude_patterns   = $10::text[],
+			    prefer_proper      = $11,
+			    prefer_repack      = $12,
+			    reject_cam         = $13,
+			    allow_upgrade      = $14,
+			    minimum_upgrade_custom_format_score = $15,
+			    cutoff_resolution  = $16,
+			    minimum_age_hours  = $17,
+			    min_mb_per_minute  = $18,
+			    max_mb_per_minute  = $19,
+			    updated_at         = now()
+			WHERE id = $1
+			RETURNING`+profileSelectCols,
+			p.ID, p.Name, p.IsDefault,
+			pgTextArray(p.Resolutions), pgTextArray(p.Sources),
+			pgTextArray(p.Codecs), pgTextArray(p.Languages),
+			pgTextArray(p.AudioFormats), pgTextArray(p.HdrFormats),
+			pgTextArray(p.ExcludePatterns),
+			p.PreferProper, p.PreferRepack, p.RejectCam, p.AllowUpgrade, p.MinimumUpgradeCustomFormatScore,
+			p.CutoffResolution, p.MinimumAgeHours,
+			p.MinMBPerMinute, p.MaxMBPerMinute,
+		)
+		return scanProfile(row)
+	}
 	row := db.SQL.QueryRowContext(ctx, `
 		INSERT INTO quality_profiles
 		    (name, is_default, resolutions, sources, codecs, languages,
@@ -131,25 +179,6 @@ func (db *DB) UpsertQualityProfile(ctx context.Context, p QualityProfile) (Quali
 		     min_mb_per_minute, max_mb_per_minute, updated_at)
 		VALUES ($1,$2,$3::text[],$4::text[],$5::text[],$6::text[],
 		        $7::text[],$8::text[],$9::text[],$10,$11,$12,$13,$14,$15,$16,$17,$18,now())
-		ON CONFLICT (name) DO UPDATE SET
-		    is_default         = excluded.is_default,
-		    resolutions        = excluded.resolutions,
-		    sources            = excluded.sources,
-		    codecs             = excluded.codecs,
-		    languages          = excluded.languages,
-		    audio_formats      = excluded.audio_formats,
-		    hdr_formats        = excluded.hdr_formats,
-		    exclude_patterns   = excluded.exclude_patterns,
-		    prefer_proper      = excluded.prefer_proper,
-		    prefer_repack      = excluded.prefer_repack,
-		    reject_cam         = excluded.reject_cam,
-		    allow_upgrade      = excluded.allow_upgrade,
-		    minimum_upgrade_custom_format_score = excluded.minimum_upgrade_custom_format_score,
-		    cutoff_resolution  = excluded.cutoff_resolution,
-		    minimum_age_hours  = excluded.minimum_age_hours,
-		    min_mb_per_minute  = excluded.min_mb_per_minute,
-		    max_mb_per_minute  = excluded.max_mb_per_minute,
-		    updated_at         = now()
 		RETURNING`+profileSelectCols,
 		p.Name, p.IsDefault,
 		pgTextArray(p.Resolutions), pgTextArray(p.Sources),

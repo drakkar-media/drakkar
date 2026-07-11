@@ -90,10 +90,8 @@
     Refresh
   </Button>
   <a class="btn-link" href="/api/logs?limit=2000" target="_blank" rel="noreferrer" download>
-    <Button kind="secondary">
-      <Download size={14} />
-      Download
-    </Button>
+    <Download size={14} />
+    Download
   </a>
 </PageHeader>
 
@@ -264,7 +262,26 @@
     font-size: 13px;
   }
 
-  .btn-link { display: contents; }
+  .btn-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 42px;
+    padding: 0 14px;
+    border-radius: 14px;
+    border: 1px solid hsl(0 0% 100% / 0.08);
+    background: hsl(0 0% 100% / 0.05);
+    color: hsl(var(--foreground));
+    font-weight: 600;
+    text-decoration: none;
+    cursor: pointer;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+
+  .btn-link:hover {
+    background: hsl(0 0% 100% / 0.09);
+    border-color: hsl(0 0% 100% / 0.18);
+  }
 
   @media (max-width: 700px) {
     .toolbar { grid-template-columns: 1fr; }

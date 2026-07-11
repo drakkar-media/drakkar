@@ -18,7 +18,16 @@
   let page = 1;
   const pageSize = 25;
   let loading = true;
-  let working = false;
+  let busy: Record<string, boolean> = {};
+  function isBusy(key: string): boolean {
+    return !!busy[key];
+  }
+  function setBusy(key: string, value: boolean) {
+    busy = { ...busy, [key]: value };
+  }
+  function anyBusy(): boolean {
+    return Object.values(busy).some(Boolean);
+  }
   let search = '';
   let mediaType: 'all' | 'movie' | 'episode' = 'all';
   let missingOnly = false;
@@ -72,7 +81,7 @@
   }
 
   async function searchOne(id: number) {
-    working = true;
+    setBusy(`search-${id}`, true);
     try {
       await api.searchSubtitles(id, []);
       toastSuccess('Subtitle search queued');
@@ -80,13 +89,13 @@
     } catch (err) {
       toastError(err instanceof Error ? err.message : String(err));
     } finally {
-      working = false;
+      setBusy(`search-${id}`, false);
     }
   }
 
   async function deleteOne(id: number) {
     if (typeof window !== 'undefined' && !window.confirm('Delete all subtitles for this item?')) return;
-    working = true;
+    setBusy(`delete-${id}`, true);
     try {
       await api.bulkSubtitleAction('delete', [id]);
       toastSuccess('Subtitles deleted');
@@ -94,7 +103,7 @@
     } catch (err) {
       toastError(err instanceof Error ? err.message : String(err));
     } finally {
-      working = false;
+      setBusy(`delete-${id}`, false);
     }
   }
 
@@ -102,7 +111,7 @@
     if (selectedCount === 0) return;
     const ids = Array.from(selected);
     if (action === 'delete' && typeof window !== 'undefined' && !window.confirm(`Delete all subtitles for ${ids.length} selected item(s)?`)) return;
-    working = true;
+    setBusy(`bulk-${action}`, true);
     try {
       const result = await api.bulkSubtitleAction(action, ids);
       toastSuccess(action === 'search' ? `Queued search for ${result.count} item(s)` : `Deleted subtitles for ${result.count} item(s)`);
@@ -111,14 +120,14 @@
     } catch (err) {
       toastError(err instanceof Error ? err.message : String(err));
     } finally {
-      working = false;
+      setBusy(`bulk-${action}`, false);
     }
   }
 
   onMount(() => {
     void load();
     const unsub = subscribeEvents(() => {
-      if (!working) void load();
+      if (!anyBusy()) void load();
     });
     return unsub;
   });
@@ -127,7 +136,7 @@
 <svelte:head><title>Subtitles — Drakkar</title></svelte:head>
 
 <PageHeader title="Subtitle Manager" subtitle="Search, download, and clean up subtitles across every movie and TV episode.">
-  <Button kind="secondary" on:click={load} disabled={loading || working}>
+  <Button kind="secondary" on:click={load} disabled={loading}>
     <RefreshCw size={14} />
     Refresh
   </Button>
@@ -166,18 +175,18 @@
         <input
           type="checkbox"
           checked={allVisibleSelected}
-          disabled={items.length === 0 || working}
+          disabled={items.length === 0 || isBusy('bulk-search') || isBusy('bulk-delete')}
           on:change={(e) => toggleAllVisible((e.currentTarget as HTMLInputElement).checked)}
         />
         <span>Select visible ({items.length})</span>
       </label>
       <div class="toolbar-actions">
         <StatusPill tone="neutral">{selectedCount} selected</StatusPill>
-        <Button kind="secondary" on:click={() => bulkAction('search')} disabled={working || selectedCount === 0}>
+        <Button kind="secondary" on:click={() => bulkAction('search')} disabled={isBusy('bulk-search') || selectedCount === 0}>
           <SearchCheck size={14} />
           Search Selected
         </Button>
-        <Button kind="danger" on:click={() => bulkAction('delete')} disabled={working || selectedCount === 0}>
+        <Button kind="danger" on:click={() => bulkAction('delete')} disabled={isBusy('bulk-delete') || selectedCount === 0}>
           <Trash2 size={14} />
           Delete Selected
         </Button>
@@ -191,7 +200,7 @@
             <input
               type="checkbox"
               checked={selected.has(item.libraryItemId)}
-              disabled={working}
+              disabled={isBusy('bulk-search') || isBusy('bulk-delete')}
               on:change={(e) => toggleSelected(item.libraryItemId, (e.currentTarget as HTMLInputElement).checked)}
             />
           </label>
@@ -213,11 +222,11 @@
               <Link size={14} />
               Open
             </a>
-            <Button kind="secondary" on:click={() => searchOne(item.libraryItemId)} disabled={working}>
+            <Button kind="secondary" on:click={() => searchOne(item.libraryItemId)} disabled={isBusy(`search-${item.libraryItemId}`)}>
               <SearchCheck size={14} />
               Search
             </Button>
-            <Button kind="danger" on:click={() => deleteOne(item.libraryItemId)} disabled={working || item.languages.length === 0}>
+            <Button kind="danger" on:click={() => deleteOne(item.libraryItemId)} disabled={isBusy(`delete-${item.libraryItemId}`) || item.languages.length === 0}>
               <Trash2 size={14} />
               Delete
             </Button>

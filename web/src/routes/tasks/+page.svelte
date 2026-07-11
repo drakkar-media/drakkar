@@ -112,6 +112,22 @@
     'maintenance.nzb_health_check': (e) => `NZB Health Check: scanned ${e.scannedRows}, reset ${e.resetItems}`,
   };
 
+  // Every fire-and-forget "Operations" task's row was permanently stuck
+  // showing "started in background" + a green "Success" pill the instant the
+  // queue-ack resolved, because nothing ever wrote the real outcome back into
+  // `results` once the background job actually finished. Maps each
+  // completion event kind to the task id whose row should be updated.
+  const backgroundResultUpdates: Record<string, { taskId: string; detail: (e: Record<string, unknown>) => string }> = {
+    'library.republish_pending':     { taskId: 'republish_pending',        detail: (e) => `processed ${e.processed}, republished ${e.republished}, failed ${e.failed}` },
+    'library.reset_orphaned':        { taskId: 'reset_orphaned_available', detail: (e) => `found ${e.found}, reset ${e.reset}, failed ${e.failed}` },
+    'library.search_pending':        { taskId: 'backlog_search',           detail: (e) => `processed ${e.processed}, searched ${e.searched}, selected ${e.selected}, failed ${e.failed}` },
+    'library.search_upgrades':       { taskId: 'search_upgrades',          detail: (e) => `checked ${e.checked}, upgraded ${e.upgraded}, failed ${e.failed}` },
+    'library.push_library':          { taskId: 'seerr_push_library',       detail: (e) => `movies ${e.moviesPushed}, shows ${e.showsPushed}` },
+    'library.backfill_metadata':     { taskId: 'backfill_metadata',        detail: (e) => `enriched ${e.enriched} items` },
+    'library.fill_missing_episodes': { taskId: 'fill_missing_episodes',    detail: (e) => `processed ${e.showsProcessed} shows, created ${e.itemsCreated} items` },
+    'cache.prune':                   { taskId: 'cache_prune',              detail: (e) => `deleted ${e.deletedFiles} files` },
+  };
+
   onMount(() => {
     void loadSchedules();
     const t = window.setInterval(() => void loadSchedules(), 30000);
@@ -121,6 +137,10 @@
       if (fmt) {
         toastSuccess(fmt(event));
         void loadSchedules();
+      }
+      const resultUpdate = backgroundResultUpdates[event.kind as string];
+      if (resultUpdate) {
+        results = { ...results, [resultUpdate.taskId]: { ok: true, detail: resultUpdate.detail(event), ranAt: new Date().toISOString() } };
       }
     });
     return () => { window.clearInterval(t); unsub(); };

@@ -171,7 +171,7 @@
               <select
                 class="profile-select"
                 value={item.qualityProfileId == null ? '' : String(item.qualityProfileId)}
-                disabled={working || !!profileSaving[item.id]}
+                disabled={!!profileSaving[item.id]}
                 on:change={(event) => setProfile(item.id, (event.currentTarget as HTMLSelectElement).value)}
               >
                 <option value="">Default profile</option>

@@ -67,7 +67,16 @@
   let fullSettings: FullSettings | null = null;
   let draft: FullSettings | null = null;
   let loading = true;
-  let working = false;
+  let busy: Record<string, boolean> = {};
+  function isBusy(key: string): boolean {
+    return !!busy[key];
+  }
+  function setBusy(key: string, value: boolean) {
+    busy = { ...busy, [key]: value };
+  }
+  function anyBusy(): boolean {
+    return Object.values(busy).some(Boolean);
+  }
   let blocklist: BlocklistItem[] = [];
   let blPage = 1;
   let blPageSize = 50;
@@ -650,7 +659,7 @@
 
   async function saveSettings() {
     if (!draft) return;
-    working = true;
+    setBusy('save-settings', true);
     try {
       const saved = await api.saveSettings(draft);
       fullSettings = saved;
@@ -659,7 +668,7 @@
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
-      working = false;
+      setBusy('save-settings', false);
     }
   }
 
@@ -693,7 +702,7 @@
 
   async function clearBlocklist(id: number) {
     if (typeof window !== 'undefined' && !window.confirm('Clear this runtime blocklist entry?')) return;
-    working = true;
+    setBusy(`clear-blocklist-${id}`, true);
     try {
       await api.clearBlocklist(id);
       toastSuccess('Blocklist item cleared');
@@ -701,13 +710,13 @@
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
-      working = false;
+      setBusy(`clear-blocklist-${id}`, false);
     }
   }
 
   async function clearAllBlocklist() {
     if (typeof window !== 'undefined' && !window.confirm('Clear all active runtime blocklist entries?')) return;
-    working = true;
+    setBusy('clear-all-blocklist', true);
     try {
       const r = await api.clearAllBlocklist();
       toastSuccess(`Cleared ${r.cleared} blocklist entr${r.cleared === 1 ? 'y' : 'ies'}`);
@@ -716,13 +725,13 @@
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
-      working = false;
+      setBusy('clear-all-blocklist', false);
     }
   }
 
   async function clearBlocklistByReason(reason: string) {
     if (typeof window !== 'undefined' && !window.confirm(`Clear all active runtime blocklist entries with reason "${reason}"?`)) return;
-    working = true;
+    setBusy(`clear-blocklist-reason-${reason}`, true);
     try {
       const r = await api.clearBlocklistByReason(reason);
       toastSuccess(`Cleared ${r.cleared} ${reason} entr${r.cleared === 1 ? 'y' : 'ies'}`);
@@ -731,7 +740,7 @@
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
-      working = false;
+      setBusy(`clear-blocklist-reason-${reason}`, false);
     }
   }
 
@@ -782,7 +791,7 @@
       reason: blockEditor.reason.trim() || 'manual',
       expiresAt: blockEditor.expiresAt ? new Date(blockEditor.expiresAt).toISOString() : undefined
     };
-    working = true;
+    setBusy('save-blocklist-entry', true);
     try {
       if (blockEditor.id) {
         await api.updateBlocklist(blockEditor.id, payload);
@@ -797,7 +806,7 @@
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
-      working = false;
+      setBusy('save-blocklist-entry', false);
     }
   }
 
@@ -826,19 +835,19 @@
     // off this call, which made lastCachePrune/the toast always show
     // "undefined") arrive later via the 'cache.prune' event handled in
     // onMount below, which populates lastCachePrune itself.
-    working = true;
+    setBusy('prune-cache', true);
     try {
       await api.pruneCache();
       toastSuccess('Cache prune queued — processing in background…');
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
-      working = false;
+      setBusy('prune-cache', false);
     }
   }
 
   async function probeIntegrations() {
-    working = true;
+    setBusy('probe-integrations', true);
     try {
       lastProbe = await api.probeIntegrations();
       const ok = lastProbe.results.filter((r) => r.ok).length;
@@ -846,20 +855,20 @@
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
-      working = false;
+      setBusy('probe-integrations', false);
     }
   }
 
   async function savePolicies() {
     if (!policySettings) return;
-    working = true;
+    setBusy('save-policies', true);
     try {
       policySettings = await api.savePolicies(policySettings);
       toastSuccess('Queue policy saved');
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
-      working = false;
+      setBusy('save-policies', false);
     }
   }
 
@@ -875,7 +884,27 @@
       'library.fill_missing_episodes': (e) => `Fill Missing Episodes complete: processed ${e.showsProcessed} shows, created ${e.itemsCreated} new items`,
       'cache.prune': (e) => `Prune Block Cache complete: deleted ${e.deletedFiles} files`,
       'library.backfill_metadata': (e) => `Backfill Metadata complete: enriched ${e.enriched} items`,
-      'library.push_library': (e) => `Push Library to Seerr complete: movies ${e.moviesPushed}, shows ${e.showsPushed}`
+      'library.push_library': (e) => `Push Library to Seerr complete: movies ${e.moviesPushed}, shows ${e.showsPushed}`,
+      'library.search_upgrades': (e) => `Search Quality Upgrades complete: checked ${e.checked}, upgraded ${e.upgraded}, failed ${e.failed}`,
+      'library.search_pending': (e) => `Backlog Search complete: processed ${e.processed}, searched ${e.searched}, selected ${e.selected}, failed ${e.failed}`,
+      'library.republish_pending': (e) => `Republish Pending complete: processed ${e.processed}, republished ${e.republished}, failed ${e.failed}`,
+      'library.reset_orphaned': (e) => `Reset Orphaned Available complete: found ${e.found}, reset ${e.reset}, failed ${e.failed}`
+    };
+    // The Tasks tab's status pill/result line for fire-and-forget "Operations"
+    // tasks was permanently frozen at the literal string "started in
+    // background" (set the instant the queue-ack resolves) because nothing
+    // ever wrote the real outcome back into taskResults once the background
+    // job actually finished. Maps each completion event kind to the task id
+    // it belongs to and a real detail string, mirrored from the toasts above.
+    const backgroundTaskResultUpdates: Record<string, { taskId: string; detail: (e: Record<string, unknown>) => string }> = {
+      'library.fill_missing_episodes': { taskId: 'fill_missing_episodes', detail: (e) => `processed ${e.showsProcessed} shows, created ${e.itemsCreated} items` },
+      'cache.prune': { taskId: 'cache_prune', detail: (e) => `deleted ${e.deletedFiles} files` },
+      'library.backfill_metadata': { taskId: 'backfill_metadata', detail: (e) => `enriched ${e.enriched} items` },
+      'library.push_library': { taskId: 'seerr_push_library', detail: (e) => `movies ${e.moviesPushed}, shows ${e.showsPushed}` },
+      'library.search_upgrades': { taskId: 'search_upgrades', detail: (e) => `checked ${e.checked}, upgraded ${e.upgraded}, failed ${e.failed}` },
+      'library.search_pending': { taskId: 'backlog_search', detail: (e) => `processed ${e.processed}, searched ${e.searched}, selected ${e.selected}, failed ${e.failed}` },
+      'library.republish_pending': { taskId: 'republish_pending', detail: (e) => `processed ${e.processed}, republished ${e.republished}, failed ${e.failed}` },
+      'library.reset_orphaned': { taskId: 'reset_orphaned_available', detail: (e) => `found ${e.found}, reset ${e.reset}, failed ${e.failed}` }
     };
     const unsub = subscribeEvents((event) => {
       const kind = event?.kind as string | undefined;
@@ -885,7 +914,11 @@
       if (kind && backgroundTaskToasts[kind]) {
         toastSuccess(backgroundTaskToasts[kind](event as Record<string, unknown>));
       }
-      if (!working) void loadAll();
+      if (kind && backgroundTaskResultUpdates[kind]) {
+        const { taskId, detail } = backgroundTaskResultUpdates[kind];
+        taskResults = { ...taskResults, [taskId]: { ok: true, detail: detail(event as Record<string, unknown>), ranAt: new Date().toISOString() } };
+      }
+      if (!anyBusy()) void loadAll();
     });
     const timer = window.setInterval(() => void loadAll(), 30000);
     const taskTimer = window.setInterval(() => void loadTaskSchedules(), 30000);
@@ -911,11 +944,11 @@
 <svelte:head><title>Settings — Drakkar</title></svelte:head>
 
 <PageHeader title="Settings" subtitle="Integrations, providers, queue policy, rules and system configuration.">
-  <Button kind="secondary" on:click={loadAll} disabled={loading || working}>
+  <Button kind="secondary" on:click={loadAll} disabled={loading}>
     <RefreshCw size={16} />
     Refresh
   </Button>
-  <Button kind="secondary" on:click={probeIntegrations} disabled={loading || working}>
+  <Button kind="secondary" on:click={probeIntegrations} disabled={loading || isBusy('probe-integrations')}>
     <Wrench size={16} />
     Probe
   </Button>
@@ -1144,7 +1177,7 @@
         </Panel>
 
         <div class="actions-row">
-          <Button kind="primary" on:click={saveSettings} disabled={working}>
+          <Button kind="primary" on:click={saveSettings} disabled={isBusy('save-settings')}>
             <Save size={16} />
             Save Integrations
           </Button>
@@ -1264,7 +1297,7 @@
         </Panel>
 
         <div class="actions-row">
-          <Button kind="primary" on:click={saveSettings} disabled={working}>
+          <Button kind="primary" on:click={saveSettings} disabled={isBusy('save-settings')}>
             <Save size={16} />
             Save Providers
           </Button>
@@ -1316,8 +1349,8 @@
           </div>
         </Panel>
         <div class="settings-actions">
-          <Button kind="primary" on:click={saveSettings} disabled={working}>
-            <Save size={14} /> {working ? 'Saving…' : 'Save Indexer Settings'}
+          <Button kind="primary" on:click={saveSettings} disabled={isBusy('save-settings')}>
+            <Save size={14} /> {isBusy('save-settings') ? 'Saving…' : 'Save Indexer Settings'}
           </Button>
         </div>
       {/if}
@@ -1438,7 +1471,7 @@
             </label>
           </div>
           <div class="actions-row">
-            <Button kind="secondary" on:click={savePolicies} disabled={loading || working}>
+            <Button kind="secondary" on:click={savePolicies} disabled={loading || isBusy('save-policies')}>
               <Save size={16} />
               Save Behavior
             </Button>
@@ -1461,7 +1494,7 @@
             {/each}
           </div>
           <div class="actions-row">
-            <Button kind="secondary" on:click={savePolicies} disabled={loading || working}>
+            <Button kind="secondary" on:click={savePolicies} disabled={loading || isBusy('save-policies')}>
               <Save size={16} />
               Save Queue Rules
             </Button>
@@ -1545,7 +1578,7 @@
               <p>Use a structured URL/signature entry or paste a raw runtime key directly.</p>
             </div>
             {#if blockEditor.id}
-              <Button kind="ghost" on:click={resetBlockEditor} disabled={working}>
+              <Button kind="ghost" on:click={resetBlockEditor}>
                 <X size={14} />
                 Cancel Edit
               </Button>
@@ -1606,7 +1639,7 @@
             </div>
           {/if}
           <div class="bl-editor-actions">
-            <Button kind="primary" on:click={saveBlocklistEntry} disabled={working}>
+            <Button kind="primary" on:click={saveBlocklistEntry} disabled={isBusy('save-blocklist-entry')}>
               <Save size={14} />
               {blockEditor.id ? 'Update Entry' : 'Create Entry'}
             </Button>
@@ -1665,7 +1698,7 @@
             <option value={100}>100 / page</option>
           </select>
           {#if blTotal > 0}
-            <Button kind="ghost" on:click={clearAllBlocklist} disabled={loading || working}>
+            <Button kind="ghost" on:click={clearAllBlocklist} disabled={loading || isBusy('clear-all-blocklist')}>
               <X size={14} />
               Clear all
             </Button>
@@ -1730,13 +1763,13 @@
                     <td class="muted mono">{item.expiresAt ? new Date(item.expiresAt).toLocaleDateString('en-GB') : 'Never'}</td>
                     <td class="bl-action">
                       <div class="bl-row-actions">
-                        <button class="icon-btn" type="button" on:click={() => clearBlocklistByReason(item.reason)} disabled={working} title="Clear all with this reason">
+                        <button class="icon-btn" type="button" on:click={() => clearBlocklistByReason(item.reason)} disabled={isBusy(`clear-blocklist-reason-${item.reason}`)} title="Clear all with this reason">
                           <Trash2 size={13} />
                         </button>
-                        <button class="icon-btn" type="button" on:click={() => startEditBlocklist(item)} disabled={working} title="Edit entry">
+                        <button class="icon-btn" type="button" on:click={() => startEditBlocklist(item)} title="Edit entry">
                           <Pencil size={13} />
                         </button>
-                        <button class="clear-btn" on:click={() => clearBlocklist(item.id)} disabled={working} title="Clear this entry">
+                        <button class="clear-btn" on:click={() => clearBlocklist(item.id)} disabled={isBusy(`clear-blocklist-${item.id}`)} title="Clear this entry">
                         <X size={13} />
                         </button>
                       </div>
@@ -1765,7 +1798,7 @@
               policySettings = { ...cur, ignoredPatterns: t.value.split('\n').map((l) => l.trim()).filter(Boolean) };
             }}></textarea>
             <div class="actions-row">
-              <Button kind="secondary" on:click={savePolicies} disabled={loading || working}>
+              <Button kind="secondary" on:click={savePolicies} disabled={loading || isBusy('save-policies')}>
                 <Save size={16} />
                 Save Patterns
               </Button>
@@ -1777,7 +1810,7 @@
 
         <Panel title="Maintenance" subtitle="Operator cleanup and cache controls.">
           <div class="maint-list">
-            <Button kind="secondary" on:click={pruneCache} disabled={loading || working}>
+            <Button kind="secondary" on:click={pruneCache} disabled={loading || isBusy('prune-cache')}>
               <Wrench size={16} />
               Prune Block Cache
             </Button>
@@ -2418,8 +2451,8 @@
         </div>
         <div class="divider"></div>
         <div class="editor-actions">
-          <Button kind="primary" on:click={saveSettings} disabled={working}>
-            <Save size={15} /> {working ? 'Saving…' : 'Save Notifications'}
+          <Button kind="primary" on:click={saveSettings} disabled={isBusy('save-settings')}>
+            <Save size={15} /> {isBusy('save-settings') ? 'Saving…' : 'Save Notifications'}
           </Button>
         </div>
       </Panel>
@@ -2568,7 +2601,7 @@
               <div class="plex-token-row">
                 <input type="password" bind:value={draft.plex.token} placeholder="••••••••" autocomplete="off" />
                 {#if !plexPin}
-                  <Button kind="secondary" on:click={startPlexOAuth} disabled={working}>
+                  <Button kind="secondary" on:click={startPlexOAuth}>
                     <ExternalLink size={14} /> Get token with Plex
                   </Button>
                 {:else}
@@ -2590,26 +2623,26 @@
           <div class="actions-row" style="margin-top:16px; gap:10px; justify-content:space-between">
             <div style="display:flex;gap:10px">
               <Button kind="secondary" on:click={async () => {
-                working = true;
+                setBusy('plex-test', true);
                 try {
                   const r = await api.plexTest();
                   if (r.ok) toastSuccess(`Plex connected: ${r.serverName} (${r.libraries?.length ?? 0} libraries)`);
                   else toastError(r.error ?? 'Plex connection failed');
                 } catch (e) { toastError(e instanceof Error ? e.message : String(e)); }
-                finally { working = false; }
-              }} disabled={working}>
+                finally { setBusy('plex-test', false); }
+              }} disabled={isBusy('plex-test')}>
                 <Wrench size={16} /> Test Connection
               </Button>
               <Button kind="secondary" on:click={async () => {
-                working = true;
+                setBusy('plex-refresh', true);
                 try { await api.plexRefresh(); toastSuccess('Plex library scan triggered'); }
                 catch (e) { toastError(e instanceof Error ? e.message : String(e)); }
-                finally { working = false; }
-              }} disabled={working}>
+                finally { setBusy('plex-refresh', false); }
+              }} disabled={isBusy('plex-refresh')}>
                 <RefreshCw size={16} /> Refresh Libraries
               </Button>
             </div>
-            <Button kind="primary" on:click={saveSettings} disabled={working}>
+            <Button kind="primary" on:click={saveSettings} disabled={isBusy('save-settings')}>
               <Save size={16} /> Save Plex Settings
             </Button>
           </div>
@@ -2629,26 +2662,26 @@
           <div class="actions-row" style="margin-top:16px; gap:10px; justify-content:space-between">
             <div style="display:flex;gap:10px">
               <Button kind="secondary" on:click={async () => {
-                working = true;
+                setBusy('jellyfin-test', true);
                 try {
                   const r = await api.jellyfinTest();
                   if (r.ok) toastSuccess(`Jellyfin connected: ${r.serverName} v${r.version}`);
                   else toastError(r.error ?? 'Jellyfin connection failed');
                 } catch (e) { toastError(e instanceof Error ? e.message : String(e)); }
-                finally { working = false; }
-              }} disabled={working}>
+                finally { setBusy('jellyfin-test', false); }
+              }} disabled={isBusy('jellyfin-test')}>
                 <Wrench size={16} /> Test Connection
               </Button>
               <Button kind="secondary" on:click={async () => {
-                working = true;
+                setBusy('jellyfin-refresh', true);
                 try { await api.jellyfinRefresh(); toastSuccess('Jellyfin library scan triggered'); }
                 catch (e) { toastError(e instanceof Error ? e.message : String(e)); }
-                finally { working = false; }
-              }} disabled={working}>
+                finally { setBusy('jellyfin-refresh', false); }
+              }} disabled={isBusy('jellyfin-refresh')}>
                 <RefreshCw size={16} /> Refresh Libraries
               </Button>
             </div>
-            <Button kind="primary" on:click={saveSettings} disabled={working}>
+            <Button kind="primary" on:click={saveSettings} disabled={isBusy('save-settings')}>
               <Save size={16} /> Save Jellyfin Settings
             </Button>
           </div>

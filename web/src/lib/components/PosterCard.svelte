@@ -75,9 +75,17 @@
       <div class="status-badge status-badge-{status}">{statusLabel(item)}</div>
     {/if}
     {#if notInLibrary && onRequest}
-      <button class="request-btn" on:click|preventDefault|stopPropagation={() => onRequest && onRequest(item)} title="Request this title">
+      <span
+        class="request-btn"
+        role="button"
+        tabindex="0"
+        aria-label="Request this title"
+        title="Request this title"
+        on:click|preventDefault|stopPropagation={() => onRequest && onRequest(item)}
+        on:keydown|preventDefault|stopPropagation={(e) => { if (e.key === 'Enter' || e.key === ' ') onRequest && onRequest(item); }}
+      >
         <Plus size={14} />
-      </button>
+      </span>
     {/if}
   </div>
 

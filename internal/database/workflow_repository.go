@@ -2205,6 +2205,12 @@ func isFKViolation(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.SQLState() == "23503"
 }
 
+// IsUniqueViolation returns true when err is a PostgreSQL unique constraint violation (SQLSTATE 23505).
+func IsUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.SQLState() == "23505"
+}
+
 func isHardRejectReason(reason string) bool {
 	r := strings.TrimSpace(strings.ToLower(reason))
 	if isPermanentArchiveRejectReason(r) {

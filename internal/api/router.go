@@ -1850,6 +1850,10 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		saved, err := profilesRepo.UpsertQualityProfile(r.Context(), p)
 		if err != nil {
+			if database.IsUniqueViolation(err) {
+				respondError(w, http.StatusConflict, fmt.Errorf("a profile named %q already exists", p.Name))
+				return
+			}
 			respondError(w, http.StatusInternalServerError, err)
 			return
 		}

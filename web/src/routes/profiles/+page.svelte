@@ -74,14 +74,18 @@
     finally { saving = false; }
   }
 
+  let deleting = false;
+
   async function deleteProfile(p: QualityProfile) {
-    if (!p.id || p.isDefault) return;
+    if (!p.id || p.isDefault || deleting) return;
+    deleting = true;
     try {
       await api.deleteProfile(p.id);
       toastSuccess(`Profile "${p.name}" deleted`);
       if (selected?.id === p.id) selected = null;
       await load();
     } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
+    finally { deleting = false; }
   }
 
   // Ordered list reorder helpers
@@ -352,7 +356,7 @@
         <!-- Actions -->
         <div class="editor-actions">
           {#if selected.id && !selected.isDefault}
-            <Button kind="danger" on:click={() => selected && deleteProfile(selected)} disabled={saving}>
+            <Button kind="danger" on:click={() => selected && deleteProfile(selected)} disabled={saving || deleting}>
               <Trash2 size={15} />
               Delete
             </Button>

@@ -17,7 +17,13 @@
   let me: User | null = null;
   let tokens: APIToken[] = [];
   let loading = true;
-  let working = false;
+  let busy: Record<string, boolean> = {};
+  function isBusy(key: string): boolean {
+    return !!busy[key];
+  }
+  function setBusy(key: string, value: boolean) {
+    busy = { ...busy, [key]: value };
+  }
 
   let username = '';
   let password = '';
@@ -43,7 +49,7 @@
 
   async function createUser() {
     if (!username.trim() || password.length < 8) return;
-    working = true;
+    setBusy('create-user', true);
     try {
       await api.createUser(username.trim(), password, role);
       toastSuccess(`User ${username.trim()} created`);
@@ -54,7 +60,7 @@
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy('create-user', false);
     }
   }
 
@@ -64,7 +70,7 @@
       return;
     }
     if (typeof window !== 'undefined' && !window.confirm(`Delete user "${name}"?`)) return;
-    working = true;
+    setBusy(`delete-user-${id}`, true);
     try {
       const res = await api.deleteUser(id);
       if (!res.ok) throw new Error(await res.text() || 'delete failed');
@@ -73,7 +79,7 @@
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy(`delete-user-${id}`, false);
     }
   }
 
@@ -83,7 +89,7 @@
       toastError('Password must be at least 8 characters');
       return;
     }
-    working = true;
+    setBusy(`change-password-${id}`, true);
     try {
       const res = await api.changePassword(id, next);
       if (!res.ok) throw new Error(await res.text() || 'password change failed');
@@ -92,13 +98,13 @@
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy(`change-password-${id}`, false);
     }
   }
 
   async function createToken() {
     if (!tokenName.trim()) return;
-    working = true;
+    setBusy('create-token', true);
     try {
       const created = await api.createApiToken(tokenName.trim(), tokenExpiresAt ? new Date(tokenExpiresAt).toISOString() : null);
       createdToken = created.token;
@@ -109,13 +115,13 @@
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy('create-token', false);
     }
   }
 
   async function deleteToken(id: number, name: string) {
     if (typeof window !== 'undefined' && !window.confirm(`Delete API token "${name}"?`)) return;
-    working = true;
+    setBusy(`delete-token-${id}`, true);
     try {
       const res = await api.deleteApiToken(id);
       if (!res.ok) throw new Error(await res.text() || 'delete failed');
@@ -124,7 +130,7 @@
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
-      working = false;
+      setBusy(`delete-token-${id}`, false);
     }
   }
 
@@ -136,7 +142,7 @@
 <svelte:head><title>Users — Drakkar</title></svelte:head>
 
 <PageHeader title="Users" subtitle="Manage operator accounts, roles, and passwords for Drakkar.">
-  <Button kind="secondary" on:click={load} disabled={loading || working}>
+  <Button kind="secondary" on:click={load} disabled={loading}>
     <RefreshCw size={14} />
     Refresh
   </Button>
@@ -176,7 +182,7 @@
             <option value="user">User</option>
           </select>
         </label>
-        <Button kind="primary" disabled={working || !username.trim() || password.length < 8}>
+        <Button kind="primary" disabled={isBusy('create-user') || !username.trim() || password.length < 8}>
           <UserPlus size={14} />
           Create User
         </Button>
@@ -193,7 +199,7 @@
           <span>Expires At</span>
           <input bind:value={tokenExpiresAt} type="datetime-local" />
         </label>
-        <Button kind="primary" disabled={working || !tokenName.trim()}>
+        <Button kind="primary" disabled={isBusy('create-token') || !tokenName.trim()}>
           <Shield size={14} />
           Create Token
         </Button>
@@ -222,7 +228,7 @@
                   {/if}
                 </div>
               </div>
-              <Button kind="danger" on:click={() => deleteToken(token.id, token.name)} disabled={working}>
+              <Button kind="danger" on:click={() => deleteToken(token.id, token.name)} disabled={isBusy(`delete-token-${token.id}`)}>
                 <Trash2 size={14} />
                 Delete
               </Button>
@@ -263,11 +269,11 @@
                   placeholder="minimum 8 characters"
                 />
               </label>
-              <Button kind="secondary" on:click={() => changePassword(user.id, user.username)} disabled={working || (passwordDrafts[user.id]?.length ?? 0) < 8}>
+              <Button kind="secondary" on:click={() => changePassword(user.id, user.username)} disabled={isBusy(`change-password-${user.id}`) || (passwordDrafts[user.id]?.length ?? 0) < 8}>
                 <KeyRound size={14} />
                 Change Password
               </Button>
-              <Button kind="danger" on:click={() => deleteUser(user.id, user.username)} disabled={working || me?.id === user.id}>
+              <Button kind="danger" on:click={() => deleteUser(user.id, user.username)} disabled={isBusy(`delete-user-${user.id}`) || me?.id === user.id}>
                 <Trash2 size={14} />
                 Delete
               </Button>
