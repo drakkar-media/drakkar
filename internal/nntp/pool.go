@@ -42,6 +42,14 @@ type PooledSource struct {
 	mu   sync.Mutex
 	open int
 	idle chan pooledSession
+	// freed wakes a goroutine parked in acquire's wait-select when a slot is
+	// closed out (discard, or a stale idle session reaped) rather than
+	// handed off via idle -- acquire otherwise only wakes on idle or
+	// ctx.Done(), so that capacity would go unnoticed until happenstance
+	// (some other release) drained the select. Without this, a discarded
+	// connection can leave an already-parked waiter blocked forever on a
+	// request context that has no deadline (e.g. a FUSE/WebDAV read).
+	freed chan struct{}
 }
 
 func NewPooledSource(ctx context.Context, factory SessionFactory, maxOpen int) *PooledSource {
@@ -56,10 +64,22 @@ func NewPooledSource(ctx context.Context, factory SessionFactory, maxOpen int) *
 		// concurrent release() calls can fill; without slack, pushing the
 		// kept (non-stale) sessions back can spuriously overflow and close
 		// perfectly healthy connections. See sweepOnce.
-		idle: make(chan pooledSession, maxOpen*2),
+		idle:  make(chan pooledSession, maxOpen*2),
+		freed: make(chan struct{}, maxOpen),
 	}
 	go p.sweepLoop(ctx)
 	return p
+}
+
+// notifyFreed wakes a parked acquire() waiter after p.open is decremented
+// without a session to hand off. Non-blocking: if no one is waiting (or the
+// buffer is momentarily full), the signal is simply not needed right now --
+// acquire() re-checks p.open < p.maxOpen every time it loops.
+func (p *PooledSource) notifyFreed() {
+	select {
+	case p.freed <- struct{}{}:
+	default:
+	}
 }
 
 // sweepLoop closes connections idle longer than idleTimeout.
@@ -96,6 +116,7 @@ func (p *PooledSource) sweepOnce() {
 				p.mu.Lock()
 				p.open--
 				p.mu.Unlock()
+				p.notifyFreed()
 			} else {
 				keep = append(keep, s)
 			}
@@ -112,6 +133,7 @@ done:
 			p.mu.Lock()
 			p.open--
 			p.mu.Unlock()
+			p.notifyFreed()
 		}
 	}
 }
@@ -173,6 +195,7 @@ func (p *PooledSource) acquire(ctx context.Context) (BodySession, error) {
 					p.mu.Lock()
 					p.open--
 					p.mu.Unlock()
+					p.notifyFreed()
 					continue
 				}
 				return s.session, nil
@@ -204,10 +227,15 @@ func (p *PooledSource) acquire(ctx context.Context) (BodySession, error) {
 				p.mu.Lock()
 				p.open--
 				p.mu.Unlock()
+				p.notifyFreed()
 				// loop back: open slot freed, retry immediately
 			} else {
 				return s.session, nil
 			}
+		case <-p.freed:
+			// A slot closed out elsewhere (discard, or another waiter's
+			// stale reap) without a session to hand off -- loop back and
+			// recheck p.open < p.maxOpen to open a fresh connection.
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -227,6 +255,7 @@ func (p *PooledSource) discard(session BodySession) {
 	p.mu.Lock()
 	p.open--
 	p.mu.Unlock()
+	p.notifyFreed()
 }
 
 // Stats returns current active and idle connection counts.
