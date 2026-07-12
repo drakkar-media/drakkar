@@ -2941,15 +2941,32 @@ func hasExactEpisodeToken(title string, seasonNumber, episodeNumber int) bool {
 	return false
 }
 
+// hasSeasonPackToken reports whether title (already normalized/space-tokenized
+// by the caller, e.g. via normalizeSearchText) names a full-season release for
+// seasonNumber. Requires "pack"/"complete" as a standalone word -- a bare
+// substring check previously matched "REPACK" (a routine "corrected
+// re-release" tag with no relation to season packs), which caused ordinary
+// single-episode REPACK releases to be misclassified as season packs and
+// selected as the "pack" fulfillment for unrelated episodes of the same show.
 func hasSeasonPackToken(title string, seasonNumber int) bool {
 	if seasonNumber <= 0 {
+		return false
+	}
+	hasPackWord := false
+	for _, word := range strings.Fields(title) {
+		if word == "pack" || word == "complete" {
+			hasPackWord = true
+			break
+		}
+	}
+	if !hasPackWord {
 		return false
 	}
 	for _, token := range []string{
 		fmt.Sprintf("season %d", seasonNumber),
 		fmt.Sprintf("s%02d", seasonNumber),
 	} {
-		if strings.Contains(title, token) && (strings.Contains(title, "complete") || strings.Contains(title, "pack")) {
+		if strings.Contains(title, token) {
 			return true
 		}
 	}

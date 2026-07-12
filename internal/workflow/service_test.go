@@ -867,6 +867,40 @@ func TestSearchLibraryPrefersExactEpisodeOverSeasonPack(t *testing.T) {
 	}
 }
 
+// TestHasSeasonPackTokenIgnoresRepackTag guards against a real production bug
+// (House of the Dragon S03): "REPACK" is a routine "corrected re-release" tag
+// with no relation to season packs, but a bare substring check on "pack"
+// matched inside it, so filterToPacksOnly kept an ordinary single-episode
+// REPACK release as if it were a season pack — trySeasonPack then selected it
+// for unrelated episodes of the season that hadn't aired yet.
+func TestHasSeasonPackTokenIgnoresRepackTag(t *testing.T) {
+	singleEpisodeRepack := normalizeSearchText("House.of.the.Dragon.S03E02.REPACK.Queens.Landing.1080p.AMZN.WEB-DL.DD+5.1.H.264-playWEB")
+	if hasSeasonPackToken(singleEpisodeRepack, 3) {
+		t.Fatalf("REPACK single-episode release must not be classified as a season pack: %q", singleEpisodeRepack)
+	}
+
+	genuinePack := normalizeSearchText("House.of.the.Dragon.S03.Complete.1080p.AMZN.WEB-DL.DD+5.1.H.264-GRP")
+	if !hasSeasonPackToken(genuinePack, 3) {
+		t.Fatalf("expected a genuine season pack to still be detected: %q", genuinePack)
+	}
+
+	repackedPack := normalizeSearchText("House.of.the.Dragon.S03.REPACK.Complete.1080p.AMZN.WEB-DL.DD+5.1.H.264-GRP")
+	if !hasSeasonPackToken(repackedPack, 3) {
+		t.Fatalf("expected a repacked season pack (still containing the standalone word 'complete') to be detected: %q", repackedPack)
+	}
+}
+
+func TestFilterToPacksOnlyDropsRepackSingleEpisode(t *testing.T) {
+	candidates := []database.SearchCandidateRecord{
+		{Title: "House.of.the.Dragon.S03E02.REPACK.Queens.Landing.1080p.AMZN.WEB-DL.DD+5.1.H.264-playWEB", ExternalURL: "http://example/repack-e02"},
+		{Title: "House.of.the.Dragon.S03.Complete.1080p.AMZN.WEB-DL.DD+5.1.H.264-GRP", ExternalURL: "http://example/pack"},
+	}
+	filtered := filterToPacksOnly(candidates, 3)
+	if len(filtered) != 1 || filtered[0].ExternalURL != "http://example/pack" {
+		t.Fatalf("expected only the genuine season pack to survive filtering, got %+v", filtered)
+	}
+}
+
 func TestSearchLibraryPenalizesPreviouslyFailedCandidateAcrossRefresh(t *testing.T) {
 	repo := &repoStub{
 		searchInput: database.LibrarySearchInput{
