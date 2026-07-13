@@ -9,8 +9,8 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/ranking"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/ranking"
 )
 
 // registerProfileRoutes mounts custom-format, release-block-rule, indexer-policy,

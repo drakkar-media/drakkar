@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/config"
-	"github.com/hjongedijk/drakkar/internal/mediadate"
+	"github.com/drakkar-media/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/mediadate"
 )
 
 type Client struct {

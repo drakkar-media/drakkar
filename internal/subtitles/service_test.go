@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/database"
 )
 
 type repoStub struct {

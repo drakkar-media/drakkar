@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/config"
 )
 
 type ArticleClient struct {

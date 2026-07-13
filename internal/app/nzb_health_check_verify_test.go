@@ -10,7 +10,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/database"
 	"github.com/rs/zerolog"
 )
 

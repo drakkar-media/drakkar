@@ -13,17 +13,17 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/auth"
-	"github.com/hjongedijk/drakkar/internal/cache"
-	"github.com/hjongedijk/drakkar/internal/config"
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/library"
-	"github.com/hjongedijk/drakkar/internal/maintenance"
-	"github.com/hjongedijk/drakkar/internal/nzb"
-	"github.com/hjongedijk/drakkar/internal/probe"
-	"github.com/hjongedijk/drakkar/internal/queue"
-	intsub "github.com/hjongedijk/drakkar/internal/subtitles"
-	"github.com/hjongedijk/drakkar/internal/workflow"
+	"github.com/drakkar-media/drakkar/internal/auth"
+	"github.com/drakkar-media/drakkar/internal/cache"
+	"github.com/drakkar-media/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/library"
+	"github.com/drakkar-media/drakkar/internal/maintenance"
+	"github.com/drakkar-media/drakkar/internal/nzb"
+	"github.com/drakkar-media/drakkar/internal/probe"
+	"github.com/drakkar-media/drakkar/internal/queue"
+	intsub "github.com/drakkar-media/drakkar/internal/subtitles"
+	"github.com/drakkar-media/drakkar/internal/workflow"
 )
 
 type statusStub struct{}

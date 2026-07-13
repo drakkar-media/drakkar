@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/stream"
-	"github.com/hjongedijk/drakkar/internal/yenc"
+	"github.com/drakkar-media/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/yenc"
 )
 
 type countingSource struct {

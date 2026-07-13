@@ -12,7 +12,7 @@ import (
 
 	"github.com/rs/zerolog"
 
-	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/database"
 )
 
 const sabVersion = "4.5.1"

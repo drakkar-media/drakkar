@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/config"
 )
 
 func TestSeriesDetails(t *testing.T) {

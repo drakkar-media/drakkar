@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/hjongedijk/drakkar/internal/metrics"
-	"github.com/hjongedijk/drakkar/internal/stream"
-	"github.com/hjongedijk/drakkar/internal/yenc"
+	"github.com/drakkar-media/drakkar/internal/metrics"
+	"github.com/drakkar-media/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/yenc"
 )
 
 type ArticleSource interface {

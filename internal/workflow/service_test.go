@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/hydra"
-	"github.com/hjongedijk/drakkar/internal/library"
-	"github.com/hjongedijk/drakkar/internal/seerr"
-	"github.com/hjongedijk/drakkar/internal/tmdb"
-	"github.com/hjongedijk/drakkar/internal/tvdb"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/hydra"
+	"github.com/drakkar-media/drakkar/internal/library"
+	"github.com/drakkar-media/drakkar/internal/seerr"
+	"github.com/drakkar-media/drakkar/internal/tmdb"
+	"github.com/drakkar-media/drakkar/internal/tvdb"
 )
 
 type repoStub struct {

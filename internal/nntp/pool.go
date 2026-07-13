@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/observability"
+	"github.com/drakkar-media/drakkar/internal/observability"
 )
 
 // ErrArticleMissing is returned by Stat on a 430 status. Note that some

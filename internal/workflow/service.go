@@ -23,17 +23,17 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog"
 
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/hydra"
-	"github.com/hjongedijk/drakkar/internal/library"
-	"github.com/hjongedijk/drakkar/internal/metrics"
-	"github.com/hjongedijk/drakkar/internal/nzb"
-	"github.com/hjongedijk/drakkar/internal/observability"
-	"github.com/hjongedijk/drakkar/internal/policy"
-	"github.com/hjongedijk/drakkar/internal/ranking"
-	"github.com/hjongedijk/drakkar/internal/seerr"
-	"github.com/hjongedijk/drakkar/internal/tmdb"
-	"github.com/hjongedijk/drakkar/internal/tvdb"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/hydra"
+	"github.com/drakkar-media/drakkar/internal/library"
+	"github.com/drakkar-media/drakkar/internal/metrics"
+	"github.com/drakkar-media/drakkar/internal/nzb"
+	"github.com/drakkar-media/drakkar/internal/observability"
+	"github.com/drakkar-media/drakkar/internal/policy"
+	"github.com/drakkar-media/drakkar/internal/ranking"
+	"github.com/drakkar-media/drakkar/internal/seerr"
+	"github.com/drakkar-media/drakkar/internal/tmdb"
+	"github.com/drakkar-media/drakkar/internal/tvdb"
 )
 
 type Repository interface {
@@ -4082,7 +4082,7 @@ func (f HTTPNZBFetcher) Fetch(ctx context.Context, rawURL string) (string, []byt
 	if err != nil {
 		return "", nil, err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Drakkar/1.0; +https://github.com/hjongedijk/drakkar)")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Drakkar/1.0; +https://github.com/drakkar-media/drakkar)")
 	req.Header.Set("Accept", "application/x-nzb,application/xml,text/xml,application/octet-stream,*/*;q=0.9")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Cache-Control", "no-cache")

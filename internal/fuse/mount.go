@@ -17,9 +17,9 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/nzb"
-	"github.com/hjongedijk/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/nzb"
+	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
 var syntheticTime = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)

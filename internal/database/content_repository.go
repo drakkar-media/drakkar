@@ -9,7 +9,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/hjongedijk/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
 // computeSpans builds the SegmentSpan slice for a virtual file on-the-fly from

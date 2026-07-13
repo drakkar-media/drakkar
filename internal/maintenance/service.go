@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/config"
-	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/database"
 )
 
 type Repository interface {

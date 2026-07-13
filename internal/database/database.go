@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/config"
-	"github.com/hjongedijk/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/stream"
 	pgx "github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"

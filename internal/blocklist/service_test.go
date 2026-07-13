@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/database"
 )
 
 type repoStub struct {

@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
 // missingArticleTTL matches the reference implementation's 24-hour cache for

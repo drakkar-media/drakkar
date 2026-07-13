@@ -3,7 +3,7 @@ package subtitleutil
 import (
 	"testing"
 
-	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/database"
 )
 
 func TestSearchTitle(t *testing.T) {

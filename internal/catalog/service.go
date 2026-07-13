@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/tmdb"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/tmdb"
 )
 
 type TMDBClient interface {

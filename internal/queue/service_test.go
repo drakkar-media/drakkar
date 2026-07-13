@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/nzb"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/nzb"
 )
 
 const sampleNZB = `<?xml version="1.0" encoding="UTF-8"?>

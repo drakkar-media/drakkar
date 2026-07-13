@@ -11,9 +11,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/nzb"
-	"github.com/hjongedijk/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/nzb"
+	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
 type Repository interface {

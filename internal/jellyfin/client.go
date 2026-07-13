@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/mediaserver"
+	"github.com/drakkar-media/drakkar/internal/mediaserver"
 )
 
 // Client calls the Jellyfin HTTP API.

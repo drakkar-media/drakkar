@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/bodgit/sevenzip"
-	"github.com/hjongedijk/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
 var sevenZipCopyCoder = []byte{0x00}

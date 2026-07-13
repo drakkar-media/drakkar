@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/database"
 )
 
 func TestSearchUsesUnpackFiles(t *testing.T) {

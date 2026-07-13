@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/config"
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/subtitles"
-	"github.com/hjongedijk/drakkar/internal/subtitleutil"
+	"github.com/drakkar-media/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/subtitles"
+	"github.com/drakkar-media/drakkar/internal/subtitleutil"
 )
 
 type Client struct {

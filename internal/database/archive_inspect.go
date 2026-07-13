@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/observability"
-	"github.com/hjongedijk/drakkar/internal/par2"
-	"github.com/hjongedijk/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/observability"
+	"github.com/drakkar-media/drakkar/internal/par2"
+	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
 const (

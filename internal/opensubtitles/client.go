@@ -14,11 +14,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/config"
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/subtitles"
-	"github.com/hjongedijk/drakkar/internal/subtitleutil"
-	"github.com/hjongedijk/drakkar/internal/version"
+	"github.com/drakkar-media/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/subtitles"
+	"github.com/drakkar-media/drakkar/internal/subtitleutil"
+	"github.com/drakkar-media/drakkar/internal/version"
 )
 
 type Client struct {

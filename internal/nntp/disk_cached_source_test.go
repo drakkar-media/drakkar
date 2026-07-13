@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/hjongedijk/drakkar/internal/yenc"
+	"github.com/drakkar-media/drakkar/internal/yenc"
 )
 
 type countingBodySource struct {

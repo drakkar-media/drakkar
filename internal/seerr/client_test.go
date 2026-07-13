@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/config"
 )
 
 func TestCreateTVSeasonRequestRecoversFromCloudflareTimeout(t *testing.T) {

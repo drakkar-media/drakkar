@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/hjongedijk/drakkar/internal/auth"
+	"github.com/drakkar-media/drakkar/internal/auth"
 )
 
 func mountSetupRoutes(r chi.Router, repo UserRepository) {

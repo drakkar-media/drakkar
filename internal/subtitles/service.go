@@ -14,9 +14,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/metrics"
-	"github.com/hjongedijk/drakkar/internal/subtitleutil"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/metrics"
+	"github.com/drakkar-media/drakkar/internal/subtitleutil"
 )
 
 const maxUploadBytes = 2 << 20

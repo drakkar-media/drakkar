@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/hjongedijk/drakkar/internal/observability"
+	"github.com/drakkar-media/drakkar/internal/observability"
 )
 
 // SegmentSizer can return the actual decoded byte size of an NNTP article.

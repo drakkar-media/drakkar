@@ -13,8 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/hjongedijk/drakkar/internal/archive"
-	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/archive"
+	"github.com/drakkar-media/drakkar/internal/database"
 )
 
 var (

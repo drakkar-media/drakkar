@@ -6,11 +6,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/api"
-	"github.com/hjongedijk/drakkar/internal/config"
-	"github.com/hjongedijk/drakkar/internal/hydra"
-	"github.com/hjongedijk/drakkar/internal/observability"
-	"github.com/hjongedijk/drakkar/internal/workflow"
+	"github.com/drakkar-media/drakkar/internal/api"
+	"github.com/drakkar-media/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/hydra"
+	"github.com/drakkar-media/drakkar/internal/observability"
+	"github.com/drakkar-media/drakkar/internal/workflow"
 	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 )

@@ -1,6 +1,6 @@
 package archive
 
-import "github.com/hjongedijk/drakkar/internal/database"
+import "github.com/drakkar-media/drakkar/internal/database"
 
 // DetectImportedArchives groups NZB files by RAR archive membership.
 // Delegates to database.DetectImportedArchives so callers outside the

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/policy"
+	"github.com/drakkar-media/drakkar/internal/policy"
 )
 
 type importedFileSegments struct {

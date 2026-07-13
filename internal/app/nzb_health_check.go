@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/library"
-	"github.com/hjongedijk/drakkar/internal/maintenance"
-	"github.com/hjongedijk/drakkar/internal/workflow"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/library"
+	"github.com/drakkar-media/drakkar/internal/maintenance"
+	"github.com/drakkar-media/drakkar/internal/workflow"
 	"github.com/rs/zerolog"
 )
 

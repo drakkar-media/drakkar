@@ -7,7 +7,7 @@ package subtitleutil
 import (
 	"strings"
 
-	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/database"
 )
 
 // SearchTitle picks the show title for episode/tv searches (falling back to

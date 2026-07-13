@@ -3,7 +3,7 @@ package archive
 import (
 	"testing"
 
-	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/database"
 )
 
 func TestDetectImportedArchives(t *testing.T) {

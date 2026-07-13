@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/hjongedijk/drakkar/internal/app"
-	"github.com/hjongedijk/drakkar/internal/observability"
+	"github.com/drakkar-media/drakkar/internal/app"
+	"github.com/drakkar-media/drakkar/internal/observability"
 )
 
 func main() {

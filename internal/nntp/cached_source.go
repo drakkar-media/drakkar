@@ -5,9 +5,9 @@ import (
 	"encoding/binary"
 	"errors"
 
-	"github.com/hjongedijk/drakkar/internal/cache"
-	"github.com/hjongedijk/drakkar/internal/stream"
-	"github.com/hjongedijk/drakkar/internal/yenc"
+	"github.com/drakkar-media/drakkar/internal/cache"
+	"github.com/drakkar-media/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/yenc"
 )
 
 type DecodedArticleSource interface {

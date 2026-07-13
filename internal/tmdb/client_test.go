@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/hjongedijk/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/config"
 )
 
 func TestMovieDetails(t *testing.T) {

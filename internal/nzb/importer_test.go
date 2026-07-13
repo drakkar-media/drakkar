@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/database"
 )
 
 type sinkStub struct {

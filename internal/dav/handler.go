@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/stream"
 	"golang.org/x/net/webdav"
 )
 

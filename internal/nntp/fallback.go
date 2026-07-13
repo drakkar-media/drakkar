@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
 // retryBackoff is applied between fallback attempt rounds so a retry against

@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/metrics"
+	"github.com/drakkar-media/drakkar/internal/metrics"
 )
 
 // Keep prefetch conservative so Plex/player reads keep most NNTP capacity.

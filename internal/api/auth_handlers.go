@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/hjongedijk/drakkar/internal/auth"
-	"github.com/hjongedijk/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/auth"
+	"github.com/drakkar-media/drakkar/internal/database"
 )
 
 // UserRepository covers user + session operations needed by auth handlers.

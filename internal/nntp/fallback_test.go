@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/hjongedijk/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
 type failThenOKSource struct {

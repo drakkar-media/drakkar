@@ -8,11 +8,11 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/hjongedijk/drakkar/internal/config"
-	"github.com/hjongedijk/drakkar/internal/database"
-	"github.com/hjongedijk/drakkar/internal/metrics"
-	"github.com/hjongedijk/drakkar/internal/rclone"
-	"github.com/hjongedijk/drakkar/internal/symlink"
+	"github.com/drakkar-media/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/metrics"
+	"github.com/drakkar-media/drakkar/internal/rclone"
+	"github.com/drakkar-media/drakkar/internal/symlink"
 )
 
 var ErrNoVirtualFiles = errors.New("selected release has no publishable virtual files")

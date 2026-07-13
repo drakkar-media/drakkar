@@ -1,4 +1,4 @@
-module github.com/hjongedijk/drakkar
+module github.com/drakkar-media/drakkar
 
 go 1.26
 

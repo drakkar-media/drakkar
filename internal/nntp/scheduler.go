@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/hjongedijk/drakkar/internal/observability"
-	"github.com/hjongedijk/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/observability"
+	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
 var ErrSchedulerQueueFull = errors.New("nntp scheduler queue full")

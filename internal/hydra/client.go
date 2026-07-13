@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hjongedijk/drakkar/internal/config"
-	"github.com/hjongedijk/drakkar/internal/httperr"
+	"github.com/drakkar-media/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/httperr"
 )
 
 // defaultSearchInterval is the minimum gap between consecutive Hydra API calls.
