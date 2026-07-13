@@ -228,25 +228,33 @@ func (db *DB) ListSelectedReleasesForPublication(ctx context.Context) ([]int64, 
 }
 
 func (db *DB) ListSelectedReleasesByLibraryItem(ctx context.Context, libraryItemID int64) ([]int64, error) {
+	// The DISTINCT + sort_rank must live in the inner query together --
+	// Postgres rejects "for SELECT DISTINCT, ORDER BY expressions must
+	// appear in select list" if the CASE expression is only referenced in
+	// an outer ORDER BY. sort_rank is a deterministic function of sr.id, so
+	// DISTINCT sr.id, sort_rank still collapses to exactly one row per
+	// selected_releases id, same as the plain "distinct sr.id" before.
 	rows, err := db.SQL.QueryContext(ctx, `
-		select distinct sr.id
-		from selected_releases sr
-		join virtual_files vf on vf.selected_release_id = sr.id
-		where sr.library_item_id = $1
-		order by
-			-- Publish the release the current queue item actually points to
-			-- LAST, so it always wins the symlink-path overwrite even if a
-			-- stray duplicate selected_releases row exists for this item
-			-- (e.g. from a double-grab race). Otherwise the republish
-			-- reconciliation loop (ListPendingRepublishTargets) never
-			-- converges: it keeps finding the symlink pointing at a release
-			-- other than the current one, forever.
-			case when sr.id = (
-				select qi.selected_release_id from queue_items qi
-				where qi.library_item_id = $1
-				order by qi.id desc limit 1
-			) then 1 else 0 end,
-			sr.id asc`, libraryItemID,
+		select id
+		from (
+			select distinct sr.id,
+				-- Publish the release the current queue item actually points
+				-- to LAST, so it always wins the symlink-path overwrite even
+				-- if a stray duplicate selected_releases row exists for this
+				-- item (e.g. from a double-grab race). Otherwise the
+				-- republish reconciliation loop (ListPendingRepublishTargets)
+				-- never converges: it keeps finding the symlink pointing at a
+				-- release other than the current one, forever.
+				case when sr.id = (
+					select qi.selected_release_id from queue_items qi
+					where qi.library_item_id = $1
+					order by qi.id desc limit 1
+				) then 1 else 0 end as sort_rank
+			from selected_releases sr
+			join virtual_files vf on vf.selected_release_id = sr.id
+			where sr.library_item_id = $1
+		) ranked
+		order by sort_rank, id asc`, libraryItemID,
 	)
 	if err != nil {
 		return nil, err
