@@ -5,6 +5,7 @@ package plex
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -130,6 +131,15 @@ func (c *Client) RefreshPathAuto(ctx context.Context, preferredSectionKey, fileP
 	}
 	candidates := matchingLibrariesForPath(libs, filePath)
 	if len(candidates) == 0 {
+		// filePath doesn't fall under any known Plex library location -- most
+		// likely a mismatch between Drakkar's configured library paths and
+		// what Plex itself reports (different mount inside the Plex
+		// container/host). Refreshing every section won't actually make
+		// Plex pick up the file, so without this warning the underlying
+		// misconfiguration is invisible: the refresh calls below still
+		// return success.
+		slog.Warn("plex: path matched no known library location, refreshing all sections as a fallback",
+			"path", filePath, "libraryCount", len(libs))
 		candidates = libs
 	}
 	var firstErr error

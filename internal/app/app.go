@@ -87,6 +87,35 @@ func boundedMovieRSSInterval(minutes int) time.Duration {
 	return interval
 }
 
+// refreshPlexPathWithRetry retries a transient Plex refresh failure (a brief
+// restart, network blip) a couple of times with a short backoff, rather than
+// leaving the item permanently unnoticed by Plex on the first hiccup -- no
+// other mechanism ever retries this refresh on the caller's behalf.
+func refreshPlexPathWithRetry(ctx context.Context, client *plex.Client, sectionKey, dir string) error {
+	const maxAttempts = 3
+	delay := 500 * time.Millisecond
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		lastErr = client.RefreshPathAuto(ctx, sectionKey, dir)
+		if lastErr == nil {
+			return nil
+		}
+		if attempt == maxAttempts {
+			break
+		}
+		select {
+		case <-time.After(delay):
+			delay *= 2
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return lastErr
+}
+
 type runtimeStatus struct {
 	mu     sync.RWMutex
 	status api.Status
@@ -427,42 +456,64 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	probeSvc := probe.NewService(probeProviders...)
 	plexClient := plex.NewClient(cfg.Plex.URL, cfg.Plex.Token)
 	jellyfinClient := jellyfin.NewClient(cfg.Jellyfin.URL, cfg.Jellyfin.APIKey)
+	// notifyMediaServers refreshes Plex/Jellyfin for a single library item.
+	// Retries the Plex call a couple of times -- a brief Plex restart/network
+	// blip shouldn't permanently strand an item unnoticed, since nothing else
+	// ever retries this on the caller's behalf.
+	notifyMediaServers := func(ctx context.Context, libraryItemID int64) {
+		if plexClient.Enabled() {
+			plexCtx, plexCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer plexCancel()
+			var plexErr error
+			// Targeted refresh: scan only the directories of the newly created symlinks.
+			if paths, err := db.GetSymlinkPathsForLibraryItem(plexCtx, libraryItemID); err == nil && len(paths) > 0 {
+				dirs := make(map[string]struct{})
+				for _, p := range paths {
+					dirs[filepath.Dir(p)] = struct{}{}
+				}
+				for dir := range dirs {
+					if plexErr = refreshPlexPathWithRetry(plexCtx, plexClient, cfg.Plex.SectionKey, dir); plexErr != nil {
+						break
+					}
+				}
+			} else if cfg.Plex.SectionKey != "" {
+				plexErr = plexClient.RefreshSection(plexCtx, cfg.Plex.SectionKey)
+			}
+			if plexErr != nil {
+				logger.Warn().Err(plexErr).Int64("libraryItemId", libraryItemID).Msg("plex library refresh failed")
+			}
+		}
+		if jellyfinClient.Enabled() {
+			jfCtx, jfCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer jfCancel()
+			if err := jellyfinClient.RefreshLibraries(jfCtx); err != nil {
+				logger.Warn().Err(err).Int64("libraryItemId", libraryItemID).Msg("jellyfin library refresh failed")
+			}
+		}
+	}
 	publicationSvc.SetPostPublishHook(func(ctx context.Context, libraryItemID int64) error {
 		// Run all post-publish work in a goroutine so nothing blocks the queue pipeline.
 		go func() {
+			defer observability.Recover("post-publish-hook")
 			bgCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 			defer cancel()
 			_ = subtitleSvc.RepublishStoredSubtitles(bgCtx, libraryItemID)
 			subtitleSvc.TriggerAutomaticSearch(libraryItemID)
-			if plexClient.Enabled() {
-				plexCtx, plexCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer plexCancel()
-				var plexErr error
-				// Targeted refresh: scan only the directories of the newly created symlinks.
-				if paths, err := db.GetSymlinkPathsForLibraryItem(plexCtx, libraryItemID); err == nil && len(paths) > 0 {
-					dirs := make(map[string]struct{})
-					for _, p := range paths {
-						dirs[filepath.Dir(p)] = struct{}{}
-					}
-					for dir := range dirs {
-						if plexErr = plexClient.RefreshPathAuto(plexCtx, cfg.Plex.SectionKey, dir); plexErr != nil {
-							break
-						}
-					}
-				} else if cfg.Plex.SectionKey != "" {
-					plexErr = plexClient.RefreshSection(plexCtx, cfg.Plex.SectionKey)
-				}
-				if plexErr != nil {
-					logger.Warn().Err(plexErr).Msg("plex library refresh failed")
-				}
-			}
-			if jellyfinClient.Enabled() {
-				jfCtx, jfCancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer jfCancel()
-				if err := jellyfinClient.RefreshLibraries(jfCtx); err != nil {
-					logger.Warn().Err(err).Msg("jellyfin library refresh failed")
-				}
-			}
+			notifyMediaServers(bgCtx, libraryItemID)
+		}()
+		return nil
+	})
+	// Unlike SetPostPublishHook, this fires on repair/republish passes too
+	// (RepublishLibraryItem, season-pack sibling fulfillment) -- those never
+	// ran the full hook above, so an item whose symlink was missing or stale
+	// and got fixed would otherwise never get the media server told about it
+	// at all, with no error or log to reveal the gap.
+	publicationSvc.SetMediaServerNotifyHook(func(ctx context.Context, libraryItemID int64) error {
+		go func() {
+			defer observability.Recover("media-server-notify-hook")
+			bgCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			notifyMediaServers(bgCtx, libraryItemID)
 		}()
 		return nil
 	})

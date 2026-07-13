@@ -255,6 +255,12 @@ func TestPublishSelectedReleaseWholeShowPackPublishesEpisodeSymlink(t *testing.T
 	rt.FuseMountPath = filepath.Join(root, "vfs")
 	publisher := NewPublisher(repo, rt, "")
 
+	var notified []int64
+	publisher.SetMediaServerNotifyHook(func(ctx context.Context, libraryItemID int64) error {
+		notified = append(notified, libraryItemID)
+		return nil
+	})
+
 	if err := publisher.PublishSelectedRelease(context.Background(), 99); err != nil {
 		t.Fatal(err)
 	}
@@ -271,6 +277,9 @@ func TestPublishSelectedReleaseWholeShowPackPublishesEpisodeSymlink(t *testing.T
 	}
 	if len(repo.fulfilled) != 2 || repo.fulfilled[0] != 25894 || repo.fulfilled[1] != 25894 {
 		t.Fatalf("expected initial + post-create fulfill passes, got %+v", repo.fulfilled)
+	}
+	if len(notified) != 2 || notified[0] != 25894 || notified[1] != 25894 {
+		t.Fatalf("expected season-pack sibling 25894 notified on both fulfill passes, got %+v", notified)
 	}
 }
 
@@ -491,3 +500,97 @@ func TestPublishSelectedReleaseRunsPostPublishHook(t *testing.T) {
 	}
 }
 
+// TestRepublishLibraryItemNotifiesMediaServers guards against the media
+// server (Plex/Jellyfin) never learning about an item whose symlink was
+// missing or stale and just got repaired -- RepublishLibraryItem previously
+// only ever called postPublishHook when isNew was true, which republish
+// passes never are, so the item stayed unrecoverably invisible to Plex until
+// its own periodic scan.
+func TestRepublishLibraryItemNotifiesMediaServers(t *testing.T) {
+	root := t.TempDir()
+	repo := &repoStub{
+		byLibrary: []int64{77},
+		files: []database.ReleaseVirtualFile{
+			{
+				VirtualFileID:     11,
+				SelectedReleaseID: 77,
+				LibraryItemID:     22,
+				MediaType:         "movie",
+				Path:              "releases/77/Dune (2021).mkv",
+				FileName:          "Dune (2021).mkv",
+				MovieTitle:        "Dune",
+				MovieYear:         2021,
+				MovieTMDBID:       438631,
+			},
+		},
+		virtualData: map[int64][]byte{11: append([]byte{0x1a, 0x45, 0xdf, 0xa3}, bytes.Repeat([]byte{0x01}, 32)...)},
+	}
+	rt := config.DefaultRuntime()
+	rt.MovieLibraryPath = filepath.Join(root, "movies")
+	rt.FuseMountPath = filepath.Join(root, "vfs")
+	publisher := NewPublisher(repo, rt, "")
+
+	var postPublishCalled bool
+	publisher.SetPostPublishHook(func(ctx context.Context, libraryItemID int64) error {
+		postPublishCalled = true
+		return nil
+	})
+	var notified []int64
+	publisher.SetMediaServerNotifyHook(func(ctx context.Context, libraryItemID int64) error {
+		notified = append(notified, libraryItemID)
+		return nil
+	})
+
+	if err := publisher.RepublishLibraryItem(context.Background(), 22); err != nil {
+		t.Fatal(err)
+	}
+	if postPublishCalled {
+		t.Fatal("postPublishHook (subtitle search) must not run on a republish repair pass")
+	}
+	if len(notified) != 1 || notified[0] != 22 {
+		t.Fatalf("expected mediaServerNotifyHook called once for library item 22, got %v", notified)
+	}
+}
+
+// TestRebuildPublicationsDoesNotNotifyMediaServers ensures the full startup
+// rebuild -- which republishes every pending selected release unconditionally
+// -- does not fire a media server refresh per item. Plex/Jellyfin already
+// know about all of these from before the restart; notifying on every one
+// would hammer the media server on every container restart.
+func TestRebuildPublicationsDoesNotNotifyMediaServers(t *testing.T) {
+	root := t.TempDir()
+	repo := &repoStub{
+		selected: []int64{77},
+		files: []database.ReleaseVirtualFile{
+			{
+				VirtualFileID:     11,
+				SelectedReleaseID: 77,
+				LibraryItemID:     22,
+				MediaType:         "movie",
+				Path:              "releases/77/Dune (2021).mkv",
+				FileName:          "Dune (2021).mkv",
+				MovieTitle:        "Dune",
+				MovieYear:         2021,
+				MovieTMDBID:       438631,
+			},
+		},
+		virtualData: map[int64][]byte{11: append([]byte{0x1a, 0x45, 0xdf, 0xa3}, bytes.Repeat([]byte{0x01}, 32)...)},
+	}
+	rt := config.DefaultRuntime()
+	rt.MovieLibraryPath = filepath.Join(root, "movies")
+	rt.FuseMountPath = filepath.Join(root, "vfs")
+	publisher := NewPublisher(repo, rt, "")
+
+	var notified []int64
+	publisher.SetMediaServerNotifyHook(func(ctx context.Context, libraryItemID int64) error {
+		notified = append(notified, libraryItemID)
+		return nil
+	})
+
+	if err := publisher.RebuildPublications(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(notified) != 0 {
+		t.Fatalf("expected no media server notifications during startup rebuild, got %v", notified)
+	}
+}

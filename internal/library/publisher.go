@@ -33,11 +33,12 @@ type Repository interface {
 }
 
 type Publisher struct {
-	repo            Repository
-	runtime         config.Runtime
-	syml            *symlink.Publisher
-	rclone          *rclone.Client
-	postPublishHook func(context.Context, int64) error
+	repo                  Repository
+	runtime               config.Runtime
+	syml                  *symlink.Publisher
+	rclone                *rclone.Client
+	postPublishHook       func(context.Context, int64) error
+	mediaServerNotifyHook func(context.Context, int64) error
 }
 
 type BulkRepublishResult struct {
@@ -61,10 +62,22 @@ func (p *Publisher) SetPostPublishHook(fn func(context.Context, int64) error) {
 	p.postPublishHook = fn
 }
 
+// SetMediaServerNotifyHook registers a callback that only refreshes media
+// server (Plex/Jellyfin) libraries -- unlike postPublishHook it does not run
+// subtitle search, so it's safe to fire on repair/republish passes as well as
+// fresh publishes, without redundantly re-triggering subtitle work.
+func (p *Publisher) SetMediaServerNotifyHook(fn func(context.Context, int64) error) {
+	p.mediaServerNotifyHook = fn
+}
+
 // PublishSelectedRelease publishes virtual files for a selected release.
 // isNew should be true for fresh publishes (creates per-episode items for season
 // packs) and false for startup rebuilds (skip redundant episode item creation).
-func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseID int64, isNew bool) error {
+// notifyMediaServers requests a Plex/Jellyfin refresh even when isNew is
+// false -- for targeted repair republishes (RepublishLibraryItem), not the
+// full startup RebuildPublications sweep, which would otherwise hammer the
+// media server with a refresh per already-known item on every restart.
+func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseID int64, isNew bool, notifyMediaServers bool) error {
 	files, err := p.repo.ListVirtualFilesForRelease(ctx, selectedReleaseID)
 	if err != nil {
 		return err
@@ -115,9 +128,19 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 	}
 	// Only call the post-publish hook (subtitle search/publish) for new publications.
 	// During startup RebuildPublications, subtitles are already in place.
+	// A targeted repair republish (notifyMediaServers) skips subtitle search
+	// too, but still needs the media server told about the fixed symlink --
+	// that's the narrower mediaServerNotifyHook below.
+	shouldNotifyMediaServers := isNew || notifyMediaServers
 	if isNew && p.postPublishHook != nil {
 		for libraryItemID := range libraryItemIDs {
 			if err := p.postPublishHook(ctx, libraryItemID); err != nil {
+				return err
+			}
+		}
+	} else if notifyMediaServers && p.mediaServerNotifyHook != nil {
+		for libraryItemID := range libraryItemIDs {
+			if err := p.mediaServerNotifyHook(ctx, libraryItemID); err != nil {
 				return err
 			}
 		}
@@ -132,7 +155,7 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 	// initial publish (e.g. by CreateSeasonPackEpisodeItems).
 	if len(libraryItemIDs) == 1 {
 		for triggeringID := range libraryItemIDs {
-			p.fulfillSeasonPackEpisodes(ctx, selectedReleaseID, triggeringID, files)
+			p.fulfillSeasonPackEpisodes(ctx, selectedReleaseID, triggeringID, files, shouldNotifyMediaServers)
 		}
 	}
 	// Create per-episode library items for whole-show imports. Skip on rebuild —
@@ -142,7 +165,7 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 			if err := p.repo.CreateSeasonPackEpisodeItems(ctx, selectedReleaseID, triggeringID); err != nil {
 				slog.Warn("publish: failed to create season pack episode items", "library_item_id", triggeringID, "err", err)
 			}
-			p.fulfillSeasonPackEpisodes(ctx, selectedReleaseID, triggeringID, files)
+			p.fulfillSeasonPackEpisodes(ctx, selectedReleaseID, triggeringID, files, shouldNotifyMediaServers)
 		}
 	}
 	return nil
@@ -150,7 +173,7 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 
 // PublishSelectedRelease publishes a new release (creates per-episode items for season packs).
 func (p *Publisher) PublishSelectedRelease(ctx context.Context, selectedReleaseID int64) error {
-	return p.publishSelectedRelease(ctx, selectedReleaseID, true)
+	return p.publishSelectedRelease(ctx, selectedReleaseID, true, false)
 }
 
 func (p *Publisher) RebuildPublications(ctx context.Context) error {
@@ -159,8 +182,11 @@ func (p *Publisher) RebuildPublications(ctx context.Context) error {
 		return err
 	}
 	for _, selectedReleaseID := range selectedReleaseIDs {
-		// isNew=false: skip per-episode item creation; those were already done on initial publish.
-		if err := p.publishSelectedRelease(ctx, selectedReleaseID, false); err != nil {
+		// isNew=false: skip per-episode item creation; those were already done on
+		// initial publish. notifyMediaServers=false: this runs at startup for every
+		// pending release -- the media server already knows about all of these from
+		// before the restart, so re-notifying would just hammer it on every restart.
+		if err := p.publishSelectedRelease(ctx, selectedReleaseID, false, false); err != nil {
 			return err
 		}
 	}
@@ -183,7 +209,10 @@ func (p *Publisher) RepublishLibraryItem(ctx context.Context, libraryItemID int6
 		return p.republishEpisodeFromSourceRelease(ctx, libraryItemID, sourceID)
 	}
 	for _, selectedReleaseID := range selectedReleaseIDs {
-		if err := p.publishSelectedRelease(ctx, selectedReleaseID, false); err != nil {
+		// notifyMediaServers=true: this is a targeted repair of an item whose
+		// symlink was missing or stale -- the media server needs to be told,
+		// since it never learned about the correct file otherwise.
+		if err := p.publishSelectedRelease(ctx, selectedReleaseID, false, true); err != nil {
 			return err
 		}
 	}
@@ -228,6 +257,11 @@ func (p *Publisher) republishEpisodeFromSourceRelease(ctx context.Context, libra
 			return err
 		}
 		_ = p.rclone.RefreshPath(ctx, filepath.Dir(libraryPath))
+		if p.mediaServerNotifyHook != nil {
+			if err := p.mediaServerNotifyHook(ctx, libraryItemID); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	return nil
@@ -256,8 +290,13 @@ func (p *Publisher) RepublishPendingLibrary(ctx context.Context) (BulkRepublishR
 // fulfillSeasonPackEpisodes matches virtual files in a season pack to their
 // individual episode library items and marks each one as available.
 // This runs after a season pack is published so all episodes are fulfilled
-// without each needing its own separate NZB download.
-func (p *Publisher) fulfillSeasonPackEpisodes(ctx context.Context, selectedReleaseID, triggeringLibraryItemID int64, files []database.ReleaseVirtualFile) {
+// without each needing its own separate NZB download. notifyMediaServers
+// mirrors the caller's own notify decision (true for fresh publishes and
+// targeted repairs, false for the startup RebuildPublications sweep) --
+// without it, sibling episodes fulfilled here never got a Plex/Jellyfin
+// refresh of their own at all, since only the triggering episode's path was
+// ever passed to the media-server hook.
+func (p *Publisher) fulfillSeasonPackEpisodes(ctx context.Context, selectedReleaseID, triggeringLibraryItemID int64, files []database.ReleaseVirtualFile, notifyMediaServers bool) {
 	matches, err := p.repo.FindSeasonPackMatches(ctx, selectedReleaseID, triggeringLibraryItemID)
 	if err != nil || len(matches) == 0 {
 		return
@@ -321,6 +360,11 @@ func (p *Publisher) fulfillSeasonPackEpisodes(ctx context.Context, selectedRelea
 					// the content path right after publish could see a stale/empty
 					// cached view and wrongly report the file as corrupt.
 					_ = p.rclone.RefreshPath(ctx, filepath.Dir(target))
+					if notifyMediaServers && p.mediaServerNotifyHook != nil {
+						if err := p.mediaServerNotifyHook(ctx, m.LibraryItemID); err != nil {
+							slog.Warn("season pack: media server notify failed", "library_item_id", m.LibraryItemID, "err", err)
+						}
+					}
 				}
 			}
 		}

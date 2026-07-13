@@ -233,7 +233,20 @@ func (db *DB) ListSelectedReleasesByLibraryItem(ctx context.Context, libraryItem
 		from selected_releases sr
 		join virtual_files vf on vf.selected_release_id = sr.id
 		where sr.library_item_id = $1
-		order by sr.id asc`, libraryItemID,
+		order by
+			-- Publish the release the current queue item actually points to
+			-- LAST, so it always wins the symlink-path overwrite even if a
+			-- stray duplicate selected_releases row exists for this item
+			-- (e.g. from a double-grab race). Otherwise the republish
+			-- reconciliation loop (ListPendingRepublishTargets) never
+			-- converges: it keeps finding the symlink pointing at a release
+			-- other than the current one, forever.
+			case when sr.id = (
+				select qi.selected_release_id from queue_items qi
+				where qi.library_item_id = $1
+				order by qi.id desc limit 1
+			) then 1 else 0 end,
+			sr.id asc`, libraryItemID,
 	)
 	if err != nil {
 		return nil, err
