@@ -215,12 +215,13 @@ func (db *DB) createSeasonPackEpisodeItem(ctx context.Context, tvShowID int64, s
 
 	// Upsert the library_item for this episode (unique on episode_id).
 	var libItemID int64
+	profileID := db.resolveDefaultQualityProfileID(ctx, "episode")
 	if err := tx.QueryRowContext(ctx, `
-		INSERT INTO library_items (media_type, episode_id, title, available)
-		VALUES ('episode', $1, $2, true)
+		INSERT INTO library_items (media_type, episode_id, title, available, quality_profile_id)
+		VALUES ('episode', $1, $2, true, $3)
 		ON CONFLICT (episode_id) WHERE episode_id IS NOT NULL DO UPDATE
 		  SET available = true
-		RETURNING id`, episodeID, showTitle).Scan(&libItemID); err != nil {
+		RETURNING id`, episodeID, showTitle, profileID).Scan(&libItemID); err != nil {
 		return err
 	}
 

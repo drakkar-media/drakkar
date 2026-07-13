@@ -197,10 +197,11 @@ func (db *DB) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID 
 	var libraryItemID int64
 	err = tx.QueryRowContext(ctx, `select id from library_items where movie_id = $1 limit 1`, movieID).Scan(&libraryItemID)
 	if errors.Is(err, sql.ErrNoRows) {
+		profileID := db.resolveDefaultQualityProfileID(ctx, "movie")
 		err = tx.QueryRowContext(ctx, `
-			insert into library_items (media_type, movie_id, title)
-			values ('movie', $1, $2)
-			returning id`, movieID, title).Scan(&libraryItemID)
+			insert into library_items (media_type, movie_id, title, quality_profile_id)
+			values ('movie', $1, $2, $3)
+			returning id`, movieID, title, profileID).Scan(&libraryItemID)
 	}
 	if err != nil {
 		return 0, false, err
@@ -421,10 +422,11 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 	}
 	err = tx.QueryRowContext(ctx, `select id from library_items where episode_id = $1 limit 1`, episodeID).Scan(&libraryItemID)
 	if errors.Is(err, sql.ErrNoRows) {
+		profileID := db.resolveDefaultQualityProfileID(ctx, "episode")
 		err = tx.QueryRowContext(ctx, `
-			insert into library_items (media_type, episode_id, title)
-			values ('episode', $1, $2)
-			returning id`, episodeID, title).Scan(&libraryItemID)
+			insert into library_items (media_type, episode_id, title, quality_profile_id)
+			values ('episode', $1, $2, $3)
+			returning id`, episodeID, title, profileID).Scan(&libraryItemID)
 	}
 	if err != nil {
 		return 0, false, err
@@ -2994,11 +2996,12 @@ func (db *DB) EnsureEpisodeLibraryItemsBatch(ctx context.Context, tvShowID int64
 			WHERE e.tv_show_id = $1
 		),
 		inserted_library AS (
-			INSERT INTO library_items (media_type, episode_id, title)
+			INSERT INTO library_items (media_type, episode_id, title, quality_profile_id)
 			SELECT
 				'episode',
 				er.id,
-				format('%s S%02sE%02s', $2, er.season_number, er.episode_number)
+				format('%s S%02sE%02s', $2, er.season_number, er.episode_number),
+				$4::bigint
 			FROM episode_rows er
 			ON CONFLICT (episode_id) WHERE episode_id IS NOT NULL DO NOTHING
 			RETURNING id, episode_id
@@ -3018,7 +3021,7 @@ func (db *DB) EnsureEpisodeLibraryItemsBatch(ctx context.Context, tvShowID int64
 		)
 		SELECT library_item_id
 		FROM queued
-		ORDER BY library_item_id ASC`, tvShowID, showTitle, payload)
+		ORDER BY library_item_id ASC`, tvShowID, showTitle, payload, db.resolveDefaultQualityProfileID(ctx, "episode"))
 	if err != nil {
 		return nil, err
 	}

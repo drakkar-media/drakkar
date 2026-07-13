@@ -566,6 +566,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	workflowSvc.SetQueuePolicyProvider(policySvc)
 	workflowSvc.SetLogger(logger)
 	workflowSvc.SetDefaultProfileNames(cfg.Library.DefaultMovieProfile, cfg.Library.DefaultTvProfile)
+	db.SetDefaultProfileNames(cfg.Library.DefaultMovieProfile, cfg.Library.DefaultTvProfile)
 	broker := api.NewEventBroker()
 
 	// live metrics collector — reads NNTP pool + scheduler + disk cache at query time

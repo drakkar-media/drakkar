@@ -201,11 +201,18 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 	if mediaType == "" {
 		mediaType = "manual_nzb"
 	}
+	// Only movie/episode/tv have a real quality profile concept -- leave the
+	// generic "manual_nzb" catch-all (an already-fetched raw NZB, never
+	// re-searched) without one rather than guessing movie vs TV for it.
+	var profileID *int64
+	if mediaType == "movie" || mediaType == "episode" || mediaType == "tv" {
+		profileID = db.resolveDefaultQualityProfileID(ctx, mediaType)
+	}
 	var libraryItemID int64
 	if err = tx.QueryRowContext(ctx, `
-		insert into library_items (media_type, title)
-		values ($1, $2)
-		returning id`, mediaType, imported.FileName).Scan(&libraryItemID); err != nil {
+		insert into library_items (media_type, title, quality_profile_id)
+		values ($1, $2, $3)
+		returning id`, mediaType, imported.FileName, profileID).Scan(&libraryItemID); err != nil {
 		return QueueSnapshot{}, err
 	}
 

@@ -36,6 +36,46 @@ type DB struct {
 
 	vfCacheMu sync.RWMutex
 	vfCache   map[int64]*cachedVF
+
+	// defaultMovieProfileName/defaultTvProfileName mirror the workflow
+	// service's own copies (see Service.SetDefaultProfileNames) so every
+	// library_items INSERT site here can stamp the correct quality_profile_id
+	// at creation time, rather than leaving every new item to rely solely on
+	// the name-based fallback applied later at search time. Set once at
+	// startup before any request can reach these paths, like their workflow
+	// counterparts -- not mutex-guarded, matching that existing convention.
+	defaultMovieProfileName string
+	defaultTvProfileName    string
+}
+
+// SetDefaultProfileNames configures which quality profile names new
+// library_items rows are stamped with at creation, keyed by media type.
+// Call once at startup from the app config.
+func (db *DB) SetDefaultProfileNames(movie, tv string) {
+	db.defaultMovieProfileName = movie
+	db.defaultTvProfileName = tv
+}
+
+// resolveDefaultQualityProfileID looks up the configured default profile for
+// a media type ("movie" vs "episode"/"tv"). Returns nil if none is
+// configured or the name doesn't resolve to an existing profile -- callers
+// must tolerate a nil quality_profile_id, since the workflow service's
+// name-based fallback (defaultProfilePreferences) still applies at search
+// time regardless of whether this succeeded.
+func (db *DB) resolveDefaultQualityProfileID(ctx context.Context, mediaType string) *int64 {
+	name := db.defaultMovieProfileName
+	if (mediaType == "episode" || mediaType == "tv") && db.defaultTvProfileName != "" {
+		name = db.defaultTvProfileName
+	}
+	if strings.TrimSpace(name) == "" {
+		return nil
+	}
+	profile, err := db.GetQualityProfileByName(ctx, name)
+	if err != nil {
+		return nil
+	}
+	id := profile.ID
+	return &id
 }
 
 func Open(cfg config.DatabaseConfig) (*DB, error) {
