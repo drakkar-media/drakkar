@@ -1685,6 +1685,24 @@ func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID i
 		}
 		return SearchResult{}, err
 	}
+	// Refuse to search with no title to verify candidates against. Ranking's
+	// title check (containsNormalized/titlesWordMatch) trivially accepts any
+	// candidate when the required title tokenizes to zero words -- that's
+	// intentional for ManualSearch's free-text path (ranking.Requirements{}),
+	// but here it would mean an item whose show/episode metadata hasn't
+	// finished populating yet (e.g. a just-added show) could have ANY Hydra
+	// result, including a completely unrelated show's season pack, accepted
+	// and selected. Confirmed in production: two shows each had another
+	// unrelated show's season pack selected and fanned out across every
+	// sibling episode via season-pack fulfillment.
+	if strings.TrimSpace(input.Title) == "" && strings.TrimSpace(input.ShowTitle) == "" {
+		reason := "no title available to verify search results against"
+		if markErr := s.repo.MarkLibrarySearchFailed(ctx, libraryItemID, reason); markErr != nil {
+			return SearchResult{}, markErr
+		}
+		s.logger.Warn().Int64("libraryItemId", libraryItemID).Msg("workqueue: skipping search — item has no title yet")
+		return SearchResult{LibraryItemID: libraryItemID}, nil
+	}
 	history, err := s.repo.LookupCandidateHistory(ctx, libraryItemID)
 	if err != nil {
 		return SearchResult{}, err

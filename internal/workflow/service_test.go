@@ -792,6 +792,35 @@ func TestSearchLibraryMarksMetadataConflictWithoutHydraCall(t *testing.T) {
 	}
 }
 
+// TestSearchLibrarySkipsSearchWithNoTitleToVerifyAgainst guards against the
+// cross-show contamination bug found in production: containsNormalized's
+// title check trivially accepts ANY candidate when the required title
+// tokenizes to zero words (see ranking.titlesWordMatch). A library item
+// whose show/episode metadata hasn't finished populating yet (Title and
+// ShowTitle both blank) must never reach Hydra/ranking at all -- two real
+// shows each had a completely unrelated show's season pack selected and
+// fanned out across every sibling episode this way.
+func TestSearchLibrarySkipsSearchWithNoTitleToVerifyAgainst(t *testing.T) {
+	repo := &repoStub{searchInput: database.LibrarySearchInput{LibraryItemID: 77, MediaType: "episode"}}
+	var requests []hydra.SearchRequest
+	hydraClient := hydraStub{requests: &requests}
+	service := NewService(repo, nil, hydraClient)
+
+	result, err := service.SearchLibrary(context.Background(), 77)
+	if err != nil {
+		t.Fatalf("SearchLibrary error = %v", err)
+	}
+	if result.LibraryItemID != 77 {
+		t.Fatalf("expected library item 77, got %+v", result)
+	}
+	if len(repo.searchFailed) != 1 || repo.searchFailed[0] != "77:no title available to verify search results against" {
+		t.Fatalf("expected a no-title search-failed marker, got %#v", repo.searchFailed)
+	}
+	if len(requests) != 0 {
+		t.Fatalf("expected no hydra search when there is no title to verify against, got %#v", requests)
+	}
+}
+
 func TestSearchLibraryFallsBackWhenEarlierQueryOnlyReturnsRejectedCandidates(t *testing.T) {
 	repo := &repoStub{
 		searchInput: database.LibrarySearchInput{
