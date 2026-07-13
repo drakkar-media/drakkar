@@ -1,0 +1,650 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Drakkar — self-hosted Usenet media manager</title>
+<meta name="description" content="Drakkar is a self-hosted Usenet media manager for Plex and Jellyfin. Articles stream on demand through a virtual filesystem — playback starts immediately, no full download required." />
+<meta property="og:title" content="Drakkar — self-hosted Usenet media manager" />
+<meta property="og:description" content="Finds releases, streams them straight from Usenet through a virtual filesystem, and hands them to Plex or Jellyfin the moment they're requested." />
+<meta property="og:type" content="website" />
+<meta name="theme-color" content="#050a0d" />
+<link rel="icon" type="image/svg+xml" href="favicon.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --background:        215 36% 4%;
+    --foreground:        188 34% 91%;
+    --card:               211 31% 7%;
+    --card-foreground:    188 34% 91%;
+    --muted:              209 26% 12%;
+    --muted-foreground:   190 13% 58%;
+    --border:             197 29% 18%;
+    --primary:            171 82% 55%;
+    --primary-foreground: 191 65% 6%;
+    --accent:              83 72% 58%;
+    --accent-foreground:   190 64% 7%;
+  }
+
+  * , *::before, *::after { box-sizing: border-box; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    margin: 0;
+    min-height: 100%;
+    background:
+      linear-gradient(90deg,  hsl(171 80% 56% / 0.035) 1px, transparent 1px),
+      linear-gradient(180deg, hsl(171 80% 56% / 0.03) 1px, transparent 1px),
+      radial-gradient(circle at 82% 10%, hsl(171 82% 18% / 0.34), transparent 30rem),
+      radial-gradient(circle at 12% 62%, hsl(83  72% 15% / 0.18), transparent 36rem),
+      linear-gradient(180deg, hsl(215 36% 5%), hsl(215 36% 3%) 60rem);
+    background-size: 40px 40px, 40px 40px, auto, auto, auto;
+    color: hsl(var(--foreground));
+    font-family: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow-x: hidden;
+  }
+
+  code, pre, .mono { font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+
+  a { color: inherit; text-decoration: none; }
+
+  h1, h2, h3 { text-wrap: balance; margin: 0; }
+
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+
+  ::selection { background: hsl(var(--primary) / 0.3); color: hsl(var(--foreground)); }
+
+  /* ── Nav ─────────────────────────────────────────────────────────────── */
+
+  nav {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    backdrop-filter: blur(10px);
+    background: hsl(215 36% 4% / 0.72);
+    border-bottom: 1px solid hsl(var(--border) / 0.6);
+  }
+
+  nav .wrap {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 68px;
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 700;
+    font-size: 1.05rem;
+    letter-spacing: 0.01em;
+  }
+
+  .brand svg { color: hsl(var(--primary)); flex-shrink: 0; }
+
+  .nav-links {
+    display: flex;
+    align-items: center;
+    gap: 28px;
+    font-size: 0.92rem;
+    color: hsl(var(--muted-foreground));
+  }
+
+  .nav-links a:hover { color: hsl(var(--foreground)); }
+
+  .nav-links .sep { width: 1px; height: 18px; background: hsl(var(--border)); }
+
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid hsl(var(--border));
+    background: hsl(0 0% 100% / 0.03);
+    font-size: 0.78rem;
+    color: hsl(var(--muted-foreground));
+  }
+
+  .badge .dot { width: 6px; height: 6px; border-radius: 999px; background: hsl(var(--accent)); box-shadow: 0 0 8px hsl(var(--accent) / 0.8); }
+
+  /* ── Buttons ─────────────────────────────────────────────────────────── */
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    min-height: 46px;
+    padding: 0 20px;
+    border-radius: 14px;
+    border: 1px solid hsl(0 0% 100% / 0.08);
+    cursor: pointer;
+    white-space: nowrap;
+    font-family: inherit;
+    font-size: 0.95rem;
+    box-shadow: 0 8px 24px hsl(215 50% 2% / 0.25);
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+  }
+
+  .btn:hover { transform: translateY(-1px); border-color: hsl(0 0% 100% / 0.18); }
+
+  .btn-primary { background: hsl(var(--primary)); border-color: hsl(var(--primary)); color: hsl(var(--primary-foreground)); font-weight: 700; }
+  .btn-primary:hover { background: hsl(171 82% 60%); }
+
+  .btn-secondary { background: hsl(0 0% 100% / 0.05); color: hsl(var(--foreground)); }
+  .btn-secondary:hover { background: hsl(0 0% 100% / 0.09); }
+
+  /* ── Hero ────────────────────────────────────────────────────────────── */
+
+  .hero { position: relative; padding: 96px 0 72px; overflow: hidden; }
+
+  .hero-ship {
+    position: absolute;
+    right: -6%;
+    top: 6%;
+    width: 620px;
+    height: 620px;
+    color: hsl(var(--primary));
+    opacity: 0.06;
+    pointer-events: none;
+  }
+
+  .eyebrow {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: hsl(var(--primary));
+    margin-bottom: 22px;
+  }
+
+  .eyebrow::before { content: '›'; color: hsl(var(--accent)); }
+
+  h1.headline {
+    font-size: clamp(2.4rem, 5vw, 3.6rem);
+    font-weight: 700;
+    letter-spacing: -0.015em;
+    max-width: 15ch;
+    line-height: 1.08;
+  }
+
+  h1.headline .accent { color: hsl(var(--primary)); }
+
+  .lede {
+    margin-top: 22px;
+    max-width: 56ch;
+    font-size: 1.15rem;
+    color: hsl(var(--muted-foreground));
+  }
+
+  .cta-row { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 34px; }
+
+  .terminal {
+    margin-top: 48px;
+    max-width: 560px;
+    border: 1px solid hsl(var(--border));
+    border-radius: 14px;
+    background: hsl(var(--card) / 0.85);
+    box-shadow: 0 20px 60px hsl(215 50% 2% / 0.4);
+    overflow: hidden;
+  }
+
+  .terminal-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 11px 14px;
+    border-bottom: 1px solid hsl(var(--border) / 0.7);
+  }
+
+  .terminal-head span { width: 10px; height: 10px; border-radius: 999px; background: hsl(0 0% 100% / 0.14); }
+
+  .terminal-body {
+    padding: 18px 20px 20px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.84rem;
+    line-height: 1.9;
+    color: hsl(190 30% 78%);
+  }
+
+  .terminal-body .prompt { color: hsl(var(--accent)); }
+  .terminal-body .comment { color: hsl(var(--muted-foreground)); }
+
+  /* ── Stat strip ──────────────────────────────────────────────────────── */
+
+  .stat-strip {
+    border-top: 1px solid hsl(var(--border) / 0.6);
+    border-bottom: 1px solid hsl(var(--border) / 0.6);
+    background: hsl(0 0% 100% / 0.015);
+  }
+
+  .stat-strip .wrap {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+    padding: 22px 24px;
+    justify-content: center;
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    border-radius: 999px;
+    border: 1px solid hsl(var(--border));
+    font-size: 0.85rem;
+    color: hsl(var(--muted-foreground));
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .chip svg { width: 14px; height: 14px; color: hsl(var(--primary)); }
+
+  /* ── Sections ────────────────────────────────────────────────────────── */
+
+  section { padding: 96px 0; }
+
+  .section-head { max-width: 640px; margin: 0 auto 56px; text-align: center; }
+
+  .section-label {
+    display: block;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: hsl(var(--accent));
+    margin-bottom: 14px;
+  }
+
+  .section-head h2 { font-size: clamp(1.7rem, 3.4vw, 2.3rem); font-weight: 700; letter-spacing: -0.01em; }
+  .section-head p { margin-top: 14px; color: hsl(var(--muted-foreground)); font-size: 1.02rem; }
+
+  /* ── Feature grid ────────────────────────────────────────────────────── */
+
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 20px;
+  }
+
+  .card {
+    padding: 26px 24px;
+    border-radius: 16px;
+    border: 1px solid hsl(var(--border));
+    background: linear-gradient(180deg, hsl(0 0% 100% / 0.025), transparent), hsl(var(--card) / 0.6);
+    transition: border-color 0.2s ease, transform 0.2s ease, background 0.2s ease;
+  }
+
+  .card:hover { border-color: hsl(var(--primary) / 0.4); transform: translateY(-3px); }
+
+  .card .icon {
+    width: 38px;
+    height: 38px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 10px;
+    background: hsl(var(--primary) / 0.12);
+    color: hsl(var(--primary));
+    margin-bottom: 18px;
+  }
+
+  .card .icon svg { width: 19px; height: 19px; }
+
+  .card h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 9px; }
+  .card p { margin: 0; color: hsl(var(--muted-foreground)); font-size: 0.92rem; line-height: 1.65; }
+
+  /* ── Flow diagram ────────────────────────────────────────────────────── */
+
+  .flow {
+    display: flex;
+    align-items: stretch;
+    gap: 0;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .flow-step {
+    flex: 1 1 150px;
+    max-width: 190px;
+    padding: 22px 16px;
+    text-align: center;
+    border: 1px solid hsl(var(--border));
+    border-radius: 14px;
+    background: hsl(var(--card) / 0.6);
+  }
+
+  .flow-step .n {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    color: hsl(var(--accent));
+    letter-spacing: 0.06em;
+  }
+
+  .flow-step h4 { margin: 10px 0 6px; font-size: 0.95rem; font-weight: 600; }
+  .flow-step p { margin: 0; font-size: 0.82rem; color: hsl(var(--muted-foreground)); line-height: 1.55; }
+
+  .flow-arrow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 40px;
+    color: hsl(var(--border));
+  }
+
+  @media (max-width: 780px) {
+    .flow-arrow { transform: rotate(90deg); flex-basis: 24px; }
+  }
+
+  /* ── Integrations ────────────────────────────────────────────────────── */
+
+  .integrations {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    justify-content: center;
+  }
+
+  .integration-chip {
+    padding: 11px 20px;
+    border-radius: 12px;
+    border: 1px solid hsl(var(--border));
+    background: hsl(var(--card) / 0.5);
+    font-size: 0.92rem;
+    color: hsl(var(--foreground));
+  }
+
+  .integration-chip .tag { color: hsl(var(--muted-foreground)); font-size: 0.78rem; }
+
+  /* ── Quick start ─────────────────────────────────────────────────────── */
+
+  .quickstart-panel {
+    display: grid;
+    grid-template-columns: 1fr 1.2fr;
+    gap: 40px;
+    align-items: center;
+    border: 1px solid hsl(var(--border));
+    border-radius: 20px;
+    background: linear-gradient(135deg, hsl(171 82% 18% / 0.12), transparent 60%), hsl(var(--card) / 0.5);
+    padding: 44px;
+  }
+
+  .quickstart-panel .terminal { margin-top: 0; max-width: none; }
+
+  .req-list { list-style: none; margin: 20px 0 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
+  .req-list li { display: flex; gap: 10px; font-size: 0.92rem; color: hsl(var(--muted-foreground)); }
+  .req-list svg { flex-shrink: 0; margin-top: 3px; width: 15px; height: 15px; color: hsl(var(--primary)); }
+
+  @media (max-width: 860px) {
+    .quickstart-panel { grid-template-columns: 1fr; padding: 28px; }
+  }
+
+  /* ── Footer ──────────────────────────────────────────────────────────── */
+
+  footer { border-top: 1px solid hsl(var(--border) / 0.6); padding: 44px 0; }
+
+  footer .wrap {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  footer .brand { font-size: 0.95rem; }
+  footer .brand svg { width: 20px; height: 20px; }
+
+  .foot-links { display: flex; gap: 22px; font-size: 0.88rem; color: hsl(var(--muted-foreground)); }
+  .foot-links a:hover { color: hsl(var(--foreground)); }
+
+  @media (max-width: 640px) {
+    .nav-links > a, .nav-links .sep { display: none; }
+    section { padding: 64px 0; }
+    .hero { padding: 56px 0 48px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Shared ship-silhouette symbol, reused across nav / hero / footer -->
+<svg width="0" height="0" style="position:absolute">
+  <symbol id="ship" viewBox="0 0 36 36">
+    <rect x="9" y="5" width="18" height="14" rx="2.5" fill="currentColor" opacity="0.55"/>
+    <rect x="16.5" y="2" width="3" height="21" rx="1.5" fill="currentColor"/>
+    <path d="M4 23 L32 23 Q31 31 18 32 Q5 31 4 23 Z" fill="currentColor"/>
+  </symbol>
+</svg>
+
+<nav>
+  <div class="wrap">
+    <div class="brand"><svg width="26" height="26" aria-hidden="true"><use href="#ship"/></svg> DRAKKAR</div>
+    <div class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#how-it-works">How it works</a>
+      <a href="#integrations">Integrations</a>
+      <a href="#quickstart">Quick start</a>
+      <div class="sep"></div>
+      <a href="https://github.com/drakkar-media/drakkar" class="badge">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        GitHub
+      </a>
+    </div>
+  </div>
+</nav>
+
+<div class="hero">
+  <svg class="hero-ship" viewBox="0 0 36 36" aria-hidden="true"><use href="#ship"/></svg>
+  <div class="wrap">
+    <span class="eyebrow">Self-hosted · Usenet-native</span>
+    <h1 class="headline">Watch it before it <span class="accent">finishes downloading.</span></h1>
+    <p class="lede">
+      Drakkar is a self-hosted Usenet media manager for Plex and Jellyfin. It finds releases,
+      streams them straight from Usenet through a virtual filesystem, and hands them off the moment
+      they're requested — no full download sitting between a request and playback.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="https://github.com/drakkar-media/drakkar">
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        View on GitHub
+      </a>
+      <a class="btn btn-secondary" href="#quickstart">Quick start →</a>
+    </div>
+    <div class="terminal">
+      <div class="terminal-head"><span></span><span></span><span></span></div>
+      <div class="terminal-body"><span class="comment"># clone, configure, sail</span><br/>
+<span class="prompt">$</span> git clone https://github.com/drakkar-media/drakkar<br/>
+<span class="prompt">$</span> cd drakkar && cp data/settings.example.json data/settings.json<br/>
+<span class="prompt">$</span> docker compose up -d<br/>
+<span class="comment"># → http://localhost:8080</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="stat-strip">
+  <div class="wrap">
+    <span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/></svg>MIT licensed</span>
+    <span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>Go + SvelteKit</span>
+    <span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>Docker Compose deploy</span>
+    <span class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M2 12h4M18 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg>Multi-provider Usenet pool</span>
+  </div>
+</div>
+
+<section id="features">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="section-label">Capabilities</span>
+      <h2>Everything a downloader does, minus the waiting</h2>
+      <p>Drakkar replaces the download step entirely — content streams the moment it's needed, and the library stays consistent on its own.</p>
+    </div>
+    <div class="feature-grid">
+
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12A10 10 0 1 1 12 2"/><path d="M22 2 12 12"/></svg></div>
+        <h3>Stream-first virtual filesystem</h3>
+        <p>A FUSE + WebDAV layer serves media instantly. Articles are fetched from Usenet on read and cached to disk — playback starts before anything is fully downloaded.</p>
+      </div>
+
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M4 12a8 8 0 0 1 8-8M20 12a8 8 0 0 1-8 8"/></svg></div>
+        <h3>Multi-provider fallback</h3>
+        <p>A pooled, connection-aware NNTP client retries across every configured provider when an article is missing or throttled — one slow stream never starves the rest of the pool.</p>
+      </div>
+
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg></div>
+        <h3>Smart season-pack fulfillment</h3>
+        <p>Finds a season pack once and fulfills every requested episode from it — instead of running a separate search and download for each one.</p>
+      </div>
+
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 3 7v6c0 5 4 8 9 9 5-1 9-4 9-9V7l-9-5Z"/></svg></div>
+        <h3>Quality profiles & custom formats</h3>
+        <p>Configurable resolution and codec preferences with cutoff support, plus regex-based custom format scoring layered on top of every search result.</p>
+      </div>
+
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg></div>
+        <h3>Self-healing library</h3>
+        <p>Periodic health checks catch missing symlinks, stale releases, and unreadable articles, then repair and republish automatically — and tell Plex or Jellyfin the moment they do.</p>
+      </div>
+
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg></div>
+        <h3>Subtitle automation</h3>
+        <p>Automatic subtitle search and download via OpenSubtitles and SubDL, republished alongside the media whenever a file is repaired or replaced.</p>
+      </div>
+
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z"/></svg></div>
+        <h3>Requests that just work</h3>
+        <p>Overseerr or Jellyseerr requests flow straight into Drakkar's own queue. Or run it as a drop-in, SABnzbd-compatible download client for Radarr and Sonarr.</p>
+      </div>
+
+      <div class="card">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></div>
+        <h3>Notifications</h3>
+        <p>Discord webhooks and generic HTTP webhooks fire on grab, import, and failure events, so you know what's happening without watching the logs.</p>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<section id="how-it-works" style="background: hsl(0 0% 100% / 0.012); border-top: 1px solid hsl(var(--border) / 0.5); border-bottom: 1px solid hsl(var(--border) / 0.5);">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="section-label">Pipeline</span>
+      <h2>From request to playback</h2>
+      <p>Every step after the request is Drakkar's own pipeline — no intermediate download client, no waiting room.</p>
+    </div>
+    <div class="flow">
+      <div class="flow-step">
+        <span class="n">01</span>
+        <h4>Request</h4>
+        <p>Overseerr, Jellyseerr, or Radarr/Sonarr ask for a title.</p>
+      </div>
+      <div class="flow-arrow"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 5l7 7-7 7"/></svg></div>
+      <div class="flow-step">
+        <span class="n">02</span>
+        <h4>Search & rank</h4>
+        <p>NZBHydra2 indexers are queried and results scored by quality profile.</p>
+      </div>
+      <div class="flow-arrow"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 5l7 7-7 7"/></svg></div>
+      <div class="flow-step">
+        <span class="n">03</span>
+        <h4>Index</h4>
+        <p>The NZB is fetched and indexed — no article bodies downloaded yet.</p>
+      </div>
+      <div class="flow-arrow"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 5l7 7-7 7"/></svg></div>
+      <div class="flow-step">
+        <span class="n">04</span>
+        <h4>Publish</h4>
+        <p>A virtual file appears instantly, symlinked into your library.</p>
+      </div>
+      <div class="flow-arrow"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 5l7 7-7 7"/></svg></div>
+      <div class="flow-step">
+        <span class="n">05</span>
+        <h4>Stream</h4>
+        <p>Plex or Jellyfin plays it — articles fetch on read, in real time.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="integrations">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="section-label">Integrations</span>
+      <h2>Fits the stack you already run</h2>
+      <p>Drakkar sits next to the tools you already use — it doesn't ask you to replace them.</p>
+    </div>
+    <div class="integrations">
+      <span class="integration-chip">Plex</span>
+      <span class="integration-chip">Jellyfin</span>
+      <span class="integration-chip">Overseerr</span>
+      <span class="integration-chip">Jellyseerr</span>
+      <span class="integration-chip">Radarr <span class="tag">via SABnzbd API</span></span>
+      <span class="integration-chip">Sonarr <span class="tag">via SABnzbd API</span></span>
+      <span class="integration-chip">NZBHydra2</span>
+      <span class="integration-chip">TMDB</span>
+      <span class="integration-chip">TVDB</span>
+      <span class="integration-chip">OpenSubtitles</span>
+      <span class="integration-chip">SubDL</span>
+      <span class="integration-chip">Discord</span>
+    </div>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="wrap">
+    <div class="quickstart-panel">
+      <div>
+        <span class="section-label">Quick start</span>
+        <h2 style="font-size: clamp(1.5rem, 3vw, 2rem); font-weight: 700;">Running in about five minutes</h2>
+        <p style="color: hsl(var(--muted-foreground)); margin-top: 12px;">All you need is Docker, a Usenet provider, and an indexer.</p>
+        <ul class="req-list">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>Docker & Docker Compose</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>A Usenet provider with SSL (NNTP port 563)</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>NZBHydra2 for indexing</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>Overseerr/Jellyseerr, or Radarr/Sonarr</li>
+        </ul>
+      </div>
+      <div class="terminal">
+        <div class="terminal-head"><span></span><span></span><span></span></div>
+        <div class="terminal-body"><span class="prompt">$</span> git clone https://github.com/drakkar-media/drakkar<br/>
+<span class="prompt">$</span> cd drakkar<br/>
+<span class="prompt">$</span> cp data/settings.example.json data/settings.json<br/>
+<span class="prompt">$</span> chmod 600 data/settings.json<br/>
+<span class="comment"># edit settings.json — add Usenet, NZBHydra2, Overseerr</span><br/>
+<span class="prompt">$</span> docker compose up -d<br/>
+<span class="comment"># web UI → http://localhost:8080</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="brand"><svg width="22" height="22" aria-hidden="true"><use href="#ship"/></svg> DRAKKAR</div>
+    <div class="foot-links">
+      <a href="https://github.com/drakkar-media/drakkar">GitHub</a>
+      <a href="https://github.com/drakkar-media/drakkar#readme">Documentation</a>
+      <a href="https://github.com/drakkar-media/drakkar/blob/main/LICENSE">MIT License</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
