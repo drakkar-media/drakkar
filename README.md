@@ -22,7 +22,7 @@ Drakkar is a self-hosted Usenet media downloader that integrates with Radarr, So
 ## Quick start
 
 ```bash
-git clone https://github.com/hjongedijk/drakkar
+git clone https://github.com/drakkar-media/drakkar
 cd drakkar
 cp data/settings.example.json data/settings.json
 chmod 600 data/settings.json

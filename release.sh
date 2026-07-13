@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO="hjongedijk/drakkar"
+REPO="drakkar-media/drakkar"
 
 VERSION="${1:-}"
 COMMIT_MESSAGE="${2:-}"
@@ -99,9 +99,9 @@ else
     --notes "Drakkar $VERSION
 
 Changes in this release are tracked in the commit history.
-Docker image: \`ghcr.io/hjongedijk/drakkar:$VERSION\`"
+Docker image: \`ghcr.io/drakkar-media/drakkar:$VERSION\`"
 fi
 
 echo
 echo "Done. Released $VERSION — GitHub Actions will build and push the Docker image."
-echo "Image will be available at: ghcr.io/hjongedijk/drakkar:$VERSION"
+echo "Image will be available at: ghcr.io/drakkar-media/drakkar:$VERSION"

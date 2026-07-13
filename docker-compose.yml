@@ -1,6 +1,6 @@
 services:
   drakkar:
-    image: ghcr.io/hjongedijk/drakkar:latest
+    image: ghcr.io/drakkar-media/drakkar:latest
     container_name: drakkar
     restart: unless-stopped
     environment:
