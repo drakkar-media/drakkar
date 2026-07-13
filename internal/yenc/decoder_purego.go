@@ -13,6 +13,14 @@ var (
 	ErrCRCMismatch  = errors.New("yenc crc mismatch")
 )
 
+// DecoderInfo identifies which decode implementation this binary was built
+// with -- logged once at startup so a Dockerfile regression that silently
+// drops back to this pure-Go path (e.g. losing the rapidyenc build tag or
+// CGO_ENABLED) is visible instead of just showing up as unexplained CPU load.
+func DecoderInfo() string {
+	return "purego (no CGO/rapidyenc build tag)"
+}
+
 func DecodeArticle(body []byte) ([]byte, error) {
 	return decodeArticleLines(splitLines(body))
 }

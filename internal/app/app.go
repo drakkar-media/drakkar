@@ -41,6 +41,7 @@ import (
 	"github.com/drakkar-media/drakkar/internal/tmdb"
 	"github.com/drakkar-media/drakkar/internal/tvdb"
 	"github.com/drakkar-media/drakkar/internal/workflow"
+	"github.com/drakkar-media/drakkar/internal/yenc"
 	"github.com/redis/go-redis/v9"
 	"github.com/redis/go-redis/v9/maintnotifications"
 	"github.com/rs/zerolog"
@@ -228,6 +229,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// Route all slog output (nntp, library, api packages) through the same
 	// zerolog logger so every line shares the same color/format.
 	slog.SetDefault(slog.New(observability.NewSlogHandler(logger)))
+	logger.Info().Str("yenc", yenc.DecoderInfo()).Msg("startup: yEnc decoder")
 
 	rt := config.DefaultRuntime()
 	if env := os.Getenv("DRAKKAR_SETTINGS_PATH"); env != "" {

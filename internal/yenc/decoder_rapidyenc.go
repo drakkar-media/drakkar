@@ -16,6 +16,13 @@ var (
 	ErrCRCMismatch  = errors.New("yenc crc mismatch")
 )
 
+// DecoderInfo identifies which decode implementation this binary was built
+// with -- logged once at startup so it's easy to confirm the SIMD decoder is
+// really active in a given deployment rather than a silently-reverted build.
+func DecoderInfo() string {
+	return "rapidyenc (" + rapidyenc.DecodeKernel() + ")"
+}
+
 func DecodeArticle(body []byte) ([]byte, error) {
 	return decodeArticleRapid(body, splitLines(body))
 }

@@ -70,5 +70,10 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://drakkar:drakkar@localhost:5432/drakkar_test?sslmode=disable
 
+      - name: Test (rapidyenc SIMD decoder build)
+        run: go test -tags rapidyenc ./internal/yenc/...
+        env:
+          CGO_ENABLED: 1
+
       - name: Docker build smoke test
         run: docker build -t drakkar:ci .
