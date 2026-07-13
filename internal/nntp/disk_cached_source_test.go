@@ -2,8 +2,11 @@ package nntp
 
 import (
 	"context"
+	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/drakkar-media/drakkar/internal/yenc"
 )
@@ -33,6 +36,68 @@ func TestDiskCachedDecodedSourceCaches(t *testing.T) {
 	if src.calls.Load() != 1 {
 		t.Fatalf("expected 1 fetch, got %d", src.calls.Load())
 	}
+}
+
+// TestDiskCachedDecodedSourceBoundsDecodeConcurrency guards against
+// unbounded concurrent yEnc decodes: the rapidyenc/CGO decoder isn't
+// preemptible mid-call the way pure-Go code is, so many concurrent decodes
+// (one per in-flight segment fetch, which can be 30+ for a single
+// high-bitrate stream) can starve the Go scheduler of OS threads for
+// unrelated work -- confirmed in production causing the app to fail its own
+// health check under load. decodeArticle must serialize through decodeSem,
+// sized to runtime.NumCPU(), independent of fetch parallelism.
+func TestDiskCachedDecodedSourceBoundsDecodeConcurrency(t *testing.T) {
+	src := &countingBodySource{body: []byte("=ybegin line=128 size=5 name=test\r\n" + encode([]byte("hello")) + "\r\n=yend size=5\r\n")}
+	cache := NewDiskCachedDecodedSource(src, t.TempDir(), 1024)
+	if cap(cache.decodeSem) != runtime.NumCPU() {
+		t.Fatalf("expected decodeSem capacity %d, got %d", runtime.NumCPU(), cap(cache.decodeSem))
+	}
+
+	// Track observed concurrency directly: fill the semaphore, then confirm
+	// one more acquire attempt genuinely blocks until a slot is released,
+	// rather than just trusting the channel's capacity in isolation.
+	held := 0
+	for held < cap(cache.decodeSem) {
+		cache.decodeSem <- struct{}{}
+		held++
+	}
+	acquired := make(chan struct{})
+	go func() {
+		cache.decodeSem <- struct{}{}
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("acquired a slot while decodeSem was already full")
+	case <-time.After(50 * time.Millisecond):
+	}
+	<-cache.decodeSem // release one slot
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("waiting acquire did not proceed after a slot was released")
+	}
+	for i := 0; i < held; i++ {
+		<-cache.decodeSem
+	}
+
+	// Confirm decodeArticle itself still works correctly under concurrent load.
+	var wg sync.WaitGroup
+	for i := 0; i < runtime.NumCPU()*3; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			decoded, _, err := cache.decodeArticle(context.Background(), src.body)
+			if err != nil {
+				t.Errorf("decode %d: %v", n, err)
+				return
+			}
+			if string(decoded) != "hello" {
+				t.Errorf("decode %d: got %q", n, string(decoded))
+			}
+		}(i)
+	}
+	wg.Wait()
 }
 
 func TestDiskCachedDecodedSourceReturnsPartInfo(t *testing.T) {

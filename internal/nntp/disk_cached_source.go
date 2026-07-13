@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"runtime"
 
 	"github.com/drakkar-media/drakkar/internal/cache"
 	"github.com/drakkar-media/drakkar/internal/metrics"
@@ -20,6 +21,20 @@ type DiskCachedDecodedSource struct {
 	// unbounded map here would otherwise grow forever across a long-running
 	// process. Bounded the same way as CachedDecodedSource's infoCache.
 	partInfo *cache.ByteLRU
+	// decodeSem bounds how many yEnc decodes run at once, independent of how
+	// many segment fetches are in flight (which can be much higher -- e.g.
+	// 30 for a single high-bitrate read-ahead stream). The rapidyenc/CGO
+	// decoder isn't preemptible mid-call the way pure-Go code is: a goroutine
+	// in a CGO call ties up its OS thread for the duration, so many
+	// concurrent decodes can starve the Go scheduler of threads for
+	// unrelated work (including the HTTP health-check handler) even though
+	// each individual decode is fast. Confirmed in production: streaming a
+	// ~47 Mbps 4K remux at 30x fetch parallelism drove sustained 400-600%
+	// CPU and made the app fail its own health check under load. Decoding
+	// itself is CPU-bound and fast, so bounding it to NumCPU lets fetches
+	// stay highly concurrent (I/O-bound, cheap to leave in flight) while
+	// capping how many CPU-bound CGO calls compete for OS threads at once.
+	decodeSem chan struct{}
 }
 
 func NewDiskCachedDecodedSource(source ArticleSource, root string, maxBytes int64) *DiskCachedDecodedSource {
@@ -28,6 +43,7 @@ func NewDiskCachedDecodedSource(source ArticleSource, root string, maxBytes int6
 		cache:        cache.NewFileCache(root, maxBytes),
 		singleflight: cache.NewSingleFlight(),
 		partInfo:     cache.NewByteLRU(infoCacheMaxBytes),
+		decodeSem:    make(chan struct{}, runtime.NumCPU()),
 	}
 }
 
@@ -77,7 +93,7 @@ func (s *DiskCachedDecodedSource) DecodedBodyInfoPriority(ctx context.Context, m
 		if err != nil {
 			return nil, err
 		}
-		decoded, info, err := yenc.DecodeArticleWithInfo(raw)
+		decoded, info, err := s.decodeArticle(ctx, raw)
 		if err != nil {
 			return nil, err
 		}
@@ -109,6 +125,19 @@ func (s *DiskCachedDecodedSource) fillPartInfoFromRaw(ctx context.Context, messa
 	info, _ := yenc.ParsePartInfo(raw)
 	s.storePartInfo(messageID, info)
 	return decoded, info, nil
+}
+
+// decodeArticle runs the yEnc decode under decodeSem -- see the field comment
+// on DiskCachedDecodedSource for why this needs its own, smaller concurrency
+// bound separate from fetch parallelism.
+func (s *DiskCachedDecodedSource) decodeArticle(ctx context.Context, raw []byte) ([]byte, yenc.PartInfo, error) {
+	select {
+	case s.decodeSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, yenc.PartInfo{}, ctx.Err()
+	}
+	defer func() { <-s.decodeSem }()
+	return yenc.DecodeArticleWithInfo(raw)
 }
 
 func (s *DiskCachedDecodedSource) fetchRaw(ctx context.Context, messageID string, priority stream.FetchPriority) ([]byte, error) {
