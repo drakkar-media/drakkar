@@ -25,7 +25,7 @@ Finds releases, streams them straight from Usenet through a virtual filesystem, 
 - [🔧 Configuration](#-configuration)
 - [🧩 Features](#-features)
 - [🐳 Docker](#-docker)
-- [🧑‍💻 Development](#-development)
+- [🧑‍💻 Development](#‍-development)
 - [🤝 Contributing](#-contributing)
 - [📄 License](#-license)
 - [⚠️ Disclaimer](#️-disclaimer)
@@ -70,8 +70,8 @@ docker compose up -d
 - A Usenet provider with SSL access (NNTP port 563)
 - [NZBHydra2](https://github.com/theotherp/nzbhydra2) for NZB indexing
 - [Seerr](https://seerr.dev) for media requests
-- Plex or Jellyfin (optional, for playback)
-- TMDB API key (optional, for metadata enrichment)
+- Plex or Jellyfin, for playback
+- TMDB API key, for metadata enrichment
 
 ## ⚙️ How it works
 
