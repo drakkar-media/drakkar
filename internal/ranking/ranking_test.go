@@ -132,6 +132,44 @@ func TestScoreWithPreferencesUsesOrderedResolution(t *testing.T) {
 	}
 }
 
+// TestScoreWithPreferencesRejectsUnlistedResolution guards the fix for a
+// real production incident: a profile's Resolutions field is presented to
+// users as an allow-list (e.g. "HD - 720p/1080p"), but was only a scoring
+// nudge (-120 for an unlisted resolution) rather than a hard reject. A show
+// with that profile ended up with a 2160p HDR/Atmos remux selected over a
+// perfectly good 1080p release for the same episode, because the remux's
+// bonuses on other dimensions outweighed the resolution penalty -- the
+// remux's bitrate then made read-ahead unable to keep up, causing repeated
+// playback stalls. An unlisted resolution must now be rejected outright.
+func TestScoreWithPreferencesRejectsUnlistedResolution(t *testing.T) {
+	prefs := Preferences{Resolutions: []string{"720p", "1080p"}}
+	result := ScoreWithPreferences(Candidate{
+		Title:      "A.Knight.of.the.Seven.Kingdoms.S01E06.2160p.UHD.BluRay.REMUX",
+		Resolution: "2160p",
+		Source:     "bluray",
+		Language:   "en",
+	}, Requirements{Title: "A Knight of the Seven Kingdoms", MediaType: "episode", SeasonNumber: 1, EpisodeNumber: 6}, prefs)
+	if !result.Rejected || result.RejectReason != "resolution_not_allowed" {
+		t.Fatalf("expected resolution_not_allowed rejection, got %+v", result)
+	}
+}
+
+// TestScoreWithPreferencesAllowsAnyResolutionWhenUnconfigured ensures a
+// profile that never set Resolutions (or a search run with no profile at
+// all) keeps accepting any resolution -- the hard filter above only applies
+// once a profile actually lists specific allowed resolutions.
+func TestScoreWithPreferencesAllowsAnyResolutionWhenUnconfigured(t *testing.T) {
+	result := ScoreWithPreferences(Candidate{
+		Title:      "Dune.2021.2160p.UHD.BluRay.REMUX",
+		Resolution: "2160p",
+		Source:     "bluray",
+		Language:   "en",
+	}, Requirements{Title: "Dune", MediaType: "movie", Year: 2021}, Preferences{})
+	if result.Rejected {
+		t.Fatalf("expected no resolution rejection with an empty preference list, got %+v", result)
+	}
+}
+
 func TestScoreWithPreferencesRejectsTooLarge(t *testing.T) {
 	// 8 GB candidate; 120-min runtime × 34 MB/min max = 4080 MB limit → too_large.
 	result := ScoreWithPreferences(Candidate{

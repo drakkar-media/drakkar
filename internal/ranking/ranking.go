@@ -312,6 +312,27 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 	if reHardSubs.MatchString(candidate.Title) {
 		return Result{Rejected: true, RejectReason: "hardsub", Explanations: []string{"Rejected: hardcoded subtitles were detected."}}
 	}
+	// Resolution allow-list: a profile's Resolutions field is presented to
+	// users as which resolutions are allowed (e.g. "HD - 720p/1080p"), so it
+	// must behave like one. Previously an unlisted resolution only took a
+	// -120 scoring penalty (see scoreResolution/scoreByPreference) rather
+	// than being rejected outright, so a 2160p remux with strong HDR/audio/
+	// source bonuses elsewhere could still win on total score over a 1080p
+	// release despite that penalty -- confirmed in production for a real
+	// show whose selected 4K remux couldn't be streamed reliably even though
+	// a perfectly good 1080p release was available for the same episode.
+	if len(prefs.Resolutions) > 0 && candidate.Resolution != "" {
+		allowed := false
+		for _, r := range prefs.Resolutions {
+			if strings.EqualFold(strings.TrimSpace(r), candidate.Resolution) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return Result{Rejected: true, RejectReason: "resolution_not_allowed", Explanations: []string{fmt.Sprintf("Rejected: resolution %s is not in the profile's allowed resolutions.", candidate.Resolution)}}
+		}
+	}
 	if sizeReject := rejectBySize(candidate, prefs, required.RuntimeMinutes); sizeReject != "" {
 		return Result{Rejected: true, RejectReason: sizeReject, Explanations: []string{"Rejected: size was outside configured MB/min limits."}}
 	}

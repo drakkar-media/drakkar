@@ -8,10 +8,21 @@ import (
 	"github.com/drakkar-media/drakkar/internal/metrics"
 )
 
-// Keep prefetch conservative so Plex/player reads keep most NNTP capacity.
+// Read-ahead fetches always run at PriorityReadAhead (80), strictly below
+// PriorityInteractive (100) used for the player's actual current-position
+// reads -- the priority queue, not this ceiling, is what protects live
+// playback from being starved by prefetch. That means this ceiling only
+// needs to bound resource usage, not fight interactive reads for a slot, so
+// it can scale with the user's own configured connection budget rather than
+// sitting at a flat conservative cap regardless of it. A low ceiling here
+// was found to bottleneck sustained throughput for high-bitrate remux/UHD
+// content: e.g. a ~47 Mbps 4K remux needs roughly 8-9 concurrent ~700KB
+// segment fetches in flight just to break even, leaving little margin
+// against any per-fetch latency before the read-ahead buffer runs dry and
+// playback stalls -- repeatedly, since it refills and drains on every cycle.
 const (
 	defaultMaxReadAheadParallelism  = 4
-	absoluteMaxReadAheadParallelism = 15
+	absoluteMaxReadAheadParallelism = 30
 	minReadAheadParallelism         = 1
 	defaultArticleBufferSize        = 40
 )
@@ -85,8 +96,10 @@ func NewReadAheadManager(windowBytes int64) *ReadAheadManager {
 	}
 }
 
-// SetConnectionBudget reserves only a small slice of total NNTP concurrency
-// for read-ahead so interactive playback reads can dominate the pool.
+// SetConnectionBudget sizes read-ahead parallelism off a share of total NNTP
+// concurrency. Interactive playback reads are protected by priority (100 vs
+// read-ahead's 80), not by starving this budget, so it can afford to be a
+// real fraction of streamingBudget rather than a token slice of it.
 func (m *ReadAheadManager) SetConnectionBudget(totalConnections int, streamingPriorityPct int) {
 	if m == nil {
 		return
@@ -100,7 +113,7 @@ func (m *ReadAheadManager) SetConnectionBudget(totalConnections int, streamingPr
 		if streamingBudget < 1 {
 			streamingBudget = 1
 		}
-		limit = streamingBudget / 4 // keep prefetch to a small slice of streaming budget
+		limit = streamingBudget / 2 // half the streaming budget for prefetch depth
 		if limit < minReadAheadParallelism {
 			limit = minReadAheadParallelism
 		}
