@@ -2,12 +2,14 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/drakkar-media/drakkar/internal/nntp"
 	"github.com/drakkar-media/drakkar/internal/observability"
 )
 
@@ -262,6 +264,20 @@ func (db *DB) CalibrateNZBOffsetsBatch(ctx context.Context, limit int) (int, err
 	return len(ids), nil
 }
 
+// isArticlePermanentlyMissing confirms via a cheap NNTP STAT (no body
+// download) whether messageID is genuinely gone (430 -> nntp.ErrArticleMissing)
+// rather than a transient fetch failure. Only a confirmed-missing article is
+// safe to mark calibrated_at permanently; a timeout, throttled/circuit-open
+// provider, connection error, or an inconclusive check (checker unavailable)
+// must fall through to "retry later" instead.
+func (db *DB) isArticlePermanentlyMissing(ctx context.Context, messageID string) bool {
+	checker, ok := db.SegmentFetcher.(SegmentChecker)
+	if !ok || checker == nil {
+		return false
+	}
+	return errors.Is(checker.Exists(ctx, messageID), nntp.ErrArticleMissing)
+}
+
 // CalibrateNZBOffsets corrects segment decoded offsets for all files in an NZB
 // document by fetching the first segment of each file and measuring its actual
 // decoded size. This replaces the estimated offsets (0.74 or 0.97 factor) with
@@ -311,8 +327,20 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 	for _, f := range files {
 		actualFirst, err := sizer.DecodedSize(ctx, f.firstMsgID)
 		if err != nil {
-			slog.Warn("calibrate: could not fetch first segment — marking as skipped", "nzb_file_id", f.id, "err", err)
-			// Mark calibrated so expired/missing articles are not retried on every startup.
+			if !db.isArticlePermanentlyMissing(ctx, f.firstMsgID) {
+				// Transient failure (timeout, provider throttle/circuit-open,
+				// connection error, or the async import-time calibration
+				// budget expiring mid-fetch) -- leave calibrated_at NULL so
+				// a later CalibrateNZBOffsetsBatch pass retries. Previously
+				// ANY error here permanently froze size_bytes at the
+				// pre-calibration estimate, which then silently truncated
+				// the served file (computeSpans uses size_bytes as the hard
+				// end of the stream) -- reproducible for any release whose
+				// first-segment fetch merely hiccuped once during import.
+				slog.Warn("calibrate: could not fetch first segment, will retry later", "nzb_file_id", f.id, "err", err)
+				continue
+			}
+			slog.Warn("calibrate: first segment confirmed missing (NNTP STAT 430) — marking as permanently skipped", "nzb_file_id", f.id, "err", err)
 			// If this UPDATE itself fails (e.g. a transient DB error), the file is
 			// NOT actually marked calibrated — log it, so a hung/lost mark-as-skipped
 			// isn't invisible (it would otherwise just look like a normal retry).
