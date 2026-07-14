@@ -392,6 +392,55 @@ func TestAggregateRARVolumeEntriesAcrossParts(t *testing.T) {
 	}
 }
 
+func TestAggregateRARVolumeEntriesCorrectsImpossibleStoreMethodSize(t *testing.T) {
+	entries, err := aggregateRARVolumeEntries([]ImportedArchiveEntry{
+		{
+			Path:              "Movie.mkv",
+			SizeBytes:         1000, // corrupt header value, identical across every volume
+			PackedSizeBytes:   100,
+			CompressionMethod: "m0",
+			VolumeIndex:       0,
+			ArchiveOffset:     50,
+		},
+		{
+			Path:              "Movie.mkv",
+			SizeBytes:         1000,
+			PackedSizeBytes:   100,
+			CompressionMethod: "m0",
+			VolumeIndex:       1,
+			ArchiveOffset:     0,
+		},
+		{
+			Path:              "Movie.mkv",
+			SizeBytes:         1000,
+			PackedSizeBytes:   100,
+			CompressionMethod: "m0",
+			VolumeIndex:       2,
+			ArchiveOffset:     0,
+		},
+	}, map[int]int64{
+		0: 150,
+		1: 100,
+		2: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %+v", entries)
+	}
+	entry := entries[0]
+	if entry.PackedSizeBytes != 300 {
+		t.Fatalf("expected packed size 300 (real accumulated total), got %+v", entry)
+	}
+	if entry.SizeBytes != 300 {
+		t.Fatalf("expected declared size clamped to real accumulated total 300, got %+v", entry)
+	}
+	if len(entry.Ranges) != 3 {
+		t.Fatalf("unexpected ranges %+v", entry.Ranges)
+	}
+}
+
 func TestHasCompleteArchiveMapping(t *testing.T) {
 	if !hasCompleteArchiveMapping(ImportedArchiveEntry{
 		PackedSizeBytes: 120,

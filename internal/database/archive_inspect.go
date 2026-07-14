@@ -473,6 +473,13 @@ func aggregateRARVolumeEntries(parts []ImportedArchiveEntry, volumeSizes map[int
 				entry.PackedSizeBytes = entry.SizeBytes
 				last := &entry.Ranges[len(entry.Ranges)-1]
 				last.LengthBytes += entry.SizeBytes - entryOffset
+			} else if entry.CompressionMethod == "m0" && entry.SizeBytes > entry.PackedSizeBytes {
+				// Store method guarantees packed == unpacked. entry.PackedSizeBytes
+				// was just accumulated from every volume's own real, capacity-clamped
+				// contribution, so it's trustworthy even when the header-declared
+				// SizeBytes is wildly larger (a corrupt upstream unpacked-size field --
+				// confirmed byte-for-byte on a live sample, see reconcileStoreMethodSize).
+				entry.SizeBytes = entry.PackedSizeBytes
 			}
 		}
 		out = append(out, entry)
