@@ -595,13 +595,24 @@ func importedFileSegmentEnd(file ImportedNZBFile) int64 {
 }
 
 func importedFileEffectiveSize(ctx context.Context, file ImportedNZBFile, fetcher stream.SegmentFetcher) int64 {
+	// importedFileActualSize does a live fetch of the last segment's real
+	// yEnc-declared end offset -- when it succeeds, that IS the volume's
+	// true decoded size, not one more estimate to max() against the cruder
+	// segmentEnd/FileSizeBytes guesses below. Taking the max of all three
+	// previously meant a rough pre-fetch estimate that happened to
+	// over-shoot the real size would always win over the accurate
+	// measurement, since the real size is virtually never the *largest* of
+	// the three. Confirmed live in production: a multi-volume stored_rar
+	// release where every volume's real content (measured via this same
+	// live fetch) was smaller than its FileSizeBytes estimate ended up
+	// using the inflated estimate everywhere, which fed assignArchiveRanges
+	// a wrong per-volume capacity and corrupted every volume's byte range.
+	if actual, ok := importedFileActualSize(ctx, file, fetcher); ok {
+		return actual
+	}
 	size := importedFileSegmentEnd(file)
 	if file.FileSizeBytes > size {
 		size = file.FileSizeBytes
-	}
-	actual := importedFileActualSize(ctx, file, fetcher)
-	if actual > size {
-		size = actual
 	}
 	return size
 }

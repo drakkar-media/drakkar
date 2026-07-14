@@ -359,10 +359,24 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 		// positions beyond the real end of file.
 		actualLast := actualFirst // default: same size as other segments
 		if f.lastMsgID != "" && f.lastMsgID != f.firstMsgID {
-			if n, err := sizer.DecodedSize(ctx, f.lastMsgID); err == nil && n > 0 {
+			n, err := sizer.DecodedSize(ctx, f.lastMsgID)
+			switch {
+			case err == nil && n > 0:
 				actualLast = n
-			} else if err != nil {
-				slog.Warn("calibrate: could not fetch last segment", "nzb_file_id", f.id, "err", err)
+			case err != nil && !db.isArticlePermanentlyMissing(ctx, f.lastMsgID):
+				// Same transient-vs-permanent distinction as the first-segment
+				// fetch above: a failed fetch here previously fell through
+				// silently, leaving actualLast at the "same size as other
+				// segments" guess and still marking calibrated_at via
+				// rescaleFileSegments below -- permanently freezing a guess
+				// that's frequently wrong (a real last segment is often a
+				// remainder chunk, not a full one) with no way to ever retry.
+				// Leave calibrated_at NULL so a later pass retries both
+				// segments fresh instead.
+				slog.Warn("calibrate: could not fetch last segment, will retry later", "nzb_file_id", f.id, "err", err)
+				continue
+			case err != nil:
+				slog.Warn("calibrate: last segment confirmed missing (NNTP STAT 430) — using first-segment size as the best available estimate", "nzb_file_id", f.id, "err", err)
 			}
 		}
 		if err := db.rescaleFileSegments(ctx, f.id, actualFirst, actualLast); err != nil {

@@ -46,7 +46,7 @@ func buildImportedArchiveReader(ctx context.Context, volumes []ImportedArchiveVo
 		if !ok {
 			return nil, nil, 0, errArchiveHeadersInvalid
 		}
-		actualSize := importedFileActualSize(ctx, file, fetcher)
+		actualSize, _ := importedFileActualSize(ctx, file, fetcher)
 		volumeSizes[volume.VolumeIndex] = actualSize
 		for _, segment := range file.Segments {
 			spans = append(spans, stream.SegmentSpan{
@@ -63,15 +63,21 @@ func buildImportedArchiveReader(ctx context.Context, volumes []ImportedArchiveVo
 	}, volumeSizes, totalSize, nil
 }
 
-func importedFileActualSize(ctx context.Context, file ImportedNZBFile, fetcher stream.SegmentFetcher) int64 {
+// importedFileActualSize does a live fetch of the last segment's real
+// yEnc-declared end offset. ok=true means size is a genuine measurement;
+// ok=false means the fetch was unavailable or failed and size is only
+// file.FileSizeBytes, an unmeasured estimate -- callers that want to prefer
+// a measurement over their own rougher estimates need this distinction,
+// since file.FileSizeBytes can itself be larger OR smaller than the truth.
+func importedFileActualSize(ctx context.Context, file ImportedNZBFile, fetcher stream.SegmentFetcher) (size int64, ok bool) {
 	if len(file.Segments) == 0 {
-		return 0
+		return 0, false
 	}
 	aware, ok := fetcher.(interface {
 		FetchRangeInfo(ctx context.Context, segment stream.SegmentRange) ([]byte, stream.SegmentSpan, error)
 	})
 	if !ok {
-		return file.FileSizeBytes
+		return file.FileSizeBytes, false
 	}
 	last := file.Segments[len(file.Segments)-1]
 	_, actual, err := aware.FetchRangeInfo(ctx, stream.SegmentRange{
@@ -82,9 +88,9 @@ func importedFileActualSize(ctx context.Context, file ImportedNZBFile, fetcher s
 		SegmentEnd:   last.DecodedEndOffset,
 	})
 	if err != nil || actual.End <= 0 {
-		return file.FileSizeBytes
+		return file.FileSizeBytes, false
 	}
-	return actual.End
+	return actual.End, true
 }
 
 type archiveReaderAt struct {

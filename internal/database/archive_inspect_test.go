@@ -208,6 +208,73 @@ func TestReadImportedFilePrefixShortFetch(t *testing.T) {
 	}
 }
 
+// fetchRangeInfoStub implements the FetchRangeInfo capability importedFileActualSize
+// looks for, returning a fixed measured end offset regardless of the request.
+type fetchRangeInfoStub struct {
+	end int64
+	err error
+}
+
+func (f fetchRangeInfoStub) FetchRange(ctx context.Context, segment stream.SegmentRange) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f fetchRangeInfoStub) FetchRangeInfo(ctx context.Context, segment stream.SegmentRange) ([]byte, stream.SegmentSpan, error) {
+	if f.err != nil {
+		return nil, stream.SegmentSpan{}, f.err
+	}
+	return nil, stream.SegmentSpan{End: f.end}, nil
+}
+
+// TestImportedFileEffectiveSizePrefersRealMeasurementOverInflatedEstimate
+// guards the stored_rar fix: a live-measured last-segment size must win
+// outright over file.FileSizeBytes, not lose a max() comparison to it.
+// Confirmed live in production against a real multi-volume RAR release: the
+// real per-volume content (768000 x 68 = 52,224,000, matching the actual
+// yEnc posting) was smaller than the volume's own FileSizeBytes estimate
+// (52,297,799, a rougher pre-fetch guess) -- taking the max of the two
+// silently kept the wrong, larger estimate on every volume, which fed
+// assignArchiveRanges an inflated per-volume capacity and corrupted the
+// whole file's byte layout downstream.
+func TestImportedFileEffectiveSizePrefersRealMeasurementOverInflatedEstimate(t *testing.T) {
+	file := ImportedNZBFile{
+		FileName:      "part001.rar",
+		FileSizeBytes: 52_297_799, // rough pre-fetch estimate: larger than the truth
+		Segments: []ImportedNZBSegment{{
+			MessageID:          "<one@test>",
+			DecodedStartOffset: 0,
+			DecodedEndOffset:   52_224_000,
+		}},
+	}
+	got := importedFileEffectiveSize(context.Background(), file, fetchRangeInfoStub{end: 52_224_000})
+	if got != 52_224_000 {
+		t.Fatalf("importedFileEffectiveSize = %d, want the measured 52224000 (not the inflated FileSizeBytes estimate)", got)
+	}
+}
+
+// TestImportedFileEffectiveSizeFallsBackWhenMeasurementUnavailable guards the
+// other half of the fix: when no real measurement can be taken (fetcher
+// doesn't support FetchRangeInfo, or the fetch fails), behavior must be
+// unchanged from before -- the max of the segment-derived estimate and
+// FileSizeBytes, exactly matching
+// TestInspectImportedArchivesUsesSegmentSizeWhenNZBFileSizeMetadataIsTooSmall's
+// expectations at the inspectImportedArchives layer.
+func TestImportedFileEffectiveSizeFallsBackWhenMeasurementUnavailable(t *testing.T) {
+	file := ImportedNZBFile{
+		FileName:      "part001.rar",
+		FileSizeBytes: 128, // too small vs. the real segment-derived estimate
+		Segments: []ImportedNZBSegment{{
+			MessageID:          "<one@test>",
+			DecodedStartOffset: 0,
+			DecodedEndOffset:   1024,
+		}},
+	}
+	got := importedFileEffectiveSize(context.Background(), file, fetcherStub{data: make([]byte, 1024)})
+	if got != 1024 {
+		t.Fatalf("importedFileEffectiveSize = %d, want fallback max(segmentEnd=1024, FileSizeBytes=128) = 1024", got)
+	}
+}
+
 func TestAssignArchiveRangesAcrossVolumes(t *testing.T) {
 	entries := []ImportedArchiveEntry{{
 		Path:            "Movie.mkv",
