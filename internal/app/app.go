@@ -5,8 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	// registers /debug/pprof/* on http.DefaultServeMux; only ever served on
+	// the loopback-only debugServer below, never on a publicly reachable port.
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -230,6 +234,12 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// zerolog logger so every line shares the same color/format.
 	slog.SetDefault(slog.New(observability.NewSlogHandler(logger)))
 	logger.Info().Str("yenc", yenc.DecoderInfo()).Msg("startup: yEnc decoder")
+	// Enables /debug/pprof/block and /debug/pprof/mutex on the loopback-only
+	// debug server below -- needed to diagnose streaming stalls that are
+	// blocking (waiting on a channel/lock/connection), which plain CPU
+	// profiling can't see since a blocked goroutine burns no CPU time.
+	runtime.SetBlockProfileRate(1)
+	runtime.SetMutexProfileFraction(1)
 
 	rt := config.DefaultRuntime()
 	if env := os.Getenv("DRAKKAR_SETTINGS_PATH"); env != "" {
@@ -988,6 +998,16 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	// Loopback-only pprof server -- not published in docker-compose.yml, so
+	// it's reachable solely via `docker exec ... wget http://127.0.0.1:6060/debug/pprof/...`.
+	// Added to diagnose a live CPU/stall issue under 4K streaming load; kept
+	// permanently since profiling access has no cost when nothing is polling it.
+	debugServer := &http.Server{
+		Addr:              "127.0.0.1:6060",
+		Handler:           http.DefaultServeMux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info().Str("addr", rt.HTTPAddress).Msg("http server starting")
@@ -1002,6 +1022,12 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}
 	}()
 	go func() {
+		logger.Info().Str("addr", debugServer.Addr).Msg("pprof debug server starting")
+		if err := debugServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error().Err(err).Msg("pprof debug server error")
+		}
+	}()
+	go func() {
 		if err := publicationSvc.RebuildPublications(ctx); err != nil {
 			logger.Error().Err(err).Msg("rebuild publications failed")
 		}
@@ -1011,6 +1037,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = webdavServer.Shutdown(shutdownCtx)
+		_ = debugServer.Shutdown(shutdownCtx)
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			return err
 		}
