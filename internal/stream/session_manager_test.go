@@ -157,13 +157,13 @@ func TestReadAheadManagerStopCancelsRequest(t *testing.T) {
 }
 
 // TestSetConnectionBudgetScalesWithStreamingBudget guards the read-ahead
-// throughput fix for high-bitrate content: sustaining something like a
-// ~47 Mbps 4K remux needs several concurrent segment fetches in flight, and
-// the old flat ceiling of 15 (streamingBudget/4) left too little margin
-// against per-fetch latency before the buffer ran dry mid-playback. Read-
-// ahead fetches always run at PriorityReadAhead, strictly below the
-// player's PriorityInteractive, so this budget can be a real fraction of
-// streamingBudget without risking starved live reads.
+// throughput fix for high-bitrate content: sustaining something like an
+// ~84.5 Mbps 4K remux needs many concurrent segment fetches in flight, and
+// a low ceiling left too little margin against per-fetch latency before the
+// buffer ran dry mid-playback. Read-ahead fetches always run at
+// PriorityReadAhead, strictly below the player's PriorityInteractive, so
+// this budget can use the full streaming budget without risking starved
+// live reads.
 func TestSetConnectionBudgetScalesWithStreamingBudget(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -171,8 +171,8 @@ func TestSetConnectionBudgetScalesWithStreamingBudget(t *testing.T) {
 		streamingPct     int
 		wantParallelism  int
 	}{
-		{"generous budget caps at absolute max", 90, 80, 30},   // streamingBudget=72, /2=36, capped to 30
-		{"modest budget scales down", 20, 80, 8},                // streamingBudget=16, /2=8
+		{"generous budget caps at absolute max", 90, 80, 60}, // streamingBudget=72, capped to 60
+		{"modest budget scales with full streaming budget", 20, 80, 16}, // streamingBudget=16
 		{"zero total falls back to default", 0, 80, defaultMaxReadAheadParallelism},
 	}
 	for _, tt := range tests {

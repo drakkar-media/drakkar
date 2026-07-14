@@ -16,13 +16,16 @@ import (
 // it can scale with the user's own configured connection budget rather than
 // sitting at a flat conservative cap regardless of it. A low ceiling here
 // was found to bottleneck sustained throughput for high-bitrate remux/UHD
-// content: e.g. a ~47 Mbps 4K remux needs roughly 8-9 concurrent ~700KB
-// segment fetches in flight just to break even, leaving little margin
-// against any per-fetch latency before the read-ahead buffer runs dry and
-// playback stalls -- repeatedly, since it refills and drains on every cycle.
+// content: measured live against a genuine ~84.5 Mbps 2160p remux
+// (19.46GB / 30m42s), sustained fetch throughput topped out around 72-76
+// Mbps at parallelism=30 -- short of the required rate, so the read-ahead
+// buffer can never build a cushion and playback stalls repeatedly. Raised
+// to 60 to test whether more concurrent segment fetches close that gap or
+// whether the ceiling is actually the provider's own account-level
+// bandwidth cap (in which case this won't help).
 const (
 	defaultMaxReadAheadParallelism  = 4
-	absoluteMaxReadAheadParallelism = 30
+	absoluteMaxReadAheadParallelism = 60
 	minReadAheadParallelism         = 1
 	defaultArticleBufferSize        = 40
 )
@@ -113,7 +116,12 @@ func (m *ReadAheadManager) SetConnectionBudget(totalConnections int, streamingPr
 		if streamingBudget < 1 {
 			streamingBudget = 1
 		}
-		limit = streamingBudget / 2 // half the streaming budget for prefetch depth
+		// Previously halved here, but that left real throughput ceiling
+		// untested for high-bitrate remux content (see the const block
+		// above) -- interactive reads are already protected by priority,
+		// not by holding back a reserved share of the budget, so give
+		// read-ahead the full streaming budget.
+		limit = streamingBudget
 		if limit < minReadAheadParallelism {
 			limit = minReadAheadParallelism
 		}
