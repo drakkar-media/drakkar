@@ -387,6 +387,11 @@ func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, 
 		}
 		if len(spans) > 0 {
 			entry.spans = spans
+			// verifyLastSpanBoundary (inside loadStoredRarSpans) may have
+			// shrunk the last span against a live measurement -- entry.size
+			// must match exactly, or validateStoredRarSpans rejects every
+			// read against this cached entry as a layout mismatch.
+			entry.size = spanFileSize(spans)
 		}
 	}
 	if len(entry.spans) == 0 && (entry.readerKind == "direct_nzb" || entry.readerKind == "stored_rar") {
@@ -403,7 +408,83 @@ func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, 
 	return &entry, nil
 }
 
+// loadStoredRarSpans returns the span table for a stored_rar virtual file,
+// verified against a live measurement of the last span's real decoded
+// boundary before returning. Unlike direct_nzb, stored_rar spans are
+// computed once at import time and cached in db.vfCache indefinitely with no
+// background recalibration path -- if the calibrated
+// decoded_segment_size/last_decoded_size estimate for that one segment is
+// wrong (confirmed live: this happens almost exclusively to the last segment
+// of the last volume), every future open of this file would report a
+// Content-Length computed from the wrong total before any read ever has a
+// chance to self-correct, which is exactly why a real player's tail probe
+// (reading near true EOF, where MP4 moov / MKV cues live) kept failing even
+// after StoredRarReader gained the ability to self-heal mid-read.
 func (db *DB) loadStoredRarSpans(ctx context.Context, virtualFileID int64) ([]stream.SegmentSpan, error) {
+	spans, err := db.loadStoredRarSpansUncorrected(ctx, virtualFileID)
+	if err != nil || len(spans) == 0 {
+		return spans, err
+	}
+	return db.verifyLastSpanBoundary(ctx, spans), nil
+}
+
+// rangeInfoFetcher is the info-aware fetch capability needed to learn a
+// segment's real decoded boundaries rather than trusting the calibrated
+// estimate. Matches the interface internal/nntp.SegmentFetcher already
+// satisfies.
+type rangeInfoFetcher interface {
+	FetchRangeInfo(ctx context.Context, segment stream.SegmentRange) ([]byte, stream.SegmentSpan, error)
+}
+
+// verifyLastSpanBoundary probes the final byte of the last span via a live
+// fetch and shrinks that span (and the effective total) if the segment's
+// real decoded content falls short of the estimate. The probe is cheap: it
+// asks for exactly one byte, and the underlying fetch is very likely already
+// disk/memory-cached from import-time archive inspection or an earlier read.
+// Never grows a span -- only ever corrects the confirmed failure direction
+// (an over-estimate), matching the same conservative rule
+// StoredRarReader.realignSpan applies during a read.
+func (db *DB) verifyLastSpanBoundary(ctx context.Context, spans []stream.SegmentSpan) []stream.SegmentSpan {
+	aware, ok := db.SegmentFetcher.(rangeInfoFetcher)
+	if !ok {
+		return spans
+	}
+	last := len(spans) - 1
+	span := spans[last]
+	length := span.End - span.Start
+	if length <= 0 {
+		return spans
+	}
+	probeOffset := span.SegmentByteStart + (length - 1)
+	req := stream.SegmentRange{
+		SegmentID:    span.SegmentID,
+		MessageID:    span.MessageID,
+		RangeStart:   span.DecodedStart + probeOffset,
+		RangeEnd:     span.DecodedStart + probeOffset + 1,
+		SegmentStart: span.DecodedStart,
+		SegmentEnd:   span.DecodedStart + span.SegmentByteStart + length,
+	}
+	_, actual, err := aware.FetchRangeInfo(ctx, req)
+	if err != nil || actual.MessageID == "" {
+		return spans
+	}
+	available := actual.End - actual.Start - span.SegmentByteStart
+	if available < 0 {
+		available = 0
+	}
+	if available >= length {
+		return spans
+	}
+	corrected := make([]stream.SegmentSpan, len(spans))
+	copy(corrected, spans)
+	corrected[last].DecodedStart = actual.Start
+	corrected[last].End = span.Start + available
+	slog.Info("stored_rar: corrected last segment estimate on load",
+		"messageID", span.MessageID, "estimated_length", length, "actual_available", available)
+	return corrected
+}
+
+func (db *DB) loadStoredRarSpansUncorrected(ctx context.Context, virtualFileID int64) ([]stream.SegmentSpan, error) {
 	var (
 		selectedReleaseID  int64
 		virtualFileSize    int64

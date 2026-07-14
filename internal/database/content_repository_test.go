@@ -1,6 +1,86 @@
 package database
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	"github.com/drakkar-media/drakkar/internal/stream"
+)
+
+type rangeInfoFetcherStub struct {
+	actual stream.SegmentSpan
+	err    error
+}
+
+func (f rangeInfoFetcherStub) FetchRange(ctx context.Context, segment stream.SegmentRange) ([]byte, error) {
+	return nil, nil
+}
+
+func (f rangeInfoFetcherStub) FetchRangeInfo(ctx context.Context, segment stream.SegmentRange) ([]byte, stream.SegmentSpan, error) {
+	return nil, f.actual, f.err
+}
+
+// TestVerifyLastSpanBoundaryShrinksOverestimatedSegment guards the fix for
+// stored_rar files where a Content-Length computed before any read ever
+// happens (the very first thing a fresh HTTP request or Plex's media
+// analyzer does) reflected an over-estimated last-segment size -- confirmed
+// live to make every player probe near true EOF (where MP4 moov / MKV cues
+// live) fail, even though StoredRarReader's mid-read self-heal (a separate
+// fix) worked fine for a read already in progress. This must correct the
+// cached span BEFORE any reader is constructed, not just during one.
+func TestVerifyLastSpanBoundaryShrinksOverestimatedSegment(t *testing.T) {
+	db := &DB{SegmentFetcher: rangeInfoFetcherStub{
+		actual: stream.SegmentSpan{SegmentID: 2, MessageID: "<seg2>", Start: 10, End: 18},
+	}}
+	spans := []stream.SegmentSpan{
+		{SegmentID: 1, MessageID: "<seg1>", Start: 0, End: 10, DecodedStart: 0, SegmentByteStart: 0},
+		{SegmentID: 2, MessageID: "<seg2>", Start: 10, End: 19, DecodedStart: 10, SegmentByteStart: 0},
+	}
+	corrected := db.verifyLastSpanBoundary(context.Background(), spans)
+	if len(corrected) != 2 {
+		t.Fatalf("expected 2 spans, got %d", len(corrected))
+	}
+	if corrected[1].End != 18 {
+		t.Fatalf("expected last span End corrected to 18, got %d", corrected[1].End)
+	}
+	if corrected[0] != spans[0] {
+		t.Fatalf("expected first span untouched, got %+v", corrected[0])
+	}
+	// The original slice must not be mutated in place -- callers may still
+	// hold a reference to the pre-correction spans elsewhere.
+	if spans[1].End != 19 {
+		t.Fatalf("expected original spans slice left untouched, got %+v", spans[1])
+	}
+}
+
+// TestVerifyLastSpanBoundaryLeavesCorrectEstimateUnchanged guards against a
+// false-positive correction: when the live measurement confirms the
+// estimate was already right, nothing should change.
+func TestVerifyLastSpanBoundaryLeavesCorrectEstimateUnchanged(t *testing.T) {
+	db := &DB{SegmentFetcher: rangeInfoFetcherStub{
+		actual: stream.SegmentSpan{SegmentID: 2, MessageID: "<seg2>", Start: 10, End: 19},
+	}}
+	spans := []stream.SegmentSpan{
+		{SegmentID: 1, MessageID: "<seg1>", Start: 0, End: 10, DecodedStart: 0, SegmentByteStart: 0},
+		{SegmentID: 2, MessageID: "<seg2>", Start: 10, End: 19, DecodedStart: 10, SegmentByteStart: 0},
+	}
+	result := db.verifyLastSpanBoundary(context.Background(), spans)
+	if result[1].End != 19 {
+		t.Fatalf("expected unchanged End=19, got %d", result[1].End)
+	}
+}
+
+// TestVerifyLastSpanBoundaryFallsBackWithoutFetchCapability guards the case
+// where the configured fetcher doesn't support FetchRangeInfo at all -- must
+// return the input unchanged rather than panicking.
+func TestVerifyLastSpanBoundaryFallsBackWithoutFetchCapability(t *testing.T) {
+	db := &DB{SegmentFetcher: nil}
+	spans := []stream.SegmentSpan{{SegmentID: 1, Start: 0, End: 10}}
+	result := db.verifyLastSpanBoundary(context.Background(), spans)
+	if result[0].End != 10 {
+		t.Fatalf("expected unchanged spans, got %+v", result)
+	}
+}
 
 func TestBuildStoredRarSpansAcrossVolumes(t *testing.T) {
 	sources := map[string]storedRarNZBSource{
