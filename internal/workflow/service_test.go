@@ -1834,6 +1834,39 @@ func TestShouldDispatchSelectedTargetImmediatelyDispatchesRequestedSelection(t *
 	}
 }
 
+// TestShouldDispatchSelectedTargetBlocksRecentlyDispatchedSelectedFallback
+// guards the account-risk production fix: a candidate left in QueueSelected
+// (mid-fallback, after promoteNextAfterFailureDepth defers the rest of the
+// chain to a later pass) previously bypassed the cooldown entirely, so the
+// 30-second pending-dispatch loop re-submitted an actual NZB download for
+// the same release on every tick. An indexer flagged this live as repeated
+// duplicate downloads of the same NZB files with an account termination
+// warning. The cooldown must apply regardless of state.
+func TestShouldDispatchSelectedTargetBlocksRecentlyDispatchedSelectedFallback(t *testing.T) {
+	now := time.Now()
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
+	rawURL := "http://example/release.nzb"
+	service.markSelectedReleaseURLDispatched(rawURL, now.Add(-selectedURLCooldown+time.Minute))
+	target := database.PendingLibrarySearchTarget{
+		LibraryItemID:     42,
+		SelectedReleaseID: 303,
+		ExternalURL:       rawURL,
+		State:             database.QueueSelected,
+		UpdatedAt:         now,
+	}
+	if service.shouldDispatchSelectedTarget(target, now) {
+		t.Fatal("expected a recently-dispatched URL to stay in cooldown even in QueueSelected state")
+	}
+	// Once the cooldown window has genuinely elapsed, dispatch must resume.
+	past := now.Add(-selectedURLCooldown - time.Minute)
+	service.recentURLMu.Lock()
+	service.recentURLHits[rawURL] = past
+	service.recentURLMu.Unlock()
+	if !service.shouldDispatchSelectedTarget(target, now) {
+		t.Fatal("expected dispatch to resume once the cooldown window elapsed")
+	}
+}
+
 func TestShouldDispatchSelectedTargetBlocksRecentlyDispatchedSameURL(t *testing.T) {
 	now := time.Now()
 	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})

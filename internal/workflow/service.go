@@ -1181,9 +1181,20 @@ func (s *Service) shouldDispatchSelectedTarget(target database.PendingLibrarySea
 	if target.SelectedReleaseID <= 0 {
 		return false
 	}
-	if target.State != database.QueueRequested {
-		return true
-	}
+	// The cooldown below used to be skipped entirely for any state other
+	// than QueueRequested -- meaning an item left in QueueSelected (exactly
+	// where a candidate sits mid-fallback, after promoteNextAfterFailureDepth
+	// hits its inline retry depth and defers the rest "to a later queue
+	// pass") got NO cooldown at all. Since this function is invoked by the
+	// pending-dispatch loop every 30s (and immediately again on every
+	// DispatchWakeCh signal, app.go's runPendingDispatch), that resubmitted
+	// an actual NZB download for the same release on every tick. Confirmed
+	// live: this is what an indexer (NZB Finder) flagged as repeated
+	// duplicate downloads of the same NZB files, with an account
+	// termination warning -- one release's candidates were re-fetched
+	// roughly every 60 seconds until the fallback chain exhausted. The
+	// cooldown is keyed purely on target.ExternalURL, which is meaningful
+	// regardless of state, so it must apply uniformly.
 	rawURL := strings.TrimSpace(target.ExternalURL)
 	if rawURL != "" && s != nil {
 		s.recentURLMu.Lock()
