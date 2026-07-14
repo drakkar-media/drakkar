@@ -441,6 +441,50 @@ func TestAggregateRARVolumeEntriesCorrectsImpossibleStoreMethodSize(t *testing.T
 	}
 }
 
+// TestAggregateRARVolumeEntriesRaisesUndercountedStoreMethodSize guards
+// against a real production bug found on "Lost S01E01" (8-volume store-method
+// RAR): the header-declared SizeBytes (707874886) was 127 bytes *smaller*
+// than the real, per-volume-calibrated PackedSizeBytes (707875013) -- the
+// opposite direction from the "impossibly larger" Transformers case above.
+// Since store method still guarantees packed == unpacked here, the fix must
+// correct in both directions, not just clamp an oversized declared value
+// down. Uncorrected, virtual_files.size_bytes was 127 bytes too small,
+// so every stream of this file had its last 127 bytes of real video
+// truncated by Content-Length.
+func TestAggregateRARVolumeEntriesRaisesUndercountedStoreMethodSize(t *testing.T) {
+	const declaredSize = 707874886 // header UnpackSize, identical on every volume
+	entries := []ImportedArchiveEntry{
+		{Path: "Lost.S01E01.mkv", SizeBytes: declaredSize, PackedSizeBytes: 92274577, CompressionMethod: "m0", VolumeIndex: 0, ArchiveOffset: 111},
+	}
+	volumeSizes := map[int]int64{0: 111 + 92274577}
+	for i := 1; i <= 6; i++ {
+		entries = append(entries, ImportedArchiveEntry{
+			Path: "Lost.S01E01.mkv", SizeBytes: declaredSize, PackedSizeBytes: 92274449, CompressionMethod: "m0", VolumeIndex: i, ArchiveOffset: 112,
+		})
+		volumeSizes[i] = 112 + 92274449
+	}
+	entries = append(entries, ImportedArchiveEntry{
+		Path: "Lost.S01E01.mkv", SizeBytes: declaredSize, PackedSizeBytes: 61953742, CompressionMethod: "m0", VolumeIndex: 7, ArchiveOffset: 112,
+	})
+	volumeSizes[7] = 112 + 61953742
+
+	aggregated, err := aggregateRARVolumeEntries(entries, volumeSizes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aggregated) != 1 {
+		t.Fatalf("expected 1 entry, got %+v", aggregated)
+	}
+	entry := aggregated[0]
+	const realTotal = 707875013
+	if entry.PackedSizeBytes != realTotal {
+		t.Fatalf("expected packed size %d (real accumulated total), got %+v", realTotal, entry)
+	}
+	if entry.SizeBytes != realTotal {
+		t.Fatalf("expected undercounted declared size raised to the real accumulated total %d, got %+v", realTotal, entry)
+	}
+}
+
 func TestHasCompleteArchiveMapping(t *testing.T) {
 	if !hasCompleteArchiveMapping(ImportedArchiveEntry{
 		PackedSizeBytes: 120,

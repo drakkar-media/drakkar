@@ -473,12 +473,19 @@ func aggregateRARVolumeEntries(parts []ImportedArchiveEntry, volumeSizes map[int
 				entry.PackedSizeBytes = entry.SizeBytes
 				last := &entry.Ranges[len(entry.Ranges)-1]
 				last.LengthBytes += entry.SizeBytes - entryOffset
-			} else if entry.CompressionMethod == "m0" && entry.SizeBytes > entry.PackedSizeBytes {
+			} else if entry.CompressionMethod == "m0" {
 				// Store method guarantees packed == unpacked. entry.PackedSizeBytes
 				// was just accumulated from every volume's own real, capacity-clamped
-				// contribution, so it's trustworthy even when the header-declared
-				// SizeBytes is wildly larger (a corrupt upstream unpacked-size field --
-				// confirmed byte-for-byte on a live sample, see reconcileStoreMethodSize).
+				// contribution (each volume individually calibrated against live
+				// segment data), so it's trustworthy over the header-declared
+				// SizeBytes whenever they disagree by more than trivial rounding --
+				// whether the header value is impossibly larger (a corrupt
+				// unpacked-size field, confirmed on Transformers: Rise of the
+				// Beasts -- see reconcileStoreMethodSize) or slightly smaller (an
+				// undercounted declared size, confirmed on Lost S01E01, where the
+				// live-calibrated segment sizes summed 127 bytes above the
+				// declared value and every stream serving that file's Content-
+				// Length was truncating the last 127 bytes of real content).
 				entry.SizeBytes = entry.PackedSizeBytes
 			}
 		}
