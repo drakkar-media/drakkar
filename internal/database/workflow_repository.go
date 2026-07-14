@@ -1108,6 +1108,9 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 		}
 	}()
 
+	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
+		return nil, err
+	}
 	if _, err = tx.ExecContext(ctx, `
 		update queue_items
 		set state = $2, failure_reason = '', updated_at = now()
@@ -1241,6 +1244,10 @@ func (db *DB) PromoteExistingCandidate(ctx context.Context, libraryItemID int64)
 			_ = tx.Rollback()
 		}
 	}()
+
+	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
+		return nil, err
+	}
 
 	var (
 		releaseCandidateID int64
@@ -1503,6 +1510,9 @@ func (db *DB) GetLatestSelectedReleaseSummaryByLibraryItem(ctx context.Context, 
 	}
 	item, err := db.GetSelectedReleaseSummary(ctx, selectedReleaseID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	return &item, nil
@@ -1548,6 +1558,28 @@ type activatedCandidateInfo struct {
 	postedAt    time.Time
 }
 
+// lockLibraryItemQueueRow takes an exclusive row lock on this library item's
+// queue_items row (unique on library_item_id since migration 000044) for the
+// remainder of the caller's transaction. selected_releases has no unique
+// constraint on library_item_id, so "at most one active selection per item"
+// has only ever been a convention every selection function follows by
+// deleting-then-inserting -- not something the schema enforces. Without a
+// lock, two concurrent selection calls for the same item (e.g. a manual
+// retry racing the scheduled queue_housekeeping retry pass) each see zero
+// existing rows before either commits, so both insert, leaving two live
+// selected_releases rows for the same candidate -- confirmed live across
+// 3,741 library items. Call this first, before any read that decides which
+// candidate to activate, in every function that deletes or inserts
+// selected_releases rows for a library item.
+func lockLibraryItemQueueRow(ctx context.Context, tx *sql.Tx, libraryItemID int64) error {
+	var id int64
+	err := tx.QueryRowContext(ctx, `select id from queue_items where library_item_id = $1 for update`, libraryItemID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	return err
+}
+
 // activateReleaseCandidate runs the transaction steps shared by
 // SelectReleaseCandidate (manual pick) and promoteRetryCandidate (automatic
 // retry promotion): clear the item's current selection, activate the given
@@ -1557,6 +1589,9 @@ type activatedCandidateInfo struct {
 // release's signature, so a user-selected release is never immediately
 // re-blocked by its own past rejection.
 func activateReleaseCandidate(ctx context.Context, tx *sql.Tx, libraryItemID, releaseCandidateID int64, info *activatedCandidateInfo) (int64, error) {
+	if err := lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
+		return 0, err
+	}
 	if err := preDeleteVFRByLibraryItem(ctx, tx, libraryItemID); err != nil {
 		return 0, err
 	}
@@ -1646,6 +1681,12 @@ func (db *DB) SelectReleaseCandidate(ctx context.Context, releaseCandidateID int
 	}
 	item, err := db.GetSelectedReleaseSummary(ctx, selectedReleaseID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// A concurrent selection replaced this row between our lookup
+			// above and this read — treat as "nothing to report" rather
+			// than surfacing a raw not-found error.
+			return nil, nil
+		}
 		return nil, err
 	}
 	return &item, nil
@@ -1707,6 +1748,12 @@ func (db *DB) promoteRetryCandidate(ctx context.Context, libraryItemID int64, ex
 
 	item, err := db.GetSelectedReleaseSummary(ctx, selectedReleaseID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// A concurrent selection replaced this row between our lookup
+			// above and this read — treat as "nothing to report" rather
+			// than surfacing a raw not-found error.
+			return nil, nil
+		}
 		return nil, err
 	}
 	return &item, nil
@@ -1736,6 +1783,9 @@ func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int
 		from release_candidates
 		where id = $1`, releaseCandidateID,
 	).Scan(&libraryItemID, &title, &externalURL, &indexerName, &sizeBytes, &postedAt); err != nil {
+		return nil, err
+	}
+	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
 		return nil, err
 	}
 
@@ -1825,6 +1875,12 @@ func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int
 	}
 	item, err := db.GetSelectedReleaseSummary(ctx, selectedReleaseID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// A concurrent selection replaced this row between our lookup
+			// above and this read — treat as "nothing to report" rather
+			// than surfacing a raw not-found error.
+			return nil, nil
+		}
 		return nil, err
 	}
 	return &item, nil
@@ -2014,6 +2070,9 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		}
 		return nil, fmt.Errorf("fail/select-sr (sr=%d): %w", selectedReleaseID, err)
 	}
+	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
+		return nil, fmt.Errorf("fail/lock-queue-item (li=%d): %w", libraryItemID, err)
+	}
 
 	hardReject := isHardRejectReason(reason)
 	if _, err = tx.ExecContext(ctx, `
@@ -2185,6 +2244,12 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 
 	next, err := db.GetSelectedReleaseSummary(ctx, nextSelectedReleaseID)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// A concurrent selection replaced this row between our insert
+			// above and this read — treat as "nothing to report" rather
+			// than surfacing a raw not-found error.
+			return nil, nil
+		}
 		return nil, err
 	}
 	return &next, nil
