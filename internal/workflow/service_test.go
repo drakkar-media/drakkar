@@ -930,6 +930,46 @@ func TestFilterToPacksOnlyDropsRepackSingleEpisode(t *testing.T) {
 	}
 }
 
+// TestMergeSearchCandidatesCollapsesSameIndexerSameTitleDifferentURL guards
+// against a real production bug: NZB Finder sent a warning threatening account
+// termination after repeated duplicate downloads of the same releases. Root
+// cause was that the same indexer can mint a fresh external_url/GUID for the
+// same underlying release across different search tiers within one search
+// pass (e.g. a tier1 ID search and a tier2 title search both matching the
+// same posting). Keying merge dedup purely on ExternalURL let that "same"
+// release survive into release_candidates as multiple distinct rows, and
+// FailSelectedReleaseAndPromoteNext's fallback chain cycled between them on
+// failure, re-fetching the identical NZB under a different URL every time.
+func TestMergeSearchCandidatesCollapsesSameIndexerSameTitleDifferentURL(t *testing.T) {
+	tier1 := []database.SearchCandidateRecord{
+		{Title: "NCIS.Los.Angeles.S09E02.Peruanische.Blueten.GERMAN.DUBBED.WebHDRiP.x264-SOF", ExternalURL: "http://hydra/getnzb/api/111", IndexerName: "NZB Finder", SizeBytes: 1_000_000_000, Score: 50},
+	}
+	tier2 := []database.SearchCandidateRecord{
+		{Title: "NCIS.Los.Angeles.S09E02.Peruanische.Blueten.GERMAN.DUBBED.WebHDRiP.x264-SOF", ExternalURL: "http://hydra/getnzb/api/222", IndexerName: "NZB Finder", SizeBytes: 1_000_000_000, Score: 50},
+	}
+	merged := mergeSearchCandidates(tier1, tier2)
+	if len(merged) != 1 {
+		t.Fatalf("expected the two same-indexer, same-title hits to collapse into 1 candidate, got %d: %+v", len(merged), merged)
+	}
+}
+
+// TestMergeSearchCandidatesKeepsSameTitleFromDifferentIndexers preserves the
+// documented, intentional behavior: the same release reported by two
+// different indexers stays as two separate candidates so the fallback chain
+// can still try every available source.
+func TestMergeSearchCandidatesKeepsSameTitleFromDifferentIndexers(t *testing.T) {
+	existing := []database.SearchCandidateRecord{
+		{Title: "Show.S01E01.1080p.WEB-DL", ExternalURL: "http://hydra/a", IndexerName: "NZBGeek", SizeBytes: 1_000_000_000, Score: 50},
+	}
+	incoming := []database.SearchCandidateRecord{
+		{Title: "Show.S01E01.1080p.WEB-DL", ExternalURL: "http://hydra/b", IndexerName: "NZB Finder", SizeBytes: 1_000_000_000, Score: 50},
+	}
+	merged := mergeSearchCandidates(existing, incoming)
+	if len(merged) != 2 {
+		t.Fatalf("expected the two different-indexer hits to stay separate, got %d: %+v", len(merged), merged)
+	}
+}
+
 func TestSearchLibraryPenalizesPreviouslyFailedCandidateAcrossRefresh(t *testing.T) {
 	repo := &repoStub{
 		searchInput: database.LibrarySearchInput{

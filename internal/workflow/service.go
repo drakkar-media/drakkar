@@ -2790,31 +2790,59 @@ func searchRequirements(input database.LibrarySearchInput) ranking.Requirements 
 	return required
 }
 
+// mergeSearchCandidates merges an incoming batch of candidates into an
+// existing set, grouping by (indexer, normalized title) and then by
+// close size within each group -- the same signature dedupeSearchResults
+// uses for a single Hydra response. This has to hold across tiers too:
+// an indexer can mint a fresh external_url/GUID for the same underlying
+// release each time it's queried (e.g. a tier1 ID search and a tier2
+// title search both matching one posting), so keying purely on
+// ExternalURL lets the "same" release survive into release_candidates as
+// multiple rows. FailSelectedReleaseAndPromoteNext's fallback chain then
+// cycles between those rows on failure, re-fetching the identical NZB
+// under a different URL each time -- indistinguishable from a real
+// duplicate download to the indexer, and exactly what tripped the
+// NZB Finder abuse warning.
 func mergeSearchCandidates(existing, incoming []database.SearchCandidateRecord) []database.SearchCandidateRecord {
-	merged := make(map[string]database.SearchCandidateRecord, len(existing)+len(incoming))
-	order := make([]string, 0, len(existing)+len(incoming))
-	for _, candidate := range existing {
-		key := candidateIdentity(candidate)
-		if _, ok := merged[key]; !ok {
-			order = append(order, key)
+	type groupKey struct {
+		title   string
+		indexer string
+	}
+	type group struct {
+		key   groupKey
+		items []database.SearchCandidateRecord
+	}
+	groups := make(map[groupKey]*group, len(existing)+len(incoming))
+	order := make([]*group, 0, len(existing)+len(incoming))
+
+	add := func(candidate database.SearchCandidateRecord) {
+		key := groupKey{normReleaseTitle(candidate.Title), strings.ToLower(strings.TrimSpace(candidate.IndexerName))}
+		g, ok := groups[key]
+		if !ok {
+			g = &group{key: key}
+			groups[key] = g
+			order = append(order, g)
 		}
-		merged[key] = candidate
+		for i := range g.items {
+			if sizesClose(candidate.SizeBytes, g.items[i].SizeBytes) {
+				if betterSearchCandidate(candidate, g.items[i]) {
+					g.items[i] = candidate
+				}
+				return
+			}
+		}
+		g.items = append(g.items, candidate)
+	}
+	for _, candidate := range existing {
+		add(candidate)
 	}
 	for _, candidate := range incoming {
-		key := candidateIdentity(candidate)
-		current, ok := merged[key]
-		if !ok {
-			order = append(order, key)
-			merged[key] = candidate
-			continue
-		}
-		if betterSearchCandidate(candidate, current) {
-			merged[key] = candidate
-		}
+		add(candidate)
 	}
-	out := make([]database.SearchCandidateRecord, 0, len(order))
-	for _, key := range order {
-		out = append(out, merged[key])
+
+	out := make([]database.SearchCandidateRecord, 0, len(existing)+len(incoming))
+	for _, g := range order {
+		out = append(out, g.items...)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Rejected != out[j].Rejected {
@@ -2829,13 +2857,6 @@ func mergeSearchCandidates(existing, incoming []database.SearchCandidateRecord) 
 		return out[i].PostedAt.After(out[j].PostedAt)
 	})
 	return out
-}
-
-func candidateIdentity(candidate database.SearchCandidateRecord) string {
-	if strings.TrimSpace(candidate.ExternalURL) != "" {
-		return "url:" + strings.TrimSpace(candidate.ExternalURL)
-	}
-	return "title:" + strings.ToLower(strings.TrimSpace(candidate.Title))
 }
 
 func betterSearchCandidate(left, right database.SearchCandidateRecord) bool {
