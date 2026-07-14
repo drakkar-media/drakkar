@@ -26,6 +26,61 @@ func (f fetcherStub) FetchRange(ctx context.Context, segment stream.SegmentRange
 	return append([]byte(nil), f.data[segment.RangeStart:segment.RangeEnd]...), nil
 }
 
+// TestReconcileStoreMethodSizeCorrectsImpossibleValue guards the fix for a
+// confirmed real-world case: a multi-volume store-method (m0) RAR5 archive
+// whose own header declared an unpacked size ~2.84x larger than the true
+// total (verified byte-for-byte to be a genuine upstream packer defect, not
+// a drakkar parsing bug). Since store method makes packed == unpacked a
+// mathematical certainty, and content can never exceed what was actually
+// posted across every volume, the declared size must be clamped to that
+// hard ceiling.
+func TestReconcileStoreMethodSizeCorrectsImpossibleValue(t *testing.T) {
+	e := ImportedArchiveEntry{
+		CompressionMethod: "m0",
+		SizeBytes:         11_042_169_794,
+		PackedSizeBytes:   209_714_896, // volume 1's own local header-parsed size
+	}
+	reconcileStoreMethodSize(&e, 3_892_423_326) // real total posted across all volumes
+	if e.SizeBytes != 3_892_423_326 {
+		t.Fatalf("expected SizeBytes clamped to the real total, got %d", e.SizeBytes)
+	}
+	if e.PackedSizeBytes != e.SizeBytes {
+		t.Fatalf("expected PackedSizeBytes to match the corrected SizeBytes, got %d", e.PackedSizeBytes)
+	}
+}
+
+// TestReconcileStoreMethodSizeLeavesPlausibleValueUnchanged guards against a
+// false-positive correction: a normal, small disagreement (RAR header
+// overhead subtracted from the total) must not get clobbered.
+func TestReconcileStoreMethodSizeLeavesPlausibleValueUnchanged(t *testing.T) {
+	e := ImportedArchiveEntry{
+		CompressionMethod: "m0",
+		SizeBytes:         4_690_284_791,
+		PackedSizeBytes:   52_223_884, // volume 1's own local size, legitimately smaller
+	}
+	reconcileStoreMethodSize(&e, 4_690_352_514) // real total, comfortably larger than SizeBytes
+	if e.SizeBytes != 4_690_284_791 {
+		t.Fatalf("expected plausible SizeBytes left unchanged, got %d", e.SizeBytes)
+	}
+	if e.PackedSizeBytes != e.SizeBytes {
+		t.Fatalf("expected PackedSizeBytes to adopt SizeBytes under store method, got %d", e.PackedSizeBytes)
+	}
+}
+
+// TestReconcileStoreMethodSizeIgnoresNonStoreMethod guards against touching
+// compressed archives, where packed != unpacked is expected and correct.
+func TestReconcileStoreMethodSizeIgnoresNonStoreMethod(t *testing.T) {
+	e := ImportedArchiveEntry{
+		CompressionMethod: "m3",
+		SizeBytes:         1_000_000_000,
+		PackedSizeBytes:   500_000_000,
+	}
+	reconcileStoreMethodSize(&e, 600_000_000)
+	if e.SizeBytes != 1_000_000_000 || e.PackedSizeBytes != 500_000_000 {
+		t.Fatalf("expected non-store-method entry untouched, got %+v", e)
+	}
+}
+
 func TestInspectImportedArchivesStoredRAR(t *testing.T) {
 	raw := buildRAR4(false, false, 0x30, "Movie.mkv", 1024)
 	files := []ImportedNZBFile{{

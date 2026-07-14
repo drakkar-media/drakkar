@@ -97,6 +97,34 @@ func inspectArchive(ctx context.Context, archive *ImportedArchive, fileByName ma
 	}
 }
 
+// reconcileStoreMethodSize corrects an entry's declared unpacked size
+// (SizeBytes, parsed straight from the uploader's own RAR header) when it
+// exceeds totalVolumeBytes -- the total bytes actually posted across every
+// volume of the archive, which already includes each volume's own RAR
+// header/footer overhead, so real embedded-file content is always strictly
+// less than it. For store method (m0, no compression), packed and unpacked
+// are mathematically identical, so PackedSizeBytes is set to match
+// afterward -- this is what assignArchiveRanges walks to build byte ranges,
+// and SizeBytes is virtual_files.size_bytes, the promised content length
+// used everywhere downstream.
+//
+// Confirmed live and verified byte-for-byte against a raw RAR5 header: one
+// real-world upload had a genuinely corrupt UnpackSize field in its own
+// header, encoding a value ~2.84x larger than the true total -- not a
+// drakkar parsing bug, an upstream packer defect. totalVolumeBytes is a hard
+// mathematical ceiling for a well-formed store-method archive, so comparing
+// against it catches that class of corruption without an arbitrary
+// magic-number threshold.
+func reconcileStoreMethodSize(e *ImportedArchiveEntry, totalVolumeBytes int64) {
+	if e.CompressionMethod != "m0" || e.SizeBytes == e.PackedSizeBytes {
+		return
+	}
+	if totalVolumeBytes > 0 && e.SizeBytes > totalVolumeBytes {
+		e.SizeBytes = totalVolumeBytes
+	}
+	e.PackedSizeBytes = e.SizeBytes
+}
+
 func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName map[string]ImportedNZBFile, fetcher stream.SegmentFetcher) error {
 	first, ok := fileByName[archive.Volumes[0].Path]
 	if !ok {
@@ -120,18 +148,12 @@ func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName
 	// where continuation parts may not expose standalone file headers.
 	volumeDataOffsets := fetchContinuationOffsets(ctx, archive.Volumes[1:], fileByName, fetcher)
 	if len(archive.Volumes) > 1 {
+		var totalVolumeBytes int64
+		for _, sz := range volumeSizes {
+			totalVolumeBytes += sz
+		}
 		for i := range entries {
-			e := &entries[i]
-			// Store method (m0) means packed and unpacked are the same bytes —
-			// assignArchiveRanges below walks PackedSizeBytes to build ranges,
-			// and virtual_files.size_bytes (the promised content length used
-			// everywhere downstream) is SizeBytes. When a header-parsed
-			// PackedSizeBytes disagrees with SizeBytes under store, trust
-			// SizeBytes so the walked ranges don't overshoot (or undershoot)
-			// the real content boundary and fail stored_rar layout validation.
-			if e.CompressionMethod == "m0" && e.SizeBytes != e.PackedSizeBytes {
-				e.PackedSizeBytes = e.SizeBytes
-			}
+			reconcileStoreMethodSize(&entries[i], totalVolumeBytes)
 		}
 	}
 	legacyEntries := make([]ImportedArchiveEntry, len(entries))
