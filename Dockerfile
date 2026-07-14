@@ -26,8 +26,12 @@ ENV CGO_ENABLED=1
 RUN go build -tags rapidyenc -o /out/drakkar ./cmd/drakkar
 
 FROM debian:bookworm-slim
+# wget is used by the container healthcheck (docker-compose.yml) -- alpine's
+# base image included it implicitly (busybox), debian-slim does not, so the
+# healthcheck silently failed every 15s ("wget: not found", exit 1) from the
+# moment this image switched to Debian, unrelated to actual app health.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates fuse3 par2 p7zip-full tzdata libstdc++6 \
+    ca-certificates fuse3 par2 p7zip-full tzdata libstdc++6 wget \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /out/drakkar /app/drakkar
