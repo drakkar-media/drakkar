@@ -2707,3 +2707,28 @@ func TestForceSearchBypassesDedupCooldown(t *testing.T) {
 func hydraSearchRequestForTest() hydra.SearchRequest {
 	return hydra.SearchRequest{MediaType: "movie", Query: "Test Movie", TMDBID: 123}
 }
+
+// TestParseCandidateDetectsSDResolutions guards a real production incident: the
+// automated search path's resolution detection only recognized "2160p",
+// "1080p", "720p" tokens (unlike the manual-import path, which also checks
+// "576p"/"480p"), so an SD release's Candidate.Resolution came out blank.
+// Combined with a since-fixed ranking bug where a blank resolution skipped the
+// profile's allow-list entirely, this let an SD DVD rip get selected under a
+// profile locked to HD resolutions only.
+func TestParseCandidateDetectsSDResolutions(t *testing.T) {
+	cases := []struct {
+		title string
+		want  string
+	}{
+		{"Movie.Title.2021.480p.WEB-DL-GROUP", "480p"},
+		{"Movie.Title.2021.576p.WEBRip-GROUP", "576p"},
+		{"Movie.Title.2021.720p.WEB-DL-GROUP", "720p"},
+	}
+	for _, tc := range cases {
+		result := hydra.SearchResult{Title: tc.title}
+		candidate := parseCandidate(result, database.CandidateHistory{}, 0, false, nil)
+		if candidate.Resolution != tc.want {
+			t.Fatalf("title=%q: expected resolution %q, got %q", tc.title, tc.want, candidate.Resolution)
+		}
+	}
+}

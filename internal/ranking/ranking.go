@@ -51,16 +51,25 @@ func compilePatterns(patterns []string) []*regexp.Regexp {
 // ── Compiled regexes (Radarr/Sonarr QualityParser.cs patterns) ─────────────
 
 // reStructuredRelease matches release names that have recognizable Usenet
-// release markers (year, resolution, season/episode, streaming source).
-// Titles that match are treated as readable — the title check applies even
-// when TrustSource=true. Titles that don't match (random-looking obfuscated
-// NZB subjects like "bGimprckUaaY.mkv") skip the title check as intended.
+// release markers (year, resolution, season/episode, streaming source, disc
+// rip source). Titles that match are treated as readable — the title check
+// applies even when TrustSource=true. Titles that don't match (random-looking
+// obfuscated NZB subjects like "bGimprckUaaY.mkv") skip the title check as
+// intended.
+//
+// The disc-rip alternation was added after a production incident: a DVD5 rip
+// titled "Troy - The Odyssey dvd 5 dvdrip-EAGLE" had no year/resolution/
+// season/streaming marker, so it was treated as obfuscated and got a free
+// pass on title verification under TrustSource=true (ID-based search) even
+// though its title was perfectly readable and for a wholly different work —
+// it was then selected and symlinked in place of the real requested movie.
 var reStructuredRelease = regexp.MustCompile(
 	`(?i)(?:\b(?:19|20)\d{2}\b` + // year (1900–2099)
 		`|\b\d{3,4}[piP I]\b` + // resolution: 720p, 1080i, 2160p
 		`|\bS\d{1,2}E\d{1,2}\b` + // SxxExx episode marker
 		`|\bS\d{2}\b` + // season pack Sxx
-		`|\b(?:BluRay|WEB-DL|WEBRip|HDTV|AMZN|NF|DSNP|HULU|MAX|PCOK|ATVP|SHO)\b)`) // streaming source
+		`|\b(?:BluRay|WEB-DL|WEBRip|HDTV|AMZN|NF|DSNP|HULU|MAX|PCOK|ATVP|SHO)\b` + // streaming source
+		`|\b(?:DVDRip|DVD5|DVD9|DVDR|BDRip|BRRip)\b)`) // disc-rip source tags
 
 var (
 	// proper/repack — word-boundary aware, matches -PROPER, PROPER., repack2, rerip
@@ -321,7 +330,17 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 	// release despite that penalty -- confirmed in production for a real
 	// show whose selected 4K remux couldn't be streamed reliably even though
 	// a perfectly good 1080p release was available for the same episode.
-	if len(prefs.Resolutions) > 0 && candidate.Resolution != "" {
+	//
+	// The guard used to also require candidate.Resolution != "", so any
+	// release the parser couldn't tag with a resolution (DVD rips, or any
+	// title without a "720p"/"1080p" token) skipped the allow-list entirely
+	// and only took the same -120 penalty -- confirmed in production where a
+	// DVD5 rip with no resolution token got selected under a profile locked
+	// to 720p/1080p only, because every real HD candidate for that movie
+	// failed for unrelated reasons and the undetected-resolution rip was
+	// never actually disqualified. An undetected resolution must now be
+	// rejected outright exactly like a detected-but-unlisted one.
+	if len(prefs.Resolutions) > 0 {
 		allowed := false
 		for _, r := range prefs.Resolutions {
 			if strings.EqualFold(strings.TrimSpace(r), candidate.Resolution) {
@@ -330,7 +349,11 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 			}
 		}
 		if !allowed {
-			return Result{Rejected: true, RejectReason: "resolution_not_allowed", Explanations: []string{fmt.Sprintf("Rejected: resolution %s is not in the profile's allowed resolutions.", candidate.Resolution)}}
+			label := candidate.Resolution
+			if label == "" {
+				label = "undetected"
+			}
+			return Result{Rejected: true, RejectReason: "resolution_not_allowed", Explanations: []string{fmt.Sprintf("Rejected: resolution %s is not in the profile's allowed resolutions.", label)}}
 		}
 	}
 	if sizeReject := rejectBySize(candidate, prefs, required.RuntimeMinutes); sizeReject != "" {
@@ -917,6 +940,16 @@ func containsNormalized(title, required string) bool {
 
 // titlesWordMatch returns true if rWords appear at the beginning of cWords,
 // allowing up to 1 extra prefix word in cWords (e.g. "Marvels" before "Agents").
+// That 1-word tolerance is only safe when either the skipped candidate word is
+// a grammatical article ("The Lost" vs required "Lost") or the remaining
+// contiguous match is long enough (3+ words, e.g. "Marvels Agents of
+// S.H.I.E.L.D." vs "Agents of S.H.I.E.L.D.") that a coincidental collision is
+// implausible. A short, generic required title (1-2 words) tolerating an
+// arbitrary non-article prefix word matches wholly unrelated releases that
+// just happen to share that short tail -- confirmed in production where a
+// required title of "The Odyssey" wrongly matched both "Ocean Odyssey" and
+// "Troy - The Odyssey" (two unrelated titles), and the latter was actually
+// selected and symlinked in place of the real movie.
 func titlesWordMatch(cWords, rWords []string) bool {
 	if len(rWords) == 0 {
 		return true
@@ -924,6 +957,9 @@ func titlesWordMatch(cWords, rWords []string) bool {
 	for offset := 0; offset < 2; offset++ {
 		if offset+len(rWords) > len(cWords) {
 			break
+		}
+		if offset > 0 && len(rWords) < 3 && !isLeadingArticle(cWords[0]) {
+			continue
 		}
 		ok := true
 		for i, rw := range rWords {

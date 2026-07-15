@@ -170,6 +170,25 @@ func TestScoreWithPreferencesAllowsAnyResolutionWhenUnconfigured(t *testing.T) {
 	}
 }
 
+// TestScoreWithPreferencesRejectsUndetectedResolution guards a real production
+// incident: a profile locked to 720p/1080p only still selected a DVD5 rip
+// whose title had no resolution token, because the allow-list guard skipped
+// candidates with an empty Resolution field entirely instead of treating an
+// undetected resolution as not-allowed. Every real HD candidate for that movie
+// failed for unrelated reasons, and the undetected-resolution rip -- never
+// actually disqualified -- ended up selected and symlinked in its place.
+func TestScoreWithPreferencesRejectsUndetectedResolution(t *testing.T) {
+	prefs := Preferences{Resolutions: []string{"1080p", "720p"}}
+	result := ScoreWithPreferences(Candidate{
+		Title:      "Movie.Title.dvd5.dvdrip-GROUP",
+		Resolution: "",
+		Language:   "en",
+	}, Requirements{Title: "Movie Title", MediaType: "movie"}, prefs)
+	if !result.Rejected || result.RejectReason != "resolution_not_allowed" {
+		t.Fatalf("expected resolution_not_allowed rejection for undetected resolution, got %+v", result)
+	}
+}
+
 func TestScoreWithPreferencesRejectsTooLarge(t *testing.T) {
 	// 8 GB candidate; 120-min runtime × 34 MB/min max = 4080 MB limit → too_large.
 	result := ScoreWithPreferences(Candidate{
@@ -391,6 +410,18 @@ func TestTitleMatchRegressions(t *testing.T) {
 		{"lone-star-correct", "9-1-1.Lone.Star.S04E18.1080p.WEB-DL", "9-1-1: Lone Star", true},
 		// TrustSource=true with structured release still applies title check
 		{"trust-source-reno911", "Reno.911.2003.S01E01.720p", "9-1-1", false},
+		// Production incident: a required title of "The Odyssey" wrongly
+		// matched both of these unrelated releases via the 1-word
+		// franchise-prefix tolerance (a non-article prefix word -- "Ocean",
+		// "Troy" -- before a short 1-2 word required title). "Troy - The
+		// Odyssey" was actually selected and symlinked in place of the real
+		// movie.
+		{"ocean-odyssey-vs-odyssey", "Ocean.Odyssey.Lions.of.the.Deep.German.DL.DOKU.1080p.BluRay.x264-TV4A", "The Odyssey", false},
+		{"troy-odyssey-vs-odyssey", "Troy - The Odyssey dvd 5  dvdrip-EAGLE .part04", "The Odyssey", false},
+		// The real movie must still match its own correct release, including
+		// a DVD rip release of it.
+		{"odyssey-correct", "The.Odyssey.2026.1080p.WEB-DL", "The Odyssey", true},
+		{"odyssey-dvdrip-correct", "The.Odyssey.2026.DVDRip.XVID-GROUP", "The Odyssey", true},
 	}
 
 	for _, tc := range cases {

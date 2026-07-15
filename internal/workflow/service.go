@@ -3664,7 +3664,7 @@ func parseCandidate(item hydra.SearchResult, history database.CandidateHistory, 
 	return ranking.Candidate{
 		Title:              item.Title,
 		SizeBytes:          item.SizeBytes,
-		Resolution:         detectOne(titleLower, "2160p", "1080p", "720p"),
+		Resolution:         detectOne(titleLower, "2160p", "1080p", "720p", "576p", "480p"),
 		Source:             detectOne(titleLower, "web-dl", "webrip", "bluray", "remux", "hdtv", "cam", "camrip", "hdcam", "telesync", "telecine", "ts", "tc"),
 		Codec:              detectOne(titleLower, "x265", "h265", "x264", "h264", "av1"),
 		Language:           detectLanguage(titleLower),
