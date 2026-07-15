@@ -422,6 +422,19 @@ func TestTitleMatchRegressions(t *testing.T) {
 		// a DVD rip release of it.
 		{"odyssey-correct", "The.Odyssey.2026.1080p.WEB-DL", "The Odyssey", true},
 		{"odyssey-dvdrip-correct", "The.Odyssey.2026.DVDRip.XVID-GROUP", "The Odyssey", true},
+		// Production incident: a required title of "NCIS" (an exact prefix,
+		// offset 0 -- always allowed) wrongly matched spinoff shows whose
+		// extra title words land right after "NCIS" and before the
+		// season/episode marker. Confirmed live: dozens of "NCIS: New
+		// Orleans" episodes were downloaded twice, once correctly under its
+		// own library item and once wrongly under the base "NCIS" show's
+		// identically-numbered episode.
+		{"ncis-vs-new-orleans", "NCIS.New.Orleans.S02E03.Touched.by.the.Sun.1080p.AMZN.WEB-DL.DDP5.1.x264-NTb", "NCIS", false},
+		{"ncis-vs-los-angeles", "ncis.los.angeles.417.hdtv-lol", "NCIS", false},
+		{"ncis-vs-origins", "NCIS.Origins.S02E04.1080p.10bit.WEBRip.6CH.X265.HEVC-PSA", "NCIS", false},
+		{"911-vs-nashville", "9-1-1-Nashville.2025.S01E11.Don.Begins.1080p.AMZN.Webrip.x265.10bit.EAC3.5.1.English-JBENT-TAoE", "9-1-1", false},
+		// The base show must still match its own correct release.
+		{"ncis-correct", "NCIS.S02E03.Vanished.1080p.WEB-DL", "NCIS", true},
 	}
 
 	for _, tc := range cases {

@@ -938,6 +938,29 @@ func containsNormalized(title, required string) bool {
 	return false
 }
 
+// releaseBoundaryToken matches a token that plausibly starts the "release
+// info" portion of a title (year, season/episode marker, resolution, or a
+// common source/quality/edition tag) as opposed to further title words.
+// Sonarr/Radarr avoid the whole class of bug this guards against by
+// extracting the *entire* candidate title up to this kind of marker and
+// requiring exact (normalized) equality against the target title -- never
+// prefix/substring matching. Our matcher is a lighter-weight token-prefix
+// design without that infrastructure (no scene-mapping/alternate-title DB),
+// so instead of a full rewrite this reuses the same underlying signal: if a
+// required title matches a prefix of the candidate's words, whatever token
+// comes right after that match must look like a release marker, not more
+// plain title words.
+var releaseBoundaryToken = regexp.MustCompile(`(?i)^(?:` +
+	`(?:19|20)\d{2}` + // year
+	`|s\d{1,2}e\d{1,3}` + // SxxExx
+	`|\d{1,2}x\d{2}` + // NxNN
+	`|s\d{2,3}` + // season pack Sxx
+	`|\d{3,4}[pi]` + // resolution
+	`|bluray|blu|web|webdl|webrip|hdtv|dvdrip|dvd5|dvd9|dvdr|bdrip|brrip|remux` +
+	`|amzn|nf|dsnp|hulu|max|pcok|atvp|sho` +
+	`|complete|season|repack\d*|proper|internal|limited|extended|uncut|unrated|hybrid` +
+	`)$`)
+
 // titlesWordMatch returns true if rWords appear at the beginning of cWords,
 // allowing up to 1 extra prefix word in cWords (e.g. "Marvels" before "Agents").
 // That 1-word tolerance is only safe when either the skipped candidate word is
@@ -950,6 +973,21 @@ func containsNormalized(title, required string) bool {
 // required title of "The Odyssey" wrongly matched both "Ocean Odyssey" and
 // "Troy - The Odyssey" (two unrelated titles), and the latter was actually
 // selected and symlinked in place of the real movie.
+//
+// A second, distinct guard checks what follows a match: a required title that
+// is an EXACT prefix of the candidate's words (offset 0, always allowed) also
+// isn't safe on its own when franchise/spinoff titles share a common prefix --
+// confirmed live in production where required title "NCIS" matched release
+// titles for "NCIS: New Orleans" (and the same pattern would hit "NCIS: Los
+// Angeles", "9-1-1" vs "9-1-1: Nashville"/"Lone Star", "FBI" vs "FBI:
+// International"/"Most Wanted", etc., since the spinoff's extra words land
+// right after the matched prefix and before the season/episode marker). This
+// was silently downloading the wrong show's episode whenever season/episode
+// numbers happened to coincide between a base show and any of its spinoffs --
+// NCIS: New Orleans alone had dozens of episodes duplicated this way across
+// two separate library items each. Requiring the token immediately after any
+// matched prefix to be a release marker (not more plain title words) rejects
+// the spinoff without needing a scene-mapping/alternate-title database.
 func titlesWordMatch(cWords, rWords []string) bool {
 	if len(rWords) == 0 {
 		return true
@@ -968,9 +1006,14 @@ func titlesWordMatch(cWords, rWords []string) bool {
 				break
 			}
 		}
-		if ok {
-			return true
+		if !ok {
+			continue
 		}
+		next := offset + len(rWords)
+		if next < len(cWords) && !releaseBoundaryToken.MatchString(cWords[next]) {
+			continue
+		}
+		return true
 	}
 	return false
 }
