@@ -113,10 +113,11 @@ func TestBlocklistReleaseSignatureKey(t *testing.T) {
 }
 
 func TestBlockedReleaseReasonMatchesSignature(t *testing.T) {
+	const scopeKey = "movie:123"
 	blocked := map[string]string{
-		blocklistReleaseSignatureKey("RED.2010.1080p.BluRay.x264-GRP", "NZB Finder", 7340032000, time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)): "manual_reject",
+		scopeKey + "|" + blocklistReleaseSignatureKey("RED.2010.1080p.BluRay.x264-GRP", "NZB Finder", 7340032000, time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)): "manual_reject",
 	}
-	reason, ok := blockedReleaseReason(blocked, SearchCandidateRecord{
+	reason, ok := blockedReleaseReason(scopeKey, blocked, SearchCandidateRecord{
 		Title:       "RED.2010.1080p.BluRay.x264-GRP",
 		IndexerName: "NZB Finder",
 		SizeBytes:   7340032000,
@@ -131,10 +132,11 @@ func TestBlockedReleaseReasonMatchesSignature(t *testing.T) {
 }
 
 func TestBlockedReleaseReasonMatchesFamilyAcrossIndexers(t *testing.T) {
+	const scopeKey = "movie:123"
 	blocked := map[string]string{
-		blocklistReleaseFamilyKey("RED.2010.1080p.BluRay.x264-GRP", 7340032000, time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)): "archive_headers_invalid",
+		scopeKey + "|" + blocklistReleaseFamilyKey("RED.2010.1080p.BluRay.x264-GRP", 7340032000, time.Date(2026, 6, 6, 12, 0, 0, 0, time.UTC)): "archive_headers_invalid",
 	}
-	reason, ok := blockedReleaseReason(blocked, SearchCandidateRecord{
+	reason, ok := blockedReleaseReason(scopeKey, blocked, SearchCandidateRecord{
 		Title:       "RED.2010.1080p.BluRay.x264-GRP",
 		IndexerName: "DrunkenSlug",
 		SizeBytes:   7340032000,
@@ -159,10 +161,11 @@ func TestBlocklistReleasePatternKey(t *testing.T) {
 }
 
 func TestBlockedReleaseReasonMatchesPatternAcrossGroups(t *testing.T) {
+	const scopeKey = "show:45"
 	blocked := map[string]string{
-		blocklistReleasePatternKey("Yellowstone.S04E01.1080p.WEB-DL.x264-BADGRP", 1610612736, time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)): "invalid media payload",
+		scopeKey + "|" + blocklistReleasePatternKey("Yellowstone.S04E01.1080p.WEB-DL.x264-BADGRP", 1610612736, time.Date(2026, 6, 8, 12, 0, 0, 0, time.UTC)): "invalid media payload",
 	}
-	reason, ok := blockedReleaseReason(blocked, SearchCandidateRecord{
+	reason, ok := blockedReleaseReason(scopeKey, blocked, SearchCandidateRecord{
 		Title:       "Yellowstone.S04E01.1080p.WEBRip.x264-OTHERGRP",
 		IndexerName: "DrunkenSlug",
 		SizeBytes:   1610612736,
@@ -173,6 +176,38 @@ func TestBlockedReleaseReasonMatchesPatternAcrossGroups(t *testing.T) {
 	}
 	if reason != "invalid media payload" {
 		t.Fatalf("unexpected reason %q", reason)
+	}
+}
+
+// TestBlockedReleaseReasonScopedPerMediaNotGlobal guards a real production
+// incident: a title-match bug (since fixed) let the base "NCIS" show wrongly
+// select and fail on a "NCIS: New Orleans" release. Before this fix, blocklist
+// keys were pure content signatures with no media scope, so blocklisting that
+// release for the wrong show ("NCIS") would have ALSO permanently blocked the
+// legitimate "NCIS: New Orleans" library item from ever using its own correct
+// release again. Confirmed via Sonarr/Radarr reference source comparison:
+// their BlocklistRepository always filters by SeriesId/MovieId first, so the
+// same physical release blocklisted for one show never blocks a different
+// show. blocklistKeysForRelease/blockedReleaseReason now take a scopeKey
+// (resolved per library item via resolveMediaScopeKey) so the same release
+// blocked under one show's scope key must not match under another's.
+func TestBlockedReleaseReasonScopedPerMediaNotGlobal(t *testing.T) {
+	candidate := SearchCandidateRecord{
+		Title:       "NCIS.New.Orleans.S02E03.Touched.by.the.Sun.1080p.AMZN.WEB-DL.DDP5.1.x264-NTb",
+		ExternalURL: "http://example/getnzb/abc123",
+		IndexerName: "NZB Finder",
+		SizeBytes:   3947154310,
+		PostedAt:    time.Date(2026, 7, 12, 9, 0, 0, 0, time.UTC),
+	}
+	blockedForWrongShow := map[string]string{}
+	for _, key := range blocklistKeysForRelease("show:50", candidate.Title, candidate.ExternalURL, candidate.IndexerName, candidate.SizeBytes, candidate.PostedAt) {
+		blockedForWrongShow[key] = "early preflight: article missing"
+	}
+	if _, ok := blockedReleaseReason("show:50", blockedForWrongShow, candidate); !ok {
+		t.Fatal("expected the release to be blocked under the show it was actually blocklisted for")
+	}
+	if _, ok := blockedReleaseReason("show:12", blockedForWrongShow, candidate); ok {
+		t.Fatal("blocklisting a release under the wrong show's scope must not block the correct show (NCIS: New Orleans, show:12) from using it")
 	}
 }
 

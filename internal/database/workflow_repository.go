@@ -1131,11 +1131,15 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 	if err != nil {
 		return nil, err
 	}
+	scopeKey, err := resolveMediaScopeKey(ctx, tx, libraryItemID)
+	if err != nil {
+		return nil, err
+	}
 
 	var selectedReleaseID *int64
 	selectedAssigned := false
 	for _, candidate := range candidates {
-		if reason, ok := blockedReleaseReason(blocked, candidate); ok {
+		if reason, ok := blockedReleaseReason(scopeKey, blocked, candidate); ok {
 			candidate.Rejected = true
 			if candidate.RejectReason == "" {
 				candidate.RejectReason = reason
@@ -1616,7 +1620,11 @@ func activateReleaseCandidate(ctx context.Context, tx *sql.Tx, libraryItemID, re
 		return 0, err
 	}
 	if info != nil && strings.TrimSpace(info.externalURL) != "" {
-		for _, key := range blocklistKeysForRelease(info.title, info.externalURL, info.indexerName, info.sizeBytes, info.postedAt) {
+		scopeKey, err := resolveMediaScopeKey(ctx, tx, libraryItemID)
+		if err != nil {
+			return 0, err
+		}
+		for _, key := range blocklistKeysForRelease(scopeKey, info.title, info.externalURL, info.indexerName, info.sizeBytes, info.postedAt) {
 			if _, err := tx.ExecContext(ctx, `
 				delete from blocklist_items
 				where key = $1`, key,
@@ -1797,7 +1805,11 @@ func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int
 		return nil, err
 	}
 	if shouldPersistBlocklistReason(reason) && strings.TrimSpace(externalURL) != "" {
-		for _, key := range blocklistKeysForRelease(title, externalURL, indexerName, sizeBytes, postedAt) {
+		var scopeKey string
+		if scopeKey, err = resolveMediaScopeKey(ctx, tx, libraryItemID); err != nil {
+			return nil, err
+		}
+		for _, key := range blocklistKeysForRelease(scopeKey, title, externalURL, indexerName, sizeBytes, postedAt) {
 			if _, err = tx.ExecContext(ctx, `
 				insert into blocklist_items (key, reason)
 				values ($1, $2)
@@ -1898,17 +1910,18 @@ func (db *DB) RestoreReleaseCandidate(ctx context.Context, releaseCandidateID in
 	}()
 
 	var (
-		title       string
-		externalURL string
-		indexerName string
-		sizeBytes   int64
-		postedAt    time.Time
+		libraryItemID int64
+		title         string
+		externalURL   string
+		indexerName   string
+		sizeBytes     int64
+		postedAt      time.Time
 	)
 	if err = tx.QueryRowContext(ctx, `
-		select title, coalesce(external_url, ''), coalesce(indexer_name, ''), coalesce(size_bytes, 0), coalesce(posted_at, to_timestamp(0))
+		select library_item_id, title, coalesce(external_url, ''), coalesce(indexer_name, ''), coalesce(size_bytes, 0), coalesce(posted_at, to_timestamp(0))
 		from release_candidates
 		where id = $1`, releaseCandidateID,
-	).Scan(&title, &externalURL, &indexerName, &sizeBytes, &postedAt); err != nil {
+	).Scan(&libraryItemID, &title, &externalURL, &indexerName, &sizeBytes, &postedAt); err != nil {
 		return err
 	}
 
@@ -1920,7 +1933,11 @@ func (db *DB) RestoreReleaseCandidate(ctx context.Context, releaseCandidateID in
 		return err
 	}
 	if strings.TrimSpace(externalURL) != "" {
-		for _, key := range blocklistKeysForRelease(title, externalURL, indexerName, sizeBytes, postedAt) {
+		var scopeKey string
+		if scopeKey, err = resolveMediaScopeKey(ctx, tx, libraryItemID); err != nil {
+			return err
+		}
+		for _, key := range blocklistKeysForRelease(scopeKey, title, externalURL, indexerName, sizeBytes, postedAt) {
 			if _, err = tx.ExecContext(ctx, `
 				delete from blocklist_items
 				where key = $1`, key,
@@ -1942,6 +1959,11 @@ func (db *DB) RestoreRejectedReleaseCandidates(ctx context.Context, libraryItemI
 			_ = tx.Rollback()
 		}
 	}()
+
+	var scopeKey string
+	if scopeKey, err = resolveMediaScopeKey(ctx, tx, libraryItemID); err != nil {
+		return RejectedReleaseRestoreResult{}, err
+	}
 
 	rows, err := tx.QueryContext(ctx, `
 		select id, title, coalesce(external_url, ''), coalesce(indexer_name, ''), coalesce(size_bytes, 0), coalesce(posted_at, to_timestamp(0))
@@ -1972,7 +1994,7 @@ func (db *DB) RestoreRejectedReleaseCandidates(ctx context.Context, libraryItemI
 		}
 		restored++
 		if strings.TrimSpace(externalURL) != "" {
-			keys = append(keys, blocklistKeysForRelease(title, externalURL, indexerName, sizeBytes, postedAt)...)
+			keys = append(keys, blocklistKeysForRelease(scopeKey, title, externalURL, indexerName, sizeBytes, postedAt)...)
 		}
 	}
 	if err = rows.Err(); err != nil {
@@ -2073,6 +2095,10 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
 		return nil, fmt.Errorf("fail/lock-queue-item (li=%d): %w", libraryItemID, err)
 	}
+	scopeKey, err := resolveMediaScopeKey(ctx, tx, libraryItemID)
+	if err != nil {
+		return nil, fmt.Errorf("fail/resolve-scope (li=%d): %w", libraryItemID, err)
+	}
 
 	hardReject := isHardRejectReason(reason)
 	if _, err = tx.ExecContext(ctx, `
@@ -2125,7 +2151,7 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		).Scan(&title, &indexerName, &sizeBytes, &postedAt); err != nil {
 			return nil, fmt.Errorf("fail/select-rc-title (rc=%d): %w", releaseCandidateID, err)
 		}
-		pendingBlocklistKeys = blocklistKeysForRelease(title, externalURL, indexerName, sizeBytes, postedAt)
+		pendingBlocklistKeys = blocklistKeysForRelease(scopeKey, title, externalURL, indexerName, sizeBytes, postedAt)
 	}
 	if err = preDeleteVFRBySelectedRelease(ctx, tx, selectedReleaseID); err != nil {
 		return nil, fmt.Errorf("fail/pre-delete-vfr (sr=%d): %w", selectedReleaseID, err)
@@ -2172,7 +2198,7 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 			rows.Close()
 			return nil, err
 		}
-		if blockedReason, isBlocked := blockedReleaseReason(blocked, candidate); isBlocked {
+		if blockedReason, isBlocked := blockedReleaseReason(scopeKey, blocked, candidate); isBlocked {
 			blockedEntries = append(blockedEntries, blockedEntry{id: candidateID, reason: blockedReason})
 			continue
 		}
@@ -2409,25 +2435,58 @@ func blocklistReleasePatternKey(title string, sizeBytes int64, postedAt time.Tim
 	}, "|")
 }
 
-func blocklistKeysForRelease(title, externalURL, indexerName string, sizeBytes int64, postedAt time.Time) []string {
+// resolveMediaScopeKey identifies the show/movie a library item belongs to
+// (e.g. "movie:123" or "show:45"), so blocklist entries can be scoped per
+// media the way Sonarr/Radarr scope theirs by SeriesId/MovieId (confirmed via
+// their reference source: BlocklistRepository always filters by SeriesId/
+// MovieId first, so the same physical release blocklisted for one show never
+// blocks a different show from trying it). Drakkar's blocklist used to be
+// keyed purely on release content (title/URL/indexer/size/date) with no media
+// scope at all -- confirmed live: a title-match bug (since fixed) let the
+// base "NCIS" show wrongly select and fail on a "NCIS: New Orleans" release,
+// which would have permanently blocklisted that release GLOBALLY, blocking
+// the legitimate "NCIS: New Orleans" library item from ever using its own
+// correct release again. Falls back to "item:<id>" if neither movie nor show
+// resolves (defensive; should not happen in practice).
+func resolveMediaScopeKey(ctx context.Context, q sqlRowQuerier, libraryItemID int64) (string, error) {
+	var movieID, showID sql.NullInt64
+	err := q.QueryRowContext(ctx, `
+		select li.movie_id, e.tv_show_id
+		from library_items li
+		left join episodes e on e.id = li.episode_id
+		where li.id = $1`, libraryItemID,
+	).Scan(&movieID, &showID)
+	if err != nil {
+		return "", err
+	}
+	if movieID.Valid {
+		return fmt.Sprintf("movie:%d", movieID.Int64), nil
+	}
+	if showID.Valid {
+		return fmt.Sprintf("show:%d", showID.Int64), nil
+	}
+	return fmt.Sprintf("item:%d", libraryItemID), nil
+}
+
+func blocklistKeysForRelease(scopeKey, title, externalURL, indexerName string, sizeBytes int64, postedAt time.Time) []string {
 	keys := make([]string, 0, 4)
 	if strings.TrimSpace(externalURL) != "" {
-		keys = append(keys, blocklistKeyForExternalURL(externalURL))
+		keys = append(keys, scopeKey+"|"+blocklistKeyForExternalURL(externalURL))
 	}
 	if signature := blocklistReleaseSignatureKey(title, indexerName, sizeBytes, postedAt); signature != "" {
-		keys = append(keys, signature)
+		keys = append(keys, scopeKey+"|"+signature)
 	}
 	if pattern := blocklistReleasePatternKey(title, sizeBytes, postedAt); pattern != "" {
-		keys = append(keys, pattern)
+		keys = append(keys, scopeKey+"|"+pattern)
 	}
 	if family := blocklistReleaseFamilyKey(title, sizeBytes, postedAt); family != "" {
-		keys = append(keys, family)
+		keys = append(keys, scopeKey+"|"+family)
 	}
 	return keys
 }
 
-func blockedReleaseReason(blocked map[string]string, candidate SearchCandidateRecord) (string, bool) {
-	for _, key := range blocklistKeysForRelease(candidate.Title, candidate.ExternalURL, candidate.IndexerName, candidate.SizeBytes, candidate.PostedAt) {
+func blockedReleaseReason(scopeKey string, blocked map[string]string, candidate SearchCandidateRecord) (string, bool) {
+	for _, key := range blocklistKeysForRelease(scopeKey, candidate.Title, candidate.ExternalURL, candidate.IndexerName, candidate.SizeBytes, candidate.PostedAt) {
 		if reason, ok := blocked[key]; ok {
 			return reason, true
 		}
@@ -2575,6 +2634,10 @@ type sqlQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
+type sqlRowQuerier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
 func loadBlocklistMapUncached(ctx context.Context, q sqlQuerier) (map[string]string, error) {
 	rows, err := q.QueryContext(ctx, `
 		select key, reason
@@ -2647,26 +2710,31 @@ func (db *DB) BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int
 	}()
 
 	var (
-		selectedReleaseID sql.NullInt64
-		title             string
-		externalURL       string
-		indexerName       string
-		sizeBytes         int64
-		postedAt          time.Time
+		queueLibraryItemID int64
+		selectedReleaseID  sql.NullInt64
+		title              string
+		externalURL        string
+		indexerName        string
+		sizeBytes          int64
+		postedAt           time.Time
 	)
 	if err = tx.QueryRowContext(ctx, `
-		select q.selected_release_id, coalesce(rc.title, ''), coalesce(rc.external_url, ''), coalesce(rc.indexer_name, ''), coalesce(rc.size_bytes, 0), coalesce(rc.posted_at, to_timestamp(0))
+		select q.library_item_id, q.selected_release_id, coalesce(rc.title, ''), coalesce(rc.external_url, ''), coalesce(rc.indexer_name, ''), coalesce(rc.size_bytes, 0), coalesce(rc.posted_at, to_timestamp(0))
 		from queue_items q
 		left join selected_releases sr on sr.id = q.selected_release_id
 		left join release_candidates rc on rc.id = sr.release_candidate_id
 		where q.id = $1`, queueItemID,
-	).Scan(&selectedReleaseID, &title, &externalURL, &indexerName, &sizeBytes, &postedAt); err != nil {
+	).Scan(&queueLibraryItemID, &selectedReleaseID, &title, &externalURL, &indexerName, &sizeBytes, &postedAt); err != nil {
+		return err
+	}
+	scopeKey, err := resolveMediaScopeKey(ctx, tx, queueLibraryItemID)
+	if err != nil {
 		return err
 	}
 
 	if selectedReleaseID.Valid && strings.TrimSpace(externalURL) != "" {
 		// Blocklist the specifically-selected release.
-		for _, key := range blocklistKeysForRelease(title, externalURL, indexerName, sizeBytes, postedAt) {
+		for _, key := range blocklistKeysForRelease(scopeKey, title, externalURL, indexerName, sizeBytes, postedAt) {
 			if _, err = tx.ExecContext(ctx, `
 				insert into blocklist_items (key, reason, expires_at)
 				values ($1, $2, case when $3 > 0 then now() + ($3 * interval '1 day') else null end)
@@ -2680,15 +2748,11 @@ func (db *DB) BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int
 		// No selected release (e.g. all_candidates_wrong_title): blocklist all
 		// rejected candidates for this library item that have a known URL so
 		// they are not reconsidered in future search rounds.
-		var libraryItemID int64
-		if err = tx.QueryRowContext(ctx, `select library_item_id from queue_items where id = $1`, queueItemID).Scan(&libraryItemID); err != nil {
-			return err
-		}
 		candRows, qErr := tx.QueryContext(ctx, `
 			select coalesce(title,''), coalesce(external_url,''), coalesce(indexer_name,''), coalesce(size_bytes,0), coalesce(posted_at, to_timestamp(0))
 			from release_candidates
 			where library_item_id = $1
-			  and coalesce(external_url,'') <> ''`, libraryItemID)
+			  and coalesce(external_url,'') <> ''`, queueLibraryItemID)
 		if qErr != nil {
 			err = qErr
 			return err
@@ -2705,7 +2769,7 @@ func (db *DB) BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int
 				err = scanErr
 				return err
 			}
-			pendingKeys = append(pendingKeys, blocklistKeysForRelease(ct, cu, ci, cs, cp)...)
+			pendingKeys = append(pendingKeys, blocklistKeysForRelease(scopeKey, ct, cu, ci, cs, cp)...)
 		}
 		if rowsErr := candRows.Err(); rowsErr != nil {
 			candRows.Close()
