@@ -1816,6 +1816,51 @@ func TestFetchIndexAndReleaseSkipsRecentlyDispatchedURL(t *testing.T) {
 	}
 }
 
+// TestFetchAndImportSelectedReleaseDepthSkipsRecentlyDispatchedURL guards a
+// second real production incident (a NZB Finder duplicate-download warning
+// jumped from 7 to 18 affected releases even after the fetchIndexAndRelease
+// fix above shipped): fetchAndImportSelectedReleaseDepth is a separate,
+// near-duplicate fetch path used by the recursive candidate-promotion chain
+// (promoteNextAfterFailureDepth) that was missed when recentlyDispatchedURL
+// was added -- it called s.fetcher.Fetch directly with no cooldown check at
+// all, so promoting through the candidate list could re-fetch a URL another
+// path had just tried moments earlier. Two different selectedReleaseIDs
+// resolving to the same ExternalURL (the promotion chain moving to a
+// "different" candidate that happens to share a URL with one already tried)
+// must only result in one real fetch.
+func TestFetchAndImportSelectedReleaseDepthSkipsRecentlyDispatchedURL(t *testing.T) {
+	const sharedURL = "http://example/shared-release.nzb"
+	repo := &repoStub{
+		selectedByID: map[int64]database.ReleaseSummary{
+			501: {SelectedReleaseID: 501, LibraryItemID: 42, ExternalURL: sharedURL},
+			502: {SelectedReleaseID: 502, LibraryItemID: 42, ExternalURL: sharedURL},
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	calls := 0
+	service.fetcher = countingFetcherStub{
+		fileName: "shared-release.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Shared (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+		calls:    &calls,
+	}
+
+	if _, err := service.fetchAndImportSelectedReleaseDepth(context.Background(), 501, 0); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 fetch for the first release, got %d", calls)
+	}
+	// A "different" candidate (502) that happens to share the same URL --
+	// exactly what the recursive promotion chain does when it moves to the
+	// next candidate -- must not re-fetch it.
+	if _, err := service.fetchAndImportSelectedReleaseDepth(context.Background(), 502, 0); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected the second candidate sharing a URL to skip re-fetching, got %d total fetches", calls)
+	}
+}
+
 func TestSearchPendingLibraryQueuesAllItems(t *testing.T) {
 	const total = pendingQueueBatchSize + 10
 	pending := make([]database.PendingLibrarySearchTarget, 0, total)

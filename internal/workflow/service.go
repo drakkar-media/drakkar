@@ -2413,9 +2413,18 @@ func (s *Service) fetchAndImportSelectedReleaseDepth(ctx context.Context, select
 	if current.NZBDocumentID != nil {
 		return s.retrySelectedReleaseFromStoredNZB(ctx, current, depth)
 	}
+	// Same recentlyDispatchedURL cooldown as fetchIndexAndRelease -- this is a
+	// separate, near-duplicate fetch path (the recursive candidate-promotion
+	// chain via promoteNextAfterFailureDepth) that was missed when that
+	// cooldown was added, so it kept bypassing it and re-fetching URLs the
+	// other path had just tried moments earlier.
+	if s.recentlyDispatchedURL(current.ExternalURL, time.Now()) {
+		return nil, nil
+	}
 	if err := s.repo.MarkSelectedReleaseFetching(ctx, current.SelectedReleaseID); err != nil {
 		return nil, err
 	}
+	s.markSelectedReleaseURLDispatched(current.ExternalURL, time.Now())
 	fileName, raw, err := s.fetcher.Fetch(ctx, current.ExternalURL)
 	if err != nil {
 		return s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
