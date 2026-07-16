@@ -1195,23 +1195,42 @@ func (s *Service) shouldDispatchSelectedTarget(target database.PendingLibrarySea
 	// roughly every 60 seconds until the fallback chain exhausted. The
 	// cooldown is keyed purely on target.ExternalURL, which is meaningful
 	// regardless of state, so it must apply uniformly.
-	rawURL := strings.TrimSpace(target.ExternalURL)
-	if rawURL != "" && s != nil {
-		s.recentURLMu.Lock()
-		lastAt, ok := s.recentURLHits[rawURL]
-		if ok && now.Sub(lastAt) < selectedURLCooldown {
-			s.recentURLMu.Unlock()
-			return false
-		}
-		// Drop stale URL entries opportunistically to keep the map bounded.
-		for url, hitAt := range s.recentURLHits {
-			if now.Sub(hitAt) >= selectedURLCooldown {
-				delete(s.recentURLHits, url)
-			}
-		}
-		s.recentURLMu.Unlock()
+	return !s.recentlyDispatchedURL(target.ExternalURL, now)
+}
+
+// recentlyDispatchedURL reports whether rawURL had an actual NZB fetch
+// attempt within the last selectedURLCooldown, opportunistically pruning
+// stale entries. Shared by shouldDispatchSelectedTarget (the passive
+// pending-dispatch resume path) and fetchIndexAndRelease (the single
+// low-level fetch point every path -- passive dispatch, an active search
+// that immediately fetches what it just selected, manual select/retry,
+// season-pack search -- ultimately funnels through). It used to only be
+// enforced in shouldDispatchSelectedTarget, so an active re-search that
+// rediscovered the same top candidate (nothing upstream had changed) would
+// refetch it immediately, ignoring this cooldown entirely -- confirmed live:
+// the same release was refetched roughly every 60-90s for several minutes
+// straight via repeated active searches, tripping the same NZB Finder
+// duplicate-download warning shouldDispatchSelectedTarget's cooldown was
+// added to prevent, just through a different, unguarded call path.
+func (s *Service) recentlyDispatchedURL(rawURL string, now time.Time) bool {
+	if s == nil {
+		return false
 	}
-	return true
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return false
+	}
+	s.recentURLMu.Lock()
+	defer s.recentURLMu.Unlock()
+	lastAt, ok := s.recentURLHits[rawURL]
+	hit := ok && now.Sub(lastAt) < selectedURLCooldown
+	// Drop stale URL entries opportunistically to keep the map bounded.
+	for url, hitAt := range s.recentURLHits {
+		if now.Sub(hitAt) >= selectedURLCooldown {
+			delete(s.recentURLHits, url)
+		}
+	}
+	return hit
 }
 
 func (s *Service) markSelectedReleaseURLDispatched(rawURL string, now time.Time) {
@@ -2259,9 +2278,17 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 		// Already indexed — skip straight to publish.
 		return nil, &pendingPublish{current: current}, nil
 	}
+	if s.recentlyDispatchedURL(current.ExternalURL, time.Now()) {
+		// Already fetched this exact NZB within the cooldown window via some
+		// other path (or a moment ago via this one) — skip quietly rather than
+		// re-fetching or promoting to the next candidate; the current
+		// selection is likely fine, we just don't need to hammer it again.
+		return nil, nil, nil
+	}
 	if err := s.repo.MarkSelectedReleaseFetching(ctx, current.SelectedReleaseID); err != nil {
 		return nil, nil, err
 	}
+	s.markSelectedReleaseURLDispatched(current.ExternalURL, time.Now())
 	fileName, raw, err := s.fetcher.Fetch(ctx, current.ExternalURL)
 	if err != nil {
 		result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), 0)

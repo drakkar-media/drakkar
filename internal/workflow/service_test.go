@@ -17,39 +17,40 @@ import (
 )
 
 type repoStub struct {
-	requests        []database.MediaRequestSummary
-	searchInput     database.LibrarySearchInput
-	history         map[string]database.CandidateHistory
-	defaultProfile  database.QualityProfile
-	itemProfile     *database.QualityProfile
-	conflict        string
-	searchApplied   []database.SearchCandidateRecord
-	searchFailed    []string
-	pending         []database.PendingLibrarySearchTarget
-	backlog         int
-	selectedBacklog int
-	failedQueues    []database.FailedQueueRetryTarget
-	selectedQueues  []database.SelectedQueueRetryTarget
-	upgradable      []int64
-	movieCalls      int
-	tvCalls         int
-	fetching        int64
-	imported        database.ImportedNZB
-	indexed         int64
-	selected        database.ReleaseSummary
-	selectedByID    map[int64]database.ReleaseSummary
-	promoted        *database.ReleaseSummary
-	alternative     *database.ReleaseSummary
-	next            *database.ReleaseSummary
-	failed          []string
-	rejected        []string
-	retryTarget     database.QueueRetryTarget
-	skipped         []int64
-	requeued        []int64
-	stored          database.StoredNZBDocument
-	restoredGroup   []int64
-	calibrateFn     func(context.Context, int64) error
-	movieMeta       struct {
+	requests          []database.MediaRequestSummary
+	searchInput       database.LibrarySearchInput
+	searchInputByItem map[int64]database.LibrarySearchInput
+	history           map[string]database.CandidateHistory
+	defaultProfile    database.QualityProfile
+	itemProfile       *database.QualityProfile
+	conflict          string
+	searchApplied     []database.SearchCandidateRecord
+	searchFailed      []string
+	pending           []database.PendingLibrarySearchTarget
+	backlog           int
+	selectedBacklog   int
+	failedQueues      []database.FailedQueueRetryTarget
+	selectedQueues    []database.SelectedQueueRetryTarget
+	upgradable        []int64
+	movieCalls        int
+	tvCalls           int
+	fetching          int64
+	imported          database.ImportedNZB
+	indexed           int64
+	selected          database.ReleaseSummary
+	selectedByID      map[int64]database.ReleaseSummary
+	promoted          *database.ReleaseSummary
+	alternative       *database.ReleaseSummary
+	next              *database.ReleaseSummary
+	failed            []string
+	rejected          []string
+	retryTarget       database.QueueRetryTarget
+	skipped           []int64
+	requeued          []int64
+	stored            database.StoredNZBDocument
+	restoredGroup     []int64
+	calibrateFn       func(context.Context, int64) error
+	movieMeta         struct {
 		libraryItemID int64
 		tmdbID        int64
 		title         string
@@ -131,6 +132,11 @@ func (r *repoStub) GetDefaultQualityProfile(ctx context.Context) (database.Quali
 	return r.defaultProfile, nil
 }
 func (r *repoStub) GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (database.LibrarySearchInput, error) {
+	if r.searchInputByItem != nil {
+		if input, ok := r.searchInputByItem[libraryItemID]; ok {
+			return input, nil
+		}
+	}
 	return r.searchInput, nil
 }
 func (r *repoStub) LookupCandidateHistory(ctx context.Context, libraryItemID int64) (map[string]database.CandidateHistory, error) {
@@ -1690,6 +1696,11 @@ func TestMaxInlineFallbackDepthUsesFastLaneOverride(t *testing.T) {
 }
 
 func TestSearchPendingLibrary(t *testing.T) {
+	// Item 42 and 43 must resolve to genuinely different releases/URLs here —
+	// recentlyDispatchedURL's cooldown (see fetchIndexAndRelease) is keyed
+	// purely on ExternalURL, matching real-world duplicate-download
+	// prevention, so two items coincidentally sharing a URL in this fixture
+	// would (correctly) have the second one skipped rather than re-fetched.
 	repo := &repoStub{
 		pending: []database.PendingLibrarySearchTarget{
 			{LibraryItemID: 42},
@@ -1701,9 +1712,13 @@ func TestSearchPendingLibrary(t *testing.T) {
 			Title:         "Dune",
 			MovieYear:     2021,
 		},
+		searchInputByItem: map[int64]database.LibrarySearchInput{
+			43: {LibraryItemID: 43, MediaType: "movie", Title: "Arrival", MovieYear: 2016},
+		},
 	}
-	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
-		{Title: "Dune.2021.1080p.WEB-DL.x265-GRP", Link: "http://example/nzb", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+	service := NewService(repo, seerrStub{}, hydraStub{byQuery: map[string][]hydra.SearchResult{
+		"Dune 2021":    {{Title: "Dune.2021.1080p.WEB-DL.x265-GRP", Link: "http://example/dune.nzb", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()}},
+		"Arrival 2016": {{Title: "Arrival.2016.1080p.WEB-DL.x265-GRP", Link: "http://example/arrival.nzb", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()}},
 	}})
 	service.fetcher = fetcherStub{
 		fileName: "dune.nzb",
@@ -1743,6 +1758,61 @@ func TestProcessLibraryItemResumesSelectedRelease(t *testing.T) {
 	}
 	if repo.fetching != 303 {
 		t.Fatalf("expected selected release fetch to resume, got fetching=%d", repo.fetching)
+	}
+}
+
+// countingFetcherStub tracks how many times Fetch was actually called, so
+// tests can assert an NZB was (or wasn't) re-downloaded.
+type countingFetcherStub struct {
+	fileName string
+	raw      []byte
+	calls    *int
+}
+
+func (f countingFetcherStub) Fetch(ctx context.Context, rawURL string) (string, []byte, error) {
+	*f.calls++
+	return f.fileName, f.raw, nil
+}
+
+// TestFetchIndexAndReleaseSkipsRecentlyDispatchedURL guards a real production
+// incident: an indexer (NZB Finder) flagged repeated duplicate downloads of
+// the same NZB, threatening account termination. shouldDispatchSelectedTarget
+// already had a 30-minute per-URL cooldown, but it only guarded the passive
+// pending-dispatch resume path -- an active search that immediately fetches
+// what it just selected (the far more common path: SearchLibrary, backlog
+// search, season-pack search, manual retry) never consulted it at all, so
+// re-discovering the same top candidate (nothing upstream had changed) kept
+// re-fetching it. The cooldown must be enforced at the actual fetch point
+// (fetchIndexAndRelease) so every caller is covered uniformly.
+func TestFetchIndexAndReleaseSkipsRecentlyDispatchedURL(t *testing.T) {
+	repo := &repoStub{
+		selected: database.ReleaseSummary{
+			SelectedReleaseID: 303,
+			LibraryItemID:     42,
+			ExternalURL:       "http://example/retry.nzb",
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	calls := 0
+	service.fetcher = countingFetcherStub{
+		fileName: "retry.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Retry (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+		calls:    &calls,
+	}
+
+	if err := service.ProcessLibraryItem(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected exactly 1 fetch on first attempt, got %d", calls)
+	}
+	// A second attempt moments later (e.g. a fresh search rediscovering the
+	// same candidate) must not re-fetch the identical URL.
+	if err := service.ProcessLibraryItem(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected the second attempt to skip re-fetching the same URL, got %d total fetches", calls)
 	}
 }
 
