@@ -781,9 +781,27 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLib
 			    -- Normal pending items: no release selected yet.
 			    -- last_searched_at cooldown (1 h) mirrors Sonarr/Radarr LastSearchTime:
 			    -- once searched, skip until the cooldown expires to avoid hammering Hydra2.
+			    -- For items in the failed state specifically, the cooldown escalates
+			    -- with consecutive_failure_searches (reset to 0 on any successful
+			    -- selection) instead of staying flat at 1h forever — an item that has
+			    -- exhausted every known candidate many times running is very likely
+			    -- never going to resolve on its own, so back off hard rather than
+			    -- retrying at the same cadence as a normal, still-plausible item that
+			    -- simply hasn't been searched yet.
 			    (q.selected_release_id is null and q.state in ($1, $2)
 			     and (q.state != $2 or q.updated_at < now() - interval '2 hours')
-			     and (q.last_searched_at is null or q.last_searched_at < now() - interval '1 hour'))
+			     and (
+			         q.last_searched_at is null
+			         or q.last_searched_at < now() - (
+			             case
+			                 when q.state != $2 then interval '1 hour'
+			                 when q.consecutive_failure_searches >= 10 then interval '7 days'
+			                 when q.consecutive_failure_searches >= 6  then interval '1 day'
+			                 when q.consecutive_failure_searches >= 3  then interval '6 hours'
+			                 else interval '1 hour'
+			             end
+			         )
+			     ))
 			    -- Resume items: release already selected, but queue item is still
 			    -- in requested. These should be dispatched immediately so the
 			    -- worker can continue fetch/import without waiting for retry pass.
@@ -917,17 +935,31 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]Fai
 		where li.available = false
 		  and (
 		    -- Failed items needing a fresh Hydra search (ActionSearchAgain /
-		    -- ActionBlocklistAndSearch) are throttled by the same 1h
-		    -- last_searched_at cooldown as the backlog scheduler — without this,
-		    -- a small set of permanently-unresolvable items (retention expired,
-		    -- quality profile too strict, etc.) gets re-searched every 10-minute
-		    -- housekeeping pass forever, burning the shared Hydra rate limit that
-		    -- genuinely-pending items are waiting on. Restart/stale-worker
-		    -- interruptions are cheap (no Hydra call) and stay immediate.
+		    -- ActionBlocklistAndSearch) are throttled by a last_searched_at
+		    -- cooldown, same as the backlog scheduler — without this, a small
+		    -- set of permanently-unresolvable items (retention expired,
+		    -- quality profile too strict, etc.) gets re-searched every
+		    -- 10-minute housekeeping pass forever, burning the shared Hydra
+		    -- rate limit that genuinely-pending items are waiting on. The
+		    -- cooldown escalates with consecutive_failure_searches (reset to
+		    -- 0 on any successful selection) rather than staying flat at 1h
+		    -- forever: an item that has struck out on every known candidate
+		    -- many times running is very likely never going to resolve on
+		    -- its own, so it's backed off hard instead of being retried at
+		    -- the same cadence as a normal, still-plausible pending item.
+		    -- Restart/stale-worker interruptions are cheap (no Hydra call)
+		    -- and stay immediate.
 		    (q.state = $1 and (
 		        q.failure_reason in ('interrupted_by_restart', 'stale_worker')
 		        or q.last_searched_at is null
-		        or q.last_searched_at < now() - interval '1 hour'
+		        or q.last_searched_at < now() - (
+		            case
+		                when q.consecutive_failure_searches >= 10 then interval '7 days'
+		                when q.consecutive_failure_searches >= 6  then interval '1 day'
+		                when q.consecutive_failure_searches >= 3  then interval '6 hours'
+		                else interval '1 hour'
+		            end
+		        )
 		    ))
 		    or (q.state = $2 and q.selected_release_id is not null and q.updated_at < now() - interval '2 minutes')
 		  )
@@ -1206,7 +1238,7 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 	if selectedReleaseID != nil {
 		if _, err = tx.ExecContext(ctx, `
 			update queue_items
-			set state = $2, selected_release_id = $3, updated_at = now()
+			set state = $2, selected_release_id = $3, updated_at = now(), consecutive_failure_searches = 0
 			where library_item_id = $1`, libraryItemID, QueueSelected, *selectedReleaseID); err != nil {
 			return nil, err
 		}
@@ -1214,7 +1246,8 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 		failureReason := summarizeSearchFailureReason(candidates)
 		if _, err = tx.ExecContext(ctx, `
 			update queue_items
-			set state = $2, failure_reason = $3, selected_release_id = null, updated_at = now()
+			set state = $2, failure_reason = $3, selected_release_id = null, updated_at = now(),
+				consecutive_failure_searches = consecutive_failure_searches + 1
 			where library_item_id = $1`, libraryItemID, QueueFailed, failureReason); err != nil {
 			return nil, err
 		}
@@ -2228,7 +2261,8 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 	if !nextCandidateID.Valid {
 		if _, err = tx.ExecContext(ctx, `
 			update queue_items
-			set state = $2, failure_reason = $3, selected_release_id = null, updated_at = now()
+			set state = $2, failure_reason = $3, selected_release_id = null, updated_at = now(),
+				consecutive_failure_searches = consecutive_failure_searches + 1
 			where library_item_id = $1`, libraryItemID, QueueFailed, reason,
 		); err != nil {
 			return nil, fmt.Errorf("fail/update-qi-failed (li=%d): %w", libraryItemID, err)

@@ -1,0 +1,14 @@
+-- Tracks how many consecutive times a library item's search has fully
+-- exhausted every known release candidate with nothing selectable (either
+-- ReplaceSearchCandidates finding zero usable candidates, or
+-- FailSelectedReleaseAndPromoteNext running out of candidates to promote
+-- to). Reset to 0 whenever a fresh search actually selects a candidate.
+--
+-- Confirmed live: items whose content is genuinely unresolvable (retention
+-- expired on every release, quality profile too strict, franchise-collision
+-- false positives, etc.) were being retried every hour forever via
+-- ListFailedQueueRetryTargets's flat last_searched_at cooldown, needlessly
+-- re-hitting Hydra/the indexers for content that was never going to
+-- succeed. This column lets that cooldown escalate the more times an item
+-- has struck out in a row, instead of staying flat.
+alter table queue_items add column if not exists consecutive_failure_searches integer not null default 0;
