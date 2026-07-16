@@ -34,13 +34,24 @@
     hasDragged = false;
     startX = event.clientX;
     startScrollLeft = scroller.scrollLeft;
-    scroller.setPointerCapture(event.pointerId);
+    // Capture is deferred to onPointerMove, acquired only once an actual
+    // drag (>8px) is detected -- acquiring it here unconditionally on every
+    // pointerdown retargets the browser's synthesized click event to the
+    // scroller itself for EVERY interaction, including plain clicks, so a
+    // nested PosterCard <a> never receives its own click and never
+    // navigates. Confirmed via an isolated repro: with capture acquired
+    // eagerly, event.target on click was the scroller div even though the
+    // pointer never left the link; deferring capture until a real drag is
+    // detected fixed it without affecting drag-scroll behavior.
   }
 
   function onPointerMove(event: PointerEvent) {
     if (!dragging || !scroller) return;
     const dx = event.clientX - startX;
-    if (Math.abs(dx) > 8) hasDragged = true;
+    if (!hasDragged && Math.abs(dx) > 8) {
+      hasDragged = true;
+      scroller.setPointerCapture(event.pointerId);
+    }
     scroller.scrollLeft = startScrollLeft - dx;
   }
 
