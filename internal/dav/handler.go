@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/drakkar-media/drakkar/internal/database"
@@ -81,6 +82,58 @@ type contentFS struct {
 	db           ContentProvider
 	movieLibPath string
 	tvLibPath    string
+
+	treeMu     sync.Mutex
+	cachedTree *treeNode
+	cachedAt   time.Time
+	// cacheTTL overrides defaultCompletedTreeCacheTTL when non-zero; only set
+	// directly in tests so they don't need real multi-second sleeps.
+	cacheTTL time.Duration
+}
+
+// defaultCompletedTreeCacheTTL bounds how stale the /completed-symlinks tree
+// can be. getTree used to rebuild the entire tree (a full, unfiltered
+// ListSymlinkPublications query plus buildTree over every row) on every
+// single Stat/OpenFile call under /completed-symlinks -- exactly the subtree
+// a Plex library scan walks. Confirmed live via a pprof-informed code audit
+// (same investigation that found the file_cache.go Trim bug) that this is
+// the same "recompute everything from scratch on every request" defect,
+// except hit even more often (once per file/directory node touched during a
+// scan, further doubled by golang.org/x/net/webdav's walkFS calling Stat
+// again for every entry Readdir already returned FileInfo for) -- making a
+// full scan effectively O(N^2) over the ~11,100-item library. A short TTL is
+// safe here: rclone's own dir-cache-time (20s, see docker-compose.yml) already
+// assumes and tolerates staleness at the layer above this one, so a newly
+// published symlink simply becoming visible a few seconds later is no
+// different from what the mount already does.
+const defaultCompletedTreeCacheTTL = 10 * time.Second
+
+// getTree returns the current /completed-symlinks tree, rebuilding it from
+// the database at most once per cache TTL rather than on every call.
+func (f *contentFS) getTree(ctx context.Context) (*treeNode, error) {
+	ttl := f.cacheTTL
+	if ttl <= 0 {
+		ttl = defaultCompletedTreeCacheTTL
+	}
+	f.treeMu.Lock()
+	if f.cachedTree != nil && time.Since(f.cachedAt) < ttl {
+		tree := f.cachedTree
+		f.treeMu.Unlock()
+		return tree, nil
+	}
+	f.treeMu.Unlock()
+
+	pubs, err := f.db.ListSymlinkPublications(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tree := f.buildTree(pubs)
+
+	f.treeMu.Lock()
+	f.cachedTree = tree
+	f.cachedAt = time.Now()
+	f.treeMu.Unlock()
+	return tree, nil
 }
 
 // parsedPath is the result of decomposing a WebDAV path.
@@ -358,11 +411,10 @@ func (f *contentFS) statCompleted(ctx context.Context, rest string) (os.FileInfo
 	if rest == "" {
 		return &dirInfo{name: "completed-symlinks"}, nil
 	}
-	pubs, err := f.db.ListSymlinkPublications(ctx)
+	tree, err := f.getTree(ctx)
 	if err != nil {
 		return nil, err
 	}
-	tree := f.buildTree(pubs)
 	node := treeNodeAt(tree, rest)
 	if node == nil {
 		return nil, os.ErrNotExist
@@ -491,11 +543,10 @@ func (f *contentFS) openContent(ctx context.Context, rest string) (webdav.File, 
 
 func (f *contentFS) openCompleted(ctx context.Context, rest string) (webdav.File, error) {
 	rest = strings.Trim(rest, "/")
-	pubs, err := f.db.ListSymlinkPublications(ctx)
+	tree, err := f.getTree(ctx)
 	if err != nil {
 		return nil, err
 	}
-	tree := f.buildTree(pubs)
 
 	if rest == "" {
 		// /completed-symlinks/ → list top-level children
