@@ -989,6 +989,49 @@ func TestMergeSearchCandidatesKeepsSameTitleFromDifferentIndexers(t *testing.T) 
 	}
 }
 
+// TestMergeSearchCandidatesCollapsesIdenticalExternalURLDespiteDifferentTitle
+// guards the fix requested 2026-07-17: two entries with the exact same
+// getnzb URL/GUID are unambiguously the same underlying release even when
+// their titles don't normalize to the same (title, indexer) group -- e.g. a
+// scene tag NZBHydra2 reports slightly differently across merged tiers.
+// Without this, both could survive as separate release_candidates rows, and
+// the promotion chain could "fail over" to a candidate that's secretly the
+// same URL that just failed.
+func TestMergeSearchCandidatesCollapsesIdenticalExternalURLDespiteDifferentTitle(t *testing.T) {
+	existing := []database.SearchCandidateRecord{
+		{Title: "Show.S01E01.1080p.WEB-DL-GRP", ExternalURL: "http://hydra/getnzb/api/999", IndexerName: "NZB Finder", SizeBytes: 1_000_000_000, Score: 50},
+	}
+	incoming := []database.SearchCandidateRecord{
+		// Same URL, differently-formatted title (extra release-group suffix) --
+		// would NOT normalize to the same groupKey as the entry above.
+		{Title: "Show S01E01 1080p WEB-DL GRP REPACK", ExternalURL: "http://hydra/getnzb/api/999", IndexerName: "NZB Finder", SizeBytes: 1_000_000_000, Score: 60},
+	}
+	merged := mergeSearchCandidates(existing, incoming)
+	if len(merged) != 1 {
+		t.Fatalf("expected identical-URL entries to collapse into 1 candidate despite differing titles, got %d: %+v", len(merged), merged)
+	}
+	if merged[0].Score != 60 {
+		t.Fatalf("expected the higher-scored duplicate to win, got score %d", merged[0].Score)
+	}
+}
+
+// TestDedupeSearchResultsByLinkCollapsesIdenticalLinkDespiteDifferentTitle is
+// the dedupeSearchResults (single-response) counterpart to
+// TestMergeSearchCandidatesCollapsesIdenticalExternalURLDespiteDifferentTitle.
+func TestDedupeSearchResultsByLinkCollapsesIdenticalLinkDespiteDifferentTitle(t *testing.T) {
+	results := []hydra.SearchResult{
+		{Title: "Show.S01E01.1080p.WEB-DL-GRP", Link: "http://hydra/getnzb/api/999", Indexer: "NZB Finder", SizeBytes: 1_000_000_000, IndexerScore: 10, Grabs: 5},
+		{Title: "Show S01E01 1080p WEB-DL GRP REPACK", Link: "http://hydra/getnzb/api/999", Indexer: "NZB Finder", SizeBytes: 1_000_000_000, IndexerScore: 20, Grabs: 1},
+	}
+	out := dedupeSearchResults(results)
+	if len(out) != 1 {
+		t.Fatalf("expected identical-Link entries to collapse into 1 result despite differing titles, got %d: %+v", len(out), out)
+	}
+	if out[0].IndexerScore != 20 {
+		t.Fatalf("expected the higher-IndexerScore duplicate to win, got %+v", out[0])
+	}
+}
+
 func TestSearchLibraryPenalizesPreviouslyFailedCandidateAcrossRefresh(t *testing.T) {
 	repo := &repoStub{
 		searchInput: database.LibrarySearchInput{

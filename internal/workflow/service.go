@@ -2646,6 +2646,7 @@ func shouldIgnorePreflightFailure(err error) bool {
 // before giving up. Within a (title, size, indexer) group the entry with the
 // highest IndexerScore wins; Grabs breaks ties.
 func dedupeSearchResults(results []hydra.SearchResult) []hydra.SearchResult {
+	results = dedupeSearchResultsByLink(results)
 	type seenKey struct {
 		title   string
 		indexer string
@@ -2679,6 +2680,36 @@ func dedupeSearchResults(results []hydra.SearchResult) []hydra.SearchResult {
 		for _, b := range buckets {
 			out = append(out, b.best)
 		}
+	}
+	return out
+}
+
+// dedupeSearchResultsByLink collapses entries that share the exact same Link
+// (the getnzb GUID/URL) before the fuzzy title+size dedup above runs. Two
+// entries with an identical Link are unambiguously the same underlying
+// release regardless of any title-normalization mismatch between them (e.g.
+// NZBHydra2 returning the same release twice across merged indexer/tier
+// results with slightly different scene-tag formatting) -- normReleaseTitle
+// wouldn't necessarily collapse those, but an exact Link match always
+// should. Entries with an empty Link (shouldn't normally happen, but not
+// asserted here) pass through unchanged and fall to the title+size dedup.
+func dedupeSearchResultsByLink(results []hydra.SearchResult) []hydra.SearchResult {
+	seen := make(map[string]int, len(results))
+	out := make([]hydra.SearchResult, 0, len(results))
+	for _, r := range results {
+		if r.Link == "" {
+			out = append(out, r)
+			continue
+		}
+		if i, ok := seen[r.Link]; ok {
+			if r.IndexerScore > out[i].IndexerScore ||
+				(r.IndexerScore == out[i].IndexerScore && r.Grabs > out[i].Grabs) {
+				out[i] = r
+			}
+			continue
+		}
+		seen[r.Link] = len(out)
+		out = append(out, r)
 	}
 	return out
 }
@@ -2930,10 +2961,35 @@ func mergeSearchCandidates(existing, incoming []database.SearchCandidateRecord) 
 		key   groupKey
 		items []database.SearchCandidateRecord
 	}
+	type urlLoc struct {
+		key   groupKey
+		index int
+	}
 	groups := make(map[groupKey]*group, len(existing)+len(incoming))
 	order := make([]*group, 0, len(existing)+len(incoming))
+	// urlSeen collapses exact-duplicate ExternalURLs across the whole merge,
+	// even when two entries' titles don't normalize to the same groupKey
+	// (e.g. a scene tag NZBHydra2 reports slightly differently across
+	// merged indexer/tier results). An identical getnzb URL is unambiguously
+	// the same underlying release, so this must win over the fuzzy
+	// title+size grouping below rather than let both survive as separate
+	// candidates -- otherwise the promotion chain could "fail over" to a
+	// candidate that's secretly the same URL that just failed. Stores a
+	// (groupKey, index) location rather than a pointer into g.items, since
+	// appends to g.items can reallocate its backing array and invalidate a
+	// cached pointer.
+	urlSeen := make(map[string]urlLoc, len(existing)+len(incoming))
 
 	add := func(candidate database.SearchCandidateRecord) {
+		if candidate.ExternalURL != "" {
+			if loc, ok := urlSeen[candidate.ExternalURL]; ok {
+				g := groups[loc.key]
+				if betterSearchCandidate(candidate, g.items[loc.index]) {
+					g.items[loc.index] = candidate
+				}
+				return
+			}
+		}
 		key := groupKey{normReleaseTitle(candidate.Title), strings.ToLower(strings.TrimSpace(candidate.IndexerName))}
 		g, ok := groups[key]
 		if !ok {
@@ -2946,10 +3002,16 @@ func mergeSearchCandidates(existing, incoming []database.SearchCandidateRecord) 
 				if betterSearchCandidate(candidate, g.items[i]) {
 					g.items[i] = candidate
 				}
+				if candidate.ExternalURL != "" {
+					urlSeen[candidate.ExternalURL] = urlLoc{key, i}
+				}
 				return
 			}
 		}
 		g.items = append(g.items, candidate)
+		if candidate.ExternalURL != "" {
+			urlSeen[candidate.ExternalURL] = urlLoc{key, len(g.items) - 1}
+		}
 	}
 	for _, candidate := range existing {
 		add(candidate)
