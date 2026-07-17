@@ -1957,6 +1957,58 @@ func TestSearchPendingLibraryDispatchesSelectedAndQueuesSearchItems(t *testing.T
 	}
 }
 
+// TestSearchPendingLibraryDoesNotPrematurelyMarkURLDispatched guards against
+// a real production incident found 2026-07-17 while investigating "the queue
+// never gets shorter": this call site used to mark a resume item's URL
+// dispatched immediately after a successful submit() -- i.e. at the moment
+// the job was merely queued, not when it was actually fetched. Since a
+// worker goroutine picks up a queued job asynchronously (often within
+// milliseconds), its own fetchIndexAndRelease call would then see that same
+// mark (via shouldSkipDuplicateURLFetch) and silently skip the real fetch,
+// every single time. Confirmed live: this made every item that reached this
+// passive resume path (e.g. after a restart) permanently unable to
+// complete a download -- zero real NZB fetches system-wide for ~20 hours
+// across many redeploys, since each redeploy funnels interrupted downloads
+// right back into this exact path via RequeueSelectedRelease.
+func TestSearchPendingLibraryDoesNotPrematurelyMarkURLDispatched(t *testing.T) {
+	const resumeURL = "http://example/resume-item.nzb"
+	repo := &repoStub{
+		pending: []database.PendingLibrarySearchTarget{
+			{LibraryItemID: 1, Selected: true, SelectedReleaseID: 101, ExternalURL: resumeURL},
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	service.WorkQueue = newWorkQueueStub()
+
+	if _, err := service.SearchPendingLibrary(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if service.recentlyDispatchedURL(resumeURL, time.Now()) {
+		t.Fatal("SearchPendingLibrary must not mark the URL dispatched itself at submit time -- only the actual fetch (inside shouldSkipDuplicateURLFetch, called from the worker that processes the queued job) should, otherwise that worker sees the URL as already dispatched and silently no-ops instead of ever fetching")
+	}
+}
+
+// TestDispatchAutomaticPendingDoesNotPrematurelyMarkURLDispatched is the
+// DispatchAutomaticPending counterpart to
+// TestSearchPendingLibraryDoesNotPrematurelyMarkURLDispatched -- see that
+// test's comment for the full incident writeup.
+func TestDispatchAutomaticPendingDoesNotPrematurelyMarkURLDispatched(t *testing.T) {
+	const resumeURL = "http://example/resume-item-2.nzb"
+	repo := &repoStub{
+		pending: []database.PendingLibrarySearchTarget{
+			{LibraryItemID: 1, Selected: true, SelectedReleaseID: 202, ExternalURL: resumeURL},
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+
+	if _, err := service.DispatchAutomaticPending(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if service.recentlyDispatchedURL(resumeURL, time.Now()) {
+		t.Fatal("DispatchAutomaticPending must not mark the URL dispatched itself at submit time -- only the actual fetch (inside shouldSkipDuplicateURLFetch, called from the worker that processes the queued job) should, otherwise that worker sees the URL as already dispatched and silently no-ops instead of ever fetching")
+	}
+}
+
 // TestSearchPendingLibraryQueuesEveryMissingEpisode verifies every missing
 // episode gets its own search turn each cycle, matching Sonarr's
 // EpisodeSearchService (searches every missing episode/group, not a rotating

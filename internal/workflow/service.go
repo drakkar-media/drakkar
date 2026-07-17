@@ -1083,6 +1083,12 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 				if !s.shouldDispatchSelectedTarget(target, now) {
 					continue
 				}
+				// Deliberately do NOT call markSelectedReleaseURLDispatched here --
+				// see the long comment on that call being removed from
+				// DispatchAutomaticPending below for why marking at submit time
+				// (rather than at the actual fetch, inside
+				// shouldSkipDuplicateURLFetch) silently defeats every dispatch
+				// through this path.
 				resultCh := make(chan downloadJobResult, 1)
 				if s.downloader.submit(downloadJob{
 					ctx:               context.Background(),
@@ -1091,7 +1097,6 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 					enqueuedAt:        time.Now(),
 					resultCh:          resultCh,
 				}) {
-					s.markSelectedReleaseURLDispatched(target.ExternalURL, now)
 					go func() { <-resultCh }()
 				}
 				result.Searched++
@@ -1133,6 +1138,30 @@ func (s *Service) DispatchAutomaticPending(ctx context.Context) (BulkSearchResul
 		if !s.shouldDispatchSelectedTarget(target, now) {
 			continue
 		}
+		// Real production bug found 2026-07-17 while investigating "the queue
+		// never gets shorter": this used to call
+		// s.markSelectedReleaseURLDispatched(target.ExternalURL, now) right
+		// here, immediately after a successful submit() -- i.e. at the moment
+		// the job was merely QUEUED, not when it was actually fetched. Since
+		// submit() only enqueues the job (a worker goroutine picks it up
+		// asynchronously, usually within milliseconds), the worker's own
+		// fetchIndexAndRelease call would then check recentlyDispatchedURL
+		// (via shouldSkipDuplicateURLFetch) mere moments later, see the mark
+		// THIS code had just set, and silently no-op instead of ever calling
+		// s.fetcher.Fetch -- every single time. submit()'s own inFlight map
+		// already fully prevents resubmitting the same selectedReleaseID
+		// while one copy is queued or in progress, so this mark served no
+		// purpose beyond what inFlight already provides, while permanently
+		// defeating every dispatch through this passive resume path. Items
+		// that ended up here (e.g. via ResetStaleQueueItems ->
+		// RetryFailedQueue's retryMatrixRestartRequeue -> RequeueSelectedRelease,
+		// which requeues to state=Requested with no synchronous fetch of its
+		// own) could NEVER complete a real download -- confirmed live: zero
+		// nzb_documents rows were created system-wide for ~20 hours before
+		// this fix, across many redeploys, because every redeploy funnels
+		// interrupted items right back into this exact path. The correct mark
+		// (right before the real network fetch) already exists inside
+		// shouldSkipDuplicateURLFetch -- do not duplicate it here.
 		resultCh := make(chan downloadJobResult, 1)
 		if s.downloader.submit(downloadJob{
 			ctx:               context.Background(),
@@ -1141,7 +1170,6 @@ func (s *Service) DispatchAutomaticPending(ctx context.Context) (BulkSearchResul
 			enqueuedAt:        now,
 			resultCh:          resultCh,
 		}) {
-			s.markSelectedReleaseURLDispatched(target.ExternalURL, now)
 			go func() { <-resultCh }()
 			result.Searched++
 		}
