@@ -136,6 +136,51 @@ func TestDiskCachedDecodedSourceBackfillsPartInfoFromRawWhenDiskHit(t *testing.T
 	}
 }
 
+// countingStatBodySource additionally implements StatSource, matching the
+// real production wiring (app.go stacks DiskCachedDecodedSource over a
+// source that also implements Stat).
+type countingStatBodySource struct {
+	countingBodySource
+	statCalls atomic.Int32
+}
+
+func (s *countingStatBodySource) Stat(ctx context.Context, messageID string) error {
+	s.statCalls.Add(1)
+	return nil
+}
+
+// TestDiskCachedDecodedSourceStatDoesNotRefetchOnDiskHit guards against a
+// real gap found in the 2026-07-17 exhaustive audit: Stat() on a disk-cache
+// hit whose in-memory partInfo companion was missing (e.g. after a process
+// restart, since partInfo is in-memory only) called fillPartInfoFromRaw,
+// which performs a full live article body fetch -- silently degrading the
+// "quick/cheap NNTP STAT check" used as earlyChecker (a preflight gate
+// before every selected-release fetch/retry) into a full download. The
+// decoded body already being on disk is itself sufficient proof the article
+// exists; Stat() must not fetch anything else to answer that.
+func TestDiskCachedDecodedSourceStatDoesNotRefetchOnDiskHit(t *testing.T) {
+	src := &countingStatBodySource{countingBodySource: countingBodySource{
+		body: []byte("=ybegin line=128 size=10 name=test\r\n=ypart begin=11 end=15\r\n" + encode([]byte("hello")) + "\r\n=yend size=5\r\n"),
+	}}
+	cache := NewDiskCachedDecodedSource(src, t.TempDir(), 1024)
+	if err := cache.cache.Put("<msg1>", []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	// partInfo is intentionally left unpopulated -- simulating a process
+	// that just restarted and lost its in-memory partInfo cache while the
+	// on-disk decoded-body cache survived.
+
+	if err := cache.Stat(context.Background(), "<msg1>"); err != nil {
+		t.Fatal(err)
+	}
+	if got := src.calls.Load(); got != 0 {
+		t.Fatalf("expected Stat on a disk-cache hit not to fetch the raw article body, got %d fetches", got)
+	}
+	if got := src.statCalls.Load(); got != 0 {
+		t.Fatalf("expected Stat on a disk-cache hit not to issue a live NNTP STAT either, got %d", got)
+	}
+}
+
 func encode(src []byte) string {
 	out := make([]byte, 0, len(src)*2)
 	for _, b := range src {

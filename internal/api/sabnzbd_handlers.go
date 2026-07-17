@@ -32,6 +32,26 @@ type sabHandler struct {
 	// (matching real SABnzbd behavior). Empty preserves the historical
 	// no-auth behavior for existing Sonarr/Radarr download-client configs.
 	apiKey string
+	// recentlyDispatchedURL/markURLDispatched provide handleAddURL the same
+	// per-URL fetch cooldown workflow.Service's own dispatch pipeline uses
+	// (fetchIndexAndRelease/fetchAndImportSelectedReleaseDepth), so a
+	// Radarr/Sonarr addurl retry -- its own download-client retry logic, or
+	// a resubmission after Drakkar restarts mid-request -- doesn't trigger a
+	// second live NZB fetch from the indexer for the same URL. This handler
+	// has no access to workflow.Service's private cooldown map, so these are
+	// injected as plain functions. Nil-safe: a nil recentlyDispatchedURL
+	// always proceeds, matching the historical no-guard behavior.
+	recentlyDispatchedURL func(rawURL string) bool
+	markURLDispatched     func(rawURL string)
+	// fetchFn defaults to fetchRemoteURL; overridable in tests.
+	fetchFn func(ctx context.Context, rawURL string) ([]byte, error)
+}
+
+func (h *sabHandler) fetchRemote(ctx context.Context, rawURL string) ([]byte, error) {
+	if h.fetchFn != nil {
+		return h.fetchFn(ctx, rawURL)
+	}
+	return fetchRemoteURL(ctx, rawURL)
 }
 
 func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -169,7 +189,15 @@ func (h *sabHandler) handleAddURL(w http.ResponseWriter, r *http.Request) {
 		nzbName = r.URL.Query().Get("nzbname")
 	}
 
-	content, err := fetchRemoteURL(r.Context(), nzbURL)
+	if h.recentlyDispatchedURL != nil && h.recentlyDispatchedURL(nzbURL) {
+		h.writeError(w, "recently added, skipping duplicate fetch")
+		return
+	}
+	if h.markURLDispatched != nil {
+		h.markURLDispatched(nzbURL)
+	}
+
+	content, err := h.fetchRemote(r.Context(), nzbURL)
 	if err != nil {
 		h.writeError(w, err.Error())
 		return

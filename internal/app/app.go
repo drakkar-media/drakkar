@@ -872,6 +872,14 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		} else if result.DeletedRows > 0 {
 			logger.Info().Int("deletedRows", result.DeletedRows).Msg("monitoring: pruned orphaned selected releases")
 		}
+		// recent_url_fetches only needs to outlive the 30-min per-URL fetch
+		// cooldown it backstops; keep a comfortable multiple of that so a
+		// prune pass never races an in-progress cooldown window.
+		if deleted, err := db.PruneRecentURLFetches(ctx, 2*time.Hour); err != nil {
+			logger.Error().Err(err).Msg("monitoring: recent URL fetch prune error")
+		} else if deleted > 0 {
+			logger.Info().Int64("deletedRows", deleted).Msg("monitoring: pruned recent URL fetch records")
+		}
 		if skip, reason := shouldSkipNonCriticalMaintenance(taskStorageMaintenance); skip {
 			logger.Info().Str("task", taskStorageMaintenance).Str("reason", reason).Msg("scheduler: skipping non-critical (filesystem-heavy) storage maintenance")
 			return

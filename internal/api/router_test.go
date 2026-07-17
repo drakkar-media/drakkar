@@ -201,6 +201,9 @@ func (w workflowStub) SyncPlexDetectedShows(_ context.Context) (workflow.SyncPle
 	return workflow.SyncPlexDetectedResult{}, nil
 }
 
+func (w workflowStub) RecentlyDispatchedURL(_ string) bool { return false }
+func (w workflowStub) MarkURLDispatched(_ string)          {}
+
 func (w workflowStub) ImportNZBFromPush(_ context.Context, content []byte, filename, mediaType string) (string, error) {
 	if w.importCall != nil {
 		w.importCall.filename = filename

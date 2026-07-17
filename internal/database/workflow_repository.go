@@ -1752,21 +1752,37 @@ func (db *DB) promoteRetryCandidate(ctx context.Context, libraryItemID int64, ex
 		}
 	}()
 
+	// Lock before deciding, matching every sibling selection function
+	// (PromoteExistingCandidate, RejectReleaseCandidate,
+	// FailSelectedReleaseAndPromoteNext, ReplaceSearchCandidates). This was
+	// previously the one outlier that ran its "pick best candidate" query
+	// unlocked, so two racing callers (e.g. a manual retry racing the
+	// scheduled queue_housekeeping retry pass) could both read the same
+	// stale "best" candidate before either committed. activateReleaseCandidate
+	// re-acquires this same row lock below (a harmless re-lock within the
+	// same transaction), so this only changes the ordering, not the
+	// locking itself.
+	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
+		return nil, err
+	}
+
 	var releaseCandidateID int64
 	query := `
-		select id
-		from release_candidates
-		where library_item_id = $1
-		  and rejected = false
-		  and coalesce(external_url, '') <> ''
+		select rc.id
+		from release_candidates rc
+		where rc.library_item_id = $1
+		  and rc.rejected = false
+		  and coalesce(rc.external_url, '') <> ''
+		  and rc.selected = false
+		  and not exists (select 1 from selected_releases sr where sr.release_candidate_id = rc.id)
 	`
 	args := []any{libraryItemID}
 	if excludeCurrent {
-		query += ` and id <> $2`
+		query += ` and rc.id <> $2`
 		args = append(args, excludeReleaseCandidateID)
 	}
 	query += `
-		order by failure_count asc, selected desc, score desc, created_at asc, id asc
+		order by rc.failure_count asc, rc.score desc, rc.created_at asc, rc.id asc
 		limit 1`
 	err = tx.QueryRowContext(ctx, query, args...).Scan(&releaseCandidateID)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1854,6 +1870,30 @@ func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int
 			}
 		}
 	}
+
+	// The rejection above (and its blocklist entry) is always honored. The
+	// delete-and-promote-next steps below assume this candidate was still
+	// the library item's current selection -- between our pre-lock read
+	// and acquiring the lock, a concurrent caller (e.g. a background fetch
+	// failure racing this same manual reject on the same currently-selected
+	// release) may have already superseded it with a different candidate.
+	// Re-deriving and re-promoting a "next" candidate from that now-stale
+	// premise would risk duplicate-inserting a selected_releases row for a
+	// candidate the winner already picked (the same defect class fixed in
+	// c4ead9f via a call-site pair that fix's lock ordering didn't cover).
+	var wasCurrentSelection bool
+	if err = tx.QueryRowContext(ctx, `
+		select exists(
+			select 1 from selected_releases
+			where release_candidate_id = $1 and library_item_id = $2
+		)`, releaseCandidateID, libraryItemID,
+	).Scan(&wasCurrentSelection); err != nil {
+		return nil, err
+	}
+	if !wasCurrentSelection {
+		return nil, tx.Commit()
+	}
+
 	if _, err = tx.ExecContext(ctx, `
 		delete from selected_releases
 		where release_candidate_id = $1`, releaseCandidateID,
@@ -1864,15 +1904,17 @@ func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int
 	var nextCandidateID sql.NullInt64
 	if err = tx.QueryRowContext(ctx, `
 		select id
-		from release_candidates
-		where library_item_id = $1
-		  and rejected = false
-		  and id <> $2
-		order by failure_count asc,
-		         score desc,
-		         posted_at desc nulls last,
-		         created_at asc,
-		         id asc
+		from release_candidates rc
+		where rc.library_item_id = $1
+		  and rc.rejected = false
+		  and rc.selected = false
+		  and rc.id <> $2
+		  and not exists (select 1 from selected_releases sr where sr.release_candidate_id = rc.id)
+		order by rc.failure_count asc,
+		         rc.score desc,
+		         rc.posted_at desc nulls last,
+		         rc.created_at asc,
+		         rc.id asc
 		limit 1`, libraryItemID, releaseCandidateID,
 	).Scan(&nextCandidateID); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
@@ -2128,6 +2170,33 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
 		return nil, fmt.Errorf("fail/lock-queue-item (li=%d): %w", libraryItemID, err)
 	}
+
+	// Re-verify this selected_releases row is still the library item's
+	// current selection now that we hold the row lock. The pre-lock read
+	// above (capturing releaseCandidateID/externalURL) ran before we had
+	// exclusive access to this item's selection state, so a concurrent
+	// caller racing on the same originally-selected release (e.g. a manual
+	// reject/skip on the same release racing this background fetch
+	// failure) may have already superseded it with a different candidate
+	// while we waited on the lock. Proceeding on that stale premise would
+	// re-derive and independently re-promote a "next" candidate the
+	// winner may have already picked, reproducing the duplicate
+	// selected_releases-row defect fixed in c4ead9f via a call-site pair
+	// that fix's lock ordering alone doesn't cover.
+	var stillCurrent bool
+	if err = tx.QueryRowContext(ctx, `
+		select exists(
+			select 1 from selected_releases where id = $1 and library_item_id = $2
+		)`, selectedReleaseID, libraryItemID,
+	).Scan(&stillCurrent); err != nil {
+		return nil, fmt.Errorf("fail/recheck-sr (sr=%d): %w", selectedReleaseID, err)
+	}
+	if !stillCurrent {
+		// Concurrent transaction already superseded this selection while
+		// we were waiting on the lock -- nothing left to fail.
+		return nil, tx.Rollback()
+	}
+
 	scopeKey, err := resolveMediaScopeKey(ctx, tx, libraryItemID)
 	if err != nil {
 		return nil, fmt.Errorf("fail/resolve-scope (li=%d): %w", libraryItemID, err)
@@ -2211,16 +2280,18 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		blockedEntries  []blockedEntry
 	)
 	rows, err := tx.QueryContext(ctx, `
-		select id, title, coalesce(external_url, ''), coalesce(indexer_name, ''), coalesce(size_bytes, 0), coalesce(posted_at, to_timestamp(0))
-		from release_candidates
-		where library_item_id = $1
-		  and rejected = false
-		  and id <> $2
-		order by failure_count asc,
-		         score desc,
-		         posted_at desc nulls last,
-		         created_at asc,
-		         id asc`, libraryItemID, releaseCandidateID)
+		select rc.id, rc.title, coalesce(rc.external_url, ''), coalesce(rc.indexer_name, ''), coalesce(rc.size_bytes, 0), coalesce(rc.posted_at, to_timestamp(0))
+		from release_candidates rc
+		where rc.library_item_id = $1
+		  and rc.rejected = false
+		  and rc.selected = false
+		  and rc.id <> $2
+		  and not exists (select 1 from selected_releases sr where sr.release_candidate_id = rc.id)
+		order by rc.failure_count asc,
+		         rc.score desc,
+		         rc.posted_at desc nulls last,
+		         rc.created_at asc,
+		         rc.id asc`, libraryItemID, releaseCandidateID)
 	if err != nil {
 		return nil, err
 	}
@@ -3295,4 +3366,61 @@ func (db *DB) TouchQueueItemSearched(ctx context.Context, libraryItemID int64) e
 		WHERE library_item_id = $1 AND state != 'available'`,
 		libraryItemID)
 	return err
+}
+
+// RecentlyDispatchedURLPersisted reports whether rawURL has a persisted
+// dispatch record within the last cooldown duration. Unlike
+// workflow.Service's in-memory recentURLHits map, this survives process
+// restarts: a release fetch interrupted mid-flight by a redeploy (SIGTERM
+// mid-Fetch, before StoreRawNZBDocument commits) would otherwise be
+// re-dispatched against a freshly-empty in-memory map with zero cooldown
+// protection once the process restarts and the pending-dispatch resume path
+// picks the item back up.
+func (db *DB) RecentlyDispatchedURLPersisted(ctx context.Context, rawURL string, cooldown time.Duration) (bool, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return false, nil
+	}
+	var dispatchedAt time.Time
+	err := db.SQL.QueryRowContext(ctx, `
+		select dispatched_at from recent_url_fetches where external_url = $1`, rawURL,
+	).Scan(&dispatchedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return time.Since(dispatchedAt) < cooldown, nil
+}
+
+// MarkURLDispatchedPersisted upserts rawURL's dispatch timestamp to now.
+// Call before the network fetch (not after) so a restart that kills the
+// process mid-fetch still leaves a record behind. See
+// RecentlyDispatchedURLPersisted.
+func (db *DB) MarkURLDispatchedPersisted(ctx context.Context, rawURL string) error {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil
+	}
+	_, err := db.SQL.ExecContext(ctx, `
+		insert into recent_url_fetches (external_url, dispatched_at)
+		values ($1, now())
+		on conflict (external_url) do update set dispatched_at = excluded.dispatched_at`, rawURL,
+	)
+	return err
+}
+
+// PruneRecentURLFetches deletes dispatch records older than maxAge, keeping
+// the table bounded. Intended to be called periodically from a maintenance
+// task alongside the other housekeeping sweeps.
+func (db *DB) PruneRecentURLFetches(ctx context.Context, maxAge time.Duration) (int64, error) {
+	res, err := db.SQL.ExecContext(ctx, `
+		delete from recent_url_fetches where dispatched_at < now() - make_interval(secs => $1)`,
+		maxAge.Seconds(),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

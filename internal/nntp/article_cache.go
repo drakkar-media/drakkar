@@ -136,11 +136,15 @@ func classifyCacheableError(err error) (time.Duration, bool) {
 	if errors.Is(err, ErrProviderCircuitOpen) {
 		return throttleTTL, true
 	}
+	if errors.Is(err, ErrArticleMissing) {
+		return missingArticleTTL, true
+	}
 	msg := err.Error()
 	switch {
 	case strings.Contains(msg, "status 430"), // no such article
 		strings.Contains(msg, "status 423"), // no such article/group
-		strings.Contains(msg, "article not found"):
+		strings.Contains(msg, "article not found"),
+		strings.Contains(msg, "article missing"): // ErrArticleMissing's message, e.g. from client.go's Stat() on a 430 STAT response
 		return missingArticleTTL, true
 	default:
 		return 0, false

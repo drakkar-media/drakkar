@@ -79,6 +79,8 @@ type Repository interface {
 	RestoreRejectedReleaseCandidates(ctx context.Context, libraryItemID int64) (database.RejectedReleaseRestoreResult, error)
 	SkipReleaseCandidate(ctx context.Context, releaseCandidateID int64) (*database.ReleaseSummary, error)
 	MarkSelectedReleaseFetching(ctx context.Context, selectedReleaseID int64) error
+	RecentlyDispatchedURLPersisted(ctx context.Context, rawURL string, cooldown time.Duration) (bool, error)
+	MarkURLDispatchedPersisted(ctx context.Context, rawURL string) error
 	StoreRawNZBDocument(ctx context.Context, selectedReleaseID int64, fileName string, xml []byte, externalURL string) error
 	ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID int64, imported database.ImportedNZB) (database.QueueSnapshot, error)
 	CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) error
@@ -1246,6 +1248,50 @@ func (s *Service) markSelectedReleaseURLDispatched(rawURL string, now time.Time)
 	s.recentURLMu.Unlock()
 }
 
+// RecentlyDispatchedURL reports whether rawURL was dispatched within the
+// last selectedURLCooldown window. Exported so callers outside this
+// package's own dispatch pipeline (e.g. the SABnzbd-compatible addurl
+// endpoint) share the same duplicate-fetch protection as
+// fetchIndexAndRelease/fetchAndImportSelectedReleaseDepth.
+func (s *Service) RecentlyDispatchedURL(rawURL string) bool {
+	return s.recentlyDispatchedURL(rawURL, time.Now())
+}
+
+// MarkURLDispatched records rawURL as freshly dispatched, starting its
+// cooldown window. See RecentlyDispatchedURL.
+func (s *Service) MarkURLDispatched(rawURL string) {
+	s.markSelectedReleaseURLDispatched(rawURL, time.Now())
+}
+
+// shouldSkipDuplicateURLFetch is the single choke point every NZB fetch call
+// site must go through immediately before calling s.fetcher.Fetch. It checks
+// both the in-memory per-URL cooldown (recentURLHits, cleared on every
+// process restart) and a Postgres-persisted equivalent (recent_url_fetches,
+// which survives a restart), and marks the URL dispatched in both places
+// before returning false. The persisted check exists because a redeploy
+// landing between MarkSelectedReleaseFetching and the fetch actually
+// completing would otherwise wipe recentURLHits and let the resume-dispatch
+// path re-fetch the same URL with zero cooldown protection. This project has
+// twice shipped a fix for one fetch call site and missed a near-duplicate
+// one (v0.2.22, then v0.2.28) -- consolidating both cooldowns into one
+// function that every call site shares closes off a third recurrence.
+func (s *Service) shouldSkipDuplicateURLFetch(ctx context.Context, rawURL string) bool {
+	now := time.Now()
+	if s.recentlyDispatchedURL(rawURL, now) {
+		return true
+	}
+	if persisted, err := s.repo.RecentlyDispatchedURLPersisted(ctx, rawURL, selectedURLCooldown); err != nil {
+		s.logger.Warn().Err(err).Str("url", rawURL).Msg("persisted URL-dispatch check failed — falling back to in-memory cooldown only")
+	} else if persisted {
+		return true
+	}
+	s.markSelectedReleaseURLDispatched(rawURL, now)
+	if err := s.repo.MarkURLDispatchedPersisted(ctx, rawURL); err != nil {
+		s.logger.Warn().Err(err).Str("url", rawURL).Msg("failed to persist URL-dispatch marker — restart-window duplicate-fetch protection degraded for this attempt")
+	}
+	return false
+}
+
 func searchRequestFingerprint(libraryItemID int64, request hydra.SearchRequest) string {
 	query := normalizeSearchText(request.Query)
 	return fmt.Sprintf("%d|%s|%s|%d|%s|%d|%d", libraryItemID,
@@ -1452,17 +1498,29 @@ func (s *Service) SearchRecentPending(ctx context.Context, mediaType string) (Bu
 		if !hasNonRejectedCandidate(candidates) {
 			continue
 		}
+		// O-05: skip if another goroutine (a manual search, backlog_search,
+		// or queue_housekeeping retry) is already searching/selecting for
+		// this item -- the same per-item guard SearchLibrary uses. Without
+		// it, this RSS-recent-feed cycle could race one of those, each
+		// independently selecting and fetching a different candidate's URL
+		// for the same library item.
+		if _, loaded := s.searchInflight.LoadOrStore(target.LibraryItemID, struct{}{}); loaded {
+			continue
+		}
 		selectedReleaseID, err := s.repo.ReplaceSearchCandidates(ctx, target.LibraryItemID, candidates)
 		if err != nil {
+			s.searchInflight.Delete(target.LibraryItemID)
 			result.Failed++
 			result.FailedItems = append(result.FailedItems, target.LibraryItemID)
 			continue
 		}
 		result.Searched++
 		if selectedReleaseID == nil {
+			s.searchInflight.Delete(target.LibraryItemID)
 			continue
 		}
 		finalSelected, err := s.fetchAndImportSelectedRelease(ctx, *selectedReleaseID)
+		s.searchInflight.Delete(target.LibraryItemID)
 		if err != nil {
 			result.Failed++
 			result.FailedItems = append(result.FailedItems, target.LibraryItemID)
@@ -1687,10 +1745,6 @@ func (s *Service) SearchLibrary(ctx context.Context, libraryItemID int64) (Searc
 		return result, err
 	}
 	return SearchResult{}, fmt.Errorf("searchLibrary: too many deadlock retries for item %d", libraryItemID)
-}
-
-func (s *Service) searchLibraryOnce(ctx context.Context, libraryItemID int64) (SearchResult, error) {
-	return s.searchLibraryOnceWithMode(ctx, libraryItemID, false)
 }
 
 func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID int64, upgradeSearch bool) (SearchResult, error) {
@@ -2278,7 +2332,7 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 		// Already indexed — skip straight to publish.
 		return nil, &pendingPublish{current: current}, nil
 	}
-	if s.recentlyDispatchedURL(current.ExternalURL, time.Now()) {
+	if s.shouldSkipDuplicateURLFetch(ctx, current.ExternalURL) {
 		// Already fetched this exact NZB within the cooldown window via some
 		// other path (or a moment ago via this one) — skip quietly rather than
 		// re-fetching or promoting to the next candidate; the current
@@ -2288,7 +2342,6 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 	if err := s.repo.MarkSelectedReleaseFetching(ctx, current.SelectedReleaseID); err != nil {
 		return nil, nil, err
 	}
-	s.markSelectedReleaseURLDispatched(current.ExternalURL, time.Now())
 	fileName, raw, err := s.fetcher.Fetch(ctx, current.ExternalURL)
 	if err != nil {
 		result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), 0)
@@ -2413,18 +2466,19 @@ func (s *Service) fetchAndImportSelectedReleaseDepth(ctx context.Context, select
 	if current.NZBDocumentID != nil {
 		return s.retrySelectedReleaseFromStoredNZB(ctx, current, depth)
 	}
-	// Same recentlyDispatchedURL cooldown as fetchIndexAndRelease -- this is a
-	// separate, near-duplicate fetch path (the recursive candidate-promotion
-	// chain via promoteNextAfterFailureDepth) that was missed when that
-	// cooldown was added, so it kept bypassing it and re-fetching URLs the
-	// other path had just tried moments earlier.
-	if s.recentlyDispatchedURL(current.ExternalURL, time.Now()) {
+	// Same shouldSkipDuplicateURLFetch cooldown as fetchIndexAndRelease --
+	// this is a separate, near-duplicate fetch path (the recursive
+	// candidate-promotion chain via promoteNextAfterFailureDepth) that was
+	// missed when the in-memory cooldown was first added (v0.2.22), so it
+	// kept bypassing it and re-fetching URLs the other path had just tried
+	// moments earlier until that was fixed (v0.2.28). Both call sites now
+	// share the exact same guard function so this can't recur a third time.
+	if s.shouldSkipDuplicateURLFetch(ctx, current.ExternalURL) {
 		return nil, nil
 	}
 	if err := s.repo.MarkSelectedReleaseFetching(ctx, current.SelectedReleaseID); err != nil {
 		return nil, err
 	}
-	s.markSelectedReleaseURLDispatched(current.ExternalURL, time.Now())
 	fileName, raw, err := s.fetcher.Fetch(ctx, current.ExternalURL)
 	if err != nil {
 		return s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
@@ -3678,7 +3732,17 @@ func (s *Service) SearchUpgrades(ctx context.Context) (UpgradeSearchResult, erro
 	}
 	result := UpgradeSearchResult{Checked: len(items)}
 	for _, libraryItemID := range items {
+		// O-05: skip if another goroutine (a manual search, backlog_search,
+		// or queue_housekeeping retry) is already searching/selecting for
+		// this item -- the same per-item guard SearchLibrary uses. Without
+		// it, this upgrade search's ReplaceSearchCandidates+fetch cycle
+		// could race one of those, each independently selecting and
+		// fetching a different candidate's URL for the same library item.
+		if _, loaded := s.searchInflight.LoadOrStore(libraryItemID, struct{}{}); loaded {
+			continue
+		}
 		res, err := s.searchLibraryOnceWithMode(ctx, libraryItemID, true)
+		s.searchInflight.Delete(libraryItemID)
 		if err != nil {
 			s.logger.Warn().Int64("libraryItemId", libraryItemID).Err(err).Msg("upgrade search failed")
 			result.Failed++

@@ -77,6 +77,17 @@ func (s *FallbackSource) BodyPriority(ctx context.Context, messageID string, pri
 		return nil, errors.New("fallback source unavailable")
 	}
 	var failures []error
+	// conclusivelyMissing remembers, within this single call, which sources
+	// already gave a definitive "no such article" answer for this exact
+	// messageID (per classifyCacheableError's missingArticleTTL
+	// classification -- not a throttle/circuit-open failure, which is
+	// already handled per-round by s.breaker.Allow). Without this, a
+	// multi-provider config with retries>0 would re-query the same source
+	// for the same known-dead article on every retry round. Currently
+	// dormant in production: NewFallbackSource forces retries=0 for a
+	// single-provider setup, so the outer loop only ever runs once -- this
+	// only matters the moment a second provider is configured.
+	conclusivelyMissing := make(map[string]bool)
 	for attempt := 0; attempt <= s.retries; attempt++ {
 		if attempt > 0 {
 			if err := waitBackoff(ctx); err != nil {
@@ -85,6 +96,9 @@ func (s *FallbackSource) BodyPriority(ctx context.Context, messageID string, pri
 		}
 		for _, source := range s.sources {
 			name := sourceName(source)
+			if conclusivelyMissing[name] {
+				continue
+			}
 			if !s.breaker.Allow(name) {
 				failures = append(failures, fmt.Errorf("%s attempt %d: %w", name, attempt+1, ErrProviderCircuitOpen))
 				continue
@@ -99,6 +113,9 @@ func (s *FallbackSource) BodyPriority(ctx context.Context, messageID string, pri
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
+			if ttl, cacheable := classifyCacheableError(err); cacheable && ttl == missingArticleTTL {
+				conclusivelyMissing[name] = true
+			}
 			failures = append(failures, fmt.Errorf("%s attempt %d: %w", name, attempt+1, err))
 		}
 	}
@@ -110,6 +127,8 @@ func (s *FallbackSource) Stat(ctx context.Context, messageID string) error {
 		return errors.New("fallback source unavailable")
 	}
 	var failures []error
+	// See the matching comment in BodyPriority.
+	conclusivelyMissing := make(map[string]bool)
 	for attempt := 0; attempt <= s.retries; attempt++ {
 		if attempt > 0 {
 			if err := waitBackoff(ctx); err != nil {
@@ -118,6 +137,9 @@ func (s *FallbackSource) Stat(ctx context.Context, messageID string) error {
 		}
 		for _, source := range s.sources {
 			name := sourceName(source)
+			if conclusivelyMissing[name] {
+				continue
+			}
 			if !s.breaker.Allow(name) {
 				failures = append(failures, fmt.Errorf("%s attempt %d: %w", name, attempt+1, ErrProviderCircuitOpen))
 				continue
@@ -130,6 +152,9 @@ func (s *FallbackSource) Stat(ctx context.Context, messageID string) error {
 			s.breaker.RecordFailure(name, err)
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if ttl, cacheable := classifyCacheableError(err); cacheable && ttl == missingArticleTTL {
+				conclusivelyMissing[name] = true
 			}
 			failures = append(failures, fmt.Errorf("%s attempt %d: %w", name, attempt+1, err))
 		}

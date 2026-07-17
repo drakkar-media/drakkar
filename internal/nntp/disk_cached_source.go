@@ -163,11 +163,20 @@ func (s *DiskCachedDecodedSource) Stat(ctx context.Context, messageID string) er
 	if s == nil || s.source == nil {
 		return errors.New("disk cached source unavailable")
 	}
-	if body, ok, err := s.cache.Get(messageID); err == nil && ok {
+	if _, ok, err := s.cache.Get(messageID); err == nil && ok {
+		// The decoded body already being on disk is itself proof the
+		// article exists -- that's all a Stat caller needs. Don't call
+		// fillPartInfoFromRaw here: its only purpose is recovering the
+		// yEnc PartInfo lost across a restart (partInfo is in-memory
+		// only), which no Stat caller ever observes, and doing so degrades
+		// this supposedly-cheap existence check into a full live article
+		// body fetch. earlyChecker (used as a preflight gate before every
+		// selected-release fetch/retry) calls exactly this path, so that
+		// degradation defeated the entire point of using a cheap check
+		// there. A missing partInfo entry is instead filled in lazily by
+		// DecodedBodyInfoPriority the next time this article is actually
+		// read for playback, which already needs to hold the body in hand.
 		metrics.M.CacheHits.Add(1)
-		if _, hasInfo := s.lookupPartInfo(messageID); !hasInfo {
-			_, _, _ = s.fillPartInfoFromRaw(ctx, messageID, stream.PriorityBackground, body)
-		}
 		return nil
 	} else if err != nil {
 		return err

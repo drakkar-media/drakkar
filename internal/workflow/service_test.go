@@ -17,40 +17,41 @@ import (
 )
 
 type repoStub struct {
-	requests          []database.MediaRequestSummary
-	searchInput       database.LibrarySearchInput
-	searchInputByItem map[int64]database.LibrarySearchInput
-	history           map[string]database.CandidateHistory
-	defaultProfile    database.QualityProfile
-	itemProfile       *database.QualityProfile
-	conflict          string
-	searchApplied     []database.SearchCandidateRecord
-	searchFailed      []string
-	pending           []database.PendingLibrarySearchTarget
-	backlog           int
-	selectedBacklog   int
-	failedQueues      []database.FailedQueueRetryTarget
-	selectedQueues    []database.SelectedQueueRetryTarget
-	upgradable        []int64
-	movieCalls        int
-	tvCalls           int
-	fetching          int64
-	imported          database.ImportedNZB
-	indexed           int64
-	selected          database.ReleaseSummary
-	selectedByID      map[int64]database.ReleaseSummary
-	promoted          *database.ReleaseSummary
-	alternative       *database.ReleaseSummary
-	next              *database.ReleaseSummary
-	failed            []string
-	rejected          []string
-	retryTarget       database.QueueRetryTarget
-	skipped           []int64
-	requeued          []int64
-	stored            database.StoredNZBDocument
-	restoredGroup     []int64
-	calibrateFn       func(context.Context, int64) error
-	movieMeta         struct {
+	persistedDispatchedURLs map[string]bool
+	requests                []database.MediaRequestSummary
+	searchInput             database.LibrarySearchInput
+	searchInputByItem       map[int64]database.LibrarySearchInput
+	history                 map[string]database.CandidateHistory
+	defaultProfile          database.QualityProfile
+	itemProfile             *database.QualityProfile
+	conflict                string
+	searchApplied           []database.SearchCandidateRecord
+	searchFailed            []string
+	pending                 []database.PendingLibrarySearchTarget
+	backlog                 int
+	selectedBacklog         int
+	failedQueues            []database.FailedQueueRetryTarget
+	selectedQueues          []database.SelectedQueueRetryTarget
+	upgradable              []int64
+	movieCalls              int
+	tvCalls                 int
+	fetching                int64
+	imported                database.ImportedNZB
+	indexed                 int64
+	selected                database.ReleaseSummary
+	selectedByID            map[int64]database.ReleaseSummary
+	promoted                *database.ReleaseSummary
+	alternative             *database.ReleaseSummary
+	next                    *database.ReleaseSummary
+	failed                  []string
+	rejected                []string
+	retryTarget             database.QueueRetryTarget
+	skipped                 []int64
+	requeued                []int64
+	stored                  database.StoredNZBDocument
+	restoredGroup           []int64
+	calibrateFn             func(context.Context, int64) error
+	movieMeta               struct {
 		libraryItemID int64
 		tmdbID        int64
 		title         string
@@ -297,6 +298,18 @@ func (r *repoStub) SkipReleaseCandidate(ctx context.Context, releaseCandidateID 
 
 func (r *repoStub) MarkSelectedReleaseFetching(ctx context.Context, selectedReleaseID int64) error {
 	r.fetching = selectedReleaseID
+	return nil
+}
+
+func (r *repoStub) RecentlyDispatchedURLPersisted(ctx context.Context, rawURL string, cooldown time.Duration) (bool, error) {
+	return r.persistedDispatchedURLs[rawURL], nil
+}
+
+func (r *repoStub) MarkURLDispatchedPersisted(ctx context.Context, rawURL string) error {
+	if r.persistedDispatchedURLs == nil {
+		r.persistedDispatchedURLs = make(map[string]bool)
+	}
+	r.persistedDispatchedURLs[rawURL] = true
 	return nil
 }
 
@@ -1861,6 +1874,43 @@ func TestFetchAndImportSelectedReleaseDepthSkipsRecentlyDispatchedURL(t *testing
 	}
 }
 
+// TestFetchIndexAndReleaseSkipsPersistedlyDispatchedURLAfterRestart guards
+// against the in-memory-cooldown restart gap found in the 2026-07-17
+// exhaustive audit: recentURLHits (the in-memory 30-min per-URL fetch
+// cooldown) is wiped on every process restart. A release fetch interrupted
+// mid-flight by a redeploy (or a resume-dispatch pass racing a fresh
+// process start) would otherwise be re-dispatched with zero cooldown
+// protection. This simulates exactly that: an empty in-memory map (as if
+// the process just restarted) but a persisted dispatch record surviving
+// from before the restart -- the fetch must still be skipped.
+func TestFetchIndexAndReleaseSkipsPersistedlyDispatchedURLAfterRestart(t *testing.T) {
+	const restartURL = "http://example/restart-window.nzb"
+	repo := &repoStub{
+		selected: database.ReleaseSummary{
+			SelectedReleaseID: 303,
+			LibraryItemID:     42,
+			ExternalURL:       restartURL,
+		},
+		persistedDispatchedURLs: map[string]bool{restartURL: true},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	calls := 0
+	service.fetcher = countingFetcherStub{
+		fileName: "restart-window.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Restart (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+		calls:    &calls,
+	}
+	// service.recentURLHits is intentionally left empty -- simulating a
+	// process that just restarted and lost its in-memory cooldown state.
+
+	if err := service.ProcessLibraryItem(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("expected the persisted dispatch record to block the fetch even with an empty in-memory cooldown map, got %d fetches", calls)
+	}
+}
+
 func TestSearchPendingLibraryQueuesAllItems(t *testing.T) {
 	const total = pendingQueueBatchSize + 10
 	pending := make([]database.PendingLibrarySearchTarget, 0, total)
@@ -2072,6 +2122,53 @@ func TestSearchRecentPendingMovieSelectsWithoutActiveHydraSearch(t *testing.T) {
 	}
 	if result.Processed != 1 || result.Searched != 1 || result.Selected != 1 || result.Failed != 0 {
 		t.Fatalf("unexpected result %+v", result)
+	}
+}
+
+// TestSearchRecentPendingSkipsItemAlreadyInFlight guards against a real gap
+// found in the 2026-07-17 exhaustive audit: SearchRecentPending (the RSS
+// "recent feed" pass) computed candidates and called ReplaceSearchCandidates
+// + fetchAndImportSelectedRelease directly, without ever checking
+// s.searchInflight -- the only per-library-item mutual-exclusion guard
+// SearchLibrary uses. A manual search, backlog_search, or queue_housekeeping
+// retry racing this same item could independently select and fetch a
+// different candidate's URL for it at the same time.
+func TestSearchRecentPendingSkipsItemAlreadyInFlight(t *testing.T) {
+	repo := &repoStub{
+		pending: []database.PendingLibrarySearchTarget{{LibraryItemID: 42}},
+		searchInput: database.LibrarySearchInput{
+			LibraryItemID: 42,
+			MediaType:     "movie",
+			Title:         "Dune",
+			IMDbID:        "tt1160419",
+			MovieYear:     2021,
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{
+		recent: map[string][]hydra.SearchResult{
+			"movie": {
+				{Title: "Dune.2021.1080p.WEB-DL.x265-GRP", Link: "http://example/nzb", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+			},
+		},
+	})
+	service.fetcher = fetcherStub{
+		fileName: "dune.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Dune (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+	}
+
+	// Simulate another goroutine (a manual search, backlog_search, or
+	// queue_housekeeping retry) already searching/selecting for this item.
+	service.searchInflight.Store(int64(42), struct{}{})
+
+	result, err := service.SearchRecentPending(context.Background(), "movie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Searched != 0 || result.Selected != 0 {
+		t.Fatalf("expected the in-flight item to be skipped without searching/selecting, got %+v", result)
+	}
+	if len(repo.searchApplied) != 0 {
+		t.Fatalf("expected ReplaceSearchCandidates not to be called for an in-flight item, got %+v", repo.searchApplied)
 	}
 }
 
@@ -2640,6 +2737,50 @@ func TestSearchUpgradesRequiresMinimumCustomFormatScoreIncrement(t *testing.T) {
 	}
 	if !repo.searchApplied[0].Rejected || repo.searchApplied[0].RejectReason != "upgrade_custom_format_score" {
 		t.Fatalf("expected upgrade_custom_format_score reject, got %+v", repo.searchApplied[0])
+	}
+}
+
+// TestSearchUpgradesSkipsItemAlreadyInFlight is the SearchUpgrades
+// counterpart to TestSearchRecentPendingSkipsItemAlreadyInFlight: it called
+// searchLibraryOnceWithMode directly, bypassing the same s.searchInflight
+// guard SearchLibrary uses.
+func TestSearchUpgradesSkipsItemAlreadyInFlight(t *testing.T) {
+	repo := &repoStub{
+		upgradable: []int64{42},
+		itemProfile: &database.QualityProfile{
+			Name:         "Upgrade Gate",
+			AllowUpgrade: true,
+		},
+		searchInput: database.LibrarySearchInput{
+			LibraryItemID: 42,
+			MediaType:     "movie",
+			Title:         "Dune",
+			MovieYear:     2021,
+		},
+		selected: database.ReleaseSummary{
+			SelectedReleaseID:  90,
+			LibraryItemID:      42,
+			CustomFormatScore:  50,
+			ReleaseCandidateID: 9,
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
+		{Title: "Dune.2021.2160p.WEB-DL.Atmos-GRP", Link: "http://example/nzb", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+	}})
+
+	// Simulate another goroutine (a manual search, backlog_search, or
+	// queue_housekeeping retry) already searching/selecting for this item.
+	service.searchInflight.Store(int64(42), struct{}{})
+
+	result, err := service.SearchUpgrades(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Upgraded != 0 || result.Failed != 0 {
+		t.Fatalf("expected the in-flight item to be skipped without upgrading or failing, got %+v", result)
+	}
+	if len(repo.searchApplied) != 0 {
+		t.Fatalf("expected no search candidates to be applied for an in-flight item, got %+v", repo.searchApplied)
 	}
 }
 

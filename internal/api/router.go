@@ -152,6 +152,8 @@ type WorkflowService interface {
 	ResetOrphanedAvailableItems(ctx context.Context) (workflow.ResetOrphanedAvailableItemsResult, error)
 	PushMissingLibraryItemsToSeerr(ctx context.Context) (workflow.PushMissingToSeerrResult, error)
 	SyncPlexDetectedShows(ctx context.Context) (workflow.SyncPlexDetectedResult, error)
+	RecentlyDispatchedURL(rawURL string) bool
+	MarkURLDispatched(rawURL string)
 }
 
 type PublicationService interface {
@@ -361,6 +363,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 				}
 				return mp
 			}(),
+			recentlyDispatchedURL: workflowSvc.RecentlyDispatchedURL,
+			markURLDispatched:     workflowSvc.MarkURLDispatched,
 		}
 		r.HandleFunc("/sabnzbd/api", sabH.ServeHTTP)
 		r.HandleFunc("/api/sabnzbd/api", sabH.ServeHTTP)
