@@ -29,6 +29,24 @@ func TestScorePreferredCandidate(t *testing.T) {
 	}
 }
 
+// TestScoreHeavilyPenalizesSingleFailureCount guards the 2026-07-17 fix:
+// maxCandidateFailuresBeforeExclude was lowered from 5 to 1, so a single
+// prior failure must now be "effectively excluded" (-50000), not just
+// mildly penalized. This must stay in sync with
+// workflow.maxCandidateFailuresBeforeGiveUp, which stops a candidate from
+// getting a second real fetch attempt at the same threshold.
+func TestScoreHeavilyPenalizesSingleFailureCount(t *testing.T) {
+	clean := Score(Candidate{
+		Title: "Dune.2021.1080p.WEB-DL", Resolution: "1080p", Source: "WEB-DL",
+	}, Requirements{Title: "Dune", MediaType: "movie", Year: 2021})
+	failedOnce := Score(Candidate{
+		Title: "Dune.2021.1080p.WEB-DL", Resolution: "1080p", Source: "WEB-DL", FailureCount: 1,
+	}, Requirements{Title: "Dune", MediaType: "movie", Year: 2021})
+	if clean.Score-failedOnce.Score < 40000 {
+		t.Fatalf("expected a single failure to apply the heavy exclusion penalty, clean=%d failedOnce=%d", clean.Score, failedOnce.Score)
+	}
+}
+
 func TestScoreRejectsWrongMovieYear(t *testing.T) {
 	result := Score(Candidate{
 		Title:      "Dune.1984.1080p.BluRay",

@@ -2472,7 +2472,20 @@ func shouldPersistBlocklistReason(reason string) bool {
 
 func isPermanentArchiveRejectReason(reason string) bool {
 	switch strings.TrimSpace(strings.ToLower(reason)) {
-	case "archive_encrypted", "archive_solid_unsupported", "archive_compression_unsupported":
+	case "archive_encrypted", "archive_solid_unsupported", "archive_compression_unsupported",
+		// These three describe a permanent, structural property of the
+		// actual posted content (invalid/corrupt archive headers, no video
+		// file inside the archive, no publishable file at all) -- the same
+		// segments produce the same result on every retry, unlike a
+		// transient network/process failure. Added 2026-07-17: previously
+		// treated as "soft"/retryable in workflow/service.go's
+		// candidateFailurePenaltyProfile, which let a candidate survive up
+		// to 3 real fetch attempts before being durably rejected -- that
+		// leniency was the confirmed direct cause of a second NZB Finder
+		// account-termination warning (91 duplicate downloads, 23
+		// releases). See maxCandidateFailuresBeforeGiveUp in
+		// internal/workflow/service.go for the matching 1-strike gate.
+		"archive_headers_invalid", "archive_video_not_found", "no_publishable_files":
 		return true
 	default:
 		return false

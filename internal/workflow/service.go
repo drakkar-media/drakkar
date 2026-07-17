@@ -302,6 +302,26 @@ const (
 	asyncCalibrateBudget        = 2 * time.Minute
 	asyncCalibrateWorkers       = 2
 	tmdbEnrichWorkers           = 5
+	// maxCandidateFailuresBeforeGiveUp bounds how many real NZB fetch
+	// attempts a single release_candidate gets before it's force-blocklisted
+	// as "too_many_failures", regardless of whether its specific failure
+	// reason is independently classified as a hard reject. Was 5 until
+	// 2026-07-17: with a lenient value here, a candidate whose failure
+	// reason isn't (yet) recognized as permanent (see
+	// isPermanentArchiveRejectReason in workflow_repository.go) gets
+	// re-selected and re-fetched from the indexer up to 5 times before this
+	// safety net finally kicks in -- confirmed live as the direct cause of a
+	// second NZB Finder account-termination warning (91 duplicate
+	// downloads, 23 releases, avg 4x each) on the exact same day this
+	// session's earlier duplicate-download fixes shipped: every repeated
+	// title in NZBHydra2's download history traced back to a
+	// release_candidates row stuck retrying under this threshold. Lowered
+	// to 1 so a candidate gets exactly one real fetch attempt -- if it
+	// fails for any reason, the next time it's selected this check
+	// intercepts it before a second network fetch. ranking.go has a
+	// matching constant (maxCandidateFailuresBeforeExclude) that must stay
+	// in sync with this one.
+	maxCandidateFailuresBeforeGiveUp = 1
 )
 
 type searchAttemptRecord struct {
@@ -2352,7 +2372,7 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 		}
 		return nil, nil, err
 	}
-	if current.FailureCount >= 5 {
+	if current.FailureCount >= maxCandidateFailuresBeforeGiveUp {
 		result, err := s.promoteNextAfterFailureDepth(ctx, current, "too_many_failures", 0)
 		return result, nil, err
 	}
@@ -2485,7 +2505,7 @@ func (s *Service) fetchAndImportSelectedReleaseDepth(ctx context.Context, select
 	// Hard guard: if this release has already failed 5+ times, blocklist it
 	// immediately and promote the next candidate. This prevents infinite retry
 	// loops (e.g. 403 from NZBFinder causing 870 identical attempts).
-	if current.FailureCount >= 5 {
+	if current.FailureCount >= maxCandidateFailuresBeforeGiveUp {
 		return s.promoteNextAfterFailureDepth(ctx, current, "too_many_failures", depth)
 	}
 	// If the NZB was already downloaded in a previous attempt (e.g. stuck in
@@ -2846,50 +2866,25 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 func candidateFailurePenaltyProfile(history database.CandidateHistory) (effectiveFailureCount int, degraded bool, durableRejectThreshold int) {
 	effectiveFailureCount = history.FailureCount
 	degraded = history.FailureCount > 0
-	// Sonarr blocks on first failure. Allow 1 retry only for truly transient
-	// reasons (process restart mid-download, indexer quota). Everything else
-	// is rejected after the first attempt.
+	// Sonarr blocks on first failure -- every reason durably rejects a
+	// candidate on its first recurrence. Used to soften this to
+	// threshold=3 (with a reduced effective failure count for ranking) for
+	// reasons classified as "soft" -- archive_headers_invalid,
+	// archive_video_not_found, no_publishable_files, and confirmed-missing
+	// NNTP articles (status 430 / "article missing") among them -- on the
+	// theory those might be transient. Removed 2026-07-17: confirmed live
+	// that this leniency was the direct cause of a second NZB Finder
+	// account-termination warning (91 duplicate downloads, 23 releases) --
+	// candidates kept getting re-fetched well past this softened
+	// threshold, and none of those reasons are actually transient (a
+	// confirmed-430 article is permanently gone, an invalid archive header
+	// is the same corrupt data on every retry). The restart/quota
+	// exceptions below (isRestartInterruption/isTemporaryQuota) are
+	// untouched -- those aren't about the release's own quality, they're
+	// about not blaming a release for Drakkar's own process restart or a
+	// temporary indexer quota.
 	durableRejectThreshold = 1
-	if isSoftCandidateFailureReason(history.LastFailureReason) {
-		degraded = false
-		durableRejectThreshold = 3
-		if effectiveFailureCount <= 1 {
-			effectiveFailureCount = 0
-		} else {
-			effectiveFailureCount -= 1
-		}
-	}
-	if effectiveFailureCount < 0 {
-		effectiveFailureCount = 0
-	}
 	return effectiveFailureCount, degraded, durableRejectThreshold
-}
-
-func isSoftCandidateFailureReason(reason string) bool {
-	reason = strings.TrimSpace(strings.ToLower(reason))
-	if reason == "" {
-		return false
-	}
-	if strings.Contains(reason, "interrupted_by_restart") || strings.Contains(reason, "stale_worker") || strings.Contains(reason, "status 403") || strings.Contains(reason, "status 430") {
-		return true
-	}
-	if isRetryablePreflightCandidateReason(reason) {
-		return true
-	}
-	switch reason {
-	case "archive_headers_invalid", "archive_video_not_found", "no_publishable_files":
-		return true
-	}
-	return false
-}
-
-func isRetryablePreflightCandidateReason(reason string) bool {
-	if !(strings.HasPrefix(reason, "early preflight:") || strings.HasPrefix(reason, "preflight:")) {
-		return false
-	}
-	return strings.Contains(reason, "article missing") ||
-		strings.Contains(reason, "article not found") ||
-		strings.Contains(reason, "430")
 }
 
 func hasNonRejectedCandidate(candidates []database.SearchCandidateRecord) bool {
@@ -3347,7 +3342,7 @@ func (s *Service) promoteNextAfterFailureDepth(ctx context.Context, current data
 	if next == nil {
 		return nil, nil
 	}
-	if next.FailureCount >= 5 {
+	if next.FailureCount >= maxCandidateFailuresBeforeGiveUp {
 		// This candidate has already failed many times — skip it and promote again.
 		return s.promoteNextAfterFailureDepth(ctx, *next, "too_many_failures", depth+1)
 	}

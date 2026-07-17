@@ -13,6 +13,14 @@ import (
 	"time"
 )
 
+// maxCandidateFailuresBeforeExclude must stay in sync with
+// workflow.maxCandidateFailuresBeforeGiveUp (internal/workflow/service.go)
+// -- that constant stops a candidate from ever getting a second real fetch
+// attempt once its failure_count reaches this value, so ranking should
+// treat it as effectively dead at the same point rather than only heavily
+// penalizing it.
+const maxCandidateFailuresBeforeExclude = 1
+
 // compiledRegexCache memoizes regexp.Compile by pattern string. Exclude
 // patterns, custom-format score-rule patterns, and block-rule regexes all
 // come from a quality profile/custom-format list that's static for the
@@ -508,13 +516,9 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 	if candidate.Degraded {
 		score -= 300
 		addExplanation("Degraded candidate penalty (-300)")
-	} else if candidate.FailureCount >= 5 {
+	} else if candidate.FailureCount >= maxCandidateFailuresBeforeExclude {
 		score -= 50000 // effectively excluded
 		addExplanation("Heavy prior failure penalty (-50000)")
-	} else if candidate.FailureCount > 0 {
-		penalty := 300 * candidate.FailureCount
-		score -= penalty
-		addExplanation("Prior failure penalty (-%d)", penalty)
 	}
 
 	// ── Custom formats + release block rules (unified evaluation pass) ──────────

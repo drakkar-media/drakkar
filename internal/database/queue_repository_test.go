@@ -40,11 +40,20 @@ func TestIsPlayableMedia(t *testing.T) {
 }
 
 func TestIsHardRejectReason(t *testing.T) {
-	if isHardRejectReason("archive_video_not_found") {
-		t.Fatal("archive_video_not_found should stay retryable")
+	// archive_video_not_found and archive_headers_invalid were treated as
+	// retryable until 2026-07-17: giving them extra chances (via the
+	// now-removed "soft failure" leniency in
+	// workflow.candidateFailurePenaltyProfile) let a candidate survive
+	// well past a reasonable retry count, confirmed live as the direct
+	// cause of a second NZB Finder account-termination warning. Both
+	// describe a permanent, structural property of the actual posted
+	// content -- the same segments produce the same result on every
+	// retry -- so they must be hard rejects, same as archive_encrypted.
+	if !isHardRejectReason("archive_video_not_found") {
+		t.Fatal("archive_video_not_found is a permanent archive defect and must be a hard reject")
 	}
-	if isHardRejectReason("archive_headers_invalid") {
-		t.Fatal("archive_headers_invalid should stay retryable")
+	if !isHardRejectReason("archive_headers_invalid") {
+		t.Fatal("archive_headers_invalid is a permanent archive defect and must be a hard reject")
 	}
 	if !isHardRejectReason(" Archive_Encrypted ") {
 		t.Fatal("expected permanent archive reject to be hard")
@@ -70,8 +79,8 @@ func TestShouldPersistBlocklistReason(t *testing.T) {
 	if !shouldPersistBlocklistReason("archive_encrypted") {
 		t.Fatal("expected permanent archive reject to persist in blocklist")
 	}
-	if shouldPersistBlocklistReason("archive_headers_invalid") {
-		t.Fatal("archive_headers_invalid should not persist in blocklist")
+	if !shouldPersistBlocklistReason("archive_headers_invalid") {
+		t.Fatal("archive_headers_invalid is a permanent archive defect and must persist in blocklist")
 	}
 	if !shouldPersistBlocklistReason(" manual_reject ") {
 		t.Fatal("expected manual reject to persist in blocklist")

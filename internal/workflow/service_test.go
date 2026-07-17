@@ -1113,7 +1113,18 @@ func TestSearchLibraryRejectsSinglePreviouslyFailedHardCandidate(t *testing.T) {
 	}
 }
 
-func TestSearchLibrarySoftensArchiveFailurePenalty(t *testing.T) {
+// TestSearchLibraryDurablyRejectsArchiveFailureOnFirstRecurrence guards a
+// real production incident (2026-07-17): archive_headers_invalid (and
+// article-missing/430 preflight reasons) used to be treated as "soft" here,
+// tolerating up to 3 real fetch attempts (with a reduced effective failure
+// count) before durably rejecting -- on the theory those failures might be
+// transient. They aren't: a corrupt archive header or a confirmed-gone NNTP
+// article produces the exact same result on every retry. That leniency was
+// the confirmed direct cause of a second NZB Finder account-termination
+// warning (91 duplicate downloads across 23 releases). Every failure reason
+// must now durably reject a candidate on its first recurrence, with no
+// special-cased exceptions for archive/preflight reasons.
+func TestSearchLibraryDurablyRejectsArchiveFailureOnFirstRecurrence(t *testing.T) {
 	repo := &repoStub{
 		searchInput: database.LibrarySearchInput{
 			LibraryItemID: 42,
@@ -1124,55 +1135,7 @@ func TestSearchLibrarySoftensArchiveFailurePenalty(t *testing.T) {
 		history: map[string]database.CandidateHistory{
 			"http://example/archive": {
 				ExternalURL:       "http://example/archive",
-				FailureCount:      2,
-				LastFailureReason: "archive_headers_invalid",
-			},
-			"http://example/hard": {
-				ExternalURL:       "http://example/hard",
-				FailureCount:      2,
-				LastFailureReason: "context deadline exceeded",
-			},
-		},
-	}
-	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
-		{Title: "Dune.2021.1080p.WEB-DL.x265-ARCHIVE", Link: "http://example/archive", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
-		{Title: "Dune.2021.1080p.WEB-DL.x265-HARD", Link: "http://example/hard", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
-	}})
-	service.fetcher = fetcherStub{
-		fileName: "dune.nzb",
-		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Dune (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
-	}
-
-	result, err := service.SearchLibrary(context.Background(), 42)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if result.SelectedReleaseID == nil {
-		t.Fatalf("expected selected release, got %+v", result)
-	}
-	if len(repo.searchApplied) != 2 {
-		t.Fatalf("unexpected candidates %+v", repo.searchApplied)
-	}
-	if repo.searchApplied[0].ExternalURL != "http://example/archive" {
-		t.Fatalf("expected retryable archive-failure candidate ranked ahead of hard-failure candidate, got %+v", repo.searchApplied)
-	}
-	if repo.searchApplied[0].Score <= repo.searchApplied[1].Score {
-		t.Fatalf("expected softer archive penalty to preserve a higher score, got %+v", repo.searchApplied)
-	}
-}
-
-func TestSearchLibraryAllowsRepeatedArchiveFailuresLonger(t *testing.T) {
-	repo := &repoStub{
-		searchInput: database.LibrarySearchInput{
-			LibraryItemID: 42,
-			MediaType:     "movie",
-			Title:         "Dune",
-			MovieYear:     2021,
-		},
-		history: map[string]database.CandidateHistory{
-			"http://example/archive": {
-				ExternalURL:       "http://example/archive",
-				FailureCount:      2,
+				FailureCount:      1,
 				LastFailureReason: "archive_headers_invalid",
 			},
 		},
@@ -1180,20 +1143,16 @@ func TestSearchLibraryAllowsRepeatedArchiveFailuresLonger(t *testing.T) {
 	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
 		{Title: "Dune.2021.1080p.WEB-DL.x265-ARCHIVE", Link: "http://example/archive", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
 	}})
-	service.fetcher = fetcherStub{
-		fileName: "dune.nzb",
-		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Dune (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
-	}
 
 	result, err := service.SearchLibrary(context.Background(), 42)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.SelectedReleaseID == nil {
-		t.Fatalf("expected archive retry candidate to remain eligible at 2 failures (effective 1, threshold 3), got %+v", result)
+	if result.SelectedReleaseID != nil {
+		t.Fatalf("expected a single archive_headers_invalid failure to durably reject the candidate, got %+v", result)
 	}
-	if len(repo.searchApplied) != 1 || repo.searchApplied[0].Rejected {
-		t.Fatalf("expected archive retry candidate not to be durably rejected yet, got %+v", repo.searchApplied)
+	if len(repo.searchApplied) != 1 || !repo.searchApplied[0].Rejected || repo.searchApplied[0].RejectReason != "previously_failed" {
+		t.Fatalf("expected durable reject after 1 archive failure, got %+v", repo.searchApplied)
 	}
 }
 
@@ -1951,6 +1910,42 @@ func TestFetchIndexAndReleaseSkipsPersistedlyDispatchedURLAfterRestart(t *testin
 	}
 	if calls != 0 {
 		t.Fatalf("expected the persisted dispatch record to block the fetch even with an empty in-memory cooldown map, got %d fetches", calls)
+	}
+}
+
+// TestFetchIndexAndReleaseGivesUpAfterOneFailure guards the 2026-07-17 fix:
+// maxCandidateFailuresBeforeGiveUp was lowered from 5 to 1 after a single
+// candidate (archive_headers_invalid) kept getting re-selected and
+// re-fetched from the indexer up to 5 times before being force-blocklisted
+// -- confirmed live as the direct cause of a second NZB Finder
+// account-termination warning (91 duplicate downloads, 23 releases). A
+// release whose own failure_count has already reached 1 must be treated as
+// "too_many_failures" and promoted/failed without a second real fetch.
+func TestFetchIndexAndReleaseGivesUpAfterOneFailure(t *testing.T) {
+	repo := &repoStub{
+		selected: database.ReleaseSummary{
+			SelectedReleaseID: 404,
+			LibraryItemID:     42,
+			ExternalURL:       "http://example/one-strike.nzb",
+			FailureCount:      1,
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	calls := 0
+	service.fetcher = countingFetcherStub{
+		fileName: "one-strike.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;OneStrike.mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+		calls:    &calls,
+	}
+
+	if err := service.ProcessLibraryItem(context.Background(), 42); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("expected a candidate with failure_count=1 to be given up on without a second real fetch, got %d fetches", calls)
+	}
+	if len(repo.failed) != 1 || repo.failed[0] != "too_many_failures" {
+		t.Fatalf("expected the give-up path to record too_many_failures, got %+v", repo.failed)
 	}
 }
 
