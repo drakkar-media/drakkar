@@ -3705,6 +3705,18 @@ func (s *Service) RetryQueueItem(ctx context.Context, queueItemID int64) (QueueR
 	if err != nil {
 		return QueueRetryResult{}, err
 	}
+	// An already-available item has nothing to retry -- most notably, an
+	// episode fulfilled purely by season-pack fan-out (createSeasonPackEpisodeItem)
+	// shares the pack's release_candidate_id/external_url but not the pack's
+	// own selected_releases.id, so GetSelectedReleaseSummary for its row
+	// always reports NZBDocumentID=nil/VirtualFileCount=0 -- indistinguishable
+	// from "never fetched" to everything below. Without this guard, retrying
+	// such an item (e.g. a direct API/script call; the UI's Retry button
+	// only renders for failed rows) would re-fetch the entire season pack
+	// from the indexer just to resolve one already-available episode.
+	if target.State == database.QueueAvailable {
+		return QueueRetryResult{QueueItemID: queueItemID, Action: "already_available"}, nil
+	}
 	if target.SelectedReleaseID != nil {
 		summary, err := s.repo.GetSelectedReleaseSummary(ctx, *target.SelectedReleaseID)
 		if err != nil {

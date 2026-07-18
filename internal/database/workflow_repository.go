@@ -738,11 +738,12 @@ func (db *DB) GetQueueRetryTarget(ctx context.Context, queueItemID int64) (Queue
 			q.library_item_id,
 			q.selected_release_id,
 			li.media_type,
-			q.idempotency_key
+			q.idempotency_key,
+			q.state
 		from queue_items q
 		join library_items li on li.id = q.library_item_id
 		where q.id = $1`, queueItemID,
-	).Scan(&item.QueueItemID, &item.LibraryItemID, &selectedRelease, &item.MediaType, &item.IdempotencyKey)
+	).Scan(&item.QueueItemID, &item.LibraryItemID, &selectedRelease, &item.MediaType, &item.IdempotencyKey, &item.State)
 	if err != nil {
 		return QueueRetryTarget{}, err
 	}

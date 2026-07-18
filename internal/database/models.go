@@ -467,6 +467,7 @@ type QueueRetryTarget struct {
 	SelectedReleaseID *int64
 	MediaType         string
 	IdempotencyKey    string
+	State             QueueState
 }
 
 type PendingLibrarySearchTarget struct {

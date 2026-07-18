@@ -540,6 +540,14 @@ func (f fetcherStub) Fetch(ctx context.Context, rawURL string) (string, []byte, 
 	return f.fileName, f.raw, nil
 }
 
+// countingFetcherFunc adapts a func to NZBFetcher, letting a test assert on
+// how many times (if any) a real fetch was attempted.
+type countingFetcherFunc func(ctx context.Context, rawURL string) (string, []byte, error)
+
+func (f countingFetcherFunc) Fetch(ctx context.Context, rawURL string) (string, []byte, error) {
+	return f(ctx, rawURL)
+}
+
 type tmdbStub struct{}
 
 func (tmdbStub) Enabled() bool { return true }
@@ -2787,6 +2795,49 @@ func TestRetryQueueItemSelectedRelease(t *testing.T) {
 	}
 	if result.Action != "retried_selected_release" || result.SelectedReleaseID == nil || *result.SelectedReleaseID != 303 {
 		t.Fatalf("unexpected result %+v", result)
+	}
+}
+
+// TestRetryQueueItemNoOpsWhenAlreadyAvailable guards against a gap found in
+// the 2026-07-19 follow-up audit: an episode fulfilled purely by
+// season-pack fan-out (createSeasonPackEpisodeItem) shares the pack's
+// release_candidate_id/external_url but not the pack's own
+// selected_releases.id, so its own GetSelectedReleaseSummary always reports
+// NZBDocumentID=nil/VirtualFileCount=0 -- indistinguishable from "never
+// fetched". Without a state guard, retrying such an item (e.g. a direct API
+// call, since the UI's Retry button only renders for failed rows) would
+// re-fetch the entire season pack from the indexer just to resolve one
+// already-available episode.
+func TestRetryQueueItemNoOpsWhenAlreadyAvailable(t *testing.T) {
+	fetchCalls := 0
+	repo := &repoStub{
+		retryTarget: database.QueueRetryTarget{
+			QueueItemID:       60,
+			LibraryItemID:     42,
+			SelectedReleaseID: func() *int64 { v := int64(305); return &v }(),
+			State:             database.QueueAvailable,
+		},
+		selected: database.ReleaseSummary{
+			SelectedReleaseID: 305,
+			LibraryItemID:     42,
+			ExternalURL:       "http://example/season-pack.nzb",
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	service.fetcher = countingFetcherFunc(func(ctx context.Context, rawURL string) (string, []byte, error) {
+		fetchCalls++
+		return "season-pack.nzb", []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb></nzb>`), nil
+	})
+
+	result, err := service.RetryQueueItem(context.Background(), 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Action != "already_available" {
+		t.Fatalf("expected a no-op result for an already-available item, got %+v", result)
+	}
+	if fetchCalls != 0 {
+		t.Fatalf("expected no NZB fetch for an already-available item, got %d", fetchCalls)
 	}
 }
 
