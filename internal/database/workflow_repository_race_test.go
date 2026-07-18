@@ -295,6 +295,198 @@ func TestRejectReleaseCandidateSerializesConcurrentRejection(t *testing.T) {
 	}
 }
 
+// TestMarkLibrarySearchFailedIsAtomicAcrossBothStatements guards against a
+// gap found in the 2026-07-19 follow-up audit: MarkLibrarySearchFailed used
+// to run as two bare ExecContext calls with no explicit transaction at all.
+// Each bare statement autocommits (and releases its implicit row lock)
+// the instant it completes, so there was a real window between the UPDATE
+// and the DELETE where nothing serialized this function against a
+// concurrent locked writer (e.g. FailSelectedReleaseAndPromoteNext
+// installing a fresh selection after an unrelated fetch failure): that
+// writer could commit a brand new selected_releases row + queue_items
+// pointer to it inside the gap, and the DELETE would then remove that
+// fresh row. queue_items.selected_release_id has an ON DELETE SET NULL FK
+// to selected_releases, so Postgres itself prevents a literally-dangling
+// pointer -- but nothing prevents queue_items.state from being left at
+// 'selected' (set by the concurrent writer) with selected_release_id
+// silently nulled back out from under it (by the FK's own cascade once the
+// legacy shape's DELETE runs) -- a queue item claiming to have a live
+// selection with nothing behind it, silently discarding the concurrent
+// writer's legitimate selection with no error anywhere.
+//
+// A single bare UPDATE still naturally blocks on another transaction's held
+// row lock (Postgres locks rows on any write, transactional or not), so a
+// test that merely holds the lock and calls MarkLibrarySearchFailed cannot
+// distinguish the old shape from the fix -- both block identically on the
+// first statement. The actual gap is *between* the two statements, which
+// requires precisely timing a third actor into a nanosecond-scale window
+// that goroutine scheduling alone won't reliably hit. So this test first
+// reproduces the old two-bare-statement shape directly (widening its gap
+// with a short sleep, the same proven technique used elsewhere in this file
+// for this class of bug) to confirm the window is real and would corrupt
+// state, then runs the identical concurrent-writer harness against the
+// actual, fixed MarkLibrarySearchFailed and confirms no corruption results.
+func TestMarkLibrarySearchFailedIsAtomicAcrossBothStatements(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	// concurrentWriterInstallsFreshSelection waits a moment (targeting the
+	// legacy shape's widened gap), then installs a brand new
+	// selected_releases row for libID and points queue_items at it --
+	// exactly what FailSelectedReleaseAndPromoteNext does after a fetch
+	// failure promotes the next candidate.
+	concurrentWriterInstallsFreshSelection := func(libID, rcID int64, startedInstalling chan<- struct{}) {
+		time.Sleep(75 * time.Millisecond)
+		var freshSRID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into selected_releases (library_item_id, release_candidate_id)
+			values ($1, $2)
+			returning id`, libID, rcID,
+		).Scan(&freshSRID); err != nil {
+			t.Errorf("concurrent writer: insert selected_releases: %v", err)
+			close(startedInstalling)
+			return
+		}
+		if _, err := sqlDB.ExecContext(ctx, `
+			update queue_items set selected_release_id = $2, state = 'selected', updated_at = now()
+			where library_item_id = $1`, libID, freshSRID,
+		); err != nil {
+			t.Errorf("concurrent writer: update queue_items: %v", err)
+		}
+		close(startedInstalling)
+	}
+
+	t.Run("legacy shape corrupts state", func(t *testing.T) {
+		libID := setupRaceTestLibraryItem(t, ctx, sqlDB, "mark-search-failed-legacy-shape", "selected")
+		defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+		var rcID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into release_candidates (library_item_id, title, external_url, indexer_name)
+			values ($1, 'Legacy Shape Fresh Candidate', 'http://example/legacy-shape-fresh', 'test-indexer')
+			returning id`, libID,
+		).Scan(&rcID); err != nil {
+			t.Fatal(err)
+		}
+
+		installed := make(chan struct{})
+		go concurrentWriterInstallsFreshSelection(libID, rcID, installed)
+
+		// Replicates the pre-fix MarkLibrarySearchFailed body exactly: two
+		// bare, separately-autocommitted statements with a gap between them
+		// (widened here so the concurrent writer above reliably lands in it;
+		// the real pre-fix gap was nanosecond-scale but structurally identical).
+		if _, err := sqlDB.ExecContext(ctx, `
+			update queue_items
+			set state = $2, failure_reason = $3, selected_release_id = null, updated_at = now()
+			where library_item_id = $1`, libID, QueueFailed, "test_search_failed",
+		); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(150 * time.Millisecond) // the gap the fix closes
+		if _, err := sqlDB.ExecContext(ctx, `
+			delete from selected_releases where library_item_id = $1`, libID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		<-installed
+
+		var srCount int
+		if err := sqlDB.QueryRowContext(ctx, `select count(*) from selected_releases where library_item_id = $1`, libID).Scan(&srCount); err != nil {
+			t.Fatal(err)
+		}
+		var state string
+		var pointer sql.NullInt64
+		if err := sqlDB.QueryRowContext(ctx, `select state, selected_release_id from queue_items where library_item_id = $1`, libID).Scan(&state, &pointer); err != nil {
+			t.Fatal(err)
+		}
+		// Expected corruption: the concurrent writer's insert+queue_items
+		// update (state='selected', pointer=freshSRID) landed in the gap
+		// between the legacy shape's two statements; the second statement
+		// then deleted that fresh row. queue_items.selected_release_id has
+		// an ON DELETE SET NULL FK, so Postgres itself nulls the pointer as
+		// part of that same DELETE -- but nothing touches queue_items.state
+		// again, leaving it stuck at 'selected' with no selected release
+		// behind it: the legitimate concurrent selection is gone without a
+		// trace, and the queue item is left in a self-contradictory state.
+		if srCount != 0 {
+			t.Fatalf("expected the concurrent writer's row to have been deleted by the legacy shape's second statement, got %d rows -- harness timing didn't land in the gap as intended", srCount)
+		}
+		if pointer.Valid {
+			t.Fatalf("expected the FK's ON DELETE SET NULL to have cleared the pointer, got %v -- harness timing didn't land in the gap as intended", pointer.Int64)
+		}
+		if state != "selected" {
+			t.Fatalf("expected queue_items.state to still (wrongly) read 'selected' with no selection behind it, got %q -- harness timing didn't land in the gap as intended", state)
+		}
+		// Confirmed: queue_items ends up with state='selected' and
+		// selected_release_id=NULL -- a self-contradictory state that
+		// silently discarded the concurrent writer's legitimate selection,
+		// exactly the corruption the fix (wrapping both statements in one
+		// locked transaction) exists to prevent.
+	})
+
+	t.Run("fixed MarkLibrarySearchFailed stays consistent", func(t *testing.T) {
+		libID := setupRaceTestLibraryItem(t, ctx, sqlDB, "mark-search-failed-fixed-shape", "selected")
+		defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+		var rcID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into release_candidates (library_item_id, title, external_url, indexer_name)
+			values ($1, 'Fixed Shape Fresh Candidate', 'http://example/fixed-shape-fresh', 'test-indexer')
+			returning id`, libID,
+		).Scan(&rcID); err != nil {
+			t.Fatal(err)
+		}
+
+		installed := make(chan struct{})
+		go concurrentWriterInstallsFreshSelection(libID, rcID, installed)
+
+		if err := db.MarkLibrarySearchFailed(ctx, libID, "test_search_failed"); err != nil {
+			t.Fatal(err)
+		}
+		<-installed
+
+		// Whichever operation's single atomic transaction commits last wins
+		// outright -- either outcome must be fully self-consistent, unlike
+		// the legacy shape's "state says selected, but nothing is" corruption.
+		var srCount int
+		if err := sqlDB.QueryRowContext(ctx, `select count(*) from selected_releases where library_item_id = $1`, libID).Scan(&srCount); err != nil {
+			t.Fatal(err)
+		}
+		var state string
+		var pointer sql.NullInt64
+		if err := sqlDB.QueryRowContext(ctx, `select state, selected_release_id from queue_items where library_item_id = $1`, libID).Scan(&state, &pointer); err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case srCount == 0 && !pointer.Valid && state == string(QueueFailed):
+			// MarkLibrarySearchFailed's transaction committed last (or the
+			// concurrent writer never got a chance to land before it) --
+			// fully consistent: no selection, and the state agrees.
+		case srCount == 1 && pointer.Valid && state == "selected":
+			// The concurrent writer's transaction committed last -- also
+			// fully consistent, and the pointer must reference the row that
+			// actually exists.
+			var pointedRowExists bool
+			if err := sqlDB.QueryRowContext(ctx, `select exists(select 1 from selected_releases where id = $1 and library_item_id = $2)`, pointer.Int64, libID).Scan(&pointedRowExists); err != nil {
+				t.Fatal(err)
+			}
+			if !pointedRowExists {
+				t.Fatalf("queue_items.selected_release_id=%d does not reference an existing selected_releases row for library_item_id=%d -- dangling reference", pointer.Int64, libID)
+			}
+		default:
+			t.Fatalf("inconsistent end state: %d selected_releases row(s), queue_items.state=%q, selected_release_id=%+v", srCount, state, pointer)
+		}
+	})
+}
+
 // TestPromoteRetryCandidateIgnoresStaleDecisionAcrossConcurrentReject guards
 // against the promoteRetryCandidate lock-ordering gap found in the
 // 2026-07-17 audit: it used to run its "pick best candidate" decision query

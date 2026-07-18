@@ -312,6 +312,20 @@ func (db *DB) FulfillEpisodeLibraryItem(ctx context.Context, libraryItemID, sour
 	}
 	defer tx.Rollback()
 
+	// Unlike createSeasonPackEpisodeItem's sibling flow (which naturally
+	// serializes concurrent calls for the same episode via the earlier
+	// library_items upsert's ON CONFLICT (episode_id) row lock),
+	// libraryItemID here is a bare caller-supplied parameter with no prior
+	// statement in this transaction to serialize on -- so two concurrent
+	// calls for the same libraryItemID (e.g. two overlapping season-pack
+	// publishes finishing around the same time via the download worker
+	// pool) could otherwise both pass the alreadyFulfilled check below
+	// before either commits. Lock first, matching every selection-mutating
+	// function in workflow_repository.go.
+	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
+		return err
+	}
+
 	// Re-use the same release candidate as the triggering item so all episodes
 	// share the same NZB document and provenance.
 	var releaseCandidateID int64

@@ -677,6 +677,16 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusBadRequest, errors.New("url required"))
 			return
 		}
+		// Same atomic per-URL fetch-dedup guard as every other real NZB
+		// fetch in the app (see Service.ClaimURLForFetch) -- this manual
+		// import endpoint was the one caller of fetchRemoteURL that never
+		// went through it, so a double form-submit, a second browser tab,
+		// or a client-side retry of the same pasted URL could each trigger
+		// their own live duplicate fetch from the indexer.
+		if workflowSvc != nil && workflowSvc.ClaimURLForFetch(r.Context(), body.URL) {
+			respondError(w, http.StatusBadRequest, errors.New("recently added, skipping duplicate fetch"))
+			return
+		}
 		content, err := fetchRemoteURL(r.Context(), body.URL)
 		if err != nil {
 			respondError(w, http.StatusBadRequest, err)

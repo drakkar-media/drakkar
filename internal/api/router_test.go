@@ -45,6 +45,7 @@ type workflowStub struct {
 	queueAct   workflow.QueueManageResult
 	queueBulk  workflow.BulkQueueRetryResult
 	importCall *sabImportCall
+	claimURL   func(rawURL string) bool
 }
 
 type sabImportCall struct {
@@ -201,7 +202,12 @@ func (w workflowStub) SyncPlexDetectedShows(_ context.Context) (workflow.SyncPle
 	return workflow.SyncPlexDetectedResult{}, nil
 }
 
-func (w workflowStub) ClaimURLForFetch(_ context.Context, _ string) bool { return false }
+func (w workflowStub) ClaimURLForFetch(_ context.Context, rawURL string) bool {
+	if w.claimURL != nil {
+		return w.claimURL(rawURL)
+	}
+	return false
+}
 
 func (w workflowStub) ImportNZBFromPush(_ context.Context, content []byte, filename, mediaType string) (string, error) {
 	if w.importCall != nil {
@@ -455,6 +461,75 @@ func TestImportNZBEndpoint(t *testing.T) {
 	}
 	if item.State != database.QueuePreflight {
 		t.Fatalf("unexpected state %s", item.State)
+	}
+}
+
+// TestImportURLEndpointSkipsRecentlyDispatchedURL guards against a gap found
+// in the 2026-07-19 follow-up audit: POST /api/nzbs/import-url was the one
+// caller of fetchRemoteURL that never went through ClaimURLForFetch, unlike
+// its sibling sabHandler.handleAddURL -- a double form-submit, a second
+// browser tab, or a client-side retry of the same pasted NZB URL could each
+// trigger their own live duplicate fetch from the indexer.
+func TestImportURLEndpointSkipsRecentlyDispatchedURL(t *testing.T) {
+	fetchCalls := 0
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetchCalls++
+		w.Write([]byte(sampleNZB))
+	}))
+	defer remote.Close()
+
+	var claimedURL string
+	queueSvc := queue.NewService(queue.NewMemoryRepository(), nzb.NewImporter(t.TempDir(), 1024*1024))
+	workflowSvc := workflowStub{claimURL: func(rawURL string) bool {
+		claimedURL = rawURL
+		return true // already dispatched -- caller must not fetch
+	}}
+	router := Router(statusStub{}, queueSvc, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	body, _ := json.Marshal(map[string]string{"url": remote.URL + "/dune.nzb"})
+	req := httptest.NewRequest(http.MethodPost, "/api/nzbs/import-url", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if fetchCalls != 0 {
+		t.Fatalf("expected fetchRemoteURL not to be called for a recently-dispatched URL, got %d calls", fetchCalls)
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected a non-200 error response for a duplicate import-url, got status %d body %s", rec.Code, rec.Body.String())
+	}
+	if claimedURL != remote.URL+"/dune.nzb" {
+		t.Fatalf("expected ClaimURLForFetch to be called with the submitted URL, got %q", claimedURL)
+	}
+}
+
+// TestImportURLEndpointClaimsURLBeforeFetching confirms a URL that hasn't
+// been recently dispatched proceeds past the dedup guard to the real fetch
+// attempt (rather than being rejected as a duplicate). It can't assert a
+// full successful import in-process: fetchRemoteURL's SSRF protection
+// (internal/api/safe_fetch.go) refuses any loopback target, including an
+// httptest.NewServer, by design -- so this asserts ClaimURLForFetch was
+// actually called and the response is the real fetch's own error, not the
+// "recently added, skipping duplicate fetch" short-circuit.
+func TestImportURLEndpointClaimsURLBeforeFetching(t *testing.T) {
+	var claimedURL string
+	queueSvc := queue.NewService(queue.NewMemoryRepository(), nzb.NewImporter(t.TempDir(), 1024*1024))
+	workflowSvc := workflowStub{claimURL: func(rawURL string) bool {
+		claimedURL = rawURL
+		return false // not already claimed -- caller may proceed to fetch
+	}}
+	router := Router(statusStub{}, queueSvc, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	const testURL = "http://127.0.0.1:1/dune.nzb"
+	body, _ := json.Marshal(map[string]string{"url": testURL})
+	req := httptest.NewRequest(http.MethodPost, "/api/nzbs/import-url", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if claimedURL != testURL {
+		t.Fatalf("expected ClaimURLForFetch to be called with the submitted URL, got %q", claimedURL)
+	}
+	if strings.Contains(rec.Body.String(), "recently added") {
+		t.Fatalf("expected the real fetch attempt to proceed (and fail on its own terms), not the duplicate-skip short-circuit: %s", rec.Body.String())
 	}
 }
 

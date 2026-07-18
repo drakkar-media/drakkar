@@ -1417,21 +1417,45 @@ func (db *DB) MarkLibrarySearchFailed(ctx context.Context, libraryItemID int64, 
 	if reason == "" {
 		reason = "search_error"
 	}
-	_, err := db.SQL.ExecContext(ctx, `
+
+	tx, err := db.SQL.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	// Lock like every other function that deletes/inserts selected_releases
+	// rows for this library item -- this used to run as two bare,
+	// unlocked ExecContext calls with no transaction at all, so a
+	// concurrent locked writer (e.g. FailSelectedReleaseAndPromoteNext
+	// installing a fresh selection after an unrelated fetch failure) could
+	// commit a real selected_releases row in the gap between these two
+	// statements, or between this whole operation and a caller reading the
+	// result, corrupting queue_items/selected_releases consistency.
+	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
+		return err
+	}
+
+	if _, err = tx.ExecContext(ctx, `
 		update queue_items
 		set state = $2, failure_reason = $3, selected_release_id = null, updated_at = now()
 		where library_item_id = $1`, libraryItemID, QueueFailed, reason,
-	)
-	if err != nil {
+	); err != nil {
 		return err
 	}
 	// Clean up any stale selected_releases rows so the item re-enters the normal
 	// search cycle on the next pass rather than getting stuck re-attempting the
 	// same failed release.
-	_, err = db.SQL.ExecContext(ctx, `
+	if _, err = tx.ExecContext(ctx, `
 		delete from selected_releases where library_item_id = $1`, libraryItemID,
-	)
-	return err
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func summarizeSearchFailureReason(candidates []SearchCandidateRecord) string {
