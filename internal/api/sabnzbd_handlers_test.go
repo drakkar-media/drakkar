@@ -31,10 +31,9 @@ func TestHandleAddURLSkipsRecentlyDispatchedURL(t *testing.T) {
 			fetchCalls++
 			return []byte("<nzb></nzb>"), nil
 		},
-		recentlyDispatchedURL: func(rawURL string) bool {
+		claimURLForFetch: func(_ context.Context, rawURL string) bool {
 			return rawURL == "http://indexer.example/get/duplicate.nzb"
 		},
-		markURLDispatched: func(_ string) {},
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/sabnzbd/api?"+url.Values{
@@ -55,11 +54,11 @@ func TestHandleAddURLSkipsRecentlyDispatchedURL(t *testing.T) {
 	}
 }
 
-// TestHandleAddURLMarksURLDispatchedBeforeFetching confirms the happy path
-// still fetches and marks the URL as dispatched (so a near-simultaneous
-// retry is caught even before this first fetch completes).
-func TestHandleAddURLMarksURLDispatchedBeforeFetching(t *testing.T) {
-	var markedURL string
+// TestHandleAddURLClaimsURLBeforeFetching confirms the happy path calls
+// claimURLForFetch (which atomically claims the URL) before fetchRemote, so
+// a near-simultaneous retry is caught even before this first fetch completes.
+func TestHandleAddURLClaimsURLBeforeFetching(t *testing.T) {
+	var claimedURL string
 	fetchCalls := 0
 	h := &sabHandler{
 		importFn: func(_ context.Context, _ []byte, _, _ string) (string, error) {
@@ -68,14 +67,14 @@ func TestHandleAddURLMarksURLDispatchedBeforeFetching(t *testing.T) {
 		log: zerolog.Nop(),
 		fetchFn: func(_ context.Context, _ string) ([]byte, error) {
 			fetchCalls++
-			if markedURL == "" {
-				t.Fatal("expected the URL to be marked dispatched before fetchRemote is called")
+			if claimedURL == "" {
+				t.Fatal("expected the URL to be claimed before fetchRemote is called")
 			}
 			return []byte("<nzb></nzb>"), nil
 		},
-		recentlyDispatchedURL: func(_ string) bool { return false },
-		markURLDispatched: func(rawURL string) {
-			markedURL = rawURL
+		claimURLForFetch: func(_ context.Context, rawURL string) bool {
+			claimedURL = rawURL
+			return false // not already claimed -- caller may proceed
 		},
 	}
 
@@ -89,8 +88,8 @@ func TestHandleAddURLMarksURLDispatchedBeforeFetching(t *testing.T) {
 	if fetchCalls != 1 {
 		t.Fatalf("expected exactly 1 fetch for a fresh URL, got %d", fetchCalls)
 	}
-	if markedURL != "http://indexer.example/get/fresh.nzb" {
-		t.Fatalf("expected the fetched URL to be marked dispatched, got %q", markedURL)
+	if claimedURL != "http://indexer.example/get/fresh.nzb" {
+		t.Fatalf("expected the fetched URL to be claimed, got %q", claimedURL)
 	}
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected a successful response, got status %d body %s", rec.Code, rec.Body.String())

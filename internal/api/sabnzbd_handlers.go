@@ -32,17 +32,21 @@ type sabHandler struct {
 	// (matching real SABnzbd behavior). Empty preserves the historical
 	// no-auth behavior for existing Sonarr/Radarr download-client configs.
 	apiKey string
-	// recentlyDispatchedURL/markURLDispatched provide handleAddURL the same
-	// per-URL fetch cooldown workflow.Service's own dispatch pipeline uses
-	// (fetchIndexAndRelease/fetchAndImportSelectedReleaseDepth), so a
-	// Radarr/Sonarr addurl retry -- its own download-client retry logic, or
-	// a resubmission after Drakkar restarts mid-request -- doesn't trigger a
-	// second live NZB fetch from the indexer for the same URL. This handler
-	// has no access to workflow.Service's private cooldown map, so these are
-	// injected as plain functions. Nil-safe: a nil recentlyDispatchedURL
-	// always proceeds, matching the historical no-guard behavior.
-	recentlyDispatchedURL func(rawURL string) bool
-	markURLDispatched     func(rawURL string)
+	// claimURLForFetch provides handleAddURL the exact same atomic per-URL
+	// fetch claim workflow.Service's own dispatch pipeline uses
+	// (Service.ClaimURLForFetch, shared by fetchIndexAndRelease/
+	// fetchAndImportSelectedReleaseDepth), so a Radarr/Sonarr addurl retry --
+	// its own download-client retry logic, or a resubmission after Drakkar
+	// restarts mid-request -- doesn't trigger a second live NZB fetch from
+	// the indexer for the same URL. Returns true if the caller must skip
+	// (someone already holds a live claim on this URL). This handler used to
+	// call two separate, in-memory-only functions (recentlyDispatchedURL/
+	// markURLDispatched) -- found 2026-07-18 to have no restart-surviving
+	// (Postgres-persisted) coverage at all, unlike the two internal fetch
+	// call sites, directly contradicting this field's own prior doc comment.
+	// Nil-safe: a nil claimURLForFetch always proceeds, matching the
+	// historical no-guard behavior.
+	claimURLForFetch func(ctx context.Context, rawURL string) bool
 	// fetchFn defaults to fetchRemoteURL; overridable in tests.
 	fetchFn func(ctx context.Context, rawURL string) ([]byte, error)
 }
@@ -189,12 +193,9 @@ func (h *sabHandler) handleAddURL(w http.ResponseWriter, r *http.Request) {
 		nzbName = r.URL.Query().Get("nzbname")
 	}
 
-	if h.recentlyDispatchedURL != nil && h.recentlyDispatchedURL(nzbURL) {
+	if h.claimURLForFetch != nil && h.claimURLForFetch(r.Context(), nzbURL) {
 		h.writeError(w, "recently added, skipping duplicate fetch")
 		return
-	}
-	if h.markURLDispatched != nil {
-		h.markURLDispatched(nzbURL)
 	}
 
 	content, err := h.fetchRemote(r.Context(), nzbURL)

@@ -3381,47 +3381,58 @@ func (db *DB) TouchQueueItemSearched(ctx context.Context, libraryItemID int64) e
 	return err
 }
 
-// RecentlyDispatchedURLPersisted reports whether rawURL has a persisted
-// dispatch record within the last cooldown duration. Unlike
-// workflow.Service's in-memory recentURLHits map, this survives process
-// restarts: a release fetch interrupted mid-flight by a redeploy (SIGTERM
-// mid-Fetch, before StoreRawNZBDocument commits) would otherwise be
+// ClaimURLDispatchPersisted atomically claims rawURL for dispatch: if no
+// record exists, or the existing record is already older than cooldown,
+// this upserts a fresh dispatched_at and reports true (the caller may
+// proceed with the fetch). If a live (within-cooldown) record already
+// exists, this is a no-op and reports false (someone else already claimed
+// this URL -- the caller must skip). Deliberately a single
+// INSERT ... ON CONFLICT ... WHERE ... RETURNING statement rather than a
+// separate SELECT-then-UPSERT (which is what this replaced): two concurrent
+// callers racing on the identical URL, from the same process or different
+// ones, can no longer both read "not recently dispatched" before either
+// commits a mark -- Postgres serializes the two INSERTs against the same
+// conflict target, so only one caller's statement can see the fresh row.
+// Also survives process restarts, unlike workflow.Service's in-memory
+// recentURLHits map: a release fetch interrupted mid-flight by a redeploy
+// (SIGTERM mid-Fetch, before StoreRawNZBDocument commits) would otherwise be
 // re-dispatched against a freshly-empty in-memory map with zero cooldown
 // protection once the process restarts and the pending-dispatch resume path
 // picks the item back up.
-func (db *DB) RecentlyDispatchedURLPersisted(ctx context.Context, rawURL string, cooldown time.Duration) (bool, error) {
+//
+// Found 2026-07-18: the two functions this replaced (RecentlyDispatchedURLPersisted
+// doing a plain SELECT, MarkURLDispatchedPersisted doing a separate,
+// unconditional UPSERT) were a real, confirmed TOCTOU race -- two goroutines
+// (e.g. two of the up to 8 concurrent download workers processing a
+// season-pack's per-episode selected_releases rows, which legitimately
+// share one external_url) could both see "not recently dispatched" from the
+// SELECT before either committed the UPSERT, both proceed to a real NZB
+// fetch. This single atomic statement closes that gap.
+func (db *DB) ClaimURLDispatchPersisted(ctx context.Context, rawURL string, cooldown time.Duration) (bool, error) {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
-		return false, nil
+		return true, nil
 	}
-	var dispatchedAt time.Time
+	var claimedURL string
 	err := db.SQL.QueryRowContext(ctx, `
-		select dispatched_at from recent_url_fetches where external_url = $1`, rawURL,
-	).Scan(&dispatchedAt)
+		insert into recent_url_fetches (external_url, dispatched_at)
+		values ($1, now())
+		on conflict (external_url) do update
+			set dispatched_at = excluded.dispatched_at
+		where recent_url_fetches.dispatched_at < now() - make_interval(secs => $2)
+		returning external_url`, rawURL, cooldown.Seconds(),
+	).Scan(&claimedURL)
 	if errors.Is(err, sql.ErrNoRows) {
+		// ON CONFLICT's WHERE clause was false: an existing row is still
+		// within the cooldown window, so no row was inserted/updated and
+		// nothing came back from RETURNING -- someone else already holds a
+		// live claim on this URL.
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	return time.Since(dispatchedAt) < cooldown, nil
-}
-
-// MarkURLDispatchedPersisted upserts rawURL's dispatch timestamp to now.
-// Call before the network fetch (not after) so a restart that kills the
-// process mid-fetch still leaves a record behind. See
-// RecentlyDispatchedURLPersisted.
-func (db *DB) MarkURLDispatchedPersisted(ctx context.Context, rawURL string) error {
-	rawURL = strings.TrimSpace(rawURL)
-	if rawURL == "" {
-		return nil
-	}
-	_, err := db.SQL.ExecContext(ctx, `
-		insert into recent_url_fetches (external_url, dispatched_at)
-		values ($1, now())
-		on conflict (external_url) do update set dispatched_at = excluded.dispatched_at`, rawURL,
-	)
-	return err
+	return true, nil
 }
 
 // PruneRecentURLFetches deletes dispatch records older than maxAge, keeping

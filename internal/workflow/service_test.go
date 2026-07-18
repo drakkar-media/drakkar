@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,7 +18,8 @@ import (
 )
 
 type repoStub struct {
-	persistedDispatchedURLs map[string]bool
+	persistedDispatchedURLsMu sync.Mutex
+	persistedDispatchedURLs   map[string]bool
 	requests                []database.MediaRequestSummary
 	searchInput             database.LibrarySearchInput
 	searchInputByItem       map[int64]database.LibrarySearchInput
@@ -301,16 +303,20 @@ func (r *repoStub) MarkSelectedReleaseFetching(ctx context.Context, selectedRele
 	return nil
 }
 
-func (r *repoStub) RecentlyDispatchedURLPersisted(ctx context.Context, rawURL string, cooldown time.Duration) (bool, error) {
-	return r.persistedDispatchedURLs[rawURL], nil
-}
-
-func (r *repoStub) MarkURLDispatchedPersisted(ctx context.Context, rawURL string) error {
+// ClaimURLDispatchPersisted mimics the real atomic claim: returns false
+// (not claimed -- someone already holds it) if rawURL is already marked,
+// otherwise marks it and returns true (claimed).
+func (r *repoStub) ClaimURLDispatchPersisted(ctx context.Context, rawURL string, cooldown time.Duration) (bool, error) {
+	r.persistedDispatchedURLsMu.Lock()
+	defer r.persistedDispatchedURLsMu.Unlock()
 	if r.persistedDispatchedURLs == nil {
 		r.persistedDispatchedURLs = make(map[string]bool)
 	}
+	if r.persistedDispatchedURLs[rawURL] {
+		return false, nil
+	}
 	r.persistedDispatchedURLs[rawURL] = true
-	return nil
+	return true, nil
 }
 
 func (r *repoStub) StoreRawNZBDocument(ctx context.Context, selectedReleaseID int64, fileName string, xml []byte, externalURL string) error {
@@ -1949,6 +1955,79 @@ func TestFetchIndexAndReleaseGivesUpAfterOneFailure(t *testing.T) {
 	}
 }
 
+// TestClaimURLForFetchIsAtomicUnderConcurrency guards the exact gap found in
+// the 2026-07-18 "make it a fact" audit: ClaimURLForFetch used to be
+// implemented as a separate check (recentlyDispatchedURL) then, later, a
+// separate mark (markSelectedReleaseURLDispatched) -- two independent
+// critical sections with nothing held across them. Two goroutines racing on
+// the identical URL could both see "not recently dispatched" before either
+// committed its mark, both proceed to a real fetch. This is concretely
+// reachable in production: season-pack search (trySeasonPack) legitimately
+// creates one selected_releases row per missing episode, all referencing
+// the identical season-pack URL, and up to 8 concurrent download workers
+// can pick several of those up at nearly the same instant. This test fires
+// many real goroutines at the in-memory claim for the same URL and asserts
+// exactly one wins -- confirmed to fail (multiple winners) against the
+// prior two-step implementation.
+func TestClaimURLForFetchIsAtomicUnderConcurrency(t *testing.T) {
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
+	const rawURL = "http://example/season-pack-race.nzb"
+
+	const attempts = 64
+	start := make(chan struct{})
+	var wins atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // released all at once below, to maximize genuine overlap
+			if !service.ClaimURLForFetch(context.Background(), rawURL) {
+				wins.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := wins.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 of %d concurrent claims on the identical URL to win (proceed with the fetch), got %d", attempts, got)
+	}
+}
+
+// TestClaimURLInMemoryIsAtomicUnderConcurrency isolates the in-memory half
+// of ClaimURLForFetch specifically (bypassing the independently-atomic
+// Postgres-persisted layer, which would otherwise backstop a regression
+// here) to directly guard against reintroducing a check-then-separately-
+// mark pair for the in-memory map. See
+// TestClaimURLForFetchIsAtomicUnderConcurrency for the combined-layer proof.
+func TestClaimURLInMemoryIsAtomicUnderConcurrency(t *testing.T) {
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
+	const rawURL = "http://example/season-pack-race-2.nzb"
+	now := time.Now()
+
+	const attempts = 64
+	start := make(chan struct{})
+	var wins atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if !service.claimURLInMemory(rawURL, now) {
+				wins.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := wins.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 of %d concurrent in-memory claims on the identical URL to win, got %d", attempts, got)
+	}
+}
+
 func TestSearchPendingLibraryQueuesAllItems(t *testing.T) {
 	const total = pendingQueueBatchSize + 10
 	pending := make([]database.PendingLibrarySearchTarget, 0, total)
@@ -2002,7 +2081,7 @@ func TestSearchPendingLibraryDispatchesSelectedAndQueuesSearchItems(t *testing.T
 // the job was merely queued, not when it was actually fetched. Since a
 // worker goroutine picks up a queued job asynchronously (often within
 // milliseconds), its own fetchIndexAndRelease call would then see that same
-// mark (via shouldSkipDuplicateURLFetch) and silently skip the real fetch,
+// mark (via ClaimURLForFetch) and silently skip the real fetch,
 // every single time. Confirmed live: this made every item that reached this
 // passive resume path (e.g. after a restart) permanently unable to
 // complete a download -- zero real NZB fetches system-wide for ~20 hours
@@ -2021,8 +2100,8 @@ func TestSearchPendingLibraryDoesNotPrematurelyMarkURLDispatched(t *testing.T) {
 	if _, err := service.SearchPendingLibrary(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if service.recentlyDispatchedURL(resumeURL, time.Now()) {
-		t.Fatal("SearchPendingLibrary must not mark the URL dispatched itself at submit time -- only the actual fetch (inside shouldSkipDuplicateURLFetch, called from the worker that processes the queued job) should, otherwise that worker sees the URL as already dispatched and silently no-ops instead of ever fetching")
+	if service.peekRecentlyDispatchedURL(resumeURL, time.Now()) {
+		t.Fatal("SearchPendingLibrary must not mark the URL dispatched itself at submit time -- only the actual fetch (inside ClaimURLForFetch, called from the worker that processes the queued job) should, otherwise that worker sees the URL as already dispatched and silently no-ops instead of ever fetching")
 	}
 }
 
@@ -2042,8 +2121,8 @@ func TestDispatchAutomaticPendingDoesNotPrematurelyMarkURLDispatched(t *testing.
 	if _, err := service.DispatchAutomaticPending(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if service.recentlyDispatchedURL(resumeURL, time.Now()) {
-		t.Fatal("DispatchAutomaticPending must not mark the URL dispatched itself at submit time -- only the actual fetch (inside shouldSkipDuplicateURLFetch, called from the worker that processes the queued job) should, otherwise that worker sees the URL as already dispatched and silently no-ops instead of ever fetching")
+	if service.peekRecentlyDispatchedURL(resumeURL, time.Now()) {
+		t.Fatal("DispatchAutomaticPending must not mark the URL dispatched itself at submit time -- only the actual fetch (inside ClaimURLForFetch, called from the worker that processes the queued job) should, otherwise that worker sees the URL as already dispatched and silently no-ops instead of ever fetching")
 	}
 }
 
@@ -2141,7 +2220,7 @@ func TestShouldDispatchSelectedTargetBlocksRecentlyDispatchedSelectedFallback(t 
 	now := time.Now()
 	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
 	rawURL := "http://example/release.nzb"
-	service.markSelectedReleaseURLDispatched(rawURL, now.Add(-selectedURLCooldown+time.Minute))
+	service.claimURLInMemory(rawURL, now.Add(-selectedURLCooldown+time.Minute))
 	target := database.PendingLibrarySearchTarget{
 		LibraryItemID:     42,
 		SelectedReleaseID: 303,
@@ -2166,7 +2245,7 @@ func TestShouldDispatchSelectedTargetBlocksRecentlyDispatchedSameURL(t *testing.
 	now := time.Now()
 	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
 	rawURL := "http://example/release.nzb"
-	service.markSelectedReleaseURLDispatched(rawURL, now.Add(-selectedURLCooldown+time.Minute))
+	service.claimURLInMemory(rawURL, now.Add(-selectedURLCooldown+time.Minute))
 	target := database.PendingLibrarySearchTarget{
 		LibraryItemID:     42,
 		SelectedReleaseID: 303,
@@ -2340,6 +2419,53 @@ func TestRetryFailedQueue(t *testing.T) {
 	}
 	if len(repo.requeued) != 2 || repo.requeued[0] != 55 || repo.requeued[1] != 56 {
 		t.Fatalf("unexpected requeued items %+v", repo.requeued)
+	}
+}
+
+// TestPromoteNextAfterFailureDepthNoOpsWhenNextAlreadyInFlight guards the
+// secondary gap found in the same 2026-07-18 audit as the atomic URL claim:
+// promoteNextAfterFailureDepth's recursive fallback-chain continuation used
+// to call fetchAndImportSelectedReleaseDepth directly, never registering
+// the newly-promoted selectedReleaseID in downloader.inFlight. That let a
+// second, fully independent dispatch (e.g. DispatchAutomaticPending's
+// passive sweep, which can see the freshly-promoted selection the instant
+// it's committed) submit() a second worker for the identical release while
+// this inline chain was still working on it -- with only the URL-level
+// claim standing between that and an actual duplicate fetch. This test
+// simulates the concurrent claim directly and confirms the inline
+// continuation gracefully no-ops instead of racing it.
+func TestPromoteNextAfterFailureDepthNoOpsWhenNextAlreadyInFlight(t *testing.T) {
+	repo := &repoStub{
+		next: &database.ReleaseSummary{
+			SelectedReleaseID: 555,
+			LibraryItemID:     42,
+			ExternalURL:       "http://example/already-inflight.nzb",
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	calls := 0
+	service.fetcher = countingFetcherStub{
+		fileName: "already-inflight.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;AlreadyInFlight.mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+		calls:    &calls,
+	}
+
+	// Simulate a concurrent dispatch (e.g. DispatchAutomaticPending) having
+	// already claimed the soon-to-be-promoted selectedReleaseID.
+	if !service.downloader.claimInFlight(555) {
+		t.Fatal("test setup: expected the pre-claim to succeed")
+	}
+
+	current := database.ReleaseSummary{SelectedReleaseID: 100, LibraryItemID: 42, ExternalURL: "http://example/original.nzb"}
+	result, err := service.promoteNextAfterFailureDepth(context.Background(), current, "some failure", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != nil {
+		t.Fatalf("expected a graceful no-op (nil result) when the next candidate is already in-flight, got %+v", result)
+	}
+	if calls != 0 {
+		t.Fatalf("expected no fetch attempt for a candidate already claimed by a concurrent dispatch, got %d", calls)
 	}
 }
 

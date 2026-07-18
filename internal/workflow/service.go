@@ -79,8 +79,7 @@ type Repository interface {
 	RestoreRejectedReleaseCandidates(ctx context.Context, libraryItemID int64) (database.RejectedReleaseRestoreResult, error)
 	SkipReleaseCandidate(ctx context.Context, releaseCandidateID int64) (*database.ReleaseSummary, error)
 	MarkSelectedReleaseFetching(ctx context.Context, selectedReleaseID int64) error
-	RecentlyDispatchedURLPersisted(ctx context.Context, rawURL string, cooldown time.Duration) (bool, error)
-	MarkURLDispatchedPersisted(ctx context.Context, rawURL string) error
+	ClaimURLDispatchPersisted(ctx context.Context, rawURL string, cooldown time.Duration) (bool, error)
 	StoreRawNZBDocument(ctx context.Context, selectedReleaseID int64, fileName string, xml []byte, externalURL string) error
 	ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID int64, imported database.ImportedNZB) (database.QueueSnapshot, error)
 	CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) error
@@ -434,6 +433,30 @@ func (d *downloadDispatcher) markDone(selectedReleaseID int64) {
 	d.mu.Lock()
 	delete(d.inFlight, selectedReleaseID)
 	d.mu.Unlock()
+}
+
+// claimInFlight marks selectedReleaseID as in-flight if it isn't already,
+// for callers that process a release inline/recursively rather than through
+// submit()/next() -- specifically promoteNextAfterFailureDepth's fallback-
+// chain continuation, which (unlike every other path to a real fetch) used
+// to call fetchAndImportSelectedReleaseDepth directly without ever
+// registering the newly-promoted selectedReleaseID here. Found 2026-07-18:
+// that gap let a second, fully independent dispatch (most concretely
+// DispatchAutomaticPending's 30s passive sweep, which polls for any
+// state='selected' item with no grace period) submit() the SAME
+// selectedReleaseID to a second worker while this inline chain was still
+// working on it, with only the (now-fixed) URL-level claim in
+// ClaimURLForFetch standing between that and an actual duplicate fetch.
+// Returns false if already in-flight -- the caller must gracefully no-op
+// rather than race a second in-process attempt.
+func (d *downloadDispatcher) claimInFlight(selectedReleaseID int64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.inFlight[selectedReleaseID] {
+		return false
+	}
+	d.inFlight[selectedReleaseID] = true
+	return true
 }
 
 func (d *downloadDispatcher) next(ctx context.Context) (downloadJob, bool) {
@@ -1107,7 +1130,7 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 				// see the long comment on that call being removed from
 				// DispatchAutomaticPending below for why marking at submit time
 				// (rather than at the actual fetch, inside
-				// shouldSkipDuplicateURLFetch) silently defeats every dispatch
+				// ClaimURLForFetch) silently defeats every dispatch
 				// through this path.
 				resultCh := make(chan downloadJobResult, 1)
 				if s.downloader.submit(downloadJob{
@@ -1166,7 +1189,7 @@ func (s *Service) DispatchAutomaticPending(ctx context.Context) (BulkSearchResul
 		// submit() only enqueues the job (a worker goroutine picks it up
 		// asynchronously, usually within milliseconds), the worker's own
 		// fetchIndexAndRelease call would then check recentlyDispatchedURL
-		// (via shouldSkipDuplicateURLFetch) mere moments later, see the mark
+		// (via ClaimURLForFetch) mere moments later, see the mark
 		// THIS code had just set, and silently no-op instead of ever calling
 		// s.fetcher.Fetch -- every single time. submit()'s own inFlight map
 		// already fully prevents resubmitting the same selectedReleaseID
@@ -1181,7 +1204,7 @@ func (s *Service) DispatchAutomaticPending(ctx context.Context) (BulkSearchResul
 		// this fix, across many redeploys, because every redeploy funnels
 		// interrupted items right back into this exact path. The correct mark
 		// (right before the real network fetch) already exists inside
-		// shouldSkipDuplicateURLFetch -- do not duplicate it here.
+		// ClaimURLForFetch -- do not duplicate it here.
 		resultCh := make(chan downloadJobResult, 1)
 		if s.downloader.submit(downloadJob{
 			ctx:               context.Background(),
@@ -1245,24 +1268,44 @@ func (s *Service) shouldDispatchSelectedTarget(target database.PendingLibrarySea
 	// roughly every 60 seconds until the fallback chain exhausted. The
 	// cooldown is keyed purely on target.ExternalURL, which is meaningful
 	// regardless of state, so it must apply uniformly.
-	return !s.recentlyDispatchedURL(target.ExternalURL, now)
+	return !s.peekRecentlyDispatchedURL(target.ExternalURL, now)
 }
 
-// recentlyDispatchedURL reports whether rawURL had an actual NZB fetch
-// attempt within the last selectedURLCooldown, opportunistically pruning
-// stale entries. Shared by shouldDispatchSelectedTarget (the passive
-// pending-dispatch resume path) and fetchIndexAndRelease (the single
-// low-level fetch point every path -- passive dispatch, an active search
-// that immediately fetches what it just selected, manual select/retry,
-// season-pack search -- ultimately funnels through). It used to only be
-// enforced in shouldDispatchSelectedTarget, so an active re-search that
-// rediscovered the same top candidate (nothing upstream had changed) would
-// refetch it immediately, ignoring this cooldown entirely -- confirmed live:
-// the same release was refetched roughly every 60-90s for several minutes
-// straight via repeated active searches, tripping the same NZB Finder
-// duplicate-download warning shouldDispatchSelectedTarget's cooldown was
-// added to prevent, just through a different, unguarded call path.
-func (s *Service) recentlyDispatchedURL(rawURL string, now time.Time) bool {
+// peekRecentlyDispatchedURL reports whether rawURL has an in-memory dispatch
+// record within the cooldown, WITHOUT claiming/marking it. Read-only
+// pre-filter for shouldDispatchSelectedTarget, which only decides whether a
+// job is even worth submitting -- submitting is not the same as fetching
+// (downloadDispatcher.submit just queues the job for a worker), so this
+// must not itself claim the URL. The actual, load-bearing claim happens
+// later and atomically, in ClaimURLForFetch, immediately before the real
+// network fetch inside the worker. Marking here (as an earlier, buggy
+// version of this dispatch path once did) would let this pre-filter
+// silently defeat the real fetch's own check -- see the v0.2.30 incident
+// writeup on DispatchAutomaticPending/SearchPendingLibrary for exactly that
+// failure mode.
+func (s *Service) peekRecentlyDispatchedURL(rawURL string, now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return false
+	}
+	s.recentURLMu.Lock()
+	defer s.recentURLMu.Unlock()
+	lastAt, ok := s.recentURLHits[rawURL]
+	return ok && now.Sub(lastAt) < selectedURLCooldown
+}
+
+// claimURLInMemory atomically checks-and-sets rawURL's in-memory dispatch
+// timestamp under a single lock: if rawURL was NOT dispatched within the
+// cooldown, this claims it now (recording now) and returns false (caller
+// may proceed); if it WAS, this leaves the existing timestamp untouched and
+// returns true (caller must skip). The check and the set happen under one
+// critical section, unlike the two-function (check-then-separately-mark)
+// design this replaced, which left a real window between them for a
+// concurrent goroutine to also observe "not recently dispatched."
+func (s *Service) claimURLInMemory(rawURL string, now time.Time) bool {
 	if s == nil {
 		return false
 	}
@@ -1274,6 +1317,9 @@ func (s *Service) recentlyDispatchedURL(rawURL string, now time.Time) bool {
 	defer s.recentURLMu.Unlock()
 	lastAt, ok := s.recentURLHits[rawURL]
 	hit := ok && now.Sub(lastAt) < selectedURLCooldown
+	if !hit {
+		s.recentURLHits[rawURL] = now
+	}
 	// Drop stale URL entries opportunistically to keep the map bounded.
 	for url, hitAt := range s.recentURLHits {
 		if now.Sub(hitAt) >= selectedURLCooldown {
@@ -1283,61 +1329,45 @@ func (s *Service) recentlyDispatchedURL(rawURL string, now time.Time) bool {
 	return hit
 }
 
-func (s *Service) markSelectedReleaseURLDispatched(rawURL string, now time.Time) {
-	if s == nil {
-		return
-	}
-	rawURL = strings.TrimSpace(rawURL)
-	if rawURL == "" {
-		return
-	}
-	s.recentURLMu.Lock()
-	s.recentURLHits[rawURL] = now
-	s.recentURLMu.Unlock()
-}
-
-// RecentlyDispatchedURL reports whether rawURL was dispatched within the
-// last selectedURLCooldown window. Exported so callers outside this
-// package's own dispatch pipeline (e.g. the SABnzbd-compatible addurl
-// endpoint) share the same duplicate-fetch protection as
-// fetchIndexAndRelease/fetchAndImportSelectedReleaseDepth.
-func (s *Service) RecentlyDispatchedURL(rawURL string) bool {
-	return s.recentlyDispatchedURL(rawURL, time.Now())
-}
-
-// MarkURLDispatched records rawURL as freshly dispatched, starting its
-// cooldown window. See RecentlyDispatchedURL.
-func (s *Service) MarkURLDispatched(rawURL string) {
-	s.markSelectedReleaseURLDispatched(rawURL, time.Now())
-}
-
-// shouldSkipDuplicateURLFetch is the single choke point every NZB fetch call
-// site must go through immediately before calling s.fetcher.Fetch. It checks
-// both the in-memory per-URL cooldown (recentURLHits, cleared on every
-// process restart) and a Postgres-persisted equivalent (recent_url_fetches,
-// which survives a restart), and marks the URL dispatched in both places
-// before returning false. The persisted check exists because a redeploy
-// landing between MarkSelectedReleaseFetching and the fetch actually
-// completing would otherwise wipe recentURLHits and let the resume-dispatch
-// path re-fetch the same URL with zero cooldown protection. This project has
-// twice shipped a fix for one fetch call site and missed a near-duplicate
-// one (v0.2.22, then v0.2.28) -- consolidating both cooldowns into one
-// function that every call site shares closes off a third recurrence.
-func (s *Service) shouldSkipDuplicateURLFetch(ctx context.Context, rawURL string) bool {
+// ClaimURLForFetch is the single choke point every NZB fetch call site (in
+// this package or outside it, e.g. the SABnzbd-compatible addurl endpoint)
+// must go through immediately before issuing the real network fetch. It
+// atomically claims rawURL against both the in-memory per-process cooldown
+// (recentURLHits, cleared on every process restart) and a Postgres-persisted
+// equivalent (recent_url_fetches, which survives a restart), returning true
+// if the caller must SKIP the fetch (someone already holds a live claim) or
+// false if the caller has now claimed the URL itself and may proceed.
+//
+// Both claims are atomic check-and-set operations (a single mutex-protected
+// map write in-memory; a single INSERT ... ON CONFLICT ... WHERE ...
+// RETURNING statement in Postgres), not a separate check then a later,
+// independent mark. Found 2026-07-18: an earlier version of this function
+// (then named shouldSkipDuplicateURLFetch) checked and marked each layer in
+// two separate steps, leaving a real TOCTOU window between them. That
+// window was concretely reachable: release_candidates has no uniqueness
+// constraint on external_url, and season-pack search (trySeasonPack)
+// legitimately creates one selected_releases row per missing episode, all
+// referencing the identical season-pack URL -- so up to 8 concurrent
+// download workers could pick up several of those rows at once, all pass
+// the old check before any of them committed its mark, and all issue a real
+// duplicate fetch to the indexer. This project has now shipped a fix for
+// one fetch call site and missed a near-duplicate one three times running
+// (v0.2.22, v0.2.28, and this exact function's own prior non-atomic
+// version) -- every current and future real-fetch call site must go
+// through this single, atomic function, with no parallel/simplified copy
+// anywhere else (see the SABnzbd handler wiring in router.go, which used to
+// have its own, in-memory-only, equally non-atomic pair of calls).
+func (s *Service) ClaimURLForFetch(ctx context.Context, rawURL string) bool {
 	now := time.Now()
-	if s.recentlyDispatchedURL(rawURL, now) {
+	if s.claimURLInMemory(rawURL, now) {
 		return true
 	}
-	if persisted, err := s.repo.RecentlyDispatchedURLPersisted(ctx, rawURL, selectedURLCooldown); err != nil {
-		s.logger.Warn().Err(err).Str("url", rawURL).Msg("persisted URL-dispatch check failed — falling back to in-memory cooldown only")
-	} else if persisted {
-		return true
+	claimed, err := s.repo.ClaimURLDispatchPersisted(ctx, rawURL, selectedURLCooldown)
+	if err != nil {
+		s.logger.Warn().Err(err).Str("url", rawURL).Msg("persisted URL-dispatch claim failed — falling back to in-memory cooldown only")
+		return false
 	}
-	s.markSelectedReleaseURLDispatched(rawURL, now)
-	if err := s.repo.MarkURLDispatchedPersisted(ctx, rawURL); err != nil {
-		s.logger.Warn().Err(err).Str("url", rawURL).Msg("failed to persist URL-dispatch marker — restart-window duplicate-fetch protection degraded for this attempt")
-	}
-	return false
+	return !claimed
 }
 
 func searchRequestFingerprint(libraryItemID int64, request hydra.SearchRequest) string {
@@ -2380,7 +2410,7 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 		// Already indexed — skip straight to publish.
 		return nil, &pendingPublish{current: current}, nil
 	}
-	if s.shouldSkipDuplicateURLFetch(ctx, current.ExternalURL) {
+	if s.ClaimURLForFetch(ctx, current.ExternalURL) {
 		// Already fetched this exact NZB within the cooldown window via some
 		// other path (or a moment ago via this one) — skip quietly rather than
 		// re-fetching or promoting to the next candidate; the current
@@ -2514,14 +2544,14 @@ func (s *Service) fetchAndImportSelectedReleaseDepth(ctx context.Context, select
 	if current.NZBDocumentID != nil {
 		return s.retrySelectedReleaseFromStoredNZB(ctx, current, depth)
 	}
-	// Same shouldSkipDuplicateURLFetch cooldown as fetchIndexAndRelease --
+	// Same ClaimURLForFetch cooldown as fetchIndexAndRelease --
 	// this is a separate, near-duplicate fetch path (the recursive
 	// candidate-promotion chain via promoteNextAfterFailureDepth) that was
 	// missed when the in-memory cooldown was first added (v0.2.22), so it
 	// kept bypassing it and re-fetching URLs the other path had just tried
 	// moments earlier until that was fixed (v0.2.28). Both call sites now
 	// share the exact same guard function so this can't recur a third time.
-	if s.shouldSkipDuplicateURLFetch(ctx, current.ExternalURL) {
+	if s.ClaimURLForFetch(ctx, current.ExternalURL) {
 		return nil, nil
 	}
 	if err := s.repo.MarkSelectedReleaseFetching(ctx, current.SelectedReleaseID); err != nil {
@@ -3350,6 +3380,21 @@ func (s *Service) promoteNextAfterFailureDepth(ctx context.Context, current data
 		return s.retrySelectedReleaseFromStoredNZB(ctx, *next, depth+1)
 	}
 	// Recursively try the next candidate, but track depth to prevent stack overflow.
+	// Claim next.SelectedReleaseID in-flight for the duration of this inline
+	// attempt, exactly like the normal submit()/next() dispatch path does --
+	// see downloadDispatcher.claimInFlight's doc comment for why this
+	// mattered: without it, a second, fully independent dispatch (e.g.
+	// DispatchAutomaticPending's passive sweep, which can see this same
+	// selectedReleaseID the instant FailSelectedReleaseAndPromoteNext
+	// committed it above) could submit() a second worker for the identical
+	// release while this inline chain is still working on it.
+	if !s.downloader.claimInFlight(next.SelectedReleaseID) {
+		// Someone else (the passive dispatch sweep, or a concurrent inline
+		// chain) already claimed this exact selectedReleaseID -- let that
+		// claimant own it rather than racing a second in-process attempt.
+		return nil, nil
+	}
+	defer s.downloader.markDone(next.SelectedReleaseID)
 	result, err := s.fetchAndImportSelectedReleaseDepth(ctx, next.SelectedReleaseID, depth+1)
 	return result, err
 }
