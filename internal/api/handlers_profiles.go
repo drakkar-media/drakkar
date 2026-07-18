@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -54,9 +53,8 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(rq, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, rq, "id")
+		if !ok {
 			return
 		}
 		var f database.CustomFormat
@@ -77,9 +75,8 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(rq, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, rq, "id")
+		if !ok {
 			return
 		}
 		if err := repo.DeleteCustomFormat(rq.Context(), id); err != nil {
@@ -150,9 +147,8 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(rq, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, rq, "id")
+		if !ok {
 			return
 		}
 		var rule database.ReleaseBlockRule
@@ -201,9 +197,8 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(rq, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, rq, "id")
+		if !ok {
 			return
 		}
 		if err := repo.DeleteReleaseBlockRule(rq.Context(), id); err != nil {
@@ -285,9 +280,8 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(rq, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, rq, "id")
+		if !ok {
 			return
 		}
 		var p database.IndexerPolicy
@@ -308,9 +302,8 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(rq, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, rq, "id")
+		if !ok {
 			return
 		}
 		if err := repo.DeleteIndexerPolicy(rq.Context(), id); err != nil {
@@ -362,9 +355,8 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(rq, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, rq, "id")
+		if !ok {
 			return
 		}
 		var p database.SubtitleProfile
@@ -385,9 +377,8 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(rq, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, rq, "id")
+		if !ok {
 			return
 		}
 		if err := repo.DeleteSubtitleProfile(rq.Context(), id); err != nil {

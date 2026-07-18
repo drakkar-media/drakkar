@@ -1752,7 +1752,10 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
 			}
 		case retryPolicyRemove:
-			_ = s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID)
+			if err := s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID); err != nil {
+				result.Failed++
+				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+			}
 		case retryPolicyDoNothing:
 			// no-op: policy explicitly says leave this item alone.
 		case retryMatrixBlocklistAndSearch:
@@ -1798,12 +1801,6 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 func isDeadlock(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.SQLState() == "40P01"
-}
-
-// isFKViolation returns true when err is a PostgreSQL foreign-key constraint violation (SQLSTATE 23503).
-func isFKViolation(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.SQLState() == "23503"
 }
 
 func (s *Service) SearchLibrary(ctx context.Context, libraryItemID int64) (SearchResult, error) {
@@ -2254,18 +2251,28 @@ func isRetryableSearchFailure(err error) bool {
 	}
 }
 
+// isRetryableSeerrSyncFailure decides whether a whole Seerr requests-sync
+// operation should be treated as a transient failure. It first delegates to
+// seerr.IsRetryableError -- the seerr package's own internal per-request
+// retry classifier -- so the two don't independently maintain their own
+// copies of the same "is this a timeout/5xx/gateway hiccup" substring list
+// (they used to, and had already drifted: this package's list included
+// "server misbehaving" and Cloudflare-specific substrings the seerr package
+// didn't have, while lacking nothing seerr's had). Anything seerr's
+// narrower per-request classifier doesn't catch falls through to this
+// package's own broader lists, shared with classifySearchFailureReason so
+// Hydra search failures and Seerr sync failures agree on what "transient"
+// means.
 func isRetryableSeerrSyncFailure(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
+	if seerr.IsRetryableError(err) {
 		return true
 	}
 	message := strings.ToLower(strings.TrimSpace(err.Error()))
 	switch {
-	case strings.Contains(message, "timeout"),
-		strings.Contains(message, "deadline exceeded"),
-		containsAnySubstring(message, transientServerErrorSubstrings),
+	case containsAnySubstring(message, transientServerErrorSubstrings),
 		containsAnySubstring(message, transientGatewayTimeoutSubstrings):
 		return true
 	// Seerr's own client wraps some errors with wording Hydra's search errors
@@ -2410,49 +2417,11 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 		// Already indexed — skip straight to publish.
 		return nil, &pendingPublish{current: current}, nil
 	}
-	if s.ClaimURLForFetch(ctx, current.ExternalURL) {
-		// Already fetched this exact NZB within the cooldown window via some
-		// other path (or a moment ago via this one) — skip quietly rather than
-		// re-fetching or promoting to the next candidate; the current
-		// selection is likely fine, we just don't need to hammer it again.
-		return nil, nil, nil
-	}
-	if err := s.repo.MarkSelectedReleaseFetching(ctx, current.SelectedReleaseID); err != nil {
-		return nil, nil, err
-	}
-	fileName, raw, err := s.fetcher.Fetch(ctx, current.ExternalURL)
-	if err != nil {
-		result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), 0)
+	result, imported, err := s.fetchAndBuildImportedNZB(ctx, current, 0)
+	if err != nil || imported == nil {
 		return result, nil, err
 	}
-	// Persist raw NZB bytes immediately after download so that a crash or restart
-	// between here and ImportSelectedReleaseNZB does not cause a re-download.
-	// NZBDocumentID != nil check at the top of this function will reuse the stored
-	// bytes on the next attempt instead of calling NZBFinder again.
-	if storeErr := s.repo.StoreRawNZBDocument(ctx, current.SelectedReleaseID, fileName, raw, current.ExternalURL); storeErr != nil {
-		if isFKViolation(storeErr) {
-			return nil, nil, nil
-		}
-		s.logger.Warn().Err(storeErr).Int64("srId", current.SelectedReleaseID).Msg("early NZB store failed — will re-download on next attempt if restart occurs")
-	}
-	imported, err := nzb.BuildImportedNZB(fileName, raw, fmt.Sprintf("selected-release:%d", current.SelectedReleaseID), current.ExternalURL)
-	if err != nil {
-		result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), 0)
-		return result, nil, err
-	}
-	if s.earlyChecker != nil {
-		if msgID := largestFileFirstSegment(imported.Files); msgID != "" {
-			if err := s.earlyChecker(ctx, msgID); err != nil {
-				if shouldIgnoreEarlyPreflightFailure(err) {
-					s.logger.Info().Err(err).Int64("srId", current.SelectedReleaseID).Msg("early preflight advisory only; continuing import")
-				} else {
-					result, err := s.promoteNextAfterFailureDepth(ctx, current, fmt.Sprintf("early preflight: %s", err), 0)
-					return result, nil, err
-				}
-			}
-		}
-	}
-	item, err := s.repo.ImportSelectedReleaseNZB(ctx, current.SelectedReleaseID, imported)
+	item, err := s.repo.ImportSelectedReleaseNZB(ctx, current.SelectedReleaseID, *imported)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil, nil
@@ -2484,6 +2453,95 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 	return nil, &pendingPublish{current: current, item: item}, nil
 }
 
+// fetchAndBuildImportedNZB runs the steps shared by fetchIndexAndRelease
+// (the primary async download-worker path) and
+// fetchAndImportSelectedReleaseDepth (the synchronous recursive
+// candidate-promotion fallback chain): claim the per-URL fetch cooldown,
+// fetch the NZB, persist the raw bytes, parse them, and run the early NNTP
+// preflight check. This is exactly the prefix that drifted out of sync
+// once before -- the ClaimURLForFetch cooldown was added to one call site
+// and missed on the other (v0.2.22, fixed v0.2.28) -- so it's now the one
+// place either path can fetch from.
+//
+// The two callers diverge both before this (how they handle an
+// already-indexed NZBDocumentID) and after it (fetchIndexAndRelease
+// continues inline to build its own pendingPublish handoff for the
+// publish-goroutine; fetchAndImportSelectedReleaseDepth delegates the rest
+// to importSelectedRelease), so only this shared middle section is
+// extracted.
+//
+// imported is nil whenever the caller should return immediately: either a
+// graceful no-op (result and err both nil -- the cooldown already covers
+// this URL, or a concurrent worker already claimed the row) or a
+// promote-next-candidate outcome (result/err as returned by
+// promoteNextAfterFailureDepth). imported is non-nil only on a successful
+// fetch+parse, ready for the caller's own next step.
+func (s *Service) fetchAndBuildImportedNZB(ctx context.Context, current database.ReleaseSummary, depth int) (*int64, *database.ImportedNZB, error) {
+	if s.ClaimURLForFetch(ctx, current.ExternalURL) {
+		// Already fetched this exact NZB within the cooldown window via some
+		// other path (or a moment ago via this one) — skip quietly rather than
+		// re-fetching or promoting to the next candidate; the current
+		// selection is likely fine, we just don't need to hammer it again.
+		return nil, nil, nil
+	}
+	if err := s.repo.MarkSelectedReleaseFetching(ctx, current.SelectedReleaseID); err != nil {
+		return nil, nil, err
+	}
+	fileName, raw, err := s.fetcher.Fetch(ctx, current.ExternalURL)
+	if err != nil {
+		result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
+		return result, nil, err
+	}
+	// Persist raw NZB bytes immediately after download so that a crash or restart
+	// between here and ImportSelectedReleaseNZB does not cause a re-download.
+	// A NZBDocumentID != nil check at the top of each caller will reuse the
+	// stored bytes on the next attempt instead of calling NZBFinder again.
+	if storeErr := s.repo.StoreRawNZBDocument(ctx, current.SelectedReleaseID, fileName, raw, current.ExternalURL); storeErr != nil {
+		if database.IsFKViolation(storeErr) {
+			return nil, nil, nil
+		}
+		s.logger.Warn().Err(storeErr).Int64("srId", current.SelectedReleaseID).Msg("early NZB store failed — will re-download on next attempt if restart occurs")
+	}
+	imported, err := nzb.BuildImportedNZB(fileName, raw, fmt.Sprintf("selected-release:%d", current.SelectedReleaseID), current.ExternalURL)
+	if err != nil {
+		result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
+		return result, nil, err
+	}
+	// Quick NNTP STAT check before the expensive archive inspection + DB import.
+	// Pick the first segment of the largest NZB file (proxy for the main content file).
+	if s.earlyChecker != nil {
+		if msgID := largestFileFirstSegment(imported.Files); msgID != "" {
+			if err := s.earlyChecker(ctx, msgID); err != nil {
+				if shouldIgnoreEarlyPreflightFailure(err) {
+					s.logger.Info().Err(err).Int64("srId", current.SelectedReleaseID).Msg("early preflight advisory only; continuing import")
+				} else {
+					result, err := s.promoteNextAfterFailureDepth(ctx, current, fmt.Sprintf("early preflight: %s", err), depth)
+					return result, nil, err
+				}
+			}
+		}
+	}
+	return nil, &imported, nil
+}
+
+// zeroVirtualFilesReason returns the promote-reason for a release whose
+// import produced no publishable files, preferring the recorded
+// archive-reject detail (e.g. "archive_headers_invalid") when one was
+// captured and otherwise falling back to "no_publishable_files" --
+// isPermanentArchiveRejectReason recognizes both as permanent, hard-reject
+// reasons. Every "did this release publish anything?" check must go
+// through this so the outcome doesn't depend on which of the two
+// near-duplicate fetch/publish paths (fetchIndexAndRelease's
+// publishImportedRelease vs. the recursive fallback chain's
+// importSelectedRelease) happened to run it.
+func zeroVirtualFilesReason(archiveRejects string) string {
+	reason := strings.TrimSpace(archiveRejects)
+	if reason == "" {
+		reason = "no_publishable_files"
+	}
+	return reason
+}
+
 // publishImportedRelease runs postImportHook (symlinks, episode items, Plex)
 // without holding the import semaphore so other fetches can proceed in parallel.
 func (s *Service) publishImportedRelease(ctx context.Context, p pendingPublish) (*int64, error) {
@@ -2495,8 +2553,8 @@ func (s *Service) publishImportedRelease(ctx context.Context, p pendingPublish) 
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
-	if err == nil && updated.VirtualFileCount == 0 && strings.TrimSpace(updated.ArchiveRejects) != "" {
-		return s.promoteNextAfterFailure(ctx, p.current, updated.ArchiveRejects)
+	if err == nil && updated.VirtualFileCount == 0 {
+		return s.promoteNextAfterFailure(ctx, p.current, zeroVirtualFilesReason(updated.ArchiveRejects))
 	}
 	if p.item.QueueItemID > 0 {
 		if publisher, ok := s.repo.(interface {
@@ -2512,8 +2570,8 @@ func (s *Service) publishImportedRelease(ctx context.Context, p pendingPublish) 
 		if err := s.postImportHook(ctx, p.item); err != nil {
 			failureReason := err.Error()
 			if errors.Is(err, library.ErrNoVirtualFiles) {
-				if updated, lookupErr := s.repo.GetSelectedReleaseSummary(ctx, p.current.SelectedReleaseID); lookupErr == nil && strings.TrimSpace(updated.ArchiveRejects) != "" {
-					failureReason = updated.ArchiveRejects
+				if updated, lookupErr := s.repo.GetSelectedReleaseSummary(ctx, p.current.SelectedReleaseID); lookupErr == nil {
+					failureReason = zeroVirtualFilesReason(updated.ArchiveRejects)
 				}
 			}
 			return s.promoteNextAfterFailure(ctx, p.current, failureReason)
@@ -2544,47 +2602,11 @@ func (s *Service) fetchAndImportSelectedReleaseDepth(ctx context.Context, select
 	if current.NZBDocumentID != nil {
 		return s.retrySelectedReleaseFromStoredNZB(ctx, current, depth)
 	}
-	// Same ClaimURLForFetch cooldown as fetchIndexAndRelease --
-	// this is a separate, near-duplicate fetch path (the recursive
-	// candidate-promotion chain via promoteNextAfterFailureDepth) that was
-	// missed when the in-memory cooldown was first added (v0.2.22), so it
-	// kept bypassing it and re-fetching URLs the other path had just tried
-	// moments earlier until that was fixed (v0.2.28). Both call sites now
-	// share the exact same guard function so this can't recur a third time.
-	if s.ClaimURLForFetch(ctx, current.ExternalURL) {
-		return nil, nil
+	result, imported, err := s.fetchAndBuildImportedNZB(ctx, current, depth)
+	if err != nil || imported == nil {
+		return result, err
 	}
-	if err := s.repo.MarkSelectedReleaseFetching(ctx, current.SelectedReleaseID); err != nil {
-		return nil, err
-	}
-	fileName, raw, err := s.fetcher.Fetch(ctx, current.ExternalURL)
-	if err != nil {
-		return s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
-	}
-	if storeErr := s.repo.StoreRawNZBDocument(ctx, current.SelectedReleaseID, fileName, raw, current.ExternalURL); storeErr != nil {
-		if isFKViolation(storeErr) {
-			return nil, nil
-		}
-		s.logger.Warn().Err(storeErr).Int64("srId", current.SelectedReleaseID).Msg("early NZB store failed — will re-download on next attempt if restart occurs")
-	}
-	imported, err := nzb.BuildImportedNZB(fileName, raw, fmt.Sprintf("selected-release:%d", current.SelectedReleaseID), current.ExternalURL)
-	if err != nil {
-		return s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
-	}
-	// Quick NNTP STAT check before the expensive archive inspection + DB import.
-	// Pick the first segment of the largest NZB file (proxy for the main content file).
-	if s.earlyChecker != nil {
-		if msgID := largestFileFirstSegment(imported.Files); msgID != "" {
-			if err := s.earlyChecker(ctx, msgID); err != nil {
-				if shouldIgnoreEarlyPreflightFailure(err) {
-					s.logger.Info().Err(err).Int64("srId", current.SelectedReleaseID).Msg("early preflight advisory only; continuing import")
-				} else {
-					return s.promoteNextAfterFailureDepth(ctx, current, fmt.Sprintf("early preflight: %s", err), depth)
-				}
-			}
-		}
-	}
-	return s.importSelectedRelease(ctx, current, imported, depth)
+	return s.importSelectedRelease(ctx, current, *imported, depth)
 }
 
 // largestFileFirstSegment returns the first segment message ID of the largest
@@ -3267,18 +3289,14 @@ func (s *Service) importSelectedRelease(ctx context.Context, current database.Re
 	// Don't call postImportHook (FUSE symlinks, subtitles, Plex) for an empty release.
 	updated, err := s.repo.GetSelectedReleaseSummary(ctx, current.SelectedReleaseID)
 	if err == nil && updated.VirtualFileCount == 0 {
-		reason := strings.TrimSpace(updated.ArchiveRejects)
-		if reason == "" {
-			reason = "no_publishable_files"
-		}
-		return s.promoteNextAfterFailureDepth(ctx, current, reason, depth)
+		return s.promoteNextAfterFailureDepth(ctx, current, zeroVirtualFilesReason(updated.ArchiveRejects), depth)
 	}
 	if s.postImportHook != nil {
 		if err := s.postImportHook(ctx, item); err != nil {
 			failureReason := err.Error()
 			if errors.Is(err, library.ErrNoVirtualFiles) {
-				if updated2, lookupErr := s.repo.GetSelectedReleaseSummary(ctx, current.SelectedReleaseID); lookupErr == nil && strings.TrimSpace(updated2.ArchiveRejects) != "" {
-					failureReason = updated2.ArchiveRejects
+				if updated2, lookupErr := s.repo.GetSelectedReleaseSummary(ctx, current.SelectedReleaseID); lookupErr == nil {
+					failureReason = zeroVirtualFilesReason(updated2.ArchiveRejects)
 				}
 			}
 			return s.promoteNextAfterFailureDepth(ctx, current, failureReason, depth)
@@ -4262,11 +4280,7 @@ func (s *Service) ImportNZBFromPush(ctx context.Context, content []byte, filenam
 		}
 		updated, lookupErr := s.repo.GetSelectedReleaseSummary(bgCtx, current.SelectedReleaseID)
 		if lookupErr == nil && updated.VirtualFileCount == 0 {
-			reason := strings.TrimSpace(updated.ArchiveRejects)
-			if reason == "" {
-				reason = "no_publishable_files"
-			}
-			if _, promoteErr := s.promoteNextAfterFailure(bgCtx, current, reason); promoteErr != nil {
+			if _, promoteErr := s.promoteNextAfterFailure(bgCtx, current, zeroVirtualFilesReason(updated.ArchiveRejects)); promoteErr != nil {
 				s.logger.Error().Err(promoteErr).Msg("sabnzbd: promoteNextAfterFailure failed (no files)")
 			}
 			return

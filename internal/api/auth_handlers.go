@@ -30,6 +30,20 @@ type UserRepository interface {
 	DeleteAPIToken(ctx context.Context, userID, tokenID int64) error
 }
 
+// parseInt64PathID parses the chi "id" URL param as an int64. Unlike
+// router.go's parseInt64URLParam (which uses respondError's JSON encoder),
+// this file's existing convention writes errors via http.Error with a
+// hand-built JSON-shaped body, so this mirrors that exact behavior on
+// failure: it writes {"error":"invalid id"} with 400 and returns ok=false.
+func parseInt64PathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		return 0, false
+	}
+	return id, true
+}
+
 func mountAuthRoutes(r chi.Router, repo UserRepository) {
 	r.Post("/api/auth/login", handleLogin(repo))
 	r.Post("/api/auth/logout", handleLogout(repo))
@@ -179,9 +193,8 @@ func handleDeleteAPIToken(repo UserRepository) http.HandlerFunc {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		id, ok := parseInt64PathID(w, r)
+		if !ok {
 			return
 		}
 		if err := repo.DeleteAPIToken(r.Context(), claims.UserID, id); err != nil {
@@ -253,9 +266,8 @@ func handleDeleteUser(repo UserRepository) http.HandlerFunc {
 			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		id, ok := parseInt64PathID(w, r)
+		if !ok {
 			return
 		}
 		if claims.UserID == id {
@@ -272,9 +284,8 @@ func handleDeleteUser(repo UserRepository) http.HandlerFunc {
 
 func handleChangePassword(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			http.Error(w, `{"error":"invalid id"}`, http.StatusBadRequest)
+		id, ok := parseInt64PathID(w, r)
+		if !ok {
 			return
 		}
 		claims, _ := auth.FromContext(r.Context())

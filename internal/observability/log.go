@@ -15,18 +15,10 @@ import (
 type Level string
 
 const (
-	LevelTrace Level = "trace"
-	LevelDebug Level = "debug"
 	LevelInfo  Level = "info"
 	LevelWarn  Level = "warn"
 	LevelError Level = "error"
 )
-
-// New creates a zerolog logger that writes to w. If logsDir is non-empty,
-// log lines are also tee'd to logsDir/drakkar.log for the /api/logs endpoint.
-func New(w io.Writer, level Level) zerolog.Logger {
-	return NewWithFile(w, level, "")
-}
 
 func NewWithFile(w io.Writer, level Level, logsDir string) zerolog.Logger {
 	zerolog.TimeFieldFormat = time.RFC3339

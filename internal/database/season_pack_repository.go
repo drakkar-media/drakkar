@@ -5,20 +5,9 @@ import (
 	"time"
 )
 
-type SeasonPackAttempt struct {
-	ID            int64
-	TVShowID      int64
-	SeasonNumber  int
-	LastAttemptAt time.Time
-	AttemptCount  int
-	LastOutcome   string
-}
-
 const (
-	SeasonPackOutcomeSearching = "searching"
-	SeasonPackOutcomeSelected  = "selected"
-	SeasonPackOutcomeFailed    = "failed"
-	SeasonPackOutcomeExhausted = "exhausted"
+	SeasonPackOutcomeSelected = "selected"
+	SeasonPackOutcomeFailed   = "failed"
 )
 
 // SeasonPackCooldown is the minimum time between pack attempts for the same season.

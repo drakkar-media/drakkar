@@ -222,7 +222,7 @@ func (db *DB) enrichBlocklistSignature(ctx context.Context, item *BlocklistItemS
 		if err := rows.Scan(&selectedReleaseID, &libraryItemID, &releaseTitle, &indexerName, &sizeBytes, &postedAt); err != nil {
 			return err
 		}
-		if normalizeReleaseTitleForBlocklist(releaseTitle) != titleKey {
+		if NormalizeReleaseTitle(releaseTitle) != titleKey {
 			continue
 		}
 		assignBlocklistMetadata(item, selectedReleaseID, libraryItemID, releaseTitle, indexerName, sizeBytes, postedAt)
@@ -271,10 +271,6 @@ func parseReleaseSignatureKey(key string) (titleKey, indexerKey string, sizeBuck
 	return titleKey, indexerKey, sizeBucket, dateBucket
 }
 
-func normalizeReleaseTitleForBlocklist(value string) string {
-	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ", "{", " ", "}", " ")
-	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(strings.TrimSpace(value)))), " ")
-}
 
 func (db *DB) BlocklistStats(ctx context.Context) (BlocklistStats, error) {
 	var s BlocklistStats

@@ -17,14 +17,10 @@ func splitLines(body []byte) [][]byte {
 	return out
 }
 
-func verifyExpectedCRC(body, decoded []byte) error {
-	return verifyExpectedCRCLines(splitLines(body), decoded)
-}
-
-// verifyExpectedCRCLines is verifyExpectedCRC for a caller that already has
-// the article split into lines (e.g. DecodeArticle, which needs the same
-// split for its own decoding pass) — avoids re-splitting the same ~700KB
-// article body a second time.
+// verifyExpectedCRCLines verifies decoded against the =yend crc32/pcrc32
+// footer found in lines, for a caller that already has the article split
+// into lines (e.g. DecodeArticle, which needs the same split for its own
+// decoding pass) — avoids re-splitting the same ~700KB article body again.
 func verifyExpectedCRCLines(lines [][]byte, decoded []byte) error {
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := lines[i]

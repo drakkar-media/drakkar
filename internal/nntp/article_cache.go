@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/drakkar-media/drakkar/internal/cache"
 	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
@@ -31,12 +32,29 @@ type CachedFallbackSource struct {
 
 	mu      sync.Mutex
 	missing map[string]time.Time // messageID → expiry
+
+	// statFlight/bodyFlight coalesce concurrent Stat/BodyPriority calls for
+	// the same messageID that all miss the missing-article cache at once.
+	// Without this, isMissing()+markMissing() being two separate critical
+	// sections left a window where two concurrent callers (e.g. earlyChecker
+	// calls from several download-worker-pool goroutines importing the same
+	// selected release) could both see isMissing()==false and both issue a
+	// real duplicate fetch/STAT against the NNTP provider for a
+	// never-before-cached, currently-dead/throttled article. Kept as two
+	// separate SingleFlight instances (rather than one shared by key) so a
+	// concurrent Stat and BodyPriority for the same messageID never share a
+	// flight — they call different inner methods and BodyPriority callers
+	// need the actual bytes back, not a Stat-shaped (nil, err) result.
+	statFlight *cache.SingleFlight
+	bodyFlight *cache.SingleFlight
 }
 
 func NewCachedFallbackSource(inner *FallbackSource) *CachedFallbackSource {
 	return &CachedFallbackSource{
-		inner:   inner,
-		missing: make(map[string]time.Time),
+		inner:      inner,
+		missing:    make(map[string]time.Time),
+		statFlight: cache.NewSingleFlight(),
+		bodyFlight: cache.NewSingleFlight(),
 	}
 }
 
@@ -48,25 +66,30 @@ func (s *CachedFallbackSource) BodyPriority(ctx context.Context, messageID strin
 	if s.isMissing(messageID) {
 		return nil, errArticleNotFound(messageID)
 	}
-	body, err := s.inner.BodyPriority(ctx, messageID, priority)
-	if err != nil {
-		if ttl, ok := classifyCacheableError(err); ok {
-			s.markMissing(messageID, ttl)
+	return s.bodyFlight.Do(ctx, messageID, func(ctx context.Context) ([]byte, error) {
+		body, err := s.inner.BodyPriority(ctx, messageID, priority)
+		if err != nil {
+			if ttl, ok := classifyCacheableError(err); ok {
+				s.markMissing(messageID, ttl)
+			}
 		}
-	}
-	return body, err
+		return body, err
+	})
 }
 
 func (s *CachedFallbackSource) Stat(ctx context.Context, messageID string) error {
 	if s.isMissing(messageID) {
 		return errArticleNotFound(messageID)
 	}
-	err := s.inner.Stat(ctx, messageID)
-	if err != nil {
-		if ttl, ok := classifyCacheableError(err); ok {
-			s.markMissing(messageID, ttl)
+	_, err := s.statFlight.Do(ctx, messageID, func(ctx context.Context) ([]byte, error) {
+		err := s.inner.Stat(ctx, messageID)
+		if err != nil {
+			if ttl, ok := classifyCacheableError(err); ok {
+				s.markMissing(messageID, ttl)
+			}
 		}
-	}
+		return nil, err
+	})
 	return err
 }
 

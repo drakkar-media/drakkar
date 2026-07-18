@@ -225,19 +225,32 @@ func (db *DB) createSeasonPackEpisodeItem(ctx context.Context, tvShowID int64, s
 		return err
 	}
 
-	// Link a selected_release so the episode is associated with the NZB release.
+	// Link a selected_release so the episode is associated with the NZB
+	// release. This must be idempotent -- re-running this for an episode
+	// that's already linked (e.g. the pack being re-selected/republished)
+	// must not create a second row. selected_releases has no unique
+	// constraint on library_item_id for ON CONFLICT to match against, so (as
+	// with FulfillEpisodeLibraryItem below, which hit this same bug and had
+	// 94.5% of the table end up as dead duplicate rows) an explicit
+	// existence check is required instead of relying on ON CONFLICT, which
+	// never fires and always inserts a fresh row.
 	var srID int64
+	var alreadyLinked bool
 	err = tx.QueryRowContext(ctx, `
-		INSERT INTO selected_releases (release_candidate_id, library_item_id)
-		VALUES ($1, $2)
-		ON CONFLICT DO NOTHING
-		RETURNING id`, releaseCandidateID, libItemID).Scan(&srID)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
+		SELECT id FROM selected_releases WHERE library_item_id = $1`, libItemID).Scan(&srID)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		err = nil
+	} else {
+		alreadyLinked = true
 	}
-	if srID == 0 {
-		if err := tx.QueryRowContext(ctx, `
-			SELECT id FROM selected_releases WHERE library_item_id = $1`, libItemID).Scan(&srID); err != nil {
+	if !alreadyLinked {
+		if err = tx.QueryRowContext(ctx, `
+			INSERT INTO selected_releases (release_candidate_id, library_item_id)
+			VALUES ($1, $2)
+			RETURNING id`, releaseCandidateID, libItemID).Scan(&srID); err != nil {
 			return err
 		}
 	}

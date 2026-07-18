@@ -11,7 +11,8 @@
   import Button from '$lib/components/Button.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
   import { api } from '$lib/api';
-  import { toastError, toastSuccess } from '$lib/toast';
+  import { toastError } from '$lib/toast';
+  import { runAction, confirmed } from '$lib/actions';
   import type { QualityProfile } from '$lib/types';
 
   const ALL_RESOLUTIONS = ['2160p', '1080p', '720p', '576p', '480p'];
@@ -63,30 +64,32 @@
 
   async function save() {
     if (!selected) return;
-    saving = true;
-    try {
-      const saved = await api.saveProfile(selected);
-      toastSuccess(`Profile "${saved.name}" saved`);
-      await load();
-      const found = profiles.find(p => p.name === saved.name);
-      if (found) selected = { ...found };
-    } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
-    finally { saving = false; }
+    const toSave = selected;
+    await runAction(() => api.saveProfile(toSave), {
+      setWorking: (v) => (saving = v),
+      successMessage: (saved) => `Profile "${saved.name}" saved`,
+      afterSuccess: async (saved) => {
+        await load();
+        const found = profiles.find(p => p.name === saved.name);
+        if (found) selected = { ...found };
+      }
+    });
   }
 
   let deleting = false;
 
   async function deleteProfile(p: QualityProfile) {
     if (!p.id || p.isDefault || deleting) return;
-    if (typeof window !== 'undefined' && !window.confirm(`Delete profile "${p.name}"?`)) return;
-    deleting = true;
-    try {
-      await api.deleteProfile(p.id);
-      toastSuccess(`Profile "${p.name}" deleted`);
-      if (selected?.id === p.id) selected = null;
-      await load();
-    } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
-    finally { deleting = false; }
+    if (!confirmed(`Delete profile "${p.name}"?`)) return;
+    const id = p.id;
+    await runAction(() => api.deleteProfile(id), {
+      setWorking: (v) => (deleting = v),
+      successMessage: () => `Profile "${p.name}" deleted`,
+      afterSuccess: async () => {
+        if (selected?.id === p.id) selected = null;
+        await load();
+      }
+    });
   }
 
   // Ordered list reorder helpers

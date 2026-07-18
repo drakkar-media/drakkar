@@ -38,10 +38,7 @@
     loading = true;
     try {
       const [listing, nextMetrics, nextStreams] = await Promise.all([
-        fetch(`/api/vfs?path=${encodeURIComponent(path)}`).then(async (r) => {
-          if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-          return r.json();
-        }),
+        api.vfs(path),
         api.metrics(),
         api.streams()
       ]);

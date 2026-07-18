@@ -39,7 +39,7 @@
   import { api, subscribeEvents } from '$lib/api';
   import { bytes, dateTime } from '$lib/format';
   import { toastError, toastSuccess } from '$lib/toast';
-  import { runAction } from '$lib/actions';
+  import { runAction, confirmed } from '$lib/actions';
   import { debounce } from '$lib/debounce';
   import type { BlocklistItem, BlocklistMutation, BlockTestResult, CustomFormat, FullSettings, IndexerPolicy, IntegrationProbeReport, PolicySettings, QualityDefinition, QualityProfile, ReleaseBlockRule, Status, SubtitleProfile, TaskSchedule, UsenetProvider } from '$lib/types';
 
@@ -312,7 +312,7 @@
   }
 
   async function deleteIndexerPolicy(id: number) {
-    if (typeof window !== 'undefined' && !window.confirm('Delete this indexer policy?')) return;
+    if (!confirmed('Delete this indexer policy?')) return;
     await runAction(() => api.deleteIndexerPolicy(id), {
       setWorking: () => {},
       successMessage: () => 'Deleted',
@@ -354,7 +354,7 @@
   }
 
   async function deleteSubtitleProfile(id: number) {
-    if (typeof window !== 'undefined' && !window.confirm('Delete this subtitle profile?')) return;
+    if (!confirmed('Delete this subtitle profile?')) return;
     await runAction(() => api.deleteSubtitleProfile(id), {
       setWorking: () => {},
       successMessage: () => 'Deleted',
@@ -438,7 +438,7 @@
   }
 
   async function deleteBlockRule(id: number) {
-    if (typeof window !== 'undefined' && !window.confirm('Delete this block rule?')) return;
+    if (!confirmed('Delete this block rule?')) return;
     await runAction(() => api.deleteReleaseBlockRule(id), {
       setWorking: () => {},
       successMessage: () => 'Deleted',
@@ -484,7 +484,7 @@
   }
 
   async function deleteFormat(id: number) {
-    if (typeof window !== 'undefined' && !window.confirm('Delete this custom format?')) return;
+    if (!confirmed('Delete this custom format?')) return;
     await runAction(() => api.deleteCustomFormat(id), {
       setWorking: () => {},
       successMessage: () => 'Custom format deleted',
@@ -515,7 +515,7 @@
 
   async function deleteSelectedProfile(p: QualityProfile) {
     if (!p.id || p.isDefault) return;
-    if (typeof window !== 'undefined' && !window.confirm(`Delete profile "${p.name}"?`)) return;
+    if (!confirmed(`Delete profile "${p.name}"?`)) return;
     await runAction(() => api.deleteProfile(p.id!), {
       setWorking: () => {},
       successMessage: () => `Profile "${p.name}" deleted`,
@@ -727,7 +727,7 @@
   }
 
   async function clearBlocklist(id: number) {
-    if (typeof window !== 'undefined' && !window.confirm('Clear this runtime blocklist entry?')) return;
+    if (!confirmed('Clear this runtime blocklist entry?')) return;
     setBusy(`clear-blocklist-${id}`, true);
     try {
       await api.clearBlocklist(id);
@@ -741,7 +741,7 @@
   }
 
   async function clearAllBlocklist() {
-    if (typeof window !== 'undefined' && !window.confirm('Clear all active runtime blocklist entries?')) return;
+    if (!confirmed('Clear all active runtime blocklist entries?')) return;
     setBusy('clear-all-blocklist', true);
     try {
       const r = await api.clearAllBlocklist();
@@ -756,7 +756,7 @@
   }
 
   async function clearBlocklistByReason(reason: string) {
-    if (typeof window !== 'undefined' && !window.confirm(`Clear all active runtime blocklist entries with reason "${reason}"?`)) return;
+    if (!confirmed(`Clear all active runtime blocklist entries with reason "${reason}"?`)) return;
     setBusy(`clear-blocklist-reason-${reason}`, true);
     try {
       const r = await api.clearBlocklistByReason(reason);
@@ -856,7 +856,7 @@
   // storage_maintenance scheduled task (every 6h). No individual API endpoints remain.
 
   async function pruneCache() {
-    if (typeof window !== 'undefined' && !window.confirm('Prune the block cache now?')) return;
+    if (!confirmed('Prune the block cache now?')) return;
     // Backend responds immediately with {queued: true} and prunes in a
     // background goroutine — the real stats (previously expected directly
     // off this call, which made lastCachePrune/the toast always show

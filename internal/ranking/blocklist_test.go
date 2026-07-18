@@ -11,10 +11,6 @@ func penaltyRule(ruleType, pattern string, penalty int) BlockRule {
 	return BlockRule{ID: 2, Type: ruleType, Pattern: pattern, MediaType: "both", Action: "penalty", ScorePenalty: penalty, Enabled: true}
 }
 
-func candidate(title string) Candidate {
-	return Candidate{Title: title}
-}
-
 // ── ParseReleaseGroup ────────────────────────────────────────────────────────
 
 func TestParseReleaseGroup(t *testing.T) {

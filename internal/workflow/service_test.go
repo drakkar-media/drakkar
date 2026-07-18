@@ -2554,7 +2554,13 @@ func TestSearchLibraryFallsBackWhenPublishFails(t *testing.T) {
 	if result.SelectedReleaseID == nil || *result.SelectedReleaseID != 89 {
 		t.Fatalf("unexpected result %+v", result)
 	}
-	if len(repo.failed) != 1 || repo.failed[0] != library.ErrNoVirtualFiles.Error() {
+	// "no_publishable_files", not the raw library.ErrNoVirtualFiles.Error()
+	// string -- zeroVirtualFilesReason normalizes both fetch/publish paths to
+	// this same permanent reject reason (see isPermanentArchiveRejectReason)
+	// regardless of which path produced the zero-file outcome, closing a gap
+	// found in the 2026-07-18 audit where this path alone left it classified
+	// as a soft, retryable failure.
+	if len(repo.failed) != 1 || repo.failed[0] != "no_publishable_files" {
 		t.Fatalf("unexpected failed reasons %+v", repo.failed)
 	}
 }

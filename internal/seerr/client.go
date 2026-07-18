@@ -357,14 +357,14 @@ func (c *Client) createRequestWithRecovery(ctx context.Context, body map[string]
 		return err
 	}
 	if err := c.postCreateRequest(ctx, data); err != nil {
-		if !isRetryableSeerrError(err) {
+		if !IsRetryableError(err) {
 			return err
 		}
 		if waitErr := c.waitForVisibleRequest(ctx, match); waitErr == nil {
 			return nil
 		}
 		if err := c.postCreateRequest(ctx, data); err != nil {
-			if !isRetryableSeerrError(err) {
+			if !IsRetryableError(err) {
 				return err
 			}
 			if waitErr := c.waitForVisibleRequest(ctx, match); waitErr == nil {
@@ -374,7 +374,7 @@ func (c *Client) createRequestWithRecovery(ctx context.Context, body map[string]
 		}
 	}
 	if err := c.waitForVisibleRequest(ctx, match); err != nil {
-		if errors.Is(err, errRequestNotVisible) || isRetryableSeerrError(err) {
+		if errors.Is(err, errRequestNotVisible) || IsRetryableError(err) {
 			return nil
 		}
 		return err
@@ -424,7 +424,7 @@ func (c *Client) waitForVisibleRequest(ctx context.Context, match func(Request) 
 		}
 		requests, err := c.PendingRequests(ctx)
 		if err != nil {
-			if isRetryableSeerrError(err) {
+			if IsRetryableError(err) {
 				continue
 			}
 			return err
@@ -505,7 +505,13 @@ func detectSeerrResponseError(action string, statusCode int, body []byte) error 
 	return httperr.DetectResponseError("seerr", action, statusCode, body)
 }
 
-func isRetryableSeerrError(err error) bool {
+// IsRetryableError reports whether err represents a transient Seerr-API
+// failure (timeout, 5xx, Cloudflare/gateway hiccup, connection-level
+// failure) worth retrying. Exported so callers outside this package (e.g.
+// workflow.isRetryableSeerrSyncFailure, which layers its own broader
+// sync-specific retry decision on top) do not have to maintain their own
+// parallel copy of this substring list.
+func IsRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}

@@ -26,3 +26,11 @@ export async function runAction<T>(
     opts.setWorking(false);
   }
 }
+
+// Shared guard for destructive actions, replacing the
+// `if (typeof window !== 'undefined' && !window.confirm(message)) return;`
+// line copy-pasted at ~21 call sites. Skips confirmation only when `window`
+// is unavailable (SSR) — never the case for these client-only handlers.
+export function confirmed(message: string): boolean {
+  return typeof window === 'undefined' || window.confirm(message);
+}

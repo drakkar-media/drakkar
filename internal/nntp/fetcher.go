@@ -24,11 +24,6 @@ type SegmentFetcher struct {
 	source DecodedArticleSource
 }
 
-type SpanAwareSegmentFetcher interface {
-	FetchRange(ctx context.Context, segment stream.SegmentRange) ([]byte, error)
-	FetchRangeInfo(ctx context.Context, segment stream.SegmentRange) ([]byte, stream.SegmentSpan, error)
-}
-
 func NewSegmentFetcher(source DecodedArticleSource) *SegmentFetcher {
 	return &SegmentFetcher{source: source}
 }

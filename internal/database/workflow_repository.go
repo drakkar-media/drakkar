@@ -1272,6 +1272,14 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 // candidate from an earlier search can sit untouched indefinitely — the item
 // never re-selects it and never gets a chance to replace it either.
 func (db *DB) PromoteExistingCandidate(ctx context.Context, libraryItemID int64) (*int64, error) {
+	// Preload before opening the transaction -- see FailSelectedReleaseAndPromoteNext,
+	// which does the same to avoid holding release_candidates write locks
+	// during this (potentially large) read.
+	blocked, err := loadBlocklistMapUncached(ctx, db.SQL)
+	if err != nil {
+		return nil, err
+	}
+
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -1286,28 +1294,46 @@ func (db *DB) PromoteExistingCandidate(ctx context.Context, libraryItemID int64)
 		return nil, err
 	}
 
-	var (
-		releaseCandidateID int64
-		title              string
-		indexerName        string
-		score              int
-		resolution         string
-	)
-	if err = tx.QueryRowContext(ctx, `
-		select rc.id, rc.title, rc.indexer_name, rc.score, rc.resolution
+	scopeKey, err := resolveMediaScopeKey(ctx, tx, libraryItemID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Blocklist-aware scan, same standard as FailSelectedReleaseAndPromoteNext
+	// (see scanNextViableCandidate) -- this was the one "promote next
+	// candidate" function that filtered only on rejected=false, so an
+	// already-blocklisted sibling candidate (same content, different
+	// indexer/URL) could be promoted and re-fetched here.
+	releaseCandidateIDOpt, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, blocked, `
+		select rc.id, rc.title, coalesce(rc.external_url, ''), coalesce(rc.indexer_name, ''), coalesce(rc.size_bytes, 0), coalesce(rc.posted_at, to_timestamp(0))
 		from release_candidates rc
 		where rc.library_item_id = $1
 		  and rc.rejected = false
 		  and rc.selected = false
 		  and not exists (select 1 from selected_releases sr where sr.release_candidate_id = rc.id)
-		order by rc.score desc, rc.id asc
-		limit 1
-		for update`, libraryItemID,
-	).Scan(&releaseCandidateID, &title, &indexerName, &score, &resolution); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			err = nil
-			return nil, tx.Rollback()
-		}
+		order by rc.score desc, rc.id asc`, libraryItemID)
+	if err != nil {
+		return nil, err
+	}
+	if err = markBlockedCandidatesRejected(ctx, tx, blockedEntries); err != nil {
+		return nil, err
+	}
+	if !releaseCandidateIDOpt.Valid {
+		return nil, tx.Commit()
+	}
+	releaseCandidateID := releaseCandidateIDOpt.Int64
+
+	var (
+		title       string
+		indexerName string
+		score       int
+		resolution  string
+	)
+	if err = tx.QueryRowContext(ctx, `
+		select title, indexer_name, score, resolution
+		from release_candidates
+		where id = $1`, releaseCandidateID,
+	).Scan(&title, &indexerName, &score, &resolution); err != nil {
 		return nil, err
 	}
 
@@ -1742,6 +1768,14 @@ func (db *DB) PromoteAlternativeRetryCandidate(ctx context.Context, libraryItemI
 }
 
 func (db *DB) promoteRetryCandidate(ctx context.Context, libraryItemID int64, excludeReleaseCandidateID int64, excludeCurrent bool) (*ReleaseSummary, error) {
+	// Preload before opening the transaction -- see FailSelectedReleaseAndPromoteNext,
+	// which does the same to avoid holding release_candidates write locks
+	// during this (potentially large) read.
+	blocked, err := loadBlocklistMapUncached(ctx, db.SQL)
+	if err != nil {
+		return nil, err
+	}
+
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -1766,9 +1800,13 @@ func (db *DB) promoteRetryCandidate(ctx context.Context, libraryItemID int64, ex
 		return nil, err
 	}
 
-	var releaseCandidateID int64
+	scopeKey, err := resolveMediaScopeKey(ctx, tx, libraryItemID)
+	if err != nil {
+		return nil, err
+	}
+
 	query := `
-		select rc.id
+		select rc.id, rc.title, coalesce(rc.external_url, ''), coalesce(rc.indexer_name, ''), coalesce(rc.size_bytes, 0), coalesce(rc.posted_at, to_timestamp(0))
 		from release_candidates rc
 		where rc.library_item_id = $1
 		  and rc.rejected = false
@@ -1782,18 +1820,21 @@ func (db *DB) promoteRetryCandidate(ctx context.Context, libraryItemID int64, ex
 		args = append(args, excludeReleaseCandidateID)
 	}
 	query += `
-		order by rc.failure_count asc, rc.score desc, rc.created_at asc, rc.id asc
-		limit 1`
-	err = tx.QueryRowContext(ctx, query, args...).Scan(&releaseCandidateID)
-	if errors.Is(err, sql.ErrNoRows) {
-		if err = tx.Rollback(); err != nil {
+		order by rc.failure_count asc, rc.score desc, rc.created_at asc, rc.id asc`
+	releaseCandidateIDOpt, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, blocked, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	if err = markBlockedCandidatesRejected(ctx, tx, blockedEntries); err != nil {
+		return nil, err
+	}
+	if !releaseCandidateIDOpt.Valid {
+		if err = tx.Commit(); err != nil {
 			return nil, err
 		}
 		return nil, nil
 	}
-	if err != nil {
-		return nil, err
-	}
+	releaseCandidateID := releaseCandidateIDOpt.Int64
 
 	selectedReleaseID, err := activateReleaseCandidate(ctx, tx, libraryItemID, releaseCandidateID, nil)
 	if err != nil {
@@ -1817,6 +1858,14 @@ func (db *DB) promoteRetryCandidate(ctx context.Context, libraryItemID int64, ex
 }
 
 func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int64, reason string) (*ReleaseSummary, error) {
+	// Preload before opening the transaction -- see FailSelectedReleaseAndPromoteNext,
+	// which does the same to avoid holding release_candidates write locks
+	// during this (potentially large) read.
+	blocked, err := loadBlocklistMapUncached(ctx, db.SQL)
+	if err != nil {
+		return nil, err
+	}
+
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -1853,11 +1902,11 @@ func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int
 	); err != nil {
 		return nil, err
 	}
+	scopeKey, err := resolveMediaScopeKey(ctx, tx, libraryItemID)
+	if err != nil {
+		return nil, err
+	}
 	if shouldPersistBlocklistReason(reason) && strings.TrimSpace(externalURL) != "" {
-		var scopeKey string
-		if scopeKey, err = resolveMediaScopeKey(ctx, tx, libraryItemID); err != nil {
-			return nil, err
-		}
 		for _, key := range blocklistKeysForRelease(scopeKey, title, externalURL, indexerName, sizeBytes, postedAt) {
 			if _, err = tx.ExecContext(ctx, `
 				insert into blocklist_items (key, reason)
@@ -1901,9 +1950,8 @@ func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int
 		return nil, err
 	}
 
-	var nextCandidateID sql.NullInt64
-	if err = tx.QueryRowContext(ctx, `
-		select id
+	nextCandidateID, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, blocked, `
+		select rc.id, rc.title, coalesce(rc.external_url, ''), coalesce(rc.indexer_name, ''), coalesce(rc.size_bytes, 0), coalesce(rc.posted_at, to_timestamp(0))
 		from release_candidates rc
 		where rc.library_item_id = $1
 		  and rc.rejected = false
@@ -1914,9 +1962,11 @@ func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int
 		         rc.score desc,
 		         rc.posted_at desc nulls last,
 		         rc.created_at asc,
-		         rc.id asc
-		limit 1`, libraryItemID, releaseCandidateID,
-	).Scan(&nextCandidateID); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		         rc.id asc`, libraryItemID, releaseCandidateID)
+	if err != nil {
+		return nil, err
+	}
+	if err = markBlockedCandidatesRejected(ctx, tx, blockedEntries); err != nil {
 		return nil, err
 	}
 
@@ -2219,7 +2269,7 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		values ($1, $2)
 		on conflict do nothing`, releaseCandidateID, reason,
 	); err != nil {
-		if isFKViolation(err) {
+		if IsFKViolation(err) {
 			// Candidate was deleted by concurrent worker — nothing left to fail.
 			err = nil
 			_ = tx.Rollback()
@@ -2271,15 +2321,7 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 	// resultReader, and ExecContext on the same connection returns
 	// driver.ErrBadConn (connLockError.SafeToRetry = true) while that lock
 	// is held.
-	type blockedEntry struct {
-		id     int64
-		reason string
-	}
-	var (
-		nextCandidateID sql.NullInt64
-		blockedEntries  []blockedEntry
-	)
-	rows, err := tx.QueryContext(ctx, `
+	nextCandidateID, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, blocked, `
 		select rc.id, rc.title, coalesce(rc.external_url, ''), coalesce(rc.indexer_name, ''), coalesce(rc.size_bytes, 0), coalesce(rc.posted_at, to_timestamp(0))
 		from release_candidates rc
 		where rc.library_item_id = $1
@@ -2295,38 +2337,10 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 	if err != nil {
 		return nil, err
 	}
-	for rows.Next() {
-		var candidateID int64
-		var candidate SearchCandidateRecord
-		if err = rows.Scan(&candidateID, &candidate.Title, &candidate.ExternalURL, &candidate.IndexerName, &candidate.SizeBytes, &candidate.PostedAt); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if blockedReason, isBlocked := blockedReleaseReason(scopeKey, blocked, candidate); isBlocked {
-			blockedEntries = append(blockedEntries, blockedEntry{id: candidateID, reason: blockedReason})
-			continue
-		}
-		nextCandidateID = sql.NullInt64{Int64: candidateID, Valid: true}
-		break
-	}
-	// Close rows before any ExecContext to release the pgConn lock.
-	if rowsErr := rows.Err(); rowsErr != nil {
-		rows.Close()
-		return nil, rowsErr
-	}
-	rows.Close()
 
 	// Now safe to issue writes: mark blocked candidates as rejected.
-	for _, be := range blockedEntries {
-		if _, err = tx.ExecContext(ctx, `
-			update release_candidates
-			set rejected = true,
-			    reject_reason = $2,
-			    selected = false
-			where id = $1`, be.id, be.reason,
-		); err != nil {
-			return nil, err
-		}
+	if err = markBlockedCandidatesRejected(ctx, tx, blockedEntries); err != nil {
+		return nil, err
 	}
 
 	if !nextCandidateID.Valid {
@@ -2386,8 +2400,89 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 	return &next, nil
 }
 
-// isFKViolation returns true when err is a PostgreSQL foreign-key constraint violation (SQLSTATE 23503).
-func isFKViolation(err error) bool {
+// blockedCandidateEntry is a release_candidates row that scanNextViableCandidate
+// found to match a live blocklist_items entry.
+type blockedCandidateEntry struct {
+	id     int64
+	reason string
+}
+
+// scanNextViableCandidate runs query -- which must select, in this order,
+// rc.id, title, external_url, indexer_name, size_bytes, posted_at, filtered
+// and ordered however the caller needs -- and returns the first row that
+// isn't blocklisted, plus any blocklisted rows encountered along the way so
+// the caller can mark them rejected via markBlockedCandidatesRejected.
+//
+// This exists because rejecting or blocklisting one candidate never
+// retroactively flips `rejected` on sibling release_candidates rows that
+// share the same blocklist family/pattern key (e.g. the same content
+// re-posted under a different indexer) -- see blocklistReleaseFamilyKey /
+// blocklistReleasePatternKey. A plain `rejected = false` filter alone can
+// therefore promote and re-fetch a release that's already permanently
+// blocklisted under a sibling entry. FailSelectedReleaseAndPromoteNext was
+// the only "promote next candidate" function that guarded against this;
+// this helper brings RejectReleaseCandidate, promoteRetryCandidate, and
+// PromoteExistingCandidate up to the same standard without forcing all four
+// to share one SQL query -- their WHERE/ORDER BY clauses differ
+// deliberately (e.g. promoteRetryCandidate requires a non-empty
+// external_url; PromoteExistingCandidate orders by score alone) and should
+// stay that way.
+//
+// The passed-in tx must not have any other open rows when this is called --
+// rows are closed internally before returning, same requirement as every
+// other rows-then-ExecContext sequence on this transaction.
+func scanNextViableCandidate(ctx context.Context, tx *sql.Tx, scopeKey string, blocked map[string]string, query string, args ...any) (sql.NullInt64, []blockedCandidateEntry, error) {
+	var (
+		next           sql.NullInt64
+		blockedEntries []blockedCandidateEntry
+	)
+	rows, err := tx.QueryContext(ctx, query, args...)
+	if err != nil {
+		return next, nil, err
+	}
+	for rows.Next() {
+		var candidateID int64
+		var candidate SearchCandidateRecord
+		if err := rows.Scan(&candidateID, &candidate.Title, &candidate.ExternalURL, &candidate.IndexerName, &candidate.SizeBytes, &candidate.PostedAt); err != nil {
+			rows.Close()
+			return next, nil, err
+		}
+		if reason, isBlocked := blockedReleaseReason(scopeKey, blocked, candidate); isBlocked {
+			blockedEntries = append(blockedEntries, blockedCandidateEntry{id: candidateID, reason: reason})
+			continue
+		}
+		next = sql.NullInt64{Int64: candidateID, Valid: true}
+		break
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		rows.Close()
+		return next, nil, rowsErr
+	}
+	rows.Close()
+	return next, blockedEntries, nil
+}
+
+// markBlockedCandidatesRejected persists the reject flag for candidates
+// scanNextViableCandidate skipped over. Must run after that scan's rows
+// have been closed (ExecContext on the same tx while a QueryContext's rows
+// are still open holds the pgConn lock and returns driver.ErrBadConn).
+func markBlockedCandidatesRejected(ctx context.Context, tx *sql.Tx, entries []blockedCandidateEntry) error {
+	for _, be := range entries {
+		if _, err := tx.ExecContext(ctx, `
+			update release_candidates
+			set rejected = true,
+			    reject_reason = $2,
+			    selected = false
+			where id = $1`, be.id, be.reason,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// IsFKViolation returns true when err is a PostgreSQL foreign-key constraint violation (SQLSTATE 23503).
+func IsFKViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.SQLState() == "23503"
 }
@@ -2396,6 +2491,59 @@ func isFKViolation(err error) bool {
 func IsUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.SQLState() == "23505"
+}
+
+// isCorruptPayloadReason reports whether reason describes a payload that
+// decoded but is structurally unusable -- the same segments produce the
+// same result on every retry. Shared by isHardRejectReason and
+// shouldPersistBlocklistReason so the two decisions ("give up on this
+// candidate" and "blocklist so a re-posted sibling doesn't hit the same
+// bad content") can't silently drift apart on this reason class the way
+// isConfirmedGoneArticleReason once did below.
+func isCorruptPayloadReason(r string) bool {
+	return strings.Contains(r, "invalid media payload") ||
+		strings.Contains(r, "file header does not match") ||
+		strings.Contains(r, "returned no readable bytes") ||
+		strings.Contains(r, "all zero bytes")
+}
+
+// isConfirmedGoneArticleReason reports whether reason indicates the
+// underlying NNTP article is confirmed permanently gone (past retention or
+// removed) rather than a transient throttle -- per RFC 3977 and
+// Newshosting's own support docs, regardless of which code path surfaced it:
+// a live fetch (article missing / status 430), a health-check re-probe
+// (article not found / status 423), or the article-health-check policy's
+// own classification (missing_articles / nntp_article_unavailable -- see
+// internal/policy). See isThrottleLikeErr in internal/nntp/circuit_breaker.go
+// for why the throttle assumption didn't hold up; this used to carve out
+// "status 430" as transient here too, contradicting that conclusion.
+//
+// Shared by isHardRejectReason and shouldPersistBlocklistReason -- before
+// this was extracted, shouldPersistBlocklistReason's copy of this check
+// omitted missing_articles/nntp_article_unavailable, so a candidate
+// confirmed gone via the article-health-check path was durably rejected on
+// its own row but never written to blocklist_items, leaving a re-posted
+// sibling (same dead content, different indexer) free to be selected and
+// hit the identical failure again.
+func isConfirmedGoneArticleReason(r string) bool {
+	return strings.Contains(r, "missing_articles") ||
+		strings.Contains(r, "nntp_article_unavailable") ||
+		strings.Contains(r, "article missing") ||
+		strings.Contains(r, "article not found") ||
+		strings.Contains(r, "status 430") ||
+		strings.Contains(r, "status 423") ||
+		strings.Contains(r, "crc mismatch")
+}
+
+// isPermanentFetchStatusReason reports whether reason is an NZB fetch HTTP
+// error other than 403 (quota exhausted) or 429 (rate limit) -- both of
+// which are transient account/indexer conditions, not a property of this
+// specific release, so they're excluded from the "permanent" bucket both
+// callers below use.
+func isPermanentFetchStatusReason(r string) bool {
+	return strings.Contains(r, "nzb fetch status") &&
+		!strings.Contains(r, "status 403") &&
+		!strings.Contains(r, "status 429")
 }
 
 func isHardRejectReason(reason string) bool {
@@ -2414,60 +2562,39 @@ func isHardRejectReason(reason string) bool {
 	// (one live case: 6,700+ recorded failures for a single movie, still
 	// actively looping multiple times per second and re-fetching NZBs from
 	// the indexer each pass -- see the NZB Finder duplicate-download abuse
-	// warning this was traced from).
+	// warning this was traced from). Deliberately NOT shared with
+	// shouldPersistBlocklistReason: giving up on one candidate after too many
+	// of its own failures says nothing about whether the underlying content
+	// is bad, so it must not blocklist a re-posted sibling.
 	if strings.Contains(r, "too_many_failures") {
 		return true
 	}
-	if strings.Contains(r, "invalid media payload") ||
-		strings.Contains(r, "file header does not match") ||
-		strings.Contains(r, "returned no readable bytes") ||
-		strings.Contains(r, "all zero bytes") {
+	if isCorruptPayloadReason(r) {
 		return true
 	}
-	// NNTP 430/423 mean "no such article" per RFC 3977 and Newshosting's own
-	// support docs — the article is confirmed gone (past retention or removed),
-	// not a transient throttle, regardless of whether it surfaced via STAT
-	// ("article missing"), BODY ("status 430"), or a health-check re-fetch
-	// ("article not found"). See isThrottleLikeErr in
-	// internal/nntp/circuit_breaker.go for why the throttle assumption didn't
-	// hold up; this used to carve out "status 430" as transient here too,
-	// contradicting that conclusion.
-	if strings.Contains(r, "missing_articles") ||
-		strings.Contains(r, "nntp_article_unavailable") ||
-		strings.Contains(r, "article missing") ||
-		strings.Contains(r, "article not found") ||
-		strings.Contains(r, "status 430") ||
-		strings.Contains(r, "status 423") ||
-		strings.Contains(r, "crc mismatch") {
+	if isConfirmedGoneArticleReason(r) {
 		return true
 	}
-	// Any NZB fetch HTTP error except 403 (quota exhausted) and 429 (rate limit)
-	// is treated as permanent for that specific URL.
-	return strings.Contains(r, "nzb fetch status") &&
-		!strings.Contains(r, "status 403") &&
-		!strings.Contains(r, "status 429")
+	return isPermanentFetchStatusReason(r)
 }
 
 func shouldPersistBlocklistReason(reason string) bool {
 	r := strings.TrimSpace(strings.ToLower(reason))
+	// "manual_"-prefixed reasons (a user explicitly rejecting a release via
+	// the UI) are deliberately NOT in isHardRejectReason's set: a manual
+	// reject only needs to durably reject *this* candidate via its own
+	// blocklist_items entry (written by the caller, e.g. RejectReleaseCandidate),
+	// not force release_candidates.rejected=true through this generic path.
 	if isPermanentArchiveRejectReason(r) || strings.HasPrefix(r, "manual_") {
 		return true
 	}
-	if strings.Contains(r, "invalid media payload") ||
-		strings.Contains(r, "file header does not match") ||
-		strings.Contains(r, "returned no readable bytes") ||
-		strings.Contains(r, "all zero bytes") {
+	if isCorruptPayloadReason(r) {
 		return true
 	}
-	if strings.Contains(r, "article missing") ||
-		strings.Contains(r, "article not found") ||
-		strings.Contains(r, "status 430") ||
-		strings.Contains(r, "status 423") ||
-		strings.Contains(r, "crc mismatch") {
+	if isConfirmedGoneArticleReason(r) {
 		return true
 	}
-	// Any NZB fetch HTTP error except 403/429 — blocklist the URL permanently.
-	return strings.Contains(r, "nzb fetch status") && !strings.Contains(r, "status 403") && !strings.Contains(r, "status 429")
+	return isPermanentFetchStatusReason(r)
 }
 
 func isPermanentArchiveRejectReason(reason string) bool {
@@ -2513,12 +2640,12 @@ func sizeDateBuckets(sizeBytes int64, postedAt time.Time) (sizeBucket, dateBucke
 }
 
 func blocklistReleaseSignatureKey(title, indexerName string, sizeBytes int64, postedAt time.Time) string {
-	normalizedTitle := normalizeReleaseTitle(title)
+	normalizedTitle := NormalizeReleaseTitle(title)
 	if normalizedTitle == "" {
 		return ""
 	}
 	sizeBucket, dateBucket := sizeDateBuckets(sizeBytes, postedAt)
-	indexerBucket := normalizeReleaseTitle(indexerName)
+	indexerBucket := NormalizeReleaseTitle(indexerName)
 	return "release_signature:" + strings.Join([]string{
 		normalizedTitle,
 		indexerBucket,
@@ -2528,7 +2655,7 @@ func blocklistReleaseSignatureKey(title, indexerName string, sizeBytes int64, po
 }
 
 func blocklistReleaseFamilyKey(title string, sizeBytes int64, postedAt time.Time) string {
-	normalizedTitle := normalizeReleaseTitle(title)
+	normalizedTitle := NormalizeReleaseTitle(title)
 	if normalizedTitle == "" {
 		return ""
 	}
@@ -2603,8 +2730,36 @@ func blocklistKeysForRelease(scopeKey, title, externalURL, indexerName string, s
 	return keys
 }
 
+// globalBlocklistKeysForRelease produces the same "external_url:"/
+// "release_signature:" key formats as blocklistKeysForRelease, but without
+// a scopeKey prefix. This exists because the manual blocklist API
+// (POST /api/blocklist/manual, internal/api/router.go's manualBlocklistKey)
+// has no library-item/media context to scope by -- it's a deliberately
+// global "block this URL/signature everywhere" admin tool -- so its
+// "external_url" and "release_signature" entries are written unprefixed.
+// Before this, blockedReleaseReason only ever checked scoped keys, so a
+// manually-added entry could never match anything here: it was silently
+// inert. blocklistReleaseFamilyKey/PatternKey have no manual-entry
+// equivalent (the admin form doesn't expose those key types), so only the
+// two formats the form actually produces need a global counterpart.
+func globalBlocklistKeysForRelease(title, externalURL, indexerName string, sizeBytes int64, postedAt time.Time) []string {
+	keys := make([]string, 0, 2)
+	if strings.TrimSpace(externalURL) != "" {
+		keys = append(keys, blocklistKeyForExternalURL(externalURL))
+	}
+	if signature := blocklistReleaseSignatureKey(title, indexerName, sizeBytes, postedAt); signature != "" {
+		keys = append(keys, signature)
+	}
+	return keys
+}
+
 func blockedReleaseReason(scopeKey string, blocked map[string]string, candidate SearchCandidateRecord) (string, bool) {
 	for _, key := range blocklistKeysForRelease(scopeKey, candidate.Title, candidate.ExternalURL, candidate.IndexerName, candidate.SizeBytes, candidate.PostedAt) {
+		if reason, ok := blocked[key]; ok {
+			return reason, true
+		}
+	}
+	for _, key := range globalBlocklistKeysForRelease(candidate.Title, candidate.ExternalURL, candidate.IndexerName, candidate.SizeBytes, candidate.PostedAt) {
 		if reason, ok := blocked[key]; ok {
 			return reason, true
 		}
@@ -2612,13 +2767,13 @@ func blockedReleaseReason(scopeKey string, blocked map[string]string, candidate 
 	return "", false
 }
 
-func normalizeReleaseTitle(value string) string {
+func NormalizeReleaseTitle(value string) string {
 	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ", "{", " ", "}", " ")
 	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(strings.TrimSpace(value)))), " ")
 }
 
 func normalizeReleasePattern(value string) string {
-	tokens := strings.Fields(normalizeReleaseTitle(value))
+	tokens := strings.Fields(NormalizeReleaseTitle(value))
 	if len(tokens) == 0 {
 		return ""
 	}
@@ -2921,15 +3076,37 @@ func (db *DB) ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) 
 		}
 	}()
 
-	var (
-		selectedReleaseID sql.NullInt64
-		libraryItemID     int64
-	)
+	var libraryItemID int64
 	if err = tx.QueryRowContext(ctx, `
-		select library_item_id, selected_release_id
+		select library_item_id
 		from queue_items
 		where id = $1`, queueItemID,
-	).Scan(&libraryItemID, &selectedReleaseID); err != nil {
+	).Scan(&libraryItemID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = nil
+			return nil
+		}
+		return err
+	}
+
+	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
+		return err
+	}
+
+	// Re-read now that we hold the row lock -- a concurrent selector/promoter
+	// (SelectReleaseCandidate, FailSelectedReleaseAndPromoteNext, etc., all of
+	// which take this same lock first) may have changed the selection while
+	// we were resolving libraryItemID above.
+	var selectedReleaseID sql.NullInt64
+	if err = tx.QueryRowContext(ctx, `
+		select selected_release_id
+		from queue_items
+		where id = $1`, queueItemID,
+	).Scan(&selectedReleaseID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = nil
+			return nil
+		}
 		return err
 	}
 
@@ -2992,6 +3169,10 @@ func (db *DB) ResetLibraryItemState(ctx context.Context, libraryItemID int64) er
 		}
 	}()
 
+	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
+		return err
+	}
+
 	var (
 		queueItemID       int64
 		selectedReleaseID sql.NullInt64
@@ -3003,6 +3184,10 @@ func (db *DB) ResetLibraryItemState(ctx context.Context, libraryItemID int64) er
 		ORDER BY id DESC
 		LIMIT 1`, libraryItemID,
 	).Scan(&queueItemID, &selectedReleaseID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = nil
+			return nil
+		}
 		return err
 	}
 

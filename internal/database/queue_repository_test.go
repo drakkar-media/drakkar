@@ -97,6 +97,20 @@ func TestShouldPersistBlocklistReason(t *testing.T) {
 	if !shouldPersistBlocklistReason("publish failed: returned no readable bytes") {
 		t.Fatal("expected invalid media payload to persist in blocklist")
 	}
+	// Regression for a gap found in the 2026-07-18 audit: isHardRejectReason
+	// already treated missing_articles/nntp_article_unavailable (the
+	// article-health-check policy's own classification of a confirmed-gone
+	// article, internal/policy) as equivalent to "article missing"/"article
+	// not found" -- but shouldPersistBlocklistReason's copy of that check
+	// omitted these two, so a candidate durably rejected via this path was
+	// never blocklisted, leaving a re-posted sibling free to hit the same
+	// dead content again.
+	if !shouldPersistBlocklistReason("article_health_check: missing_articles") {
+		t.Fatal("missing_articles is confirmed permanent per the article-health-check policy -- must persist in blocklist")
+	}
+	if !shouldPersistBlocklistReason("preflight: nntp_article_unavailable") {
+		t.Fatal("nntp_article_unavailable is confirmed permanent -- must persist in blocklist")
+	}
 	if shouldPersistBlocklistReason("context deadline exceeded") {
 		t.Fatal("transient failure should not persist in blocklist")
 	}

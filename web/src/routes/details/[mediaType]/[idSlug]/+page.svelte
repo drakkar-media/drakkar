@@ -16,7 +16,7 @@
   import { idFromSlug } from '$lib/detailsHref';
   import { toastError, toastSuccess } from '$lib/toast';
   import { bytes as fmtBytes } from '$lib/format';
-  import { runAction } from '$lib/actions';
+  import { runAction, confirmed } from '$lib/actions';
   import { onMount } from 'svelte';
   import type { DiscoverDetails, GrabHistoryEntry, LibraryDetail, LibraryItem, ManualSearchItem, QualityProfile, ReleaseItem, SubtitleCandidate, SubtitleFile } from '$lib/types';
 
@@ -407,7 +407,7 @@
   }
 
   async function deleteSubtitleFile(subtitleID: number) {
-    if (typeof window !== 'undefined' && !window.confirm('Delete this subtitle file?')) return;
+    if (!confirmed('Delete this subtitle file?')) return;
     await runAction(() => api.deleteSubtitle(subtitleID), {
       setWorking: (v) => setBusy(`subtitle-delete-${subtitleID}`, v),
       successMessage: () => 'subtitle deleted',
@@ -450,7 +450,7 @@
   }
 
   async function deleteEpisodeSubtitle(epLibraryItemId: number, subtitleID: number) {
-    if (typeof window !== 'undefined' && !window.confirm('Delete this subtitle file?')) return;
+    if (!confirmed('Delete this subtitle file?')) return;
     await runAction(() => api.deleteSubtitle(subtitleID), {
       setWorking: (v) => setBusy(`ep-subtitle-delete-${epLibraryItemId}-${subtitleID}`, v),
       successMessage: () => 'subtitle deleted',

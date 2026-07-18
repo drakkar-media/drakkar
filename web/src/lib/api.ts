@@ -250,7 +250,14 @@ export const api = {
       body: JSON.stringify(s)
     }),
   healthSummary: () => request<{ total: number; checked: number; healthy: number; neverChecked: number; consistencyIssues: number; uncalibratedNZBFiles: number }>('/api/health/summary'),
-  healthEntries: () => request<{ items: { id: number; libraryItemId: number; libraryPath: string; targetPath: string; createdAt: string; lastCheckedAt?: string; healthOk?: boolean }[] }>('/api/health/entries'),
+  healthEntries: (opts?: { filter?: string; limit?: number; offset?: number }) => {
+    const params = new URLSearchParams();
+    if (opts?.filter) params.set('filter', opts.filter);
+    if (opts?.limit) params.set('limit', String(opts.limit));
+    if (opts?.offset) params.set('offset', String(opts.offset));
+    const query = params.toString();
+    return request<{ items: { id: number; libraryItemId: number; libraryPath: string; targetPath: string; createdAt: string; lastCheckedAt?: string; healthOk?: boolean }[]; total: number }>(query ? `/api/health/entries?${query}` : '/api/health/entries');
+  },
   healthConsistency: () => request<{ items: { libraryItemId: number; title: string; mediaType: string; queueState: string }[] }>('/api/health/consistency'),
   runHealthCheck: () => request<QueuedResult>('/api/health/check', { method: 'POST' }),
   backfillMetadata: () => request<QueuedResult>('/api/library/backfill-metadata', { method: 'POST' }),
@@ -264,7 +271,7 @@ export const api = {
   vfs: (path?: string) => {
     const params = new URLSearchParams();
     if (path) params.set('path', path);
-    return request<{ entries: { name: string; isDir: boolean; size?: number }[] }>(`/api/vfs?${params.toString()}`);
+    return request<{ path: string; entries: { name: string; path: string; isDir: boolean; size: number }[] }>(`/api/vfs?${params.toString()}`);
   },
   // Plex integration
   plexTest: () => request<{ ok: boolean; serverName?: string; libraries?: { key: string; title: string; type: string }[]; error?: string }>('/api/plex/test', { method: 'POST' }),

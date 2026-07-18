@@ -15,8 +15,9 @@
   import StatusPill from '$lib/components/StatusPill.svelte';
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
-  import { runAction } from '$lib/actions';
+  import { runAction, confirmed } from '$lib/actions';
   import { debounce } from '$lib/debounce';
+  import { ACTIVE_STATES } from '$lib/itemStatus';
   import type { QueueItem, WorkQueueStatus } from '$lib/types';
 
   let uploading = false;
@@ -41,12 +42,15 @@
   let historyPage = 1;
   let selectedHistoryIds = new Set<number>();
 
-  const activeStates = ['requested', 'searching', 'ranking', 'selected', 'fetching_nzb', 'indexing', 'preflight', 'publishing'];
+  // Terminal states for the History tab. There's no shared DONE_STATES export in
+  // itemStatus.ts (only ACTIVE_STATES) — this pair already matches the backend's
+  // canonical terminal set (see ListQueue's recent_history CTE in
+  // internal/database/queue_repository.go), so it's kept as a local literal.
   const doneStates = ['available', 'failed'];
   const queuePageSize = 8;
   const historyPageSize = 12;
 
-  $: queueItems = items.filter((item) => activeStates.includes(item.state));
+  $: queueItems = items.filter((item) => ACTIVE_STATES.includes(item.state));
   $: historyItems = items.filter((item) => doneStates.includes(item.state));
   $: failedItems = items.filter((item) => item.state === 'failed');
   $: failedHistoryIds = new Set(failedItems.map((item) => item.queueItemId));
@@ -127,7 +131,7 @@
   }
 
   async function clearFailed() {
-    if (typeof window !== 'undefined' && !window.confirm('Clear all failed queue items? This removes their retry history.')) return;
+    if (!confirmed('Clear all failed queue items? This removes their retry history.')) return;
     await runAction(() => api.clearFailedQueue(), {
       setWorking: (v) => setBusy('clear-failed', v),
       successMessage: (result) => `Cleared ${result.cleared} failed item${result.cleared === 1 ? '' : 's'}`,
@@ -141,7 +145,7 @@
       remove_and_blocklist: 'Remove this failed queue item and add its release to the runtime blocklist?',
       remove_blocklist_and_search: 'Remove this failed queue item, blocklist its release, and search for a replacement now?'
     };
-    if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
+    if (!confirmed(messages[action])) return;
     await runAction(() => api.queueAction(id, action), {
       setWorking: (v) => setBusy(`manage-${id}`, v),
       successMessage: (result) => result.action.replaceAll('_', ' '),
@@ -155,7 +159,7 @@
       remove_and_blocklist: `Remove and blocklist all ${failedItems.length} failed queue items?`,
       remove_blocklist_and_search: `Remove, blocklist, and re-search all ${failedItems.length} failed queue items?`
     };
-    if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
+    if (!confirmed(messages[action])) return;
     await runAction(() => api.failedQueueAction(action), {
       setWorking: (v) => setBusy(`manage-all-${action}`, v),
       successMessage: () => `${action.replaceAll('_', ' ')} started in background`,
@@ -170,7 +174,7 @@
       remove_and_blocklist: `Remove and blocklist ${selectedFailedIds.length} selected failed queue item${selectedFailedIds.length === 1 ? '' : 's'}?`,
       remove_blocklist_and_search: `Remove, blocklist, and re-search ${selectedFailedIds.length} selected failed queue item${selectedFailedIds.length === 1 ? '' : 's'}?`
     };
-    if (typeof window !== 'undefined' && !window.confirm(messages[action])) return;
+    if (!confirmed(messages[action])) return;
     await runAction(() => api.bulkQueueAction(selectedFailedIds, action), {
       setWorking: (v) => setBusy(`manage-selected-${action}`, v),
       successMessage: (result) => `${result.retried ?? 0} handled, ${result.failed ?? 0} failed`,

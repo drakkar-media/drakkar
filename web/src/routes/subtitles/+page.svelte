@@ -10,7 +10,7 @@
   import StatusPill from '$lib/components/StatusPill.svelte';
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
-  import { runAction } from '$lib/actions';
+  import { runAction, confirmed } from '$lib/actions';
   import { debounce } from '$lib/debounce';
   import type { SubtitleLibraryRow } from '$lib/types';
 
@@ -91,7 +91,7 @@
   }
 
   async function deleteOne(id: number) {
-    if (typeof window !== 'undefined' && !window.confirm('Delete all subtitles for this item?')) return;
+    if (!confirmed('Delete all subtitles for this item?')) return;
     await runAction(() => api.bulkSubtitleAction('delete', [id]), {
       setWorking: (v) => setBusy(`delete-${id}`, v),
       successMessage: () => 'Subtitle deletion queued',
@@ -102,7 +102,7 @@
   async function bulkAction(action: 'search' | 'delete') {
     if (selectedCount === 0) return;
     const ids = Array.from(selected);
-    if (action === 'delete' && typeof window !== 'undefined' && !window.confirm(`Delete all subtitles for ${ids.length} selected item(s)?`)) return;
+    if (action === 'delete' && !confirmed(`Delete all subtitles for ${ids.length} selected item(s)?`)) return;
     await runAction(() => api.bulkSubtitleAction(action, ids), {
       setWorking: (v) => setBusy(`bulk-${action}`, v),
       successMessage: (result) => (action === 'search' ? `Queued search for ${result.count} item(s)` : `Queued deletion for ${result.count} item(s)`),

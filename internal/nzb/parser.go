@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"sort"
-	"strconv"
 	"strings"
 
 	"golang.org/x/net/html/charset"
@@ -87,17 +86,6 @@ func estimateDecodedSize(encoded int64) int64 {
 	return int64(float64(encoded) * 0.97)
 }
 
-func SegmentNumbers(doc *Document) []int {
-	var out []int
-	for _, file := range doc.Files {
-		for _, seg := range file.Segments {
-			out = append(out, seg.Number)
-		}
-	}
-	sort.Ints(out)
-	return out
-}
-
 func ParseSubjectFilename(subject string) string {
 	start := strings.Index(subject, "\"")
 	end := strings.LastIndex(subject, "\"")
@@ -109,9 +97,4 @@ func ParseSubjectFilename(subject string) string {
 		return ""
 	}
 	return strings.Trim(fields[0], "\"")
-}
-
-func ToInt(value string) int {
-	n, _ := strconv.Atoi(value)
-	return n
 }

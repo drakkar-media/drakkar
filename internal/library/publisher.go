@@ -3,7 +3,6 @@ package library
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -16,7 +15,6 @@ import (
 )
 
 var ErrNoVirtualFiles = errors.New("selected release has no publishable virtual files")
-var ErrInvalidMediaPayload = errors.New("selected release has unreadable or invalid media payload")
 
 type Repository interface {
 	ListVirtualFilesForRelease(ctx context.Context, selectedReleaseID int64) ([]database.ReleaseVirtualFile, error)
@@ -406,8 +404,4 @@ func (p *Publisher) libraryPathFor(file database.ReleaseVirtualFile) string {
 		}
 	}
 	return ""
-}
-
-func CompletedTargetVirtualPath(selectedReleaseID int64, fileName string) string {
-	return filepath.Join("/content", "releases", fmt.Sprintf("%d", selectedReleaseID), fileName)
 }

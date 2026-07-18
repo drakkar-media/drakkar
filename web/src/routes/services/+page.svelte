@@ -16,7 +16,8 @@
   import Button from '$lib/components/Button.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
   import { api, subscribeEvents } from '$lib/api';
-  import { toastError, toastSuccess } from '$lib/toast';
+  import { toastError } from '$lib/toast';
+  import { runAction } from '$lib/actions';
   import { bytes as fmtBytes } from '$lib/format';
   import { debounce } from '$lib/debounce';
   import type { IntegrationProbeReport, Status } from '$lib/types';
@@ -54,16 +55,14 @@
   }
 
   async function runProbe() {
-    probing = true;
-    try {
-      probeReport = await api.probeIntegrations();
-      toastSuccess('Probe complete');
-      await load();
-    } catch (err) {
-      toastError(err instanceof Error ? err.message : String(err));
-    } finally {
-      probing = false;
-    }
+    await runAction(() => api.probeIntegrations(), {
+      setWorking: (v) => (probing = v),
+      successMessage: () => 'Probe complete',
+      afterSuccess: async (result) => {
+        probeReport = result;
+        await load();
+      }
+    });
   }
 
 

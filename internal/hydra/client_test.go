@@ -381,3 +381,62 @@ func TestConcurrentSearchesShareRateLimit(t *testing.T) {
 		}
 	}
 }
+
+// TestConcurrentIdenticalSearchesCoalesceIntoOneUpstreamCall guards against a
+// check-then-act race in lookupSearchCache/storeSearchCache: two concurrent
+// calls for the exact same request (e.g. two different episodes of the same
+// show issuing the same season-pack query) could both miss the cache before
+// either had stored a result, and both hit the live NZBHydra2 API for the
+// identical request. searchSem only bounds total concurrency -- it does not
+// deduplicate identical requests, so it does not close this gap on its own.
+// Search now funnels concurrent identical requests through searchFlight (a
+// SingleFlight-shaped coalescer) so only one of them actually calls
+// NZBHydra2 and the rest share its result.
+//
+// The handler blocks on release until every goroutine has been given a
+// chance to reach the cache-miss + coalescing point, so a fast single
+// request finishing before the others even start can't produce a false
+// pass -- if the race were still present, every one of the concurrent
+// callers would reach the handler and block on release, and hits would come
+// back > 1.
+func TestConcurrentIdenticalSearchesCoalesceIntoOneUpstreamCall(t *testing.T) {
+	var hits int32
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"title":"Dune.2021.1080p.WEB-DL.x265-GRP","link":"http://example/nzb","indexer":"hydra","size":12345,"epoch":1710000000}]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(config.ServiceConfig{URL: server.URL, APIKey: "abc"})
+
+	const callers = 5
+	var wg sync.WaitGroup
+	results := make([][]SearchResult, callers)
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			results[i], errs[i] = client.Search(context.Background(), SearchRequest{MediaType: "movie", Query: "Dune 2021"})
+		}(i)
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("call %d returned error: %v", i, err)
+		}
+		if len(results[i]) != 1 || results[i][0].Indexer != "hydra" {
+			t.Fatalf("call %d: unexpected result %+v", i, results[i])
+		}
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("expected exactly 1 upstream hit across %d concurrent identical searches, got %d", callers, got)
+	}
+}

@@ -69,11 +69,79 @@ type Client struct {
 	feedMaxResults int
 	searchCache    map[string]cachedResults
 	feedCache      map[string]cachedResults
+
+	// searchFlight/feedFlight coalesce concurrent Search/SearchRecent calls
+	// that share a cache key (e.g. two different episodes of the same show
+	// issuing the same season-pack query). Without this, lookupSearchCache/
+	// storeSearchCache (and the feed-cache equivalent) were a plain
+	// check-then-act: two goroutines could both miss the cache before either
+	// had stored a result, and both would hit the live NZBHydra2 API for the
+	// identical request. searchSem bounds total concurrent requests but does
+	// not deduplicate identical ones, so it doesn't close this gap on its
+	// own. See internal/cache.SingleFlight (used the same way by
+	// CachedDecodedSource in internal/nntp) for the reference pattern this
+	// mirrors — reimplemented locally here because SingleFlight is typed to
+	// []byte and search results aren't a byte blob.
+	searchFlight *hydraFlight
+	feedFlight   *hydraFlight
 }
 
 type cachedResults struct {
 	results   []SearchResult
 	expiresAt time.Time
+}
+
+// hydraFlight deduplicates concurrent calls that share a key, so only one
+// goroutine actually runs the fetch while the rest wait for and share its
+// result. Mirrors internal/cache.SingleFlight's lock+channel design.
+type hydraFlight struct {
+	mu      sync.Mutex
+	flights map[string]*hydraFlightCall
+}
+
+type hydraFlightCall struct {
+	done    chan struct{}
+	results []SearchResult
+	err     error
+}
+
+func newHydraFlight() *hydraFlight {
+	return &hydraFlight{flights: make(map[string]*hydraFlightCall)}
+}
+
+// Do runs fn for the first caller with a given key; concurrent callers with
+// the same key wait for that result instead of running fn themselves. Each
+// caller (leader and followers alike) gets back its own copy of the results
+// slice, so nobody can mutate a shared backing array out from under another
+// caller.
+//
+// fn runs with a detached (non-cancellable) context, same rationale as
+// SingleFlight.Do: a caller cancelling its own wait (see the ctx.Done() case
+// below) must not abort the in-flight fetch out from under any other caller
+// still waiting on it.
+func (f *hydraFlight) Do(ctx context.Context, key string, fn func(context.Context) ([]SearchResult, error)) ([]SearchResult, error) {
+	f.mu.Lock()
+	if active, ok := f.flights[key]; ok {
+		f.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-active.done:
+			return cloneResults(active.results), active.err
+		}
+	}
+	active := &hydraFlightCall{done: make(chan struct{})}
+	f.flights[key] = active
+	f.mu.Unlock()
+
+	active.results, active.err = fn(context.WithoutCancel(ctx))
+	close(active.done)
+
+	f.mu.Lock()
+	delete(f.flights, key)
+	f.mu.Unlock()
+
+	return cloneResults(active.results), active.err
 }
 
 type SearchResult struct {
@@ -131,6 +199,8 @@ func NewClient(cfg config.ServiceConfig) *Client {
 		feedMaxResults: feedMaxResults,
 		searchCache:    make(map[string]cachedResults),
 		feedCache:      make(map[string]cachedResults),
+		searchFlight:   newHydraFlight(),
+		feedFlight:     newHydraFlight(),
 	}
 }
 
@@ -177,27 +247,30 @@ func (c *Client) SearchRecent(ctx context.Context, mediaType string) ([]SearchRe
 	if cached, ok := c.lookupFeedCache(mediaType); ok {
 		return cached, nil
 	}
-	if err := c.throttle(ctx); err != nil {
-		return nil, err
-	}
-	u, err := c.apiURL()
-	if err != nil {
-		return nil, err
-	}
-	q := u.Query()
-	q.Set("t", "search")
-	q.Set("cat", recentCategory(mediaType))
-	q.Set("limit", fmt.Sprintf("%d", c.feedMaxResults))
-	q.Set("extended", "1")
-	if c.apiKey != "" {
-		q.Set("apikey", c.apiKey)
-	}
-	u.RawQuery = q.Encode()
-	results, err := c.doSearchRequest(ctx, u)
-	if err == nil {
-		c.storeFeedCache(mediaType, results)
-	}
-	return results, err
+	key := strings.ToLower(strings.TrimSpace(mediaType))
+	return c.feedFlight.Do(ctx, key, func(ctx context.Context) ([]SearchResult, error) {
+		if err := c.throttle(ctx); err != nil {
+			return nil, err
+		}
+		u, err := c.apiURL()
+		if err != nil {
+			return nil, err
+		}
+		q := u.Query()
+		q.Set("t", "search")
+		q.Set("cat", recentCategory(mediaType))
+		q.Set("limit", fmt.Sprintf("%d", c.feedMaxResults))
+		q.Set("extended", "1")
+		if c.apiKey != "" {
+			q.Set("apikey", c.apiKey)
+		}
+		u.RawQuery = q.Encode()
+		results, err := c.doSearchRequest(ctx, u)
+		if err == nil {
+			c.storeFeedCache(mediaType, results)
+		}
+		return results, err
+	})
 }
 
 // throttle enforces searchInterval between consecutive Hydra API calls.
@@ -240,83 +313,90 @@ func (c *Client) Search(ctx context.Context, request SearchRequest) ([]SearchRes
 		return cached, nil
 	}
 
-	u, err := c.apiURL()
-	if err != nil {
-		return nil, err
-	}
-	q := u.Query()
-	q.Set("t", requestType(request))
-	if cats := searchCategories(request.MediaType); cats != "" {
-		q.Set("cat", cats)
-	}
-	if strings.TrimSpace(request.Query) != "" {
-		q.Set("q", request.Query)
-	}
-	if imdbID := normalizeIMDbID(request.IMDbID); imdbID != "" {
-		q.Set("imdbid", imdbID)
-	}
-	// tmdbid= is the primary ID for both Radarr (movies) and Sonarr (TV).
-	// NZBHydra2 forwards it to indexers that support it.
-	if request.TMDBID > 0 {
-		q.Set("tmdbid", fmt.Sprintf("%d", request.TMDBID))
-	}
-	if strings.EqualFold(request.MediaType, "episode") || strings.EqualFold(request.MediaType, "tv") {
-		if request.TVDBID > 0 {
-			q.Set("tvdbid", fmt.Sprintf("%d", request.TVDBID))
-		}
-		if request.SeasonNumber > 0 {
-			q.Set("season", fmt.Sprintf("%d", request.SeasonNumber))
-		}
-		if request.EpisodeNumber > 0 {
-			q.Set("ep", fmt.Sprintf("%d", request.EpisodeNumber))
-		}
-	}
-	q.Set("limit", fmt.Sprintf("%d", searchPageSize))
-	q.Set("extended", "1")
-	if c.apiKey != "" {
-		q.Set("apikey", c.apiKey)
-	}
-
-	// Acquire concurrency slot — limits simultaneous in-flight NZBHydra2
-	// requests to maxConcurrentSearches regardless of worker count.
-	select {
-	case c.searchSem <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	defer func() { <-c.searchSem }()
-
-	var allResults []SearchResult
-	for page := 0; page < searchMaxPages; page++ {
-		// Throttle only the first page — subsequent pages are served from
-		// NZBHydra2's internal search cache and don't hit the indexers again.
-		if page == 0 {
-			if err := c.throttle(ctx); err != nil {
-				return nil, err
-			}
-		}
-		q.Set("offset", fmt.Sprintf("%d", page*searchPageSize))
-		u.RawQuery = q.Encode()
-
-		pageResults, err := c.doSearchRequest(ctx, u)
+	// searchFlight.Do coalesces concurrent identical requests (e.g. two
+	// episodes of the same show issuing the same season-pack query) that all
+	// miss the cache above at once, so only one of them actually pages
+	// through NZBHydra2 — see the Client.searchFlight field comment.
+	key := searchCacheKey(request)
+	return c.searchFlight.Do(ctx, key, func(ctx context.Context) ([]SearchResult, error) {
+		u, err := c.apiURL()
 		if err != nil {
-			if page == 0 {
-				return nil, err
+			return nil, err
+		}
+		q := u.Query()
+		q.Set("t", requestType(request))
+		if cats := searchCategories(request.MediaType); cats != "" {
+			q.Set("cat", cats)
+		}
+		if strings.TrimSpace(request.Query) != "" {
+			q.Set("q", request.Query)
+		}
+		if imdbID := normalizeIMDbID(request.IMDbID); imdbID != "" {
+			q.Set("imdbid", imdbID)
+		}
+		// tmdbid= is the primary ID for both Radarr (movies) and Sonarr (TV).
+		// NZBHydra2 forwards it to indexers that support it.
+		if request.TMDBID > 0 {
+			q.Set("tmdbid", fmt.Sprintf("%d", request.TMDBID))
+		}
+		if strings.EqualFold(request.MediaType, "episode") || strings.EqualFold(request.MediaType, "tv") {
+			if request.TVDBID > 0 {
+				q.Set("tvdbid", fmt.Sprintf("%d", request.TVDBID))
 			}
-			// Partial pagination failure: return what we have.
-			break
+			if request.SeasonNumber > 0 {
+				q.Set("season", fmt.Sprintf("%d", request.SeasonNumber))
+			}
+			if request.EpisodeNumber > 0 {
+				q.Set("ep", fmt.Sprintf("%d", request.EpisodeNumber))
+			}
 		}
-		allResults = append(allResults, pageResults...)
-		// Partial page → indexer has no more results.
-		if len(pageResults) < searchPageSize {
-			break
+		q.Set("limit", fmt.Sprintf("%d", searchPageSize))
+		q.Set("extended", "1")
+		if c.apiKey != "" {
+			q.Set("apikey", c.apiKey)
 		}
-	}
 
-	if len(allResults) > 0 {
-		c.storeSearchCache(request, allResults)
-	}
-	return allResults, nil
+		// Acquire concurrency slot — limits simultaneous in-flight NZBHydra2
+		// requests to maxConcurrentSearches regardless of worker count.
+		select {
+		case c.searchSem <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		defer func() { <-c.searchSem }()
+
+		var allResults []SearchResult
+		for page := 0; page < searchMaxPages; page++ {
+			// Throttle only the first page — subsequent pages are served from
+			// NZBHydra2's internal search cache and don't hit the indexers again.
+			if page == 0 {
+				if err := c.throttle(ctx); err != nil {
+					return nil, err
+				}
+			}
+			q.Set("offset", fmt.Sprintf("%d", page*searchPageSize))
+			u.RawQuery = q.Encode()
+
+			pageResults, err := c.doSearchRequest(ctx, u)
+			if err != nil {
+				if page == 0 {
+					return nil, err
+				}
+				// Partial pagination failure: return what we have.
+				break
+			}
+			allResults = append(allResults, pageResults...)
+			// Partial page → indexer has no more results.
+			if len(pageResults) < searchPageSize {
+				break
+			}
+		}
+
+		if len(allResults) > 0 {
+			c.storeSearchCache(request, allResults)
+		}
+		return allResults, nil
+	})
 }
 
 func (c *Client) doSearchRequest(ctx context.Context, u *url.URL) ([]SearchResult, error) {

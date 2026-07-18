@@ -9,17 +9,14 @@
 package main
 
 import (
-	"bytes"
 	"database/sql"
 	"flag"
 	"log"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
+	"github.com/drakkar-media/drakkar/internal/database"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
-
-var zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}
 
 func main() {
 	dsn := flag.String("dsn", "", "PostgreSQL DSN (required)")
@@ -28,11 +25,6 @@ func main() {
 
 	if *dsn == "" {
 		log.Fatal("-dsn is required")
-	}
-
-	enc, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
-	if err != nil {
-		log.Fatalf("zstd encoder: %v", err)
 	}
 
 	db, err := sql.Open("pgx", *dsn)
@@ -91,14 +83,14 @@ func main() {
 			lastID = r.id
 			processed++
 
-			if len(r.xml) >= 4 && bytes.Equal(r.xml[:4], zstdMagic) {
+			if database.IsNZBXMLCompressed(r.xml) {
 				skipped++
 				continue
 			}
 
-			compressed_xml := enc.EncodeAll(r.xml, make([]byte, 0, len(r.xml)/4))
+			compressedXML := database.CompressNZBXML(r.xml)
 
-			if _, err := db.Exec(`UPDATE nzb_documents SET xml = $1 WHERE id = $2`, compressed_xml, r.id); err != nil {
+			if _, err := db.Exec(`UPDATE nzb_documents SET xml = $1 WHERE id = $2`, compressedXML, r.id); err != nil {
 				log.Fatalf("update id=%d: %v", r.id, err)
 			}
 			compressed++

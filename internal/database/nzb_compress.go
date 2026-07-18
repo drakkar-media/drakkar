@@ -34,3 +34,19 @@ func decompressNZBXML(src []byte) ([]byte, error) {
 	}
 	return out, nil
 }
+
+// CompressNZBXML is the exported entry point to this package's zstd NZB XML
+// compression, for one-off migration tools outside package database (e.g.
+// cmd/compress-nzb) that need byte-for-byte the same compression this
+// package uses at write time, rather than reimplementing their own encoder.
+func CompressNZBXML(src []byte) []byte {
+	return compressNZBXML(src)
+}
+
+// IsNZBXMLCompressed reports whether data already starts with the zstd frame
+// magic number, i.e. whether it was already compressed by CompressNZBXML.
+// Migration tools (e.g. cmd/compress-nzb) use this to skip rows that don't
+// need re-compressing.
+func IsNZBXMLCompressed(data []byte) bool {
+	return len(data) >= 4 && bytes.Equal(data[:4], zstdMagic)
+}

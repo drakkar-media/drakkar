@@ -18,17 +18,6 @@ const (
 	QueueFailed      QueueState = "failed"
 )
 
-type QueueItem struct {
-	ID              int64
-	LibraryItemID   int64
-	State           QueueState
-	FailureReason   string
-	IdempotencyKey  string
-	SelectedRelease *int64
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
-}
-
 type QueueSnapshot struct {
 	QueueItemID     int64      `json:"queueItemId"`
 	LibraryItemID   int64      `json:"libraryItemId"`
@@ -349,21 +338,6 @@ type ReleaseBlockRule struct {
 	Note         string    `json:"note"`
 	CreatedAt    time.Time `json:"createdAt"`
 	UpdatedAt    time.Time `json:"updatedAt"`
-}
-
-type BlockFilterMatch struct {
-	RuleID  int64  `json:"ruleId"`
-	Type    string `json:"type"`
-	Pattern string `json:"pattern"`
-	Action  string `json:"action"`
-	Reason  string `json:"reason"`
-}
-
-type BlockFilterResult struct {
-	Allowed      bool               `json:"allowed"`
-	Blocked      bool               `json:"blocked"`
-	ScorePenalty int                `json:"scorePenalty"`
-	MatchedRules []BlockFilterMatch `json:"matchedRules"`
 }
 
 type SubtitleProfile struct {

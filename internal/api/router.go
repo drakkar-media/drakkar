@@ -522,9 +522,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		result, err := workflowSvc.RetryQueueItem(workflow.WithAsyncDownload(r.Context()), id)
@@ -560,9 +559,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		var body struct {
@@ -704,9 +702,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		respondJSON(w, http.StatusCreated, item)
 	})
 	r.Delete("/api/nzbs/{id}", func(w http.ResponseWriter, r *http.Request) {
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		if err := queue.CancelNZB(r.Context(), id); err != nil {
@@ -733,9 +730,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
 			return
 		}
-		requestID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		requestID, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		var body struct {
@@ -845,9 +841,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("catalog unavailable"))
 			return
 		}
-		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		libraryItemID, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		item, err := catalogSvc.LibraryDetail(r.Context(), libraryItemID)
@@ -879,9 +874,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		libraryItemID, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		// Start search in background; return existing candidates immediately so the
@@ -912,9 +906,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		})
 	})
 	r.Get("/api/releases/{libraryItemId}", func(w http.ResponseWriter, r *http.Request) {
-		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "libraryItemId"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		libraryItemID, ok := parseInt64URLParam(w, r, "libraryItemId")
+		if !ok {
 			return
 		}
 		items, err := queue.ListReleaseSummaries(r.Context(), libraryItemID)
@@ -1000,9 +993,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
 			return
 		}
-		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "libraryItemId"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		libraryItemID, ok := parseInt64URLParam(w, r, "libraryItemId")
+		if !ok {
 			return
 		}
 		items, err := subtitleSvc.ListSubtitles(r.Context(), libraryItemID)
@@ -1017,9 +1009,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
 			return
 		}
-		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "libraryItemId"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		libraryItemID, ok := parseInt64URLParam(w, r, "libraryItemId")
+		if !ok {
 			return
 		}
 		items, err := subtitleSvc.ListCandidates(r.Context(), libraryItemID)
@@ -1034,9 +1025,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("subtitles unavailable"))
 			return
 		}
-		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "libraryItemId"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		libraryItemID, ok := parseInt64URLParam(w, r, "libraryItemId")
+		if !ok {
 			return
 		}
 		var payload struct {
@@ -1062,9 +1052,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("subtitles unavailable"))
 			return
 		}
-		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "libraryItemId"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		libraryItemID, ok := parseInt64URLParam(w, r, "libraryItemId")
+		if !ok {
 			return
 		}
 		result, err := uploadSubtitleRequest(r, subtitleSvc, libraryItemID)
@@ -1080,9 +1069,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("subtitles unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		result, err := subtitleSvc.DownloadCandidate(r.Context(), id)
@@ -1098,9 +1086,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("subtitles unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		if err := subtitleSvc.DeleteSubtitle(r.Context(), id); err != nil {
@@ -1167,9 +1154,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("blocklist unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		item, err := parseManualBlocklistMutation(r)
@@ -1190,9 +1176,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("blocklist unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		if err := blocklistSvc.Clear(r.Context(), id); err != nil {
@@ -1426,9 +1411,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		go func() {
@@ -1447,9 +1431,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		// Backgrounded: loops every season of the show making a synchronous
@@ -1471,9 +1454,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		if err := workflowSvc.ResetLibraryItem(r.Context(), id); err != nil {
@@ -1488,9 +1470,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		result, err := workflowSvc.SelectRelease(workflow.WithAsyncDownload(r.Context()), id)
@@ -1511,9 +1492,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		var payload struct {
@@ -1535,9 +1515,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		result, err := workflowSvc.RestoreRelease(r.Context(), id)
@@ -1553,9 +1532,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		result, err := workflowSvc.SkipRelease(workflow.WithAsyncDownload(r.Context()), id)
@@ -1571,9 +1549,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("publication unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		if err := publication.RepublishLibraryItem(r.Context(), id); err != nil {
@@ -1588,9 +1565,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		result, err := workflowSvc.RestoreRejectedReleases(r.Context(), id)
@@ -1954,9 +1930,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		if err := profilesRepo.DeleteQualityProfile(r.Context(), id); err != nil {
@@ -1982,9 +1957,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		var d database.QualityDefinition
@@ -2036,9 +2010,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
 			return
 		}
-		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		libraryItemID, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		var payload struct {
@@ -2070,9 +2043,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		respondJSON(w, http.StatusAccepted, result)
 	})
 	r.Post("/api/library/{id}/manual-import/upload", func(w http.ResponseWriter, r *http.Request) {
-		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		libraryItemID, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		if err := r.ParseMultipartForm(64 << 20); err != nil {
@@ -2121,9 +2093,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 
 	// Per-library-item quality profile override.
 	r.Get("/api/library/{id}/profile", func(w http.ResponseWriter, r *http.Request) {
-		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		libraryItemID, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		p, err := profilesRepo.GetLibraryItemQualityProfile(r.Context(), libraryItemID)
@@ -2134,9 +2105,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		respondJSON(w, http.StatusOK, map[string]any{"profile": p})
 	})
 	r.Put("/api/library/{id}/profile", func(w http.ResponseWriter, r *http.Request) {
-		libraryItemID, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		libraryItemID, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		var body struct {
@@ -2298,9 +2268,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondJSON(w, http.StatusOK, map[string]any{"items": []any{}})
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		entries, err := profilesRepo.GetGrabHistory(r.Context(), id)
@@ -2322,9 +2291,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("profiles unavailable"))
 			return
 		}
-		id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
-		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
 			return
 		}
 		var body struct {
@@ -2489,6 +2457,19 @@ func respondError(w http.ResponseWriter, status int, err error) {
 	respondJSON(w, status, map[string]any{
 		"error": err.Error(),
 	})
+}
+
+// parseInt64URLParam parses the named chi URL param as an int64. On failure it
+// writes the standard respondError 400 JSON body (using the underlying
+// strconv.ParseInt error as the message, matching every existing call site's
+// behavior) and returns ok=false so the caller can just `return`.
+func parseInt64URLParam(w http.ResponseWriter, r *http.Request, paramName string) (int64, bool) {
+	value, err := strconv.ParseInt(chi.URLParam(r, paramName), 10, 64)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return 0, false
+	}
+	return value, true
 }
 
 // requireAdmin wraps a handler so only an authenticated admin can reach it.
@@ -2730,11 +2711,11 @@ func manualBlocklistKey(keyType, rawKey, externalURL, releaseTitle, indexerName 
 		}
 		return "external_url:" + strings.TrimSpace(externalURL), nil
 	case "release_signature":
-		titleKey := normalizeBlocklistTitle(strings.TrimSpace(releaseTitle))
+		titleKey := database.NormalizeReleaseTitle(strings.TrimSpace(releaseTitle))
 		if titleKey == "" {
 			return "", errors.New("releaseTitle is required")
 		}
-		indexerKey := normalizeBlocklistTitle(strings.TrimSpace(indexerName))
+		indexerKey := database.NormalizeReleaseTitle(strings.TrimSpace(indexerName))
 		sizeBucket := "0"
 		if sizeMB > 0 {
 			sizeBucket = strconv.FormatInt(sizeMB, 10)
@@ -2753,10 +2734,6 @@ func manualBlocklistKey(keyType, rawKey, externalURL, releaseTitle, indexerName 
 	}
 }
 
-func normalizeBlocklistTitle(value string) string {
-	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ", "{", " ", "}", " ")
-	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(strings.TrimSpace(value)))), " ")
-}
 
 func validateReleaseBlockRule(r database.ReleaseBlockRule) error {
 	validTypes := map[string]bool{"release_group": true, "title_pattern": true, "regex": true, "missing_release_group": true}

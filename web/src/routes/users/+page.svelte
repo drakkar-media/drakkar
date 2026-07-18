@@ -11,7 +11,7 @@
   import StatusPill from '$lib/components/StatusPill.svelte';
   import { api } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
-  import { runAction } from '$lib/actions';
+  import { runAction, confirmed } from '$lib/actions';
   import type { APIToken, User } from '$lib/types';
 
   let users: User[] = [];
@@ -67,7 +67,7 @@
       toastError('You cannot delete your own account');
       return;
     }
-    if (typeof window !== 'undefined' && !window.confirm(`Delete user "${name}"?`)) return;
+    if (!confirmed(`Delete user "${name}"?`)) return;
     await runAction(() => api.deleteUser(id), {
       setWorking: (v) => setBusy(`delete-user-${id}`, v),
       successMessage: () => `User ${name} deleted`,
@@ -108,7 +108,7 @@
   }
 
   async function deleteToken(id: number, name: string) {
-    if (typeof window !== 'undefined' && !window.confirm(`Delete API token "${name}"?`)) return;
+    if (!confirmed(`Delete API token "${name}"?`)) return;
     await runAction(() => api.deleteApiToken(id), {
       setWorking: (v) => setBusy(`delete-token-${id}`, v),
       successMessage: () => `API token ${name} deleted`,

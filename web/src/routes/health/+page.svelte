@@ -13,6 +13,7 @@
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
   import { debounce } from '$lib/debounce';
+  import { confirmed } from '$lib/actions';
 
   type HealthSummary = { total: number; checked: number; healthy: number; neverChecked: number; consistencyIssues: number; uncalibratedNZBFiles: number };
   type HealthEntry = {
@@ -64,14 +65,7 @@
 
   async function loadEntries() {
     try {
-      const params = new URLSearchParams({
-        filter,
-        limit: String(PAGE_SIZE),
-        offset: String(page * PAGE_SIZE),
-      });
-      const res = await fetch(`/api/health/entries?${params}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      entriesPage = await res.json();
+      entriesPage = await api.healthEntries({ filter, limit: PAGE_SIZE, offset: page * PAGE_SIZE });
     } catch (err) {
       toastError(err instanceof Error ? err.message : String(err));
     }
@@ -117,7 +111,7 @@
   }
 
   async function resetOrphanedAvailable() {
-    if (typeof window !== 'undefined' && !window.confirm('Reset all orphaned available items back to missing?')) return;
+    if (!confirmed('Reset all orphaned available items back to missing?')) return;
     resettingOrphaned = true;
     try {
       await api.resetOrphanedAvailableItems();
