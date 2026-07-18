@@ -283,8 +283,21 @@ func (db *DB) ListUnrecoverableLibraryItems(ctx context.Context) ([]int64, error
 		select li.id
 		from library_items li
 		left join episodes ep on ep.id = li.episode_id
+		left join queue_items q on q.library_item_id = li.id
 		where li.available = true
 		  and li.media_type != 'manual_nzb'
+		  -- library_items.available is stale/orphaned only when queue_items
+		  -- agrees the item is done publishing (or has no queue row at all,
+		  -- e.g. a season-pack-fulfilled episode). If a fresh search has
+		  -- already re-selected a candidate and a fetch is in progress
+		  -- (searching/ranking/selected/fetching_nzb/indexing/preflight/
+		  -- publishing), available=true is simply not caught up yet -- not
+		  -- orphaned. Without this check, this maintenance pass would call
+		  -- ResetLibraryItem on a library item mid-fetch, discarding a
+		  -- legitimate in-progress selection and forcing the whole
+		  -- search+select+fetch cycle to restart from scratch, with a real
+		  -- chance of re-selecting and re-fetching the identical NZB.
+		  and (q.id is null or q.state not in ('searching', 'ranking', 'selected', 'fetching_nzb', 'indexing', 'preflight', 'publishing'))
 		  and not exists (
 		      select 1 from symlink_publications sp
 		      where sp.library_item_id = li.id

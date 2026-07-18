@@ -534,3 +534,66 @@ func TestListVirtualFilesForRelease(t *testing.T) {
 		t.Errorf("LibraryItemID = %d, want %d", got[0].LibraryItemID, libID)
 	}
 }
+
+// TestListUnrecoverableLibraryItemsSkipsItemsMidFetch guards against a real
+// production incident (2026-07-19): library_items.available can be left
+// stuck at true by an earlier, broken publish (e.g. content that vanished
+// after "pre-publish content check inconclusive -- publishing anyway") even
+// while a completely fresh search has already selected a new candidate and
+// a fetch is actively in progress (queue_items.state = 'selected' or later
+// pre-publish states). ListUnrecoverableLibraryItems used to check only
+// library_items.available and the absence of a symlink/matching virtual
+// file -- both of which are also true, transiently and correctly, for any
+// item that simply hasn't finished its in-progress fetch yet. The
+// scheduled ResetOrphanedAvailableItems maintenance pass (internal/app/app.go)
+// calls ResetLibraryItem on everything this returns, which wipes the
+// in-progress selection and forces the whole search+select+fetch cycle to
+// restart -- with a real chance of re-selecting and re-fetching the
+// identical NZB, confirmed live: a queue item sitting in 'selected' state
+// mid-fetch was reset back to 'requested' with no selected_release_id by
+// this exact maintenance pass while ClaimURLForFetch's own claim for that
+// URL was still within its cooldown window.
+func TestListUnrecoverableLibraryItemsSkipsItemsMidFetch(t *testing.T) {
+	db, sqlDB, ctx := openPublicationTestDB(t)
+
+	t.Run("mid-fetch item is not reported unrecoverable", func(t *testing.T) {
+		libID, _ := pubTestFixture(t, ctx, sqlDB, "unrecoverable-mid-fetch", "selected", false)
+		defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+		if _, err := sqlDB.ExecContext(ctx, `update library_items set available = true where id = $1`, libID); err != nil {
+			t.Fatal(err)
+		}
+
+		ids, err := db.ListUnrecoverableLibraryItems(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range ids {
+			if id == libID {
+				t.Fatalf("expected library item %d (queue state 'selected', mid-fetch) not to be reported unrecoverable", libID)
+			}
+		}
+	})
+
+	t.Run("genuinely orphaned available item is still reported", func(t *testing.T) {
+		libID, _ := pubTestFixture(t, ctx, sqlDB, "unrecoverable-genuinely-orphaned", "available", false)
+		defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+		if _, err := sqlDB.ExecContext(ctx, `update library_items set available = true where id = $1`, libID); err != nil {
+			t.Fatal(err)
+		}
+
+		ids, err := db.ListUnrecoverableLibraryItems(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, id := range ids {
+			if id == libID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected library item %d (queue state 'available', no symlink/virtual file) to still be reported unrecoverable", libID)
+		}
+	})
+}
