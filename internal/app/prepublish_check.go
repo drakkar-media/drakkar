@@ -32,6 +32,23 @@ func verifyContentBeforePublish(ctx context.Context, db *database.DB, rt config.
 		// genuine problem afterward.
 		return nil
 	}
+	// rclone's VFS resolves a path by walking its own cached directory tree
+	// (--dir-cache-time, 20s, see docker-compose.yml): to open
+	// .../content/releases/{id}/{file} it must first find "{id}" listed as a
+	// child of "releases". For a release that was only just created, the
+	// "releases" listing rclone already has cached predates that child's
+	// existence, so the lookup fails at that path component with "no such
+	// file or directory" -- even though the file itself is already served
+	// correctly by any direct request to the backend. Refreshing only the
+	// release's own directory (as the post-publish path in
+	// internal/library/publisher.go does, safely, since by then the release
+	// has existed for a while) doesn't fix this: there's nothing stale to
+	// invalidate in a directory listing that was never fetched in the first
+	// place. Refresh the "releases" parent too, so the new child becomes
+	// visible before the release's own directory is ever listed.
+	releaseDir := filepath.Join(rt.FuseMountPath, "content", "releases", fmt.Sprintf("%d", selectedReleaseID))
+	_ = rc.RefreshPath(ctx, filepath.Dir(releaseDir))
+	_ = rc.RefreshPath(ctx, releaseDir)
 	for _, e := range entries {
 		if !database.IsPlayableMediaFile(e.FileName, e.SizeBytes) {
 			logger.Debug().Str("file", e.FileName).Int64("sizeBytes", e.SizeBytes).
@@ -39,14 +56,6 @@ func verifyContentBeforePublish(ctx context.Context, db *database.DB, rt config.
 			continue
 		}
 		target := filepath.Join(rt.FuseMountPath, "content", e.Path)
-		// The content directory is served through rclone's VFS, which caches
-		// directory listings for --dir-cache-time (20s, see docker-compose.yml)
-		// -- longer than this check's whole retry window. A freshly-imported
-		// file can therefore appear as "no such file or directory" here even
-		// though it's already present, forcing a fallback to the periodic
-		// health check. Proactively invalidate the cache first, same as the
-		// post-publish refresh in internal/library/publisher.go.
-		_ = rc.RefreshPath(ctx, filepath.Dir(target))
 		if err := verifyOneFileBeforePublish(ctx, target, e.FileName); err != nil {
 			logger.Warn().
 				Int64("selectedReleaseId", selectedReleaseID).
