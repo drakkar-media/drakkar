@@ -119,14 +119,17 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 			// rclone's VFS caches that subtree independently of the library
 			// directory. Without this, a health check reading straight from
 			// the content path right after publish could see a stale/empty
-			// cached view and wrongly report the file as corrupt. And refresh
-			// its parent ("releases") too: rclone resolves a path by walking
-			// its cached directory tree, so a release directory created only
-			// moments ago won't show up under an already-cached "releases"
-			// listing until that listing itself is refreshed.
-			contentDir := filepath.Dir(target)
-			_ = p.rclone.RefreshMountPath(ctx, p.runtime.FuseMountPath, filepath.Dir(contentDir))
-			_ = p.rclone.RefreshMountPath(ctx, p.runtime.FuseMountPath, contentDir)
+			// cached view and wrongly report the file as corrupt.
+			//
+			// Deliberately NOT also refreshing the "releases" parent
+			// directory here: it lists every release in the library
+			// (9,000+), and golang.org/x/net/webdav's PROPFIND handler Stats
+			// every child to build the response regardless of requested
+			// depth, so refreshing "releases" costs one DB query per release
+			// every time -- confirmed live at ~8-11s and heavy sustained
+			// CPU/DB load per call, enough to degrade Plex playback when it
+			// ran on every publish.
+			_ = p.rclone.RefreshMountPath(ctx, p.runtime.FuseMountPath, filepath.Dir(target))
 		}
 		libraryItemIDs[file.LibraryItemID] = struct{}{}
 	}
@@ -358,12 +361,10 @@ func (p *Publisher) fulfillSeasonPackEpisodes(ctx context.Context, selectedRelea
 			if symlinkErr := p.syml.Publish(libraryPath, target); symlinkErr == nil {
 				if upsertErr := p.repo.UpsertSymlinkPublication(ctx, m.LibraryItemID, virtualFileID, libraryPath, target); upsertErr == nil {
 					_ = p.rclone.RefreshPath(ctx, filepath.Dir(libraryPath))
-					// Also refresh the content directory the symlink points into,
-					// and its "releases" parent (see the analogous comment in
-					// publishSelectedRelease above).
-					contentDir := filepath.Dir(target)
-					_ = p.rclone.RefreshMountPath(ctx, p.runtime.FuseMountPath, filepath.Dir(contentDir))
-					_ = p.rclone.RefreshMountPath(ctx, p.runtime.FuseMountPath, contentDir)
+					// Also refresh the content directory the symlink points into
+					// (see the comment in publishSelectedRelease above for why the
+					// "releases" parent directory is deliberately NOT refreshed too).
+					_ = p.rclone.RefreshMountPath(ctx, p.runtime.FuseMountPath, filepath.Dir(target))
 					if notifyMediaServers && p.mediaServerNotifyHook != nil {
 						if err := p.mediaServerNotifyHook(ctx, m.LibraryItemID); err != nil {
 							slog.Warn("season pack: media server notify failed", "library_item_id", m.LibraryItemID, "err", err)
