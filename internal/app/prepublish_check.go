@@ -47,8 +47,8 @@ func verifyContentBeforePublish(ctx context.Context, db *database.DB, rt config.
 	// place. Refresh the "releases" parent too, so the new child becomes
 	// visible before the release's own directory is ever listed.
 	releaseDir := filepath.Join(rt.FuseMountPath, "content", "releases", fmt.Sprintf("%d", selectedReleaseID))
-	_ = rc.RefreshPath(ctx, filepath.Dir(releaseDir))
-	_ = rc.RefreshPath(ctx, releaseDir)
+	_ = rc.RefreshMountPath(ctx, rt.FuseMountPath, filepath.Dir(releaseDir))
+	_ = rc.RefreshMountPath(ctx, rt.FuseMountPath, releaseDir)
 	for _, e := range entries {
 		if !database.IsPlayableMediaFile(e.FileName, e.SizeBytes) {
 			logger.Debug().Str("file", e.FileName).Int64("sizeBytes", e.SizeBytes).
