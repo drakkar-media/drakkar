@@ -305,16 +305,9 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		if !provider.Enabled || provider.Host == "" {
 			continue
 		}
-		client := nntp.NewArticleClient(provider)
-		pooled := nntp.NewPooledSource(ctx, client.NewSession, provider.MaxConnections)
-		pooledSources = append(pooledSources, pooled)
-		articleSources = append(articleSources, nntp.NamedArticleSource{
-			Name:   provider.Name,
-			Source: pooled,
-		})
 		totalWorkers += max(provider.MaxConnections, 1)
 	}
-	if len(articleSources) > 0 {
+	if len(cfg.Usenet.Providers) > 0 {
 		maxDownloadConnections = cfg.Usenet.MaxDownloadConnections
 		if maxDownloadConnections <= 0 {
 			maxDownloadConnections = totalWorkers
@@ -322,6 +315,35 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		if maxDownloadConnections > totalWorkers {
 			maxDownloadConnections = totalWorkers
 		}
+	}
+	for _, provider := range cfg.Usenet.Providers {
+		if !provider.Enabled || provider.Host == "" {
+			continue
+		}
+		client := nntp.NewArticleClient(provider)
+		// The pool itself is capped at MaxDownloadConnections (matching
+		// nzbdav's Math.Min(providerConnections, maxDownloadConnections)) --
+		// not the raw provider.MaxConnections. provider.MaxConnections is the
+		// account's own ceiling (e.g. 100), which is not the same thing as
+		// how many of those Drakkar should actually use concurrently:
+		// confirmed live that running near the account ceiling (90 of 100)
+		// caused corrupted reads under heavy concurrent load, misclassified
+		// as permanent yEnc CRC failures (see calibrate.go's
+		// confirmPermanentCRCMismatch). Previously maxDownloadConnections only
+		// throttled scheduler/read-ahead accounting further downstream while
+		// the pool itself still allowed up to the full account ceiling.
+		poolSize := provider.MaxConnections
+		if maxDownloadConnections > 0 && maxDownloadConnections < poolSize {
+			poolSize = maxDownloadConnections
+		}
+		pooled := nntp.NewPooledSource(ctx, client.NewSession, poolSize)
+		pooledSources = append(pooledSources, pooled)
+		articleSources = append(articleSources, nntp.NamedArticleSource{
+			Name:   provider.Name,
+			Source: pooled,
+		})
+	}
+	if len(articleSources) > 0 {
 		fallback := nntp.NewFallbackSource(articleSources, 1)
 		// Wrap with a 24-hour missing-article cache so known-expired (430) IDs
 		// are never re-fetched from NNTP within the TTL window.
