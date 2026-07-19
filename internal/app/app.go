@@ -421,25 +421,28 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	hydraClient := hydra.NewClient(cfg.NZBHydra2)
 	hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)
 	workflowSvc := workflow.NewService(db, seerrClient, hydraClient)
-	// importWorkers = number of concurrent downloads, each with ~10 NNTP connections.
-	// Cap raised 4->8: the old cap of 4 meant a 100-connection plan only ever
-	// used 40 connections for imports (10/worker x 4) regardless of how much
-	// headroom was actually available — the connection increase couldn't help
-	// because this ceiling, not connection count, was the bottleneck. 8 still
-	// leaves real headroom under a 100-connection plan for concurrent
-	// streaming reads (see streamingPriorityPercent) rather than using
-	// everything for backlog imports.
-	importWorkers := 1
-	if maxDownloadConnections > 0 {
-		importWorkers = maxDownloadConnections / 10
-		if importWorkers < 1 {
-			importWorkers = 1
-		}
-		if importWorkers > 8 {
-			importWorkers = 8
-		}
-		workflowSvc.SetImportConcurrency(importWorkers) // keeps importSem sized for ImportNZBFromPush
-	}
+	// importWorkers = number of concurrent download-job pipelines (search,
+	// select, fetch NZB, import, publish) processed at once. Deliberately
+	// independent of maxDownloadConnections/the NNTP connection budget --
+	// real NNTP concurrency is already correctly bounded downstream by the
+	// scheduler's foreground lane (ScheduledSource, sized at
+	// maxDownloadConnections), which every worker's segment fetches funnel
+	// through and queue fairly against, regardless of how many worker
+	// goroutines exist above it. Confirmed live (2026-07-20): the previous
+	// formula (maxDownloadConnections / 10, capped at 8) silently collapsed
+	// the entire download worker pool to just 1 once maxDownloadConnections
+	// was correctly lowered to nzbdav's safe default of 15 to fix a
+	// different problem (over-concurrency causing corrupted NNTP reads,
+	// v0.2.47-49) -- 15/10 == 1 via integer division. With only one worker,
+	// the whole download pipeline serialized behind it: a single worker
+	// stuck deep in a recursive candidate-fallback chain (many consecutive
+	// dead/expired candidates for a heavily-nuked backlog) stalled the
+	// entire queue for over an hour with zero completions, while repeatedly
+	// hitting NZBHydra2's download endpoint in a tight sequential loop --
+	// looking like "spam" from that one worker's perspective, since nothing
+	// else could run concurrently with it.
+	const importWorkers = 8
+	workflowSvc.SetImportConcurrency(importWorkers) // keeps importSem sized for ImportNZBFromPush
 	if checker, ok := db.SegmentFetcher.(database.SegmentChecker); ok {
 		workflowSvc.SetEarlyChecker(checker.Exists)
 		workflowSvc.SetArticleChecker(checker.Exists)
