@@ -1130,7 +1130,22 @@ func (db *DB) InsertManualReleaseCandidate(ctx context.Context, libraryItemID in
 	return id, err
 }
 
-func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []SearchCandidateRecord) (*int64, error) {
+// ReplaceSearchCandidates records a fresh batch of search candidates for a
+// library item and selects the best non-rejected one, if any. upgradeSearch
+// must be true only for a re-search of an item that may already have a
+// working, published release (SearchUpgrades and its season-pack path) —
+// it changes what happens when nothing is selected: instead of unconditionally
+// tearing down any existing selected_releases row (which cascades to
+// virtual_files/symlink_publications, destroying the currently-playable
+// file) before even knowing whether a replacement will be found, an existing
+// selection is left completely untouched unless a new candidate is actually
+// selected to replace it. Confirmed live (2026-07-19): every upgrade search,
+// including ones that found nothing better, was deleting the working
+// release's DB rows synchronously up front, well before -- and regardless of
+// whether -- a new NZB was ever successfully fetched and imported, breaking
+// playback of perfectly good content on every upgrade pass that didn't
+// happen to find something strictly better.
+func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []SearchCandidateRecord, upgradeSearch bool) (*int64, error) {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -1144,6 +1159,26 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
 		return nil, err
 	}
+
+	// For an upgrade search, capture any existing selection before mutating
+	// anything, so it can be left alone if nothing better is found below.
+	var (
+		existingSelectedReleaseID  int64
+		existingReleaseCandidateID int64
+		hasExisting                bool
+	)
+	if upgradeSearch {
+		err = tx.QueryRowContext(ctx, `
+			select id, release_candidate_id from selected_releases where library_item_id = $1`,
+			libraryItemID,
+		).Scan(&existingSelectedReleaseID, &existingReleaseCandidateID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		hasExisting = err == nil
+		err = nil
+	}
+
 	if _, err = tx.ExecContext(ctx, `
 		update queue_items
 		set state = $2, failure_reason = '', updated_at = now()
@@ -1153,11 +1188,23 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 	if err = preDeleteVFRByLibraryItem(ctx, tx, libraryItemID); err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, `delete from selected_releases where library_item_id = $1`, libraryItemID); err != nil {
-		return nil, err
-	}
-	if _, err = tx.ExecContext(ctx, `delete from release_candidates where library_item_id = $1`, libraryItemID); err != nil {
-		return nil, err
+	if hasExisting {
+		// Keep the currently-selected release_candidates row alive (it's
+		// still referenced by the existing selected_releases row via an ON
+		// DELETE CASCADE FK) -- only clear out this item's OTHER, stale
+		// candidates from a previous search attempt.
+		if _, err = tx.ExecContext(ctx, `
+			delete from release_candidates where library_item_id = $1 and id != $2`,
+			libraryItemID, existingReleaseCandidateID); err != nil {
+			return nil, err
+		}
+	} else {
+		if _, err = tx.ExecContext(ctx, `delete from selected_releases where library_item_id = $1`, libraryItemID); err != nil {
+			return nil, err
+		}
+		if _, err = tx.ExecContext(ctx, `delete from release_candidates where library_item_id = $1`, libraryItemID); err != nil {
+			return nil, err
+		}
 	}
 
 	blocked, err := loadBlocklistMap(ctx, db.SQL)
@@ -1216,6 +1263,18 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 			return nil, err
 		}
 		if shouldSelect {
+			if hasExisting {
+				// A genuinely-better candidate was found: only now tear down
+				// the preserved old selection (cascades to
+				// virtual_files/symlink_publications) to make way for it.
+				if _, err = tx.ExecContext(ctx, `delete from selected_releases where id = $1`, existingSelectedReleaseID); err != nil {
+					return nil, err
+				}
+				if _, err = tx.ExecContext(ctx, `delete from release_candidates where id = $1`, existingReleaseCandidateID); err != nil {
+					return nil, err
+				}
+				hasExisting = false
+			}
 			var value int64
 			if err = tx.QueryRowContext(ctx, `
 				insert into selected_releases (library_item_id, release_candidate_id)
@@ -1241,6 +1300,17 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 			update queue_items
 			set state = $2, selected_release_id = $3, updated_at = now(), consecutive_failure_searches = 0
 			where library_item_id = $1`, libraryItemID, QueueSelected, *selectedReleaseID); err != nil {
+			return nil, err
+		}
+	} else if hasExisting {
+		// Upgrade search found nothing genuinely better -- the existing
+		// release is untouched, so restore queue_items to its prior working
+		// state instead of marking it Failed; there is nothing wrong with
+		// this item.
+		if _, err = tx.ExecContext(ctx, `
+			update queue_items
+			set state = $2, failure_reason = '', selected_release_id = $3, updated_at = now()
+			where library_item_id = $1`, libraryItemID, QueueAvailable, existingSelectedReleaseID); err != nil {
 			return nil, err
 		}
 	} else {

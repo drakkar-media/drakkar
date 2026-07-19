@@ -191,7 +191,7 @@ func (r *repoStub) InsertManualReleaseCandidate(ctx context.Context, libraryItem
 	return 1, nil
 }
 
-func (r *repoStub) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord) (*int64, error) {
+func (r *repoStub) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord, upgradeSearch bool) (*int64, error) {
 	r.searchApplied = candidates
 	if len(candidates) == 0 || candidates[0].Rejected {
 		return nil, nil
@@ -3259,5 +3259,53 @@ func TestParseCandidateDetectsSDResolutions(t *testing.T) {
 		if candidate.Resolution != tc.want {
 			t.Fatalf("title=%q: expected resolution %q, got %q", tc.title, tc.want, candidate.Resolution)
 		}
+	}
+}
+
+// TestApplyUpgradeMinimumsRequiresGenuineImprovement guards the 2026-07-19
+// production fix: an upgrade search must never select a lateral or worse
+// release just because it's today's top-scored fresh result -- it has to
+// actually beat the currently-selected release's overall score.
+func TestApplyUpgradeMinimumsRequiresGenuineImprovement(t *testing.T) {
+	current := &database.ReleaseSummary{Score: 500, CustomFormatScore: 10}
+
+	candidates := []database.SearchCandidateRecord{
+		{Title: "worse", Score: 300},
+		{Title: "lateral (equal score)", Score: 500},
+		{Title: "genuinely better", Score: 600},
+	}
+	got := applyUpgradeMinimums(candidates, current, 0)
+	if !got[0].Rejected || got[0].RejectReason != "not_an_upgrade" {
+		t.Fatalf("expected worse candidate rejected as not_an_upgrade, got %+v", got[0])
+	}
+	if !got[1].Rejected || got[1].RejectReason != "not_an_upgrade" {
+		t.Fatalf("expected equal-score candidate rejected as not_an_upgrade (lateral moves aren't upgrades), got %+v", got[1])
+	}
+	if got[2].Rejected {
+		t.Fatalf("expected genuinely higher-scored candidate to survive, got %+v", got[2])
+	}
+}
+
+// TestApplyUpgradeMinimumsNoOpWithoutCurrentRelease covers a first-time (or
+// otherwise current-less) search: nothing to compare against, so no filtering.
+func TestApplyUpgradeMinimumsNoOpWithoutCurrentRelease(t *testing.T) {
+	candidates := []database.SearchCandidateRecord{{Title: "any", Score: 1}}
+	got := applyUpgradeMinimums(candidates, nil, 0)
+	if got[0].Rejected {
+		t.Fatalf("expected no rejection when there's no current release to compare against, got %+v", got[0])
+	}
+}
+
+// TestApplyUpgradeMinimumsAlsoAppliesCustomFormatFloor covers a profile that
+// additionally configures MinimumUpgradeCustomFormatScore: a candidate must
+// beat the overall score AND clear the custom-format floor.
+func TestApplyUpgradeMinimumsAlsoAppliesCustomFormatFloor(t *testing.T) {
+	current := &database.ReleaseSummary{Score: 500, CustomFormatScore: 10}
+	candidates := []database.SearchCandidateRecord{
+		{Title: "higher score but custom format too low", Score: 600, CustomFormatScore: 12},
+	}
+	got := applyUpgradeMinimums(candidates, current, 25)
+	if !got[0].Rejected || got[0].RejectReason != "upgrade_custom_format_score" {
+		t.Fatalf("expected rejection for failing the custom-format floor despite a higher overall score, got %+v", got[0])
 	}
 }

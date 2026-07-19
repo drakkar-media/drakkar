@@ -64,7 +64,7 @@ type Repository interface {
 	BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int64, reason string, ttlDays int) error
 	ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) error
 	RequeueSelectedRelease(ctx context.Context, queueItemID int64) error
-	ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord) (*int64, error)
+	ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord, upgradeSearch bool) (*int64, error)
 	PromoteExistingCandidate(ctx context.Context, libraryItemID int64) (*int64, error)
 	InsertManualReleaseCandidate(ctx context.Context, libraryItemID int64, title, externalURL, indexerName, resolution string, sizeBytes int64, score int) (int64, error)
 	MarkLibrarySearchFailed(ctx context.Context, libraryItemID int64, reason string) error
@@ -1585,7 +1585,7 @@ func (s *Service) SearchRecentPending(ctx context.Context, mediaType string) (Bu
 		if _, loaded := s.searchInflight.LoadOrStore(target.LibraryItemID, struct{}{}); loaded {
 			continue
 		}
-		selectedReleaseID, err := s.repo.ReplaceSearchCandidates(ctx, target.LibraryItemID, candidates)
+		selectedReleaseID, err := s.repo.ReplaceSearchCandidates(ctx, target.LibraryItemID, candidates, false)
 		if err != nil {
 			s.searchInflight.Delete(target.LibraryItemID)
 			result.Failed++
@@ -1869,7 +1869,7 @@ func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID i
 	s.logger.Debug().Int64("libraryItemId", libraryItemID).Str("title", input.Title).Str("mediaType", input.MediaType).Msg("workqueue: searching item")
 	profilePrefs := s.profilePreferencesForItem(ctx, libraryItemID, input.MediaType)
 	var currentSelected *database.ReleaseSummary
-	if upgradeSearch && profilePrefs.MinimumUpgradeCustomFormatScore > 0 {
+	if upgradeSearch {
 		currentSelected, err = s.repo.GetLatestSelectedReleaseSummaryByLibraryItem(ctx, libraryItemID)
 		if err != nil {
 			return SearchResult{}, err
@@ -1890,7 +1890,7 @@ func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID i
 	// A season pack covers all episodes in the season and avoids many separate downloads.
 	if isEpisodeSearch(input) && input.TVShowID > 0 && input.SeasonNumber > 0 {
 		if ok, _ := s.repo.ShouldAttemptSeasonPack(ctx, input.TVShowID, input.SeasonNumber); ok {
-			packResult, packSelected, packCandidates, packErr := s.trySeasonPack(ctx, input, history, libraryItemID)
+			packResult, packSelected, packCandidates, packErr := s.trySeasonPack(ctx, input, history, libraryItemID, upgradeSearch)
 			outcome := database.SeasonPackOutcomeFailed
 			if packSelected != nil {
 				outcome = database.SeasonPackOutcomeSelected
@@ -1930,10 +1930,10 @@ func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID i
 			lastSearchErr = nil
 			candidates = buildSearchCandidates(results, req, history, profilePrefs, s.indexerLimits, s.loadIndexerPolicyMap(ctx))
 			if upgradeSearch {
-				candidates = applyUpgradeCustomFormatMinimum(candidates, currentSelected, profilePrefs.MinimumUpgradeCustomFormatScore)
+				candidates = applyUpgradeMinimums(candidates, currentSelected, profilePrefs.MinimumUpgradeCustomFormatScore)
 			}
 			combinedCandidates = mergeSearchCandidates(combinedCandidates, candidates)
-			selectedReleaseID, err = s.repo.ReplaceSearchCandidates(ctx, libraryItemID, combinedCandidates)
+			selectedReleaseID, err = s.repo.ReplaceSearchCandidates(ctx, libraryItemID, combinedCandidates, upgradeSearch)
 			if err != nil {
 				return true // propagate error via outer err variable
 			}
@@ -2038,7 +2038,7 @@ func matchesRecentMediaType(input database.LibrarySearchInput, mediaType string)
 // the caller should pre-seed its combinedCandidates with these so pack options
 // remain visible in the picker even when the individual episode search runs.
 // When selectedID is nil and err is nil, no usable pack was selected.
-func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearchInput, history map[string]database.CandidateHistory, libraryItemID int64) (SearchResult, *int64, []database.SearchCandidateRecord, error) {
+func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearchInput, history map[string]database.CandidateHistory, libraryItemID int64, upgradeSearch bool) (SearchResult, *int64, []database.SearchCandidateRecord, error) {
 	packInput := input
 	packInput.EpisodeNumber = 0 // season pack: no episode
 
@@ -2065,7 +2065,7 @@ func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearc
 		// number. Keeps season packs and obfuscated NZBs (no episode token).
 		candidates = filterToPacksOnly(candidates, input.SeasonNumber)
 		combinedCandidates = mergeSearchCandidates(combinedCandidates, candidates)
-		selectedReleaseID, err = s.repo.ReplaceSearchCandidates(ctx, libraryItemID, combinedCandidates)
+		selectedReleaseID, err = s.repo.ReplaceSearchCandidates(ctx, libraryItemID, combinedCandidates, upgradeSearch)
 		if err != nil {
 			return SearchResult{}, nil, nil, err
 		}
@@ -2948,16 +2948,32 @@ func hasNonRejectedCandidate(candidates []database.SearchCandidateRecord) bool {
 	return false
 }
 
-func applyUpgradeCustomFormatMinimum(candidates []database.SearchCandidateRecord, current *database.ReleaseSummary, minimumIncrement int) []database.SearchCandidateRecord {
-	if current == nil || minimumIncrement <= 0 {
+// applyUpgradeMinimums rejects candidates that don't represent a genuine
+// improvement over the currently-selected release during an upgrade search.
+// Confirmed live (2026-07-19): without this, an upgrade search that found
+// nothing actually better than the current release would still replace it,
+// because ReplaceSearchCandidates always selects the top-scored candidate
+// among today's fresh results — a lateral or even worse release (different
+// indexer, minor re-encode) could win purely on being freshly re-ranked, with
+// no requirement that it beat what's already downloaded and working. Always
+// requires a strictly higher overall ranking score than the current release;
+// when the profile also configures MinimumUpgradeCustomFormatScore, the
+// stricter custom-format-specific increment is required on top of that.
+func applyUpgradeMinimums(candidates []database.SearchCandidateRecord, current *database.ReleaseSummary, minimumCustomFormatIncrement int) []database.SearchCandidateRecord {
+	if current == nil {
 		return candidates
 	}
-	requiredScore := current.CustomFormatScore + minimumIncrement
+	requiredCustomFormatScore := current.CustomFormatScore + minimumCustomFormatIncrement
 	for i := range candidates {
 		if candidates[i].Rejected {
 			continue
 		}
-		if candidates[i].CustomFormatScore < requiredScore {
+		if candidates[i].Score <= current.Score {
+			candidates[i].Rejected = true
+			candidates[i].RejectReason = "not_an_upgrade"
+			continue
+		}
+		if minimumCustomFormatIncrement > 0 && candidates[i].CustomFormatScore < requiredCustomFormatScore {
 			candidates[i].Rejected = true
 			candidates[i].RejectReason = "upgrade_custom_format_score"
 		}

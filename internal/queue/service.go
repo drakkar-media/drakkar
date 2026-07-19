@@ -325,7 +325,7 @@ func (m *MemoryRepository) GetLibrarySearchInput(ctx context.Context, libraryIte
 	return database.LibrarySearchInput{}, errors.New("library item not found")
 }
 
-func (m *MemoryRepository) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord) (*int64, error) {
+func (m *MemoryRepository) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord, upgradeSearch bool) (*int64, error) {
 	for i := range m.items {
 		if m.items[i].LibraryItemID != libraryItemID {
 			continue
