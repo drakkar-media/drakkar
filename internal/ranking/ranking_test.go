@@ -323,6 +323,31 @@ func TestScoreWithPreferencesIndexerPolicy(t *testing.T) {
 	}
 }
 
+// TestScoreIndexerPriorityLowerNumberWinsTies guards the NZBHydra2 "Priority"
+// convention (1 highest, higher numbers lower priority, matching Sonarr/
+// Radarr) -- a lower IndexerScore must add MORE to the total score than a
+// higher one, not less.
+func TestScoreIndexerPriorityLowerNumberWinsTies(t *testing.T) {
+	reqs := Requirements{Title: "Dune", MediaType: "movie", Year: 2021}
+	highPriority := ScoreWithPreferences(Candidate{
+		Title:        "Dune.2021.1080p.WEB-DL",
+		Resolution:   "1080p",
+		Source:       "web-dl",
+		Language:     "en",
+		IndexerScore: 10,
+	}, reqs, Preferences{})
+	lowPriority := ScoreWithPreferences(Candidate{
+		Title:        "Dune.2021.1080p.WEB-DL",
+		Resolution:   "1080p",
+		Source:       "web-dl",
+		Language:     "en",
+		IndexerScore: 30,
+	}, reqs, Preferences{})
+	if highPriority.Score <= lowPriority.Score {
+		t.Fatalf("expected indexer score 10 (higher priority) to outscore 30 (lower priority), got 10=%d 30=%d", highPriority.Score, lowPriority.Score)
+	}
+}
+
 func TestCompatibilityWarningsDolbyVision(t *testing.T) {
 	result := ScoreWithPreferences(Candidate{
 		Title:      "Dune.2021.2160p.WEB-DL.DV.HDR",

@@ -481,12 +481,15 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 		addExplanation("Recent upload bonus (+25)")
 	}
 
-	// Indexer trust score from NZBHydra2 (1–3). Acts as a tiebreaker between
-	// otherwise equal candidates from different indexers.
+	// Indexer priority from NZBHydra2's per-indexer "Priority" setting. Lower
+	// number means higher priority (same convention as Sonarr/Radarr indexer
+	// priority) -- so a lower value must add MORE to the score, hence the
+	// negation. Acts as a tiebreaker between otherwise equal candidates from
+	// different indexers.
 	if candidate.IndexerScore != 0 {
-		points := candidate.IndexerScore * 10
+		points := -candidate.IndexerScore * 10
 		score += points
-		addExplanation("Indexer trust score (%+d)", points)
+		addExplanation("Indexer priority %d (%+d)", candidate.IndexerScore, points)
 	}
 
 	// Per-indexer policy modifier configured by the operator in Settings → Indexers.
