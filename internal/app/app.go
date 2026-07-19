@@ -38,6 +38,7 @@ import (
 	"github.com/drakkar-media/drakkar/internal/policy"
 	"github.com/drakkar-media/drakkar/internal/probe"
 	"github.com/drakkar-media/drakkar/internal/queue"
+	"github.com/drakkar-media/drakkar/internal/rclone"
 	"github.com/drakkar-media/drakkar/internal/seerr"
 	"github.com/drakkar-media/drakkar/internal/stream"
 	"github.com/drakkar-media/drakkar/internal/subdl"
@@ -426,6 +427,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		workflowSvc.SetTVDBClient(tvdb.NewClient(cfg.Metadata))
 	}
 	publicationSvc := library.NewPublisher(db, rt, cfg.Rclone.RCAddr)
+	rcloneClient := rclone.NewClient(cfg.Rclone.RCAddr)
 	maintenanceSvc := &maintenanceOpsService{
 		base:           maintenance.NewService(db, rt),
 		db:             db,
@@ -470,8 +472,10 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// notifyMediaServers refreshes Plex/Jellyfin for a single library item.
 	// Retries the Plex call a couple of times -- a brief Plex restart/network
 	// blip shouldn't permanently strand an item unnoticed, since nothing else
-	// ever retries this on the caller's behalf.
-	notifyMediaServers := func(ctx context.Context, libraryItemID int64) {
+	// ever retries this on the caller's behalf. Deliberately detached from the
+	// caller's context (its own bounded timeouts below) so cancellation of the
+	// triggering request can't cut this retry short.
+	notifyMediaServers := func(libraryItemID int64) {
 		if plexClient.Enabled() {
 			plexCtx, plexCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer plexCancel()
@@ -510,7 +514,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			defer cancel()
 			_ = subtitleSvc.RepublishStoredSubtitles(bgCtx, libraryItemID)
 			subtitleSvc.TriggerAutomaticSearch(libraryItemID)
-			notifyMediaServers(bgCtx, libraryItemID)
+			notifyMediaServers(libraryItemID)
 		}()
 		return nil
 	})
@@ -522,9 +526,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	publicationSvc.SetMediaServerNotifyHook(func(ctx context.Context, libraryItemID int64) error {
 		go func() {
 			defer observability.Recover("media-server-notify-hook")
-			bgCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-			defer cancel()
-			notifyMediaServers(bgCtx, libraryItemID)
+			notifyMediaServers(libraryItemID)
 		}()
 		return nil
 	})
@@ -540,7 +542,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		if item.SelectedRelease == nil {
 			return nil
 		}
-		if err := verifyContentBeforePublish(ctx, db, rt, *item.SelectedRelease, logger); err != nil {
+		if err := verifyContentBeforePublish(ctx, db, rt, rcloneClient, *item.SelectedRelease, logger); err != nil {
 			logger.Warn().
 				Err(err).
 				Int64("selectedReleaseId", *item.SelectedRelease).

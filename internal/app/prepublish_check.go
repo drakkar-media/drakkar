@@ -9,6 +9,7 @@ import (
 
 	"github.com/drakkar-media/drakkar/internal/config"
 	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/rclone"
 	"github.com/rs/zerolog"
 )
 
@@ -23,7 +24,7 @@ import (
 // short warm-up window here: enough for the content VFS/cache to settle, but
 // not so long that every bad candidate stalls the download queue for nearly a
 // minute before Drakkar tries the next release.
-func verifyContentBeforePublish(ctx context.Context, db *database.DB, rt config.Runtime, selectedReleaseID int64, logger zerolog.Logger) error {
+func verifyContentBeforePublish(ctx context.Context, db *database.DB, rt config.Runtime, rc *rclone.Client, selectedReleaseID int64, logger zerolog.Logger) error {
 	entries, err := db.ListContentMountEntriesForRelease(ctx, selectedReleaseID)
 	if err != nil {
 		// Can't determine the file list — don't block publish on our own
@@ -38,6 +39,14 @@ func verifyContentBeforePublish(ctx context.Context, db *database.DB, rt config.
 			continue
 		}
 		target := filepath.Join(rt.FuseMountPath, "content", e.Path)
+		// The content directory is served through rclone's VFS, which caches
+		// directory listings for --dir-cache-time (20s, see docker-compose.yml)
+		// -- longer than this check's whole retry window. A freshly-imported
+		// file can therefore appear as "no such file or directory" here even
+		// though it's already present, forcing a fallback to the periodic
+		// health check. Proactively invalidate the cache first, same as the
+		// post-publish refresh in internal/library/publisher.go.
+		_ = rc.RefreshPath(ctx, filepath.Dir(target))
 		if err := verifyOneFileBeforePublish(ctx, target, e.FileName); err != nil {
 			logger.Warn().
 				Int64("selectedReleaseId", selectedReleaseID).
