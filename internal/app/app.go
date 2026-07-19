@@ -935,6 +935,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			logger.Error().Err(err).Msg("sync plex detected shows failed")
 			return
 		}
+		_ = db.TouchMaintenanceCursor(ctx, taskSyncPlexDetected, time.Now().UTC().Format(time.RFC3339))
 		if result.Requested > 0 {
 			broker.Publish(map[string]any{"kind": "requests.sync_background", "seen": result.Found, "created": result.Requested})
 		}
@@ -972,10 +973,23 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	startRecurring(taskQueueHousekeeping, 10*time.Minute, true, runQueueHousekeeping)
 	startRecurringWithStartupDelay(taskPublishingMaintenance, 30*time.Minute, 2*time.Minute, runPublishingMaintenance)
 	startRecurringWithStartupDelay(taskHealthCheck, backgroundHealthCheckInterval, 6*time.Minute, runHealthCheck)
-	startRecurring(taskNZBHealthCheck, 168*time.Hour, false, func() {
+	// runOnStartup checks the persisted cursor rather than a bare `false`:
+	// this task's 168-hour (7-day) in-process timer resets to zero on every
+	// restart, and a redeployed app restarts far more often than every 7
+	// days -- with a bare `false` (no startup catch-up at all, unlike this
+	// file's other long-interval tasks) this task could go without ever
+	// completing a single run for as long as deploys keep happening more
+	// often than the interval. Confirmed live: its maintenance_cursors row
+	// was 10+ days stale despite the app having been redeployed many times
+	// in that window. shouldRunRecentOnStartup runs it immediately only if
+	// actually overdue, so it still won't fire on every restart once it's
+	// caught up.
+	startRecurring(taskNZBHealthCheck, 168*time.Hour, shouldRunRecentOnStartup(ctx, db, taskNZBHealthCheck, 168*time.Hour, 0, time.Now().UTC()), func() {
 		if _, err := maintenanceSvc.DeepNZBHealthCheck(ctx); err != nil {
 			logger.Error().Err(err).Msg("deep nzb health check failed")
+			return
 		}
+		_ = db.TouchMaintenanceCursor(ctx, taskNZBHealthCheck, time.Now().UTC().Format(time.RFC3339))
 	})
 	startRecurringWithStartupDelay(taskArticleHealthCheck, 6*time.Hour, 15*time.Minute, func() {
 		n, err := workflowSvc.ValidatePublishedArticles(ctx)
@@ -983,6 +997,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			logger.Error().Err(err).Msg("article health check failed")
 			return
 		}
+		_ = db.TouchMaintenanceCursor(ctx, taskArticleHealthCheck, time.Now().UTC().Format(time.RFC3339))
 		if n > 0 {
 			logger.Warn().Int("reset", n).Msg("article health check: reset library items with unavailable articles")
 		} else {
