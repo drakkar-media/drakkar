@@ -11,17 +11,26 @@ import (
 var ErrSchedulerQueueFull = errors.New("nntp scheduler queue full")
 
 // ScheduledSource dispatches NNTP article fetches using a three-tier priority
-// queue that mirrors nzbdav's PrioritizedSemaphore behaviour:
+// queue split across two independent worker lanes, matching nzbdav's actual
+// architecture: nzbdav's DownloadingNntpClient PrioritizedSemaphore covers
+// only download/streaming BODY fetches (capped at "Max Download
+// Connections"), while its health check (STAT-only, no body fetch/decode)
+// bypasses that semaphore entirely and uses the raw connection pool directly
+// (HealthCheckService.cs) so it's never blocked behind download/streaming
+// traffic.
 //
-//	high   (priority ≥ Interactive=100) — direct player reads
-//	medium (priority ≥ ReadAhead=80)   — speculative prefetch
-//	low    (priority < 80)             — background calibration / checks
+//	high   (priority ≥ Interactive=100) — direct player reads     -- foreground lane
+//	medium (priority ≥ ReadAhead=80)   — speculative prefetch     -- foreground lane
+//	low    (priority < 80)             — background calibration / checks -- background lane
 //
-// Workers always drain `high` before `medium`, `medium` before `low`, so
-// interactive reads are never delayed by background work.  No hard cap is
-// placed on background (low) requests — they simply wait for a free worker,
-// matching nzbdav's connectionPool behaviour where background tasks compete
-// on the same semaphore as streaming with lower odds.
+// Drakkar's calibration/health-check does a full body fetch+decode (unlike
+// nzbdav's cheap STAT-only check), so giving it the full pool ceiling the way
+// nzbdav does its STAT checks would reintroduce the over-concurrency that
+// caused corrupted reads under heavy load (see calibrate.go's
+// confirmPermanentCRCMismatch and the 2026-07-19 incident). Instead it gets
+// its own separate, independently-sized worker lane: never blocked behind
+// foreground (high/medium) traffic, but still bounded, not run at up to the
+// full account connection ceiling.
 type ScheduledSource struct {
 	source ArticleSource
 	high   chan fetchRequest
@@ -49,7 +58,20 @@ const (
 	fetchOperationStat
 )
 
+// NewScheduledSource starts two independent worker lanes: `workers` goroutines
+// serving only high/medium (foreground: interactive + read-ahead), and
+// `backgroundWorkers` goroutines serving only low (background: calibration /
+// health-check) — see the ScheduledSource doc comment for why these must not
+// share a pool. If backgroundWorkers <= 0, low falls back to being served by
+// the foreground workers too (old behaviour), so existing callers that don't
+// care about the split keep working.
 func NewScheduledSource(ctx context.Context, source ArticleSource, workers int, queueSize int) *ScheduledSource {
+	return NewScheduledSourceLanes(ctx, source, workers, 0, queueSize)
+}
+
+// NewScheduledSourceLanes is NewScheduledSource with an explicit, independent
+// background-lane worker count. See the ScheduledSource doc comment.
+func NewScheduledSourceLanes(ctx context.Context, source ArticleSource, workers, backgroundWorkers, queueSize int) *ScheduledSource {
 	if workers <= 0 {
 		workers = 1
 	}
@@ -62,8 +84,19 @@ func NewScheduledSource(ctx context.Context, source ArticleSource, workers int, 
 		medium: make(chan fetchRequest, queueSize),
 		low:    make(chan fetchRequest, queueSize),
 	}
-	for range workers {
-		go s.worker(ctx)
+	if backgroundWorkers > 0 {
+		for range workers {
+			go s.foregroundWorker(ctx)
+		}
+		for range backgroundWorkers {
+			go s.backgroundWorker(ctx)
+		}
+	} else {
+		// No dedicated background lane: fall back to one shared pool serving
+		// all three tiers in priority order (matches the pre-split behaviour).
+		for range workers {
+			go s.worker(ctx)
+		}
 	}
 	return s
 }
@@ -158,6 +191,52 @@ func (s *ScheduledSource) worker(ctx context.Context) {
 			return
 		}
 		s.handleRequestProtected(req)
+	}
+}
+
+// foregroundWorker only ever serves high/medium (interactive + read-ahead) --
+// used when a dedicated background lane exists, so low-priority
+// calibration/health-check work can never occupy a foreground worker slot.
+func (s *ScheduledSource) foregroundWorker(ctx context.Context) {
+	for {
+		req, ok := s.nextForeground(ctx)
+		if !ok {
+			return
+		}
+		s.handleRequestProtected(req)
+	}
+}
+
+// backgroundWorker only ever serves low (calibration/health-check) -- its own
+// dedicated lane, never blocked behind foreground traffic, and separately
+// bounded rather than sharing the foreground worker count.
+func (s *ScheduledSource) backgroundWorker(ctx context.Context) {
+	for {
+		select {
+		case req := <-s.low:
+			s.handleRequestProtected(req)
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// nextForeground picks the highest-priority pending high/medium request,
+// blocking until one is available or ctx is cancelled. Mirrors next but never
+// looks at low -- see foregroundWorker.
+func (s *ScheduledSource) nextForeground(ctx context.Context) (req fetchRequest, ok bool) {
+	select {
+	case req := <-s.high:
+		return req, true
+	default:
+	}
+	select {
+	case req := <-s.high:
+		return req, true
+	case req := <-s.medium:
+		return req, true
+	case <-ctx.Done():
+		return fetchRequest{}, false
 	}
 }
 

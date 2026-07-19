@@ -321,22 +321,13 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			continue
 		}
 		client := nntp.NewArticleClient(provider)
-		// The pool itself is capped at MaxDownloadConnections (matching
-		// nzbdav's Math.Min(providerConnections, maxDownloadConnections)) --
-		// not the raw provider.MaxConnections. provider.MaxConnections is the
-		// account's own ceiling (e.g. 100), which is not the same thing as
-		// how many of those Drakkar should actually use concurrently:
-		// confirmed live that running near the account ceiling (90 of 100)
-		// caused corrupted reads under heavy concurrent load, misclassified
-		// as permanent yEnc CRC failures (see calibrate.go's
-		// confirmPermanentCRCMismatch). Previously maxDownloadConnections only
-		// throttled scheduler/read-ahead accounting further downstream while
-		// the pool itself still allowed up to the full account ceiling.
-		poolSize := provider.MaxConnections
-		if maxDownloadConnections > 0 && maxDownloadConnections < poolSize {
-			poolSize = maxDownloadConnections
-		}
-		pooled := nntp.NewPooledSource(ctx, client.NewSession, poolSize)
+		// The pool itself stays at the account's own raw ceiling
+		// (provider.MaxConnections, e.g. 100) -- matching nzbdav, where
+		// ConnectionPool is always sized from the raw provider connection
+		// count, never clamped to "Max Download Connections". That setting
+		// is enforced downstream instead (ScheduledSource's foreground lane,
+		// below), not at the pool itself.
+		pooled := nntp.NewPooledSource(ctx, client.NewSession, provider.MaxConnections)
 		pooledSources = append(pooledSources, pooled)
 		articleSources = append(articleSources, nntp.NamedArticleSource{
 			Name:   provider.Name,
@@ -348,8 +339,21 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		// Wrap with a 24-hour missing-article cache so known-expired (430) IDs
 		// are never re-fetched from NNTP within the TTL window.
 		cachedFallback := nntp.NewCachedFallbackSource(fallback)
-		scheduled := nntp.NewScheduledSource(ctx, cachedFallback, maxDownloadConnections*3, maxDownloadConnections*8)
-		// No separate background budget (matches nzbdav behaviour) — all priorities share the pool
+		// Foreground lane (interactive playback + read-ahead) is capped at
+		// maxDownloadConnections, matching nzbdav's DownloadingNntpClient
+		// PrioritizedSemaphore exactly. Background lane (calibration /
+		// health-check) is a separate, independently-sized pool of workers
+		// so it's never blocked behind foreground traffic -- matching
+		// nzbdav's health check bypassing the download semaphore entirely --
+		// but unlike nzbdav's cheap STAT-only health check, Drakkar's does a
+		// full body fetch+decode, so it does NOT get the full account
+		// ceiling the way nzbdav's does; it gets its own bounded lane
+		// instead (same size as the foreground lane is a reasonable,
+		// deliberately modest choice, not a re-derivation of the account
+		// ceiling) to avoid reintroducing the over-concurrency that caused
+		// corrupted reads under heavy load (see calibrate.go's
+		// confirmPermanentCRCMismatch).
+		scheduled := nntp.NewScheduledSourceLanes(ctx, cachedFallback, maxDownloadConnections, maxDownloadConnections, maxDownloadConnections*8)
 		diskDecoded := nntp.NewDiskCachedDecodedSource(scheduled, rt.BlockCachePath, rt.DiskCacheLimitBytes)
 		decoded := nntp.NewCachedDecodedSource(diskDecoded, rt.MemoryHotCacheMaxBytes)
 		db.SegmentFetcher = nntp.NewSegmentFetcher(decoded)
