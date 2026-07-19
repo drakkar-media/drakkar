@@ -1810,9 +1810,26 @@ func (s *Service) SearchLibrary(ctx context.Context, libraryItemID int64) (Searc
 	}
 	defer s.searchInflight.Delete(libraryItemID)
 
+	// Treat this as an upgrade-style search whenever the item already has a
+	// working, published release to protect. SearchLibrary is reachable both
+	// for a brand-new item's very first search (nothing to protect, existing
+	// is nil) and for the manual "Find Replacements"/"Manual Replace" flow
+	// against an already-available item (internal/api/router.go's
+	// POST /api/library/{id}/replacements) -- confirmed live that this
+	// second path reused the exact bug SearchUpgrades' fix (9da7d13)
+	// eliminated: ReplaceSearchCandidates destroyed the working release's
+	// selected_releases/virtual_files/symlink_publications the moment this
+	// search ran, before any replacement was ever confirmed, even if the
+	// user never went on to pick anything from the resulting candidate list.
+	existing, err := s.repo.GetLatestSelectedReleaseSummaryByLibraryItem(ctx, libraryItemID)
+	if err != nil {
+		return SearchResult{}, err
+	}
+	upgradeSearch := existing != nil
+
 	const maxDeadlockRetries = 3
 	for attempt := 0; attempt < maxDeadlockRetries; attempt++ {
-		result, err := s.searchLibraryOnceWithMode(ctx, libraryItemID, false)
+		result, err := s.searchLibraryOnceWithMode(ctx, libraryItemID, upgradeSearch)
 		if isDeadlock(err) {
 			time.Sleep(time.Duration(50+attempt*50) * time.Millisecond)
 			continue
@@ -1890,7 +1907,7 @@ func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID i
 	// A season pack covers all episodes in the season and avoids many separate downloads.
 	if isEpisodeSearch(input) && input.TVShowID > 0 && input.SeasonNumber > 0 {
 		if ok, _ := s.repo.ShouldAttemptSeasonPack(ctx, input.TVShowID, input.SeasonNumber); ok {
-			packResult, packSelected, packCandidates, packErr := s.trySeasonPack(ctx, input, history, libraryItemID, upgradeSearch)
+			packResult, packSelected, packCandidates, packErr := s.trySeasonPack(ctx, input, history, libraryItemID, upgradeSearch, currentSelected)
 			outcome := database.SeasonPackOutcomeFailed
 			if packSelected != nil {
 				outcome = database.SeasonPackOutcomeSelected
@@ -2038,7 +2055,7 @@ func matchesRecentMediaType(input database.LibrarySearchInput, mediaType string)
 // the caller should pre-seed its combinedCandidates with these so pack options
 // remain visible in the picker even when the individual episode search runs.
 // When selectedID is nil and err is nil, no usable pack was selected.
-func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearchInput, history map[string]database.CandidateHistory, libraryItemID int64, upgradeSearch bool) (SearchResult, *int64, []database.SearchCandidateRecord, error) {
+func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearchInput, history map[string]database.CandidateHistory, libraryItemID int64, upgradeSearch bool, currentSelected *database.ReleaseSummary) (SearchResult, *int64, []database.SearchCandidateRecord, error) {
 	packInput := input
 	packInput.EpisodeNumber = 0 // season pack: no episode
 
@@ -2064,6 +2081,16 @@ func (s *Service) trySeasonPack(ctx context.Context, input database.LibrarySearc
 		// Hydra returns when querying by TVDB ID + season without an episode
 		// number. Keeps season packs and obfuscated NZBs (no episode token).
 		candidates = filterToPacksOnly(candidates, input.SeasonNumber)
+		if upgradeSearch {
+			// A season pack must clear the same "genuinely better than the
+			// current release" bar as any other upgrade candidate -- without
+			// this, a lateral or worse-scoring pack could still replace a
+			// working release during an upgrade search, and an ungated pack
+			// candidate pre-seeded into the caller's combinedCandidates could
+			// even outrank a properly-gated tier1/2 candidate in the merged
+			// selection.
+			candidates = applyUpgradeMinimums(candidates, currentSelected, profilePrefs.MinimumUpgradeCustomFormatScore)
+		}
 		combinedCandidates = mergeSearchCandidates(combinedCandidates, candidates)
 		selectedReleaseID, err = s.repo.ReplaceSearchCandidates(ctx, libraryItemID, combinedCandidates, upgradeSearch)
 		if err != nil {

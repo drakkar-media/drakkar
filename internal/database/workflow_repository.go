@@ -1168,8 +1168,22 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 		hasExisting                bool
 	)
 	if upgradeSearch {
+		// Join through queue_items rather than a bare "where library_item_id
+		// = $1" -- selected_releases has no unique constraint on
+		// library_item_id (confirmed live: 138 library items currently carry
+		// stale duplicate rows from before that race was fixed elsewhere),
+		// so an unordered, unfiltered query here could nondeterministically
+		// capture the WRONG row as "the existing selection to preserve" for
+		// any of those items, corrupting queue_items.selected_release_id to
+		// point at a stale/orphaned release instead of the one actually
+		// being served. queue_items.selected_release_id is the single source
+		// of truth for which row is genuinely active (matches
+		// GetLatestSelectedReleaseSummaryByLibraryItem's own join pattern).
 		err = tx.QueryRowContext(ctx, `
-			select id, release_candidate_id from selected_releases where library_item_id = $1`,
+			select sr.id, sr.release_candidate_id
+			from selected_releases sr
+			join queue_items q on q.library_item_id = sr.library_item_id
+			where sr.library_item_id = $1 and q.selected_release_id = sr.id`,
 			libraryItemID,
 		).Scan(&existingSelectedReleaseID, &existingReleaseCandidateID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {

@@ -20,40 +20,41 @@ import (
 type repoStub struct {
 	persistedDispatchedURLsMu sync.Mutex
 	persistedDispatchedURLs   map[string]bool
-	requests                []database.MediaRequestSummary
-	searchInput             database.LibrarySearchInput
-	searchInputByItem       map[int64]database.LibrarySearchInput
-	history                 map[string]database.CandidateHistory
-	defaultProfile          database.QualityProfile
-	itemProfile             *database.QualityProfile
-	conflict                string
-	searchApplied           []database.SearchCandidateRecord
-	searchFailed            []string
-	pending                 []database.PendingLibrarySearchTarget
-	backlog                 int
-	selectedBacklog         int
-	failedQueues            []database.FailedQueueRetryTarget
-	selectedQueues          []database.SelectedQueueRetryTarget
-	upgradable              []int64
-	movieCalls              int
-	tvCalls                 int
-	fetching                int64
-	imported                database.ImportedNZB
-	indexed                 int64
-	selected                database.ReleaseSummary
-	selectedByID            map[int64]database.ReleaseSummary
-	promoted                *database.ReleaseSummary
-	alternative             *database.ReleaseSummary
-	next                    *database.ReleaseSummary
-	failed                  []string
-	rejected                []string
-	retryTarget             database.QueueRetryTarget
-	skipped                 []int64
-	requeued                []int64
-	stored                  database.StoredNZBDocument
-	restoredGroup           []int64
-	calibrateFn             func(context.Context, int64) error
-	movieMeta               struct {
+	requests                  []database.MediaRequestSummary
+	searchInput               database.LibrarySearchInput
+	searchInputByItem         map[int64]database.LibrarySearchInput
+	history                   map[string]database.CandidateHistory
+	defaultProfile            database.QualityProfile
+	itemProfile               *database.QualityProfile
+	conflict                  string
+	searchApplied             []database.SearchCandidateRecord
+	lastUpgradeSearch         bool
+	searchFailed              []string
+	pending                   []database.PendingLibrarySearchTarget
+	backlog                   int
+	selectedBacklog           int
+	failedQueues              []database.FailedQueueRetryTarget
+	selectedQueues            []database.SelectedQueueRetryTarget
+	upgradable                []int64
+	movieCalls                int
+	tvCalls                   int
+	fetching                  int64
+	imported                  database.ImportedNZB
+	indexed                   int64
+	selected                  database.ReleaseSummary
+	selectedByID              map[int64]database.ReleaseSummary
+	promoted                  *database.ReleaseSummary
+	alternative               *database.ReleaseSummary
+	next                      *database.ReleaseSummary
+	failed                    []string
+	rejected                  []string
+	retryTarget               database.QueueRetryTarget
+	skipped                   []int64
+	requeued                  []int64
+	stored                    database.StoredNZBDocument
+	restoredGroup             []int64
+	calibrateFn               func(context.Context, int64) error
+	movieMeta                 struct {
 		libraryItemID int64
 		tmdbID        int64
 		title         string
@@ -193,6 +194,7 @@ func (r *repoStub) InsertManualReleaseCandidate(ctx context.Context, libraryItem
 
 func (r *repoStub) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord, upgradeSearch bool) (*int64, error) {
 	r.searchApplied = candidates
+	r.lastUpgradeSearch = upgradeSearch
 	if len(candidates) == 0 || candidates[0].Rejected {
 		return nil, nil
 	}
@@ -3307,5 +3309,122 @@ func TestApplyUpgradeMinimumsAlsoAppliesCustomFormatFloor(t *testing.T) {
 	got := applyUpgradeMinimums(candidates, current, 25)
 	if !got[0].Rejected || got[0].RejectReason != "upgrade_custom_format_score" {
 		t.Fatalf("expected rejection for failing the custom-format floor despite a higher overall score, got %+v", got[0])
+	}
+}
+
+// TestTrySeasonPackAppliesUpgradeMinimums guards a real gap found in the
+// 2026-07-19 full-audit follow-up: trySeasonPack threaded upgradeSearch
+// straight into ReplaceSearchCandidates but never applied
+// applyUpgradeMinimums to its own candidates -- during an upgrade search, a
+// lateral or worse-scoring season pack could still replace a working
+// release, unlike the tier1/tier2 path which was correctly gated. This test
+// calls trySeasonPack directly with an upgrade-search baseline no realistic
+// candidate could beat, and confirms the pack is rejected, not selected.
+func TestTrySeasonPackAppliesUpgradeMinimums(t *testing.T) {
+	repo := &repoStub{}
+	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
+		{Title: "Loki.Season.1.Complete.1080p.WEB-DL", Link: "http://example/pack", Indexer: "hydra", SizeBytes: 5000, PublishedAt: time.Now()},
+	}})
+
+	input := database.LibrarySearchInput{
+		LibraryItemID: 42,
+		MediaType:     "episode",
+		ShowTitle:     "Loki",
+		ShowYear:      2021,
+		SeasonNumber:  1,
+		EpisodeNumber: 2,
+	}
+	// A baseline score no realistic fresh candidate could ever beat --
+	// simulates an upgrade search where nothing genuinely better exists.
+	currentSelected := &database.ReleaseSummary{Score: 1_000_000}
+
+	_, selectedReleaseID, _, err := service.trySeasonPack(context.Background(), input, map[string]database.CandidateHistory{}, 42, true, currentSelected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selectedReleaseID != nil {
+		t.Fatalf("expected the season pack to be rejected as not a genuine upgrade, got selected release %d", *selectedReleaseID)
+	}
+	if len(repo.searchApplied) != 1 {
+		t.Fatalf("expected exactly one pack candidate recorded, got %+v", repo.searchApplied)
+	}
+	if !repo.searchApplied[0].Rejected || repo.searchApplied[0].RejectReason != "not_an_upgrade" {
+		t.Fatalf("expected the pack candidate rejected as not_an_upgrade, got %+v", repo.searchApplied[0])
+	}
+	if !repo.lastUpgradeSearch {
+		t.Fatalf("expected ReplaceSearchCandidates to be called with upgradeSearch=true")
+	}
+}
+
+// TestSearchLibraryTreatsExistingSelectionAsUpgradeSearch guards a real
+// critical bug found in the 2026-07-19 full-audit: the manual "Find
+// Replacements"/"Manual Replace" flow (POST /api/library/{id}/replacements)
+// calls SearchLibrary, which unconditionally passed upgradeSearch=false --
+// so it reused the exact "destroy the working release before confirming a
+// genuine replacement" bug that commit 9da7d13 fixed for SearchUpgrades,
+// just via a different, very much still-reachable entry point. SearchLibrary
+// must now dynamically treat any item that already has a working selection
+// as an upgrade search, regardless of which caller reached it.
+func TestSearchLibraryTreatsExistingSelectionAsUpgradeSearch(t *testing.T) {
+	repo := &repoStub{
+		searchInput: database.LibrarySearchInput{
+			LibraryItemID: 42,
+			MediaType:     "movie",
+			Title:         "Dune",
+			MovieYear:     2021,
+		},
+		selected: database.ReleaseSummary{
+			SelectedReleaseID:  90,
+			LibraryItemID:      42,
+			Score:              1_000_000, // no fresh candidate could beat this
+			ReleaseCandidateID: 9,
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
+		{Title: "Dune.2021.1080p.WEB-DL.Atmos-GRP", Link: "http://example/nzb", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+	}})
+
+	result, err := service.SearchLibrary(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !repo.lastUpgradeSearch {
+		t.Fatal("expected SearchLibrary to treat an item with an existing selection as an upgrade search")
+	}
+	if result.SelectedReleaseID != nil {
+		t.Fatalf("expected no replacement for an item whose existing release cannot be beaten, got %+v", result)
+	}
+}
+
+// TestSearchLibraryTreatsNewItemAsNonUpgradeSearch is the other half: a
+// brand-new item with no existing selection must keep ordinary (non-upgrade)
+// search semantics -- nothing to protect, so the first candidate found should
+// be selected normally, matching pre-fix behavior for this case.
+func TestSearchLibraryTreatsNewItemAsNonUpgradeSearch(t *testing.T) {
+	repo := &repoStub{
+		searchInput: database.LibrarySearchInput{
+			LibraryItemID: 42,
+			MediaType:     "movie",
+			Title:         "Dune",
+			MovieYear:     2021,
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
+		{Title: "Dune.2021.1080p.WEB-DL.Atmos-GRP", Link: "http://example/nzb", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+	}})
+	service.fetcher = fetcherStub{
+		fileName: "dune.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Dune.mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+	}
+
+	result, err := service.SearchLibrary(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.lastUpgradeSearch {
+		t.Fatal("expected a brand-new item with no existing selection to use non-upgrade search semantics")
+	}
+	if result.SelectedReleaseID == nil {
+		t.Fatalf("expected the fresh candidate to be selected normally, got %+v", result)
 	}
 }

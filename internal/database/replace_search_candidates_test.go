@@ -250,3 +250,142 @@ func TestReplaceSearchCandidatesNonUpgradeSearchStillReplacesUnconditionally(t *
 		t.Fatalf("expected exactly 1 selected_releases row, got %d", count)
 	}
 }
+
+// TestReplaceSearchCandidatesUpgradeSearchIgnoresStaleDuplicateSelectedRelease
+// guards a real production data-integrity gap found live (2026-07-19): 138
+// library items currently carry a stale, orphaned second selected_releases
+// row from before an earlier concurrent-selection race was fixed elsewhere
+// (selected_releases has no unique constraint on library_item_id). The
+// original version of the upgrade-search fix queried
+// "select id, release_candidate_id from selected_releases where
+// library_item_id = $1" with no ordering and no join to queue_items -- for
+// any of those 138 items, Postgres could return either row nondeterministically,
+// so an upgrade search that found nothing better could silently overwrite
+// queue_items.selected_release_id to point at the WRONG (stale, orphaned)
+// release instead of the one actually being served, breaking playback. The
+// query must always resolve to whichever row queue_items.selected_release_id
+// actually points to -- the single source of truth for which selection is
+// genuinely active -- matching GetLatestSelectedReleaseSummaryByLibraryItem's
+// own join pattern.
+func TestReplaceSearchCandidatesUpgradeSearchIgnoresStaleDuplicateSelectedRelease(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	// Insert the STALE, orphaned selected_releases row FIRST -- matching the
+	// actual production sequence (an old duplicate-selection race left an
+	// earlier row behind, then a later, correct selection created the real
+	// active one) -- so this test discriminates against a naive "no ORDER
+	// BY, no join" query the same way Postgres's default (unordered, often
+	// insertion-order-following) scan did live: without the queue_items join,
+	// this stale row -- not the active one -- is what such a query returns.
+	title := "upgrade-stale-duplicate"
+	var libID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('movie', $1, true)
+		returning id`, title).Scan(&libID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into queue_items (library_item_id, state, idempotency_key)
+		values ($1, 'available', $2)`, libID, title,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	var staleReleaseCandidateID, staleSelectedReleaseID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, score, selected)
+		values ($1, 'Stale Orphaned Release', 300, false)
+		returning id`, libID).Scan(&staleReleaseCandidateID); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, libID, staleReleaseCandidateID).Scan(&staleSelectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now the ACTIVE release, created after the stale one, matching
+	// production's actual row order.
+	var activeReleaseCandidateID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, score, selected)
+		values ($1, 'Existing Working Release', 500, true)
+		returning id`, libID).Scan(&activeReleaseCandidateID); err != nil {
+		t.Fatal(err)
+	}
+	var activeSelectedReleaseID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, libID, activeReleaseCandidateID).Scan(&activeSelectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `
+		update queue_items set selected_release_id = $2 where library_item_id = $1`,
+		libID, activeSelectedReleaseID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var activeVirtualFileID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, size_bytes, reader_kind)
+		values ($1, $2, 'movie.mkv', 1000, 'direct_nzb')
+		returning id`, activeSelectedReleaseID, "releases/"+title+"/movie.mkv").Scan(&activeVirtualFileID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Upgrade search finds nothing better -- must preserve the ACTIVE
+	// selection (the one queue_items points to), not the stale duplicate.
+	candidates := []SearchCandidateRecord{
+		{Title: "Not Actually Better", Score: 300, Rejected: true, RejectReason: "not_an_upgrade"},
+	}
+	selectedReleaseID, err := db.ReplaceSearchCandidates(ctx, libID, candidates, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selectedReleaseID != nil {
+		t.Fatalf("expected no new selection, got %d", *selectedReleaseID)
+	}
+
+	var qState string
+	var qSelectedReleaseID sql.NullInt64
+	if err := sqlDB.QueryRowContext(ctx, `select state, selected_release_id from queue_items where library_item_id = $1`, libID).
+		Scan(&qState, &qSelectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+	if !qSelectedReleaseID.Valid || qSelectedReleaseID.Int64 != activeSelectedReleaseID {
+		t.Fatalf("expected queue_items.selected_release_id to still be the ACTIVE row %d (the one it pointed to before the search), got %+v -- the stale duplicate (%d) must never be preferred",
+			activeSelectedReleaseID, qSelectedReleaseID, staleSelectedReleaseID)
+	}
+
+	// The active release's own row, candidate, virtual_files, and symlink
+	// must all survive untouched.
+	var survivingReleaseCandidateID int64
+	if err := sqlDB.QueryRowContext(ctx, `select release_candidate_id from selected_releases where id = $1`, activeSelectedReleaseID).
+		Scan(&survivingReleaseCandidateID); err != nil {
+		t.Fatalf("expected the active selected_releases row to survive: %v", err)
+	}
+	if survivingReleaseCandidateID != activeReleaseCandidateID {
+		t.Fatalf("expected active release_candidate_id %d unchanged, got %d", activeReleaseCandidateID, survivingReleaseCandidateID)
+	}
+	var vfCount int
+	if err := sqlDB.QueryRowContext(ctx, `select count(*) from virtual_files where id = $1`, activeVirtualFileID).Scan(&vfCount); err != nil {
+		t.Fatal(err)
+	}
+	if vfCount != 1 {
+		t.Fatalf("expected the active release's virtual_files row to survive, found %d", vfCount)
+	}
+}
