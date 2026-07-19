@@ -289,13 +289,37 @@ func (db *DB) CalibrateNZBOffsetsBatch(ctx context.Context, limit int) (int, err
 // in both cases.
 func (db *DB) isArticlePermanentlyMissing(ctx context.Context, messageID string, decodeErr error) bool {
 	if errors.Is(decodeErr, yenc.ErrCRCMismatch) {
-		return true
+		return db.confirmPermanentCRCMismatch(ctx, messageID)
 	}
 	checker, ok := db.SegmentFetcher.(SegmentChecker)
 	if !ok || checker == nil {
 		return false
 	}
 	return errors.Is(checker.Exists(ctx, messageID), nntp.ErrArticleMissing)
+}
+
+// confirmPermanentCRCMismatch re-fetches and re-decodes messageID independently
+// before concluding a CRC mismatch is a permanent property of the article
+// rather than a one-off transient glitch. Verified live against a production
+// false positive: an article Drakkar had just flagged "yenc crc mismatch" and
+// marked permanently skipped decoded perfectly cleanly on an out-of-band
+// manual refetch, with a CRC matching its own declared checksum exactly --
+// the single-observation check was trusting a fluke (most likely a corrupted
+// read under the heavy concurrent NNTP load a mass health-check run puts on
+// the connection pool) as if it were proof of real corruption. Since Usenet
+// articles are immutable, genuine corruption reproduces on every independent
+// fetch; a fluke does not -- this is the same distinction the STAT-based
+// missing-article check below already gets for free from being a completely
+// separate mechanism, which the CRC path lacked entirely.
+func (db *DB) confirmPermanentCRCMismatch(ctx context.Context, messageID string) bool {
+	sizer, ok := db.SegmentFetcher.(SegmentSizer)
+	if !ok || sizer == nil {
+		// Can't re-fetch to confirm -- trust the single observation rather
+		// than retrying forever with no way to ever resolve it.
+		return true
+	}
+	_, err := sizer.DecodedSize(ctx, messageID)
+	return errors.Is(err, yenc.ErrCRCMismatch)
 }
 
 // CalibrateNZBOffsets corrects segment decoded offsets for all files in an NZB

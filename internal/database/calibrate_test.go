@@ -94,6 +94,86 @@ func TestIsArticlePermanentlyMissingCRCMismatch(t *testing.T) {
 	}
 }
 
+// fakeSegmentSizer stands in for the SegmentSizer half of db.SegmentFetcher
+// (fakeSegmentChecker above only implements SegmentChecker/Exists) so tests
+// can exercise confirmPermanentCRCMismatch's re-fetch path.
+type fakeSegmentSizer struct {
+	checkErr  error
+	sizeErr   error
+	callCount int
+}
+
+func (f *fakeSegmentSizer) FetchRange(ctx context.Context, segment stream.SegmentRange) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (f *fakeSegmentSizer) Exists(ctx context.Context, messageID string) error {
+	return f.checkErr
+}
+
+func (f *fakeSegmentSizer) DecodedSize(ctx context.Context, messageID string) (int64, error) {
+	f.callCount++
+	if f.sizeErr != nil {
+		return 0, f.sizeErr
+	}
+	return 1024, nil
+}
+
+// TestIsArticlePermanentlyMissingCRCMismatchConfirmedOnRefetch guards the
+// 2026-07-19 false-positive fix: a production article flagged "yenc crc
+// mismatch" and marked permanently skipped turned out, on an independent
+// out-of-band refetch, to decode perfectly cleanly with a CRC matching its
+// own declared checksum -- the single-observation check had no way to catch
+// that. A CRC mismatch must now be confirmed by an independent re-fetch
+// before being treated as permanent.
+func TestIsArticlePermanentlyMissingCRCMismatchConfirmedOnRefetch(t *testing.T) {
+	sizer := &fakeSegmentSizer{sizeErr: yenc.ErrCRCMismatch}
+	db := &DB{SegmentFetcher: sizer}
+	if !db.isArticlePermanentlyMissing(context.Background(), "<msg1>", yenc.ErrCRCMismatch) {
+		t.Fatal("expected a CRC mismatch confirmed by re-fetch to be treated as permanent")
+	}
+	if sizer.callCount != 1 {
+		t.Fatalf("expected exactly one confirmation re-fetch, got %d", sizer.callCount)
+	}
+}
+
+// TestIsArticlePermanentlyMissingCRCMismatchNotConfirmedOnRefetch is the other
+// half: if the independent re-fetch decodes cleanly, the original mismatch
+// was a fluke (e.g. a corrupted read under heavy concurrent NNTP load), not
+// real corruption -- must NOT be marked permanent.
+func TestIsArticlePermanentlyMissingCRCMismatchNotConfirmedOnRefetch(t *testing.T) {
+	sizer := &fakeSegmentSizer{} // DecodedSize succeeds on retry
+	db := &DB{SegmentFetcher: sizer}
+	if db.isArticlePermanentlyMissing(context.Background(), "<msg1>", yenc.ErrCRCMismatch) {
+		t.Fatal("expected a CRC mismatch that does NOT reproduce on re-fetch to NOT be treated as permanent")
+	}
+}
+
+// TestIsArticlePermanentlyMissingCRCMismatchTransientOnRefetch: if the
+// confirmation re-fetch itself fails for an unrelated, transient reason
+// (timeout, throttle), that's inconclusive, not confirmation -- must fall
+// through to "retry later", not lock in a permanent verdict off a single
+// flaky attempt.
+func TestIsArticlePermanentlyMissingCRCMismatchTransientOnRefetch(t *testing.T) {
+	sizer := &fakeSegmentSizer{sizeErr: context.DeadlineExceeded}
+	db := &DB{SegmentFetcher: sizer}
+	if db.isArticlePermanentlyMissing(context.Background(), "<msg1>", yenc.ErrCRCMismatch) {
+		t.Fatal("expected an inconclusive (transient) re-fetch error to NOT be treated as permanent")
+	}
+}
+
+// TestIsArticlePermanentlyMissingCRCMismatchNoSizerAvailable: when the
+// configured SegmentFetcher can't re-fetch at all (no SegmentSizer support),
+// fall back to trusting the single observation rather than retrying forever
+// with no way to ever resolve it -- matches fakeSegmentChecker-only setups
+// like TestIsArticlePermanentlyMissingCRCMismatch above.
+func TestIsArticlePermanentlyMissingCRCMismatchNoSizerAvailable(t *testing.T) {
+	db := &DB{SegmentFetcher: &fakeSegmentChecker{checkErr: nil}}
+	if !db.isArticlePermanentlyMissing(context.Background(), "<msg1>", yenc.ErrCRCMismatch) {
+		t.Fatal("expected fallback to trust the single observation when re-fetch isn't possible")
+	}
+}
+
 // fakeCachedMissError mimics internal/nntp's articleNotFoundError: a cache
 // HIT for an already-confirmed-missing article, returned as a distinct type
 // from nntp.ErrArticleMissing that reports itself as that sentinel via the
