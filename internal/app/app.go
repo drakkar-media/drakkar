@@ -70,7 +70,6 @@ const (
 const (
 	backgroundHealthCheckInterval = 15 * time.Minute
 	backgroundDeepHealthBatchSize = 48
-	backgroundDeepHealthSkipDepth = 150
 	pendingQueueDispatchInterval  = 30 * time.Second
 	nonCriticalBacklogThreshold   = 1000
 	nonCriticalQueueDepthLimit    = 500
@@ -744,7 +743,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		logger.Info().Int("processed", result.Processed).Int("searched", result.Searched).Msg("backlog search: complete")
 	}
 
-	shouldSkipNonCriticalMaintenance := func(taskName string) (bool, string) {
+	shouldSkipNonCriticalMaintenance := func() (bool, string) {
 		backlog, err := db.CountActiveSearchBacklog(ctx)
 		if err == nil && backlog >= nonCriticalBacklogThreshold {
 			return true, fmt.Sprintf("search backlog high (%d)", backlog)
@@ -759,7 +758,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 
 	// publishing_maintenance: republish pending + reset orphaned, every 30 min.
 	runPublishingMaintenance := func() {
-		if skip, reason := shouldSkipNonCriticalMaintenance(taskPublishingMaintenance); skip {
+		if skip, reason := shouldSkipNonCriticalMaintenance(); skip {
 			logger.Info().Str("task", taskPublishingMaintenance).Str("reason", reason).Msg("scheduler: skipping non-critical task")
 			return
 		}
@@ -880,7 +879,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		} else if deleted > 0 {
 			logger.Info().Int64("deletedRows", deleted).Msg("monitoring: pruned recent URL fetch records")
 		}
-		if skip, reason := shouldSkipNonCriticalMaintenance(taskStorageMaintenance); skip {
+		if skip, reason := shouldSkipNonCriticalMaintenance(); skip {
 			logger.Info().Str("task", taskStorageMaintenance).Str("reason", reason).Msg("scheduler: skipping non-critical (filesystem-heavy) storage maintenance")
 			return
 		}
@@ -901,7 +900,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// content_maintenance: fill missing episodes + upgrade search, every 6h.
 	// Load-gated so it doesn't compete with active backlog processing.
 	runContentMaintenance := func() {
-		if skip, reason := shouldSkipNonCriticalMaintenance(taskContentMaintenance); skip {
+		if skip, reason := shouldSkipNonCriticalMaintenance(); skip {
 			logger.Info().Str("task", taskContentMaintenance).Str("reason", reason).Msg("scheduler: skipping non-critical task")
 			return
 		}
