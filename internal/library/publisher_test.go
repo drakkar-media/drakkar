@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,18 +17,19 @@ import (
 )
 
 type repoStub struct {
-	files       []database.ReleaseVirtualFile
-	publicated  []database.CompletedSymlinkEntry
-	available   int64
-	selected    []int64
-	byLibrary   []int64
-	pending     []database.PendingRepublishTarget
-	matches     []database.SeasonPackEpisodeMatch
-	episodeMeta map[int64]database.EpisodeMetadata
-	createCalls int
-	fulfilled   []int64
-	virtualData map[int64][]byte
-	virtualErr  map[int64]error
+	files         []database.ReleaseVirtualFile
+	publicated    []database.CompletedSymlinkEntry
+	available     int64
+	selected      []int64
+	byLibrary     []int64
+	pending       []database.PendingRepublishTarget
+	matches       []database.SeasonPackEpisodeMatch
+	episodeMeta   map[int64]database.EpisodeMetadata
+	createCalls   int
+	fulfilled     []int64
+	virtualData   map[int64][]byte
+	virtualErr    map[int64]error
+	sourceRelease int64
 }
 
 func (r *repoStub) ListVirtualFilesForRelease(ctx context.Context, selectedReleaseID int64) ([]database.ReleaseVirtualFile, error) {
@@ -60,7 +63,7 @@ func (r *repoStub) ListPendingRepublishTargets(ctx context.Context) ([]database.
 }
 
 func (r *repoStub) FindSourceSelectedReleaseForItem(_ context.Context, _ int64) (int64, error) {
-	return 0, nil
+	return r.sourceRelease, nil
 }
 func (r *repoStub) GetEpisodeMetadataForLibraryItem(_ context.Context, libraryItemID int64) (database.EpisodeMetadata, error) {
 	if r.episodeMeta == nil {
@@ -592,5 +595,66 @@ func TestRebuildPublicationsDoesNotNotifyMediaServers(t *testing.T) {
 	}
 	if len(notified) != 0 {
 		t.Fatalf("expected no media server notifications during startup rebuild, got %v", notified)
+	}
+}
+
+// TestRepublishEpisodeFromSourceReleaseRefreshesContentDir guards a gap found
+// in the 2026-07-19 audit: republishEpisodeFromSourceRelease (the season-pack
+// episode fallback path, reached when a library item has no selected_releases
+// of its own and must borrow a virtual file from the pack's source release)
+// only refreshed the libraryPath's rclone VFS cache, never the content
+// directory the new symlink actually points into -- unlike its two sibling
+// publish functions in this file. Uses a real httptest RC server (not an
+// empty rcAddr, which every other test in this file uses and which
+// short-circuits before any path is ever computed) to prove both refresh
+// calls actually reach rclone with the right path.
+func TestRepublishEpisodeFromSourceReleaseRefreshesContentDir(t *testing.T) {
+	var refreshedDirs []string
+	rc := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		refreshedDirs = append(refreshedDirs, r.Form.Get("dir"))
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer rc.Close()
+
+	root := t.TempDir()
+	repo := &repoStub{
+		byLibrary:     nil, // no selected_releases of its own -- forces the source-release fallback
+		sourceRelease: 77,
+		episodeMeta: map[int64]database.EpisodeMetadata{
+			22: {ShowTitle: "Loki", ShowYear: 2021, SeasonNumber: 1, EpisodeNumber: 2},
+		},
+		files: []database.ReleaseVirtualFile{
+			{
+				VirtualFileID:     11,
+				SelectedReleaseID: 77,
+				Path:              "releases/77/Loki.S01E02.mkv",
+				FileName:          "Loki.S01E02.mkv",
+			},
+		},
+	}
+	rt := config.DefaultRuntime()
+	rt.TVLibraryPath = filepath.Join(root, "tv")
+	rt.FuseMountPath = filepath.Join(root, "vfs")
+	publisher := NewPublisher(repo, rt, rc.URL)
+
+	if err := publisher.RepublishLibraryItem(context.Background(), 22); err != nil {
+		t.Fatal(err)
+	}
+
+	wantContentDir := filepath.Join(root, "vfs", "content", "releases", "77")
+	foundContentDirRefresh := false
+	for _, d := range refreshedDirs {
+		if d == "/content/releases/77" {
+			foundContentDirRefresh = true
+		}
+	}
+	if !foundContentDirRefresh {
+		t.Fatalf("expected a refresh for the content directory %s (as /content/releases/77 relative to the mount), got refreshed dirs: %v", wantContentDir, refreshedDirs)
+	}
+	if len(repo.publicated) != 1 {
+		t.Fatalf("expected the symlink to be published, got %+v", repo.publicated)
 	}
 }

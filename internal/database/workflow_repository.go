@@ -1165,6 +1165,7 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 	var (
 		existingSelectedReleaseID  int64
 		existingReleaseCandidateID int64
+		existingScore              int
 		hasExisting                bool
 	)
 	if upgradeSearch {
@@ -1180,18 +1181,29 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 		// of truth for which row is genuinely active (matches
 		// GetLatestSelectedReleaseSummaryByLibraryItem's own join pattern).
 		err = tx.QueryRowContext(ctx, `
-			select sr.id, sr.release_candidate_id
+			select sr.id, sr.release_candidate_id, rc.score
 			from selected_releases sr
 			join queue_items q on q.library_item_id = sr.library_item_id
+			join release_candidates rc on rc.id = sr.release_candidate_id
 			where sr.library_item_id = $1 and q.selected_release_id = sr.id`,
 			libraryItemID,
-		).Scan(&existingSelectedReleaseID, &existingReleaseCandidateID)
+		).Scan(&existingSelectedReleaseID, &existingReleaseCandidateID, &existingScore)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
 		hasExisting = err == nil
 		err = nil
 	}
+	// A defensive, race-free re-check: the caller (applyUpgradeMinimums)
+	// already rejects candidates that don't beat its own snapshot of the
+	// current release's score, but that snapshot is read well before this
+	// transaction/lock -- taken before any Hydra network I/O, which can take
+	// seconds. In that window a concurrent manual SelectReleaseCandidate (or
+	// a failure-triggered promotion) can install a different, better release
+	// that the caller's snapshot never saw. requireBeatExisting re-validates
+	// against the row actually locked here, at commit time, independent of
+	// whatever the caller believed earlier.
+	requireBeatExisting := upgradeSearch && hasExisting
 
 	if _, err = tx.ExecContext(ctx, `
 		update queue_items
@@ -1239,7 +1251,7 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 				candidate.RejectReason = reason
 			}
 		}
-		shouldSelect := !selectedAssigned && !candidate.Rejected
+		shouldSelect := !selectedAssigned && !candidate.Rejected && (!requireBeatExisting || candidate.Score > existingScore)
 		var releaseCandidateID int64
 		if err = tx.QueryRowContext(ctx, `
 			insert into release_candidates (

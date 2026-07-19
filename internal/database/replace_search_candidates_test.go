@@ -389,3 +389,59 @@ func TestReplaceSearchCandidatesUpgradeSearchIgnoresStaleDuplicateSelectedReleas
 		t.Fatalf("expected the active release's virtual_files row to survive, found %d", vfCount)
 	}
 }
+
+// TestReplaceSearchCandidatesRejectsCandidateNotBeatingFreshExistingScore
+// guards the race found in the 2026-07-19 audit: applyUpgradeMinimums (the
+// Go-side "must be a genuine upgrade" gate) snapshots the current release's
+// score once, well before any Hydra network I/O -- which can take seconds.
+// In that window, a concurrent manual SelectReleaseCandidate (unguarded by
+// searchInflight) can install a better release than the stale snapshot ever
+// saw; a fresh Hydra candidate that only beat the STALE score could then
+// silently downgrade the user's just-made pick. ReplaceSearchCandidates must
+// independently re-check the candidate's score against the row it actually
+// has locked at commit time, not just trust the caller's earlier gating.
+func TestReplaceSearchCandidatesRejectsCandidateNotBeatingFreshExistingScore(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	libID, activeSelectedReleaseID, activeReleaseCandidateID, _ := setupWorkingLibraryItem(t, ctx, sqlDB, "upgrade-race-fresh-score")
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+
+	// Simulate a concurrent manual pick installing a better release AFTER
+	// the caller's applyUpgradeMinimums snapshot was taken (score 500) but
+	// BEFORE this ReplaceSearchCandidates call commits.
+	if _, err := sqlDB.ExecContext(ctx, `update release_candidates set score = 950 where id = $1`, activeReleaseCandidateID); err != nil {
+		t.Fatal(err)
+	}
+
+	// This candidate (score 700) would have passed the caller's stale gate
+	// (700 > the snapshot's 500) and arrives here NOT rejected -- exactly
+	// what a real race would produce.
+	candidates := []SearchCandidateRecord{
+		{Title: "Passed Stale Gate But Not Actually Better", Score: 700, Rejected: false},
+	}
+	selectedReleaseID, err := db.ReplaceSearchCandidates(ctx, libID, candidates, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selectedReleaseID != nil {
+		t.Fatalf("expected the candidate to be rejected by the fresh re-check (700 does not beat the actual current score 950), got selected release %d", *selectedReleaseID)
+	}
+
+	var qSelectedReleaseID sql.NullInt64
+	if err := sqlDB.QueryRowContext(ctx, `select selected_release_id from queue_items where library_item_id = $1`, libID).Scan(&qSelectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+	if !qSelectedReleaseID.Valid || qSelectedReleaseID.Int64 != activeSelectedReleaseID {
+		t.Fatalf("expected the concurrently-installed better release %d to survive untouched, got %+v", activeSelectedReleaseID, qSelectedReleaseID)
+	}
+}

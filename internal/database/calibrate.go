@@ -228,12 +228,29 @@ func (db *DB) CalibrateAllNZBOffsets(ctx context.Context) error {
 		return err
 	}
 	for _, id := range ids {
-		if err := db.CalibrateNZBOffsets(ctx, id); err != nil {
+		if err := func() error {
+			docCtx, cancel := context.WithTimeout(ctx, perDocumentCalibrateBudget)
+			defer cancel()
+			return db.CalibrateNZBOffsets(docCtx, id)
+		}(); err != nil {
 			slog.Warn("calibrate all: failed for document", "nzb_document_id", id, "err", err)
 		}
 	}
 	return nil
 }
+
+// perDocumentCalibrateBudget bounds how long CalibrateNZBOffsetsBatch spends
+// on any single document -- matching workflow's asyncCalibrateBudget (the
+// import-time calibration path already had this cap). Found live in the
+// 2026-07-19 audit: without it, a document with many consecutive genuinely-
+// corrupt segments could stall the whole periodic health-check batch for
+// tens of minutes (confirmCRCMismatchAttempts * confirmCRCMismatchDelay per
+// corrupt file, with no early-exit and no per-document cap), silently
+// degrading the 15-minute maintenance cadence for every OTHER document still
+// waiting in that batch.
+// A var, not a const, so tests can shrink it instead of a real test run
+// waiting out the full budget.
+var perDocumentCalibrateBudget = 2 * time.Minute
 
 // CalibrateNZBOffsetsBatch calibrates up to limit NZB documents that still have
 // uncalibrated files. Returns the number of documents processed.
@@ -259,7 +276,11 @@ func (db *DB) CalibrateNZBOffsetsBatch(ctx context.Context, limit int) (int, err
 		if ctx.Err() != nil {
 			break
 		}
-		if err := db.CalibrateNZBOffsets(ctx, id); err != nil {
+		if err := func() error {
+			docCtx, cancel := context.WithTimeout(ctx, perDocumentCalibrateBudget)
+			defer cancel()
+			return db.CalibrateNZBOffsets(docCtx, id)
+		}(); err != nil {
 			slog.Warn("calibrate batch: failed for document", "nzb_document_id", id, "err", err)
 		}
 	}
@@ -395,6 +416,13 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 	}
 
 	for _, f := range files {
+		if ctx.Err() != nil {
+			// Budget (perDocumentCalibrateBudget) or caller cancellation
+			// expired -- stop attempting further files in this document now
+			// rather than making each one fail-fast individually; they stay
+			// calibrated_at IS NULL and are retried on a later pass.
+			break
+		}
 		actualFirst, err := sizer.DecodedSize(ctx, f.firstMsgID)
 		if err != nil {
 			if !db.isArticlePermanentlyMissing(ctx, f.firstMsgID, err) {

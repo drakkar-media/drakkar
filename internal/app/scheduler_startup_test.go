@@ -64,3 +64,31 @@ func TestShouldRunRecentOnStartup(t *testing.T) {
 		}
 	})
 }
+
+// TestLacksSchedulerLaneHeadroom guards the gap found in the 2026-07-19
+// audit: the NNTP scheduler's foreground and background lanes each draw
+// maxDownloadConnections workers from the SAME shared per-provider
+// connection pool (sized at totalWorkers, the raw account ceiling) -- if
+// that pool doesn't have room for both lanes at once, a background
+// calibration/health-check burst can delay foreground playback fetches,
+// defeating the point of having separate lanes at all.
+func TestLacksSchedulerLaneHeadroom(t *testing.T) {
+	cases := []struct {
+		name                   string
+		totalWorkers           int
+		maxDownloadConnections int
+		want                   bool
+	}{
+		{"comfortable headroom (this repo's production config: 100 vs 15)", 100, 15, false},
+		{"exactly zero headroom (checked-in sample config: 30 vs 15)", 30, 15, true},
+		{"less than zero headroom", 20, 15, true},
+		{"just barely enough headroom", 31, 15, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := lacksSchedulerLaneHeadroom(tc.totalWorkers, tc.maxDownloadConnections); got != tc.want {
+				t.Fatalf("lacksSchedulerLaneHeadroom(%d, %d) = %v, want %v", tc.totalWorkers, tc.maxDownloadConnections, got, tc.want)
+			}
+		})
+	}
+}

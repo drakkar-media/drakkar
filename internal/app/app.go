@@ -315,6 +315,24 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		if maxDownloadConnections > totalWorkers {
 			maxDownloadConnections = totalWorkers
 		}
+		// The foreground and background scheduler lanes (below) are each
+		// sized at maxDownloadConnections, but both draw from the SAME
+		// per-provider connection pool (sized at the raw account ceiling,
+		// totalWorkers) -- the pool itself has no priority awareness, so
+		// "background never blocks foreground" only actually holds if the
+		// pool has enough spare capacity for both lanes to run at once.
+		// Found in the 2026-07-19 audit: with zero headroom (e.g.
+		// totalWorkers==2*maxDownloadConnections), a background burst can
+		// legitimately exhaust the pool and make foreground/playback fetches
+		// wait behind it -- the opposite of the dual-lane design's intent.
+		// This doesn't change behavior; it just makes an otherwise-silent
+		// misconfiguration visible.
+		if lacksSchedulerLaneHeadroom(totalWorkers, maxDownloadConnections) {
+			logger.Warn().
+				Int("maxDownloadConnections", maxDownloadConnections).
+				Int("totalProviderConnections", totalWorkers).
+				Msg("usenet: foreground + background NNTP lanes (2x maxDownloadConnections) have little or no headroom against the shared connection pool (sum of provider maxConnections) -- a background calibration/health-check burst could delay foreground playback fetches; consider raising provider maxConnections or lowering maxDownloadConnections")
+		}
 	}
 	for _, provider := range cfg.Usenet.Providers {
 		if !provider.Enabled || provider.Host == "" {
@@ -1104,6 +1122,16 @@ func maintenanceRecentTaskName(mediaType string) string {
 	default:
 		return maintenanceRecentMovieTask
 	}
+}
+
+// lacksSchedulerLaneHeadroom reports whether the shared per-provider
+// connection pool (sized at totalWorkers, the raw account ceiling) has
+// enough spare capacity for the NNTP scheduler's foreground and background
+// lanes (each sized at maxDownloadConnections) to both run at once without
+// contending for the same connections -- see the call site in Run() for the
+// full explanation.
+func lacksSchedulerLaneHeadroom(totalWorkers, maxDownloadConnections int) bool {
+	return totalWorkers <= 2*maxDownloadConnections
 }
 
 func shouldRunRecentOnStartup(ctx context.Context, db *database.DB, taskName string, floor time.Duration, ttl time.Duration, now time.Time) bool {

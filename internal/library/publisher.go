@@ -264,6 +264,12 @@ func (p *Publisher) republishEpisodeFromSourceRelease(ctx context.Context, libra
 			return err
 		}
 		_ = p.rclone.RefreshPath(ctx, filepath.Dir(libraryPath))
+		// Also refresh the content directory the symlink points into -- the
+		// two sibling publish paths in this file (publishSelectedRelease,
+		// fulfillSeasonPackEpisodes) already do this; this one (season-pack
+		// episode borrowing a virtual file from the pack's source release)
+		// was missed, found in the 2026-07-19 audit.
+		_ = p.rclone.RefreshMountPath(ctx, p.runtime.FuseMountPath, filepath.Dir(target))
 		if p.mediaServerNotifyHook != nil {
 			if err := p.mediaServerNotifyHook(ctx, libraryItemID); err != nil {
 				return err
