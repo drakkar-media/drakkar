@@ -28,6 +28,28 @@ func (s *statOnlySource) Stat(ctx context.Context, messageID string) error {
 	return s.statErr
 }
 
+// TestArticleNotFoundErrorIsErrArticleMissing guards a gap found in the
+// 2026-07-19 production incident investigation: a cache HIT for an
+// already-confirmed-missing article (served by CachedFallbackSource.Stat/
+// BodyPriority via errArticleNotFound, once the miss is cached) must still
+// be recognized by errors.Is(err, ErrArticleMissing) exactly like a fresh
+// 430 STAT response would be. Without this, callers that re-classify an
+// error to decide "is this permanent" (e.g.
+// database.isArticlePermanentlyMissing, called from the periodic segment
+// calibration health check) saw a cache hit as a different error entirely
+// and treated an already-confirmed-permanently-missing article as
+// transient -- causing the exact same segments to be retried forever,
+// every 15-minute health-check pass, instead of being marked done once.
+func TestArticleNotFoundErrorIsErrArticleMissing(t *testing.T) {
+	err := errArticleNotFound("<msg1>")
+	if !errors.Is(err, ErrArticleMissing) {
+		t.Fatal("expected errArticleNotFound's cached-miss error to satisfy errors.Is(err, ErrArticleMissing)")
+	}
+	if errors.Is(err, ErrProviderCircuitOpen) {
+		t.Fatal("expected errArticleNotFound not to falsely match an unrelated sentinel")
+	}
+}
+
 // TestClassifyCacheableErrorMatchesStatArticleMissing guards against a real
 // production gap: client.go's Stat() returns the bare ErrArticleMissing
 // sentinel (message "article missing") on a 430 STAT response, not a

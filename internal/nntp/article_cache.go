@@ -143,6 +143,20 @@ func (e articleNotFoundError) Error() string {
 	return "article not found (cached): " + string(e)
 }
 
+// Is reports this as ErrArticleMissing to errors.Is, so a cache HIT for an
+// already-confirmed-missing article is indistinguishable from a fresh 430
+// STAT response to any caller that classifies errors this way (e.g.
+// database.isArticlePermanentlyMissing). Without this, calibrate.go's
+// permanent-vs-transient check called Exists() again, got this cached
+// error back instead of the original ErrArticleMissing, and misclassified
+// an already-confirmed-permanently-missing article as "transient, retry
+// later" -- causing the exact same segments to be retried forever, every
+// health-check pass, instead of being marked calibrated_at once and never
+// touched again.
+func (e articleNotFoundError) Is(target error) bool {
+	return target == ErrArticleMissing
+}
+
 // classifyCacheableError decides whether an error is worth short-circuiting
 // on repeat fetches, and for how long. Status 430 (like 423) IS treated as a
 // definitive "article missing" signal: per RFC 3977 and Newshosting's own

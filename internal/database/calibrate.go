@@ -11,6 +11,7 @@ import (
 
 	"github.com/drakkar-media/drakkar/internal/nntp"
 	"github.com/drakkar-media/drakkar/internal/observability"
+	"github.com/drakkar-media/drakkar/internal/yenc"
 )
 
 // SegmentSizer can return the actual decoded byte size of an NNTP article.
@@ -264,13 +265,32 @@ func (db *DB) CalibrateNZBOffsetsBatch(ctx context.Context, limit int) (int, err
 	return len(ids), nil
 }
 
-// isArticlePermanentlyMissing confirms via a cheap NNTP STAT (no body
-// download) whether messageID is genuinely gone (430 -> nntp.ErrArticleMissing)
-// rather than a transient fetch failure. Only a confirmed-missing article is
-// safe to mark calibrated_at permanently; a timeout, throttled/circuit-open
-// provider, connection error, or an inconclusive check (checker unavailable)
-// must fall through to "retry later" instead.
-func (db *DB) isArticlePermanentlyMissing(ctx context.Context, messageID string) bool {
+// isArticlePermanentlyMissing decides whether decodeErr (the error from a
+// full DecodedSize fetch of messageID) reflects a permanent, never-going-
+// to-change property of that specific article, as opposed to a transient
+// fetch failure. Two distinct permanent cases:
+//
+//   - A yEnc CRC mismatch: the article exists (a STAT would succeed) but its
+//     posted content is corrupt. Usenet articles are immutable, so
+//     re-fetching the identical message-id decodes the identical bytes and
+//     fails the identical CRC check forever -- this was previously missed
+//     entirely (decodeErr was discarded in favor of a fresh STAT-only
+//     check, which trivially succeeds for a corrupt-but-present article),
+//     so calibrate.go retried these same known-corrupt segments on every
+//     15-minute health-check pass, forever, each one a real live NNTP
+//     fetch+decode.
+//   - A confirmed-missing article (430 -> nntp.ErrArticleMissing), verified
+//     via a cheap STAT (no body download). This also needs to be recognized
+//     when served from CachedFallbackSource's local miss cache, not just a
+//     live check -- see articleNotFoundError.Is in internal/nntp/article_cache.go.
+//
+// A timeout, throttled/circuit-open provider, connection error, or an
+// inconclusive check (checker unavailable) falls through to "retry later"
+// in both cases.
+func (db *DB) isArticlePermanentlyMissing(ctx context.Context, messageID string, decodeErr error) bool {
+	if errors.Is(decodeErr, yenc.ErrCRCMismatch) {
+		return true
+	}
 	checker, ok := db.SegmentFetcher.(SegmentChecker)
 	if !ok || checker == nil {
 		return false
@@ -327,7 +347,7 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 	for _, f := range files {
 		actualFirst, err := sizer.DecodedSize(ctx, f.firstMsgID)
 		if err != nil {
-			if !db.isArticlePermanentlyMissing(ctx, f.firstMsgID) {
+			if !db.isArticlePermanentlyMissing(ctx, f.firstMsgID, err) {
 				// Transient failure (timeout, provider throttle/circuit-open,
 				// connection error, or the async import-time calibration
 				// budget expiring mid-fetch) -- leave calibrated_at NULL so
@@ -340,7 +360,7 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 				slog.Warn("calibrate: could not fetch first segment, will retry later", "nzb_file_id", f.id, "err", err)
 				continue
 			}
-			slog.Warn("calibrate: first segment confirmed missing (NNTP STAT 430) — marking as permanently skipped", "nzb_file_id", f.id, "err", err)
+			slog.Warn("calibrate: first segment permanently unusable (confirmed missing or corrupt) — marking as permanently skipped", "nzb_file_id", f.id, "err", err)
 			// If this UPDATE itself fails (e.g. a transient DB error), the file is
 			// NOT actually marked calibrated — log it, so a hung/lost mark-as-skipped
 			// isn't invisible (it would otherwise just look like a normal retry).
@@ -363,7 +383,7 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 			switch {
 			case err == nil && n > 0:
 				actualLast = n
-			case err != nil && !db.isArticlePermanentlyMissing(ctx, f.lastMsgID):
+			case err != nil && !db.isArticlePermanentlyMissing(ctx, f.lastMsgID, err):
 				// Same transient-vs-permanent distinction as the first-segment
 				// fetch above: a failed fetch here previously fell through
 				// silently, leaving actualLast at the "same size as other
