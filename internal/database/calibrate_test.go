@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/drakkar-media/drakkar/internal/nntp"
 	"github.com/drakkar-media/drakkar/internal/stream"
@@ -96,11 +97,15 @@ func TestIsArticlePermanentlyMissingCRCMismatch(t *testing.T) {
 
 // fakeSegmentSizer stands in for the SegmentSizer half of db.SegmentFetcher
 // (fakeSegmentChecker above only implements SegmentChecker/Exists) so tests
-// can exercise confirmPermanentCRCMismatch's re-fetch path.
+// can exercise confirmPermanentCRCMismatch's re-fetch path. errsBySequence,
+// when set, returns a different error on each successive call (by call
+// index, clamped to the last entry) -- used to simulate a confirmation
+// sequence that doesn't agree with itself across attempts.
 type fakeSegmentSizer struct {
-	checkErr  error
-	sizeErr   error
-	callCount int
+	checkErr       error
+	sizeErr        error
+	errsBySequence []error
+	callCount      int
 }
 
 func (f *fakeSegmentSizer) FetchRange(ctx context.Context, segment stream.SegmentRange) ([]byte, error) {
@@ -112,11 +117,31 @@ func (f *fakeSegmentSizer) Exists(ctx context.Context, messageID string) error {
 }
 
 func (f *fakeSegmentSizer) DecodedSize(ctx context.Context, messageID string) (int64, error) {
-	f.callCount++
+	defer func() { f.callCount++ }()
+	if len(f.errsBySequence) > 0 {
+		idx := f.callCount
+		if idx >= len(f.errsBySequence) {
+			idx = len(f.errsBySequence) - 1
+		}
+		if err := f.errsBySequence[idx]; err != nil {
+			return 0, err
+		}
+		return 1024, nil
+	}
 	if f.sizeErr != nil {
 		return 0, f.sizeErr
 	}
 	return 1024, nil
+}
+
+// withFastCRCConfirmation shrinks confirmCRCMismatchDelay for the duration of
+// a test, restoring it afterward -- a real test run otherwise takes
+// confirmCRCMismatchAttempts * confirmCRCMismatchDelay per case (20s).
+func withFastCRCConfirmation(t *testing.T) {
+	t.Helper()
+	original := confirmCRCMismatchDelay
+	confirmCRCMismatchDelay = time.Millisecond
+	t.Cleanup(func() { confirmCRCMismatchDelay = original })
 }
 
 // TestIsArticlePermanentlyMissingCRCMismatchConfirmedOnRefetch guards the
@@ -124,24 +149,26 @@ func (f *fakeSegmentSizer) DecodedSize(ctx context.Context, messageID string) (i
 // mismatch" and marked permanently skipped turned out, on an independent
 // out-of-band refetch, to decode perfectly cleanly with a CRC matching its
 // own declared checksum -- the single-observation check had no way to catch
-// that. A CRC mismatch must now be confirmed by an independent re-fetch
-// before being treated as permanent.
+// that. A CRC mismatch must now be confirmed by multiple independent,
+// delayed re-fetches, all agreeing, before being treated as permanent.
 func TestIsArticlePermanentlyMissingCRCMismatchConfirmedOnRefetch(t *testing.T) {
+	withFastCRCConfirmation(t)
 	sizer := &fakeSegmentSizer{sizeErr: yenc.ErrCRCMismatch}
 	db := &DB{SegmentFetcher: sizer}
 	if !db.isArticlePermanentlyMissing(context.Background(), "<msg1>", yenc.ErrCRCMismatch) {
-		t.Fatal("expected a CRC mismatch confirmed by re-fetch to be treated as permanent")
+		t.Fatal("expected a CRC mismatch confirmed by every re-fetch to be treated as permanent")
 	}
-	if sizer.callCount != 1 {
-		t.Fatalf("expected exactly one confirmation re-fetch, got %d", sizer.callCount)
+	if sizer.callCount != confirmCRCMismatchAttempts {
+		t.Fatalf("expected exactly %d confirmation re-fetches, got %d", confirmCRCMismatchAttempts, sizer.callCount)
 	}
 }
 
 // TestIsArticlePermanentlyMissingCRCMismatchNotConfirmedOnRefetch is the other
-// half: if the independent re-fetch decodes cleanly, the original mismatch
+// half: if an independent re-fetch decodes cleanly, the original mismatch
 // was a fluke (e.g. a corrupted read under heavy concurrent NNTP load), not
 // real corruption -- must NOT be marked permanent.
 func TestIsArticlePermanentlyMissingCRCMismatchNotConfirmedOnRefetch(t *testing.T) {
+	withFastCRCConfirmation(t)
 	sizer := &fakeSegmentSizer{} // DecodedSize succeeds on retry
 	db := &DB{SegmentFetcher: sizer}
 	if db.isArticlePermanentlyMissing(context.Background(), "<msg1>", yenc.ErrCRCMismatch) {
@@ -149,12 +176,29 @@ func TestIsArticlePermanentlyMissingCRCMismatchNotConfirmedOnRefetch(t *testing.
 	}
 }
 
-// TestIsArticlePermanentlyMissingCRCMismatchTransientOnRefetch: if the
+// TestIsArticlePermanentlyMissingCRCMismatchDisagreesAcrossAttempts guards the
+// real 2026-07-19 production gap in the FIRST version of this fix: a single
+// immediate confirmation retry hit the exact same transient condition as the
+// original failure twice in a row and still falsely confirmed "permanent",
+// while a later, independent, delayed check decoded cleanly. A confirmation
+// sequence that doesn't agree with itself on every attempt must not be
+// treated as permanent, even if an early attempt reproduced the mismatch.
+func TestIsArticlePermanentlyMissingCRCMismatchDisagreesAcrossAttempts(t *testing.T) {
+	withFastCRCConfirmation(t)
+	sizer := &fakeSegmentSizer{errsBySequence: []error{yenc.ErrCRCMismatch, nil}}
+	db := &DB{SegmentFetcher: sizer}
+	if db.isArticlePermanentlyMissing(context.Background(), "<msg1>", yenc.ErrCRCMismatch) {
+		t.Fatal("expected a confirmation sequence that disagrees across attempts to NOT be treated as permanent")
+	}
+}
+
+// TestIsArticlePermanentlyMissingCRCMismatchTransientOnRefetch: if a
 // confirmation re-fetch itself fails for an unrelated, transient reason
 // (timeout, throttle), that's inconclusive, not confirmation -- must fall
 // through to "retry later", not lock in a permanent verdict off a single
 // flaky attempt.
 func TestIsArticlePermanentlyMissingCRCMismatchTransientOnRefetch(t *testing.T) {
+	withFastCRCConfirmation(t)
 	sizer := &fakeSegmentSizer{sizeErr: context.DeadlineExceeded}
 	db := &DB{SegmentFetcher: sizer}
 	if db.isArticlePermanentlyMissing(context.Background(), "<msg1>", yenc.ErrCRCMismatch) {

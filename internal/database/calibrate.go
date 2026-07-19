@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/drakkar-media/drakkar/internal/nntp"
 	"github.com/drakkar-media/drakkar/internal/observability"
@@ -298,19 +299,32 @@ func (db *DB) isArticlePermanentlyMissing(ctx context.Context, messageID string,
 	return errors.Is(checker.Exists(ctx, messageID), nntp.ErrArticleMissing)
 }
 
-// confirmPermanentCRCMismatch re-fetches and re-decodes messageID independently
-// before concluding a CRC mismatch is a permanent property of the article
-// rather than a one-off transient glitch. Verified live against a production
-// false positive: an article Drakkar had just flagged "yenc crc mismatch" and
-// marked permanently skipped decoded perfectly cleanly on an out-of-band
-// manual refetch, with a CRC matching its own declared checksum exactly --
-// the single-observation check was trusting a fluke (most likely a corrupted
-// read under the heavy concurrent NNTP load a mass health-check run puts on
-// the connection pool) as if it were proof of real corruption. Since Usenet
-// articles are immutable, genuine corruption reproduces on every independent
-// fetch; a fluke does not -- this is the same distinction the STAT-based
-// missing-article check below already gets for free from being a completely
-// separate mechanism, which the CRC path lacked entirely.
+// confirmCRCMismatchAttempts and confirmCRCMismatchDelay: how many delayed,
+// independent re-fetches confirmPermanentCRCMismatch requires, all agreeing,
+// before committing to "permanent". An immediate single re-fetch (the first
+// version of this fix) turned out to be insufficient in production: two
+// separate false positives were confirmed live where BOTH the original
+// failure and an immediate confirmation retry got the same wrong result,
+// while a fully independent manual refetch a minute or more later decoded
+// perfectly cleanly with a matching CRC. Back-to-back attempts evidently can
+// still hit the same transient condition (most likely a momentary backend
+// inconsistency on the provider's side); spacing attempts out gives that a
+// real chance to clear. Since Usenet articles are immutable, genuine
+// corruption reproduces regardless of timing -- there's no downside to being
+// more conservative here, only added latency for the rare corrupt/flaky case.
+const confirmCRCMismatchAttempts = 2
+
+// confirmCRCMismatchDelay is a var, not a const, so tests can shrink it
+// instead of a real test run taking confirmCRCMismatchAttempts * 10s.
+var confirmCRCMismatchDelay = 10 * time.Second
+
+// confirmPermanentCRCMismatch re-fetches and re-decodes messageID
+// independently, more than once with a delay between attempts, before
+// concluding a CRC mismatch is a permanent property of the article rather
+// than a transient glitch. See the STAT-based missing-article check below for
+// the equivalent, independent confirmation it already gets for free from
+// being a completely different mechanism -- the CRC path lacked any
+// confirmation at all before this fix.
 func (db *DB) confirmPermanentCRCMismatch(ctx context.Context, messageID string) bool {
 	sizer, ok := db.SegmentFetcher.(SegmentSizer)
 	if !ok || sizer == nil {
@@ -318,8 +332,20 @@ func (db *DB) confirmPermanentCRCMismatch(ctx context.Context, messageID string)
 		// than retrying forever with no way to ever resolve it.
 		return true
 	}
-	_, err := sizer.DecodedSize(ctx, messageID)
-	return errors.Is(err, yenc.ErrCRCMismatch)
+	for i := 0; i < confirmCRCMismatchAttempts; i++ {
+		select {
+		case <-time.After(confirmCRCMismatchDelay):
+		case <-ctx.Done():
+			// Can't wait out the delay -- don't commit to a permanent verdict
+			// off an incomplete confirmation sequence.
+			return false
+		}
+		_, err := sizer.DecodedSize(ctx, messageID)
+		if !errors.Is(err, yenc.ErrCRCMismatch) {
+			return false
+		}
+	}
+	return true
 }
 
 // CalibrateNZBOffsets corrects segment decoded offsets for all files in an NZB
