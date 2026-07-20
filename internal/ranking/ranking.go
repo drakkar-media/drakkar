@@ -778,6 +778,30 @@ func rejectBySize(candidate Candidate, prefs Preferences, runtimeMinutes int) st
 	return ""
 }
 
+// ResolutionRank orders common resolution labels from lowest to highest
+// quality, for cutoff-style comparisons (Requirements/Preferences'
+// CutoffResolution: "once the grabbed release meets this resolution or
+// better, the item is considered at cutoff and won't be upgraded further").
+// Unrecognized or blank labels rank lowest (0), so an item with an
+// undetected current resolution is never treated as already having met a
+// cutoff it can't actually be confirmed to meet.
+func ResolutionRank(resolution string) int {
+	switch strings.ToLower(strings.TrimSpace(resolution)) {
+	case "480p":
+		return 1
+	case "576p":
+		return 2
+	case "720p":
+		return 3
+	case "1080p":
+		return 4
+	case "2160p", "4k":
+		return 5
+	default:
+		return 0
+	}
+}
+
 func scoreResolution(resolution string, prefs Preferences) int {
 	if score, ok := scoreByPreference(resolution, prefs.Resolutions, 500, 75); ok {
 		return score

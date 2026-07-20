@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/drakkar-media/drakkar/internal/ranking"
 )
 
 // blocklistCache is a short-lived in-process cache for loadBlocklistMap (O-10).
@@ -1053,20 +1055,31 @@ func (db *DB) ListSelectedQueueRetryTargets(ctx context.Context, limit int) ([]S
 // ListUpgradableLibraryItems returns library_item IDs that are available but
 // whose quality profile has allow_upgrade=true and whose latest queue item is
 // still in state 'available' (i.e. not already being re-downloaded).
+//
+// Excludes items whose currently-selected release has already reached the
+// profile's cutoff_resolution -- confirmed a real gap live (2026-07-20):
+// this query never checked cutoff_resolution at all, so every available
+// item under an allow_upgrade profile was swept into every upgrade search
+// pass forever, even ones already sitting at (or above) the configured
+// cutoff, which per the profile's own documented semantics ("once the
+// grabbed release meets this resolution or better, the item is considered
+// at cutoff and won't be upgraded further") should never be searched again.
 func (db *DB) ListUpgradableLibraryItems(ctx context.Context) ([]int64, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
-		select li.id
+		select li.id, qp.cutoff_resolution, coalesce(rc.resolution, '')
 		from library_items li
 		join quality_profiles qp on qp.id = coalesce(
 			li.quality_profile_id,
 			(select id from quality_profiles where is_default = true order by id limit 1)
 		)
 		join lateral (
-			select state from queue_items
+			select state, selected_release_id from queue_items
 			where library_item_id = li.id
 			order by created_at desc
 			limit 1
 		) q on true
+		left join selected_releases sr on sr.id = q.selected_release_id
+		left join release_candidates rc on rc.id = sr.release_candidate_id
 		where li.available = true
 		  and qp.allow_upgrade = true
 		  and q.state = $1`, QueueAvailable,
@@ -1077,9 +1090,16 @@ func (db *DB) ListUpgradableLibraryItems(ctx context.Context) ([]int64, error) {
 	defer rows.Close()
 	var out []int64
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+		var (
+			id                int64
+			cutoffResolution  string
+			currentResolution string
+		)
+		if err := rows.Scan(&id, &cutoffResolution, &currentResolution); err != nil {
 			return nil, err
+		}
+		if cutoffResolution != "" && ranking.ResolutionRank(currentResolution) >= ranking.ResolutionRank(cutoffResolution) {
+			continue
 		}
 		out = append(out, id)
 	}
