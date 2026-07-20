@@ -243,7 +243,7 @@ func (db *DB) detectStoredRarContinuationOffsets(ctx context.Context, sources ma
 		if limit > size {
 			limit = size
 		}
-		prefix, err := db.SegmentFetcher.FetchRange(ctx, stream.SegmentRange{
+		prefix, err := fetchRangeBackground(ctx, db.SegmentFetcher, stream.SegmentRange{
 			SegmentID:    0,
 			MessageID:    source.MessageIDs[0],
 			RangeStart:   0,

@@ -31,6 +31,20 @@ var (
 	errNNTPArticleUnavailable        = errors.New("nntp_article_unavailable")
 )
 
+// fetchRangeBackground fetches a segment range at PriorityBackground when the
+// fetcher supports priority tagging, falling back to the plain (default
+// PriorityInteractive) FetchRange otherwise. Import-time archive inspection
+// (par2/RAR header reads) must not compete with live playback for the
+// scheduler's foreground lane -- confirmed live (2026-07-20): with 8
+// concurrent import workers, mis-tagged interactive-priority header reads
+// were starving real player segment fetches for the same 15-slot lane.
+func fetchRangeBackground(ctx context.Context, fetcher stream.SegmentFetcher, segment stream.SegmentRange) ([]byte, error) {
+	if pf, ok := fetcher.(stream.PrioritySegmentFetcher); ok {
+		return pf.FetchRangePriority(ctx, segment, stream.PriorityBackground)
+	}
+	return fetcher.FetchRange(ctx, segment)
+}
+
 func inspectImportedArchives(ctx context.Context, archives []ImportedArchive, files []ImportedNZBFile, fetcher stream.SegmentFetcher) []ImportedArchive {
 	if len(archives) == 0 {
 		return nil
@@ -605,7 +619,7 @@ func readImportedFilePrefix(ctx context.Context, file ImportedNZBFile, limit int
 	}
 	out := make([]byte, 0, limit)
 	for _, item := range ranges {
-		block, err := fetcher.FetchRange(ctx, item)
+		block, err := fetchRangeBackground(ctx, fetcher, item)
 		if err != nil {
 			return nil, err
 		}

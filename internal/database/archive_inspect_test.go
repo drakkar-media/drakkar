@@ -263,6 +263,54 @@ func TestReadImportedFilePrefixShortFetch(t *testing.T) {
 	}
 }
 
+// priorityFetcherStub records the priority passed to FetchRangePriority, so
+// tests can confirm import-time reads are tagged PriorityBackground instead
+// of silently defaulting to PriorityInteractive via plain FetchRange.
+type priorityFetcherStub struct {
+	data           []byte
+	lastPriority   stream.FetchPriority
+	priorityCalled bool
+}
+
+func (f *priorityFetcherStub) FetchRange(ctx context.Context, segment stream.SegmentRange) ([]byte, error) {
+	return append([]byte(nil), f.data[segment.RangeStart:segment.RangeEnd]...), nil
+}
+
+func (f *priorityFetcherStub) FetchRangePriority(ctx context.Context, segment stream.SegmentRange, priority stream.FetchPriority) ([]byte, error) {
+	f.priorityCalled = true
+	f.lastPriority = priority
+	return f.FetchRange(ctx, segment)
+}
+
+// TestReadImportedFilePrefixUsesBackgroundPriority guards a real production
+// bug (2026-07-20): archive-inspection reads during import used the plain
+// SegmentFetcher interface, which defaults FetchRange to PriorityInteractive
+// -- the same priority tier as live player reads. With 8 concurrent import
+// workers, this flooded the scheduler's foreground lane and starved actual
+// playback, causing mid-stream stalls. Import reads must use
+// PriorityBackground when the fetcher supports it.
+func TestReadImportedFilePrefixUsesBackgroundPriority(t *testing.T) {
+	file := ImportedNZBFile{
+		FileName:      "Movie.part01.rar",
+		FileSizeBytes: 8,
+		Segments: []ImportedNZBSegment{{
+			MessageID:          "<one@test>",
+			DecodedStartOffset: 0,
+			DecodedEndOffset:   8,
+		}},
+	}
+	fetcher := &priorityFetcherStub{data: []byte("abcdefgh")}
+	if _, err := readImportedFilePrefix(context.Background(), file, 8, fetcher); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !fetcher.priorityCalled {
+		t.Fatal("expected readImportedFilePrefix to use FetchRangePriority when available, fell back to plain FetchRange")
+	}
+	if fetcher.lastPriority != stream.PriorityBackground {
+		t.Fatalf("expected PriorityBackground, got %v", fetcher.lastPriority)
+	}
+}
+
 // fetchRangeInfoStub implements the FetchRangeInfo capability importedFileActualSize
 // looks for, returning a fixed measured end offset regardless of the request.
 type fetchRangeInfoStub struct {
