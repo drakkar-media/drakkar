@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -102,6 +103,27 @@ func Open(cfg config.DatabaseConfig) (*DB, error) {
 	poolCfg.MaxConns = 25
 	poolCfg.MinConns = 2
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	// A connection whose TCP peer vanishes mid-query (network blip, container
+	// restart, conntrack drop) otherwise never surfaces an error -- with no
+	// keepalive, the read() blocking on the response just waits on a dead
+	// socket indefinitely; the OS has no way to know the peer is gone without
+	// probing. Confirmed live (2026-07-21): a brief network hiccup severed
+	// several pool connections; the in-flight queries on them blocked forever,
+	// were never returned to the pool, and every one of the 8 download workers
+	// eventually piled up in (*sql.DB).conn waiting for one of the 25 slots to
+	// free -- wedging the whole download pipeline for 30+ minutes with nothing
+	// ever timing out or logging an error, since nothing ever returned at all.
+	// idle/interval/count=15s/5s/3 bounds detection of a truly dead peer to
+	// ~30s instead of the OS default (Linux: 2h+).
+	dialer := &net.Dialer{
+		KeepAliveConfig: net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     15 * time.Second,
+			Interval: 5 * time.Second,
+			Count:    3,
+		},
+	}
+	poolCfg.ConnConfig.DialFunc = dialer.DialContext
 	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
 	if err != nil {
 		return nil, fmt.Errorf("open postgres pool: %w", err)
