@@ -58,6 +58,24 @@ func TestScoreRejectsWrongMovieYear(t *testing.T) {
 	}
 }
 
+// TestScoreRejectsWrongYearForWholeShowSearch guards a real production
+// incident (2026-07-21): a whole-show/season-pack search (MediaType "tv",
+// set by searchRequirements for isWholeShowRequest) had no case at all in
+// Score's MediaType switch, so year was never cross-checked -- a bare
+// title-only search for "ONE PIECE" (the 2023 live-action show,
+// first_air_date year 2023) matched and downloaded "One Piece (1999)
+// S19E86", the unrelated classic anime, with zero rejection.
+func TestScoreRejectsWrongYearForWholeShowSearch(t *testing.T) {
+	result := Score(Candidate{
+		Title:      "One.Piece.1999.S19E86.1080p.WEB-DL",
+		Resolution: "1080p",
+		Source:     "web-dl",
+	}, Requirements{Title: "One Piece", MediaType: "tv", Year: 2023})
+	if !result.Rejected || result.RejectReason != "wrong_year" {
+		t.Fatalf("unexpected result %+v", result)
+	}
+}
+
 func TestScoreRejectsBadSource(t *testing.T) {
 	result := Score(Candidate{
 		Title:      "Dune.2021.1080p.CAM",

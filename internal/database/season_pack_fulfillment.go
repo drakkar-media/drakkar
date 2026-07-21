@@ -136,6 +136,8 @@ func (db *DB) CreateSeasonPackEpisodeItems(ctx context.Context, selectedReleaseI
 	if err != nil || tvShowID == 0 {
 		return nil
 	}
+	var numberOfSeasons int
+	_ = db.SQL.QueryRowContext(ctx, `SELECT coalesce(number_of_seasons, 0) FROM tv_shows WHERE id = $1`, tvShowID).Scan(&numberOfSeasons)
 
 	// Collect virtual files for this release.
 	rows, err := db.SQL.QueryContext(ctx, `
@@ -172,6 +174,20 @@ func (db *DB) CreateSeasonPackEpisodeItems(ctx context.Context, selectedReleaseI
 	for _, f := range files {
 		season, episode := ParseEpisodeFromFilename(f.name)
 		if season <= 0 || episode <= 0 {
+			continue
+		}
+		// Sanity-check the parsed season against the show's own known season
+		// count before manufacturing a blank placeholder episode for it.
+		// Confirmed live (2026-07-21): a search-ranking gap let a same-titled
+		// but wholly unrelated release ("One Piece (1999) S19E86") attach to
+		// the 2023 live-action "ONE PIECE" (number_of_seasons=3) whole-show
+		// library item; this code then blindly created a "season 19" episode
+		// with no metadata to hold it, and it was published straight into the
+		// real show's library/Plex entry. +1 tolerates a season TMDB hasn't
+		// indexed as "in production" yet; anything further out is not this
+		// show's episode, regardless of how it got matched upstream.
+		if numberOfSeasons > 0 && season > numberOfSeasons+1 {
+			slog.Warn("season pack: parsed season number implausible for this show — skipping episode item creation", "tv_show_id", tvShowID, "season", season, "episode", episode, "number_of_seasons", numberOfSeasons, "file", f.name)
 			continue
 		}
 		key := [2]int{season, episode}

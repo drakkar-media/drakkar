@@ -383,6 +383,23 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 			score += 90
 			addExplanation("Exact year match (+90)")
 		}
+	case "tv":
+		// Whole-show/season-pack searches (isWholeShowRequest) have no
+		// SeasonNumber/EpisodeNumber to cross-check, so year is the only
+		// available signal to reject a same-titled but different show --
+		// confirmed live (2026-07-21): a bare title-only search for "ONE
+		// PIECE" (tmdb_id 111110, first_air_date 2023) matched and downloaded
+		// "One Piece (1999) S19E86", the unrelated classic anime, because
+		// this MediaType had no case here at all and fell through with zero
+		// validation. Hard-reject like "movie" rather than the soft penalty
+		// "episode" uses, since here nothing else can catch the mismatch.
+		switch matchYear(titleLower, required.Year) {
+		case yearMismatch:
+			return Result{Rejected: true, RejectReason: "wrong_year", Explanations: []string{"Rejected: release year did not match the show's first-air-date year."}}
+		case yearExact:
+			score += 90
+			addExplanation("Exact year match (+90)")
+		}
 	case "episode":
 		switch matchEpisode(titleLower, required.SeasonNumber, required.EpisodeNumber) {
 		case episodeMismatch:

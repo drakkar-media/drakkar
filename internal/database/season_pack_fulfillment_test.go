@@ -379,3 +379,74 @@ func TestCreateSeasonPackEpisodeItemsIsIdempotent(t *testing.T) {
 		t.Fatalf("expected exactly 1 selected_releases row after CreateSeasonPackEpisodeItems ran twice over the same release, got %d", selectedReleaseCount)
 	}
 }
+
+// TestCreateSeasonPackEpisodeItemsSkipsImplausibleSeasonNumber guards a real
+// production incident (2026-07-21): a search-ranking gap let an unrelated
+// same-titled release ("One Piece (1999) S19E86") attach to the 2023
+// live-action "ONE PIECE" whole-show library item (number_of_seasons=3).
+// CreateSeasonPackEpisodeItems then blindly manufactured a blank "season 19"
+// episode with no metadata to hold it, publishing it straight into the real
+// show's library/Plex entry. As defense in depth against future
+// upstream-matching bugs, a parsed season number far beyond the show's own
+// known season count must not spawn a placeholder episode at all.
+func TestCreateSeasonPackEpisodeItemsSkipsImplausibleSeasonNumber(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	const showTitle = "Season Pack Implausible Season Show"
+	var tvShowID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into tv_shows (title, number_of_seasons) values ($1, 3) returning id`, showTitle,
+	).Scan(&tvShowID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from tv_shows where id = $1`, tvShowID)
+
+	triggerLibID := setupRaceTestLibraryItem(t, ctx, sqlDB, showTitle, "available")
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, triggerLibID)
+
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, external_url, indexer_name)
+		values ($1, 'Season Pack Implausible Season Release', 'http://example/season-pack-implausible', 'test-indexer')
+		returning id`, triggerLibID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+	var selectedReleaseID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2) returning id`, triggerLibID, rcID,
+	).Scan(&selectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, reader_kind)
+		values ($1, '/pack/Unrelated.S19E86.mkv', 'Unrelated.S19E86.mkv', 'archive')`, selectedReleaseID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.CreateSeasonPackEpisodeItems(ctx, selectedReleaseID, triggerLibID); err != nil {
+		t.Fatalf("CreateSeasonPackEpisodeItems: %v", err)
+	}
+
+	var count int
+	if err := sqlDB.QueryRowContext(ctx, `
+		select count(*) from episodes where tv_show_id = $1 and season_number = 19`, tvShowID,
+	).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no episode row created for implausible season 19 (show has 3 seasons), got %d", count)
+	}
+}
