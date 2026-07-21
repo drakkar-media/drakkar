@@ -1064,6 +1064,19 @@ func (db *DB) ListSelectedQueueRetryTargets(ctx context.Context, limit int) ([]S
 // cutoff, which per the profile's own documented semantics ("once the
 // grabbed release meets this resolution or better, the item is considered
 // at cutoff and won't be upgraded further") should never be searched again.
+// upgradeSearchBatchLimit caps how many items a single SearchUpgrades pass
+// processes. Confirmed live (2026-07-21): with no cap, a single run walked
+// every eligible item (thousands, once the cutoff_resolution fix above
+// stopped excluding already-upgraded ones from the count but the underlying
+// library still had that many upgrade candidates) through NZBHydra2
+// sequentially, one search every ~2s (the client's global throttle) -- a
+// single content_maintenance pass could run continuously for hours,
+// hammering the indexer non-stop and starving other search traffic of the
+// shared throttle/concurrency budget. Ordering by last_searched_at (oldest/
+// never-searched first) means a capped run still makes rotating progress
+// across the whole set instead of reprocessing the same items every cycle.
+const upgradeSearchBatchLimit = 200
+
 func (db *DB) ListUpgradableLibraryItems(ctx context.Context) ([]int64, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select li.id, qp.cutoff_resolution, coalesce(rc.resolution, '')
@@ -1073,7 +1086,7 @@ func (db *DB) ListUpgradableLibraryItems(ctx context.Context) ([]int64, error) {
 			(select id from quality_profiles where is_default = true order by id limit 1)
 		)
 		join lateral (
-			select state, selected_release_id from queue_items
+			select state, selected_release_id, last_searched_at from queue_items
 			where library_item_id = li.id
 			order by created_at desc
 			limit 1
@@ -1082,7 +1095,9 @@ func (db *DB) ListUpgradableLibraryItems(ctx context.Context) ([]int64, error) {
 		left join release_candidates rc on rc.id = sr.release_candidate_id
 		where li.available = true
 		  and qp.allow_upgrade = true
-		  and q.state = $1`, QueueAvailable,
+		  and q.state = $1
+		order by q.last_searched_at asc nulls first
+		limit $2`, QueueAvailable, upgradeSearchBatchLimit,
 	)
 	if err != nil {
 		return nil, err
@@ -3501,7 +3516,7 @@ func (db *DB) ListPendingTVShowLibraryItemIDs(ctx context.Context, tvShowID int6
 		where ep.tv_show_id = $1
 		  and li.available = false
 		  and q.state in ($2, $3, $4)
-		order by li.id asc`,
+		order by q.last_searched_at asc nulls first`,
 		tvShowID,
 		QueueRequested,
 		QueueFailed,

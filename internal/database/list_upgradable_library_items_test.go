@@ -109,3 +109,70 @@ func TestListUpgradableLibraryItemsExcludesItemsAtOrAboveCutoff(t *testing.T) {
 		t.Errorf("expected an item with an undetected current resolution to remain eligible (can't confirm it has met a cutoff it can't detect)")
 	}
 }
+
+// TestListUpgradableLibraryItemsOrdersLeastRecentlySearchedFirst guards a
+// real production incident (2026-07-21): with no cap or ordering, a single
+// SearchUpgrades pass walked every eligible item (thousands, once available)
+// through NZBHydra2 sequentially -- one search every ~2s (the client's global
+// throttle) -- so a single run could take hours of continuous back-to-back
+// searching, hammering the indexer non-stop. Capping the batch only helps if
+// each run makes rotating progress across the whole set (oldest/
+// never-searched first) instead of reprocessing the same items every cycle.
+func TestListUpgradableLibraryItemsOrdersLeastRecentlySearchedFirst(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	neverSearched := setupUpgradableLibraryItem(t, ctx, sqlDB, "rotation-never-searched", "1080p", "720p")
+	searchedLongAgo := setupUpgradableLibraryItem(t, ctx, sqlDB, "rotation-searched-long-ago", "1080p", "720p")
+	searchedRecently := setupUpgradableLibraryItem(t, ctx, sqlDB, "rotation-searched-recently", "1080p", "720p")
+	defer func() {
+		for _, id := range []int64{neverSearched, searchedLongAgo, searchedRecently} {
+			sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, id)
+		}
+		sqlDB.ExecContext(ctx, `delete from quality_profiles where name like 'rotation-%-profile'`)
+	}()
+
+	if _, err := sqlDB.ExecContext(ctx, `
+		update queue_items set last_searched_at = now() - interval '30 days' where library_item_id = $1`, searchedLongAgo,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `
+		update queue_items set last_searched_at = now() - interval '1 minute' where library_item_id = $1`, searchedRecently,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	ids, err := db.ListUpgradableLibraryItems(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pos := make(map[int64]int, len(ids))
+	for i, id := range ids {
+		pos[id] = i
+	}
+	if _, ok := pos[neverSearched]; !ok {
+		t.Fatal("expected never-searched item to be present")
+	}
+	if _, ok := pos[searchedLongAgo]; !ok {
+		t.Fatal("expected long-ago-searched item to be present")
+	}
+	if _, ok := pos[searchedRecently]; !ok {
+		t.Fatal("expected recently-searched item to be present")
+	}
+	if pos[neverSearched] > pos[searchedRecently] {
+		t.Errorf("expected never-searched item (nulls first) to sort before recently-searched item; positions: never=%d recent=%d", pos[neverSearched], pos[searchedRecently])
+	}
+	if pos[searchedLongAgo] > pos[searchedRecently] {
+		t.Errorf("expected long-ago-searched item to sort before recently-searched item; positions: long_ago=%d recent=%d", pos[searchedLongAgo], pos[searchedRecently])
+	}
+}

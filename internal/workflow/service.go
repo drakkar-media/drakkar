@@ -3946,6 +3946,10 @@ func (s *Service) SearchUpgrades(ctx context.Context) (UpgradeSearchResult, erro
 		}
 		res, err := s.searchLibraryOnceWithMode(ctx, libraryItemID, true)
 		s.searchInflight.Delete(libraryItemID)
+		// Record search time regardless of outcome so ListUpgradableLibraryItems'
+		// oldest-first ordering rotates through the whole eligible set across
+		// runs instead of reprocessing the same batch every cycle.
+		_ = s.repo.TouchQueueItemSearched(ctx, libraryItemID)
 		if err != nil {
 			s.logger.Warn().Int64("libraryItemId", libraryItemID).Err(err).Msg("upgrade search failed")
 			result.Failed++
