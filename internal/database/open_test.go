@@ -52,3 +52,55 @@ func TestOpenConnectsWithKeepaliveDialer(t *testing.T) {
 		t.Fatalf("Ping: %v", err)
 	}
 }
+
+// TestOpenSetsStatementAndLockTimeouts guards a real production incident
+// (2026-07-22, a recurrence of the 2026-07-21 pool-wedge incident despite the
+// keepalive fix): dozens of connections piled up in (*sql.DB).conn over the
+// course of the process's uptime, roughly one every 30 minutes, alongside a
+// Redis pool failure at the same moment -- some stall (a lock wait behind an
+// earlier stuck holder, or a connection wedged in a way idle-only keepalive
+// probing can't catch) kept consuming connections faster than they were
+// returned. statement_timeout/lock_timeout guarantee any single query or
+// FOR UPDATE wait is forcibly cancelled server-side well before it could
+// exhaust the pool, regardless of what caused it to stall.
+func TestOpenSetsStatementAndLockTimeouts(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	password, _ := u.User.Password()
+	cfg := config.DatabaseConfig{
+		Host:     u.Hostname(),
+		Port:     port,
+		Name:     strings.TrimPrefix(u.Path, "/"),
+		Username: u.User.Username(),
+		Password: password,
+	}
+	db, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer db.Close()
+
+	var statementTimeout, lockTimeout string
+	if err := db.SQL.QueryRowContext(context.Background(), `show statement_timeout`).Scan(&statementTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SQL.QueryRowContext(context.Background(), `show lock_timeout`).Scan(&lockTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if statementTimeout != "1min" {
+		t.Errorf("expected statement_timeout to be set to 60s (\"1min\"), got %q", statementTimeout)
+	}
+	if lockTimeout != "20s" {
+		t.Errorf("expected lock_timeout to be set to 20s, got %q", lockTimeout)
+	}
+}

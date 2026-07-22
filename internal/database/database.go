@@ -88,6 +88,26 @@ func Open(cfg config.DatabaseConfig) (*DB, error) {
 	// idle_in_transaction_session_timeout: kill connections that are idle inside
 	// a transaction for >60s to prevent pool self-deadlock if Rollback is missed.
 	poolCfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "60000"
+	// statement_timeout / lock_timeout: a hard ceiling so no single query or
+	// row-lock wait can hold a connection (and, for lockLibraryItemQueueRow's
+	// FOR UPDATE, block every other caller queued behind that same lock)
+	// forever. Confirmed live (2026-07-22, second occurrence): the TCP
+	// keepalive dialer added the previous incident (2026-07-21) didn't fully
+	// prevent a recurrence -- a goroutine dump showed dozens of connections
+	// piled up in (*sql.DB).conn, accumulating roughly one every 30 minutes
+	// (matching taskPublishingMaintenance's interval) across the entire
+	// process uptime, right alongside a Redis pool failure at the same
+	// moment -- i.e. some other, still-unidentified stall (possibly a lock
+	// wait behind an earlier stuck holder, possibly a connection wedged
+	// mid-query in a way keepalive's idle-only probing can't catch) kept
+	// consuming connections faster than they were ever returned. Rather than
+	// keep chasing the exact trigger, these two settings guarantee recovery
+	// regardless of cause: any query running longer than 60s, or any FOR
+	// UPDATE wait longer than 20s, is forcibly cancelled server-side,
+	// returning the connection to the pool instead of holding it (and
+	// everything queued behind its lock) forever.
+	poolCfg.ConnConfig.RuntimeParams["statement_timeout"] = "60000"
+	poolCfg.ConnConfig.RuntimeParams["lock_timeout"] = "20000"
 	// pgxpool health-checks each connection before returning it to callers,
 	// avoiding "driver: bad connection" errors from silently dropped idle conns.
 	// 25 max gives headroom for 12 BullMQ workers + download/monitor/HTTP load.
