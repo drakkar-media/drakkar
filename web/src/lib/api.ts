@@ -5,6 +5,7 @@ import type {
   LibraryItem,
   LibraryPage,
   MaintenanceResult,
+  SpeedTestResult,
   QueueItem,
   WorkQueueStatus,
   BulkQueueRetryResult,
@@ -89,6 +90,7 @@ export const api = {
     return request<DiscoverDetails>(`/api/discover/details/${mediaType}?${params.toString()}`);
   },
   probeIntegrations: () => request<IntegrationProbeReport>('/api/integrations/probe', { method: 'POST' }),
+  runSpeedTest: () => request<SpeedTestResult>('/api/speedtest', { method: 'POST' }),
   queue: () => request<{ items: QueueItem[]; workQueue: WorkQueueStatus }>('/api/queue'),
   pauseQueue: () => request<WorkQueueStatus>('/api/queue/pause', { method: 'POST' }),
   resumeQueue: () => request<WorkQueueStatus>('/api/queue/resume', { method: 'POST' }),

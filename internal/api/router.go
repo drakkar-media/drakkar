@@ -59,6 +59,10 @@ type StreamsProvider interface {
 	Stop(sessionID string)
 }
 
+type SpeedTestService interface {
+	RunSpeedTest(ctx context.Context) (database.SpeedTestResult, error)
+}
+
 type HealthRepository interface {
 	HealthSummary(ctx context.Context) (database.HealthSummary, error)
 	ListHealthEntries(ctx context.Context) ([]database.HealthEntry, error)
@@ -285,7 +289,7 @@ func (b *EventBroker) Publish(event map[string]any) {
 	}
 }
 
-func Router(status StatusService, queue QueueService, workflowSvc WorkflowService, publication PublicationService, maintenance MaintenanceService, cacheSvc CacheService, subtitleSvc SubtitleService, blocklistSvc BlocklistService, probeSvc IntegrationProbeService, catalogSvc CatalogService, broker *EventBroker, healthRepo HealthRepository, streamsProvider StreamsProvider, profilesRepo ProfilesRepository, taskSchedules TaskScheduleProvider, policySvc PolicyService, plexClient *plex.Client, jellyfinClient *jellyfin.Client, settingsSvc SettingsService, userRepo UserRepository, metricsProvider ...MetricsProvider) chi.Router {
+func Router(status StatusService, queue QueueService, workflowSvc WorkflowService, publication PublicationService, maintenance MaintenanceService, cacheSvc CacheService, subtitleSvc SubtitleService, blocklistSvc BlocklistService, probeSvc IntegrationProbeService, catalogSvc CatalogService, broker *EventBroker, healthRepo HealthRepository, streamsProvider StreamsProvider, profilesRepo ProfilesRepository, taskSchedules TaskScheduleProvider, policySvc PolicyService, plexClient *plex.Client, jellyfinClient *jellyfin.Client, settingsSvc SettingsService, userRepo UserRepository, speedTestSvc SpeedTestService, metricsProvider ...MetricsProvider) chi.Router {
 	r := chi.NewRouter()
 	r.Use(corsMiddleware)
 	r.Use(authMiddlewareFor(userRepo))
@@ -1860,6 +1864,24 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		publishMutation("settings.update", map[string]any{})
 		respondJSON(w, http.StatusOK, config.RedactSecrets(cfg))
+	}))
+
+	// Streams the largest already-downloaded file through the real playback
+	// read path for a fixed window and reports throughput/CPU -- mirrors
+	// nzbdav's manual wget-based tuning procedure for finding the best
+	// Max Download Connections value, as a one-click backend operation.
+	// Runs synchronously for ~8s; the frontend shows a busy state while it waits.
+	r.Post("/api/speedtest", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+		if speedTestSvc == nil {
+			respondError(w, http.StatusServiceUnavailable, errors.New("speed test unavailable"))
+			return
+		}
+		result, err := speedTestSvc.RunSpeedTest(r.Context())
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, result)
 	}))
 
 	// Recent structured log lines from the application log file.

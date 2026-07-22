@@ -513,6 +513,15 @@ export type ReleaseActionResult = {
 // policies, subtitle profiles).
 export type DeletedCount = { deleted: number };
 
+export type SpeedTestResult = {
+  fileName: string;
+  fileSizeBytes: number;
+  bytesRead: number;
+  durationSeconds: number;
+  throughputMbps: number;
+  cpuPercent: number;
+};
+
 // QueuedResult is the shared response shape for endpoints that enqueue a
 // background job rather than returning a result synchronously.
 export type QueuedResult = { queued: boolean };

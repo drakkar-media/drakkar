@@ -31,6 +31,7 @@
   import Check from '@lucide/svelte/icons/check';
   import Webhook from '@lucide/svelte/icons/webhook';
   import Languages from '@lucide/svelte/icons/languages';
+  import Gauge from '@lucide/svelte/icons/gauge';
   import Button from '$lib/components/Button.svelte';
   import PageHeader from '$lib/components/PageHeader.svelte';
   import Pagination from '$lib/components/Pagination.svelte';
@@ -41,9 +42,9 @@
   import { toastError, toastSuccess } from '$lib/toast';
   import { runAction, confirmed } from '$lib/actions';
   import { debounce } from '$lib/debounce';
-  import type { BlocklistItem, BlocklistMutation, BlockTestResult, CustomFormat, FullSettings, IndexerPolicy, IntegrationProbeReport, PolicySettings, QualityDefinition, QualityProfile, ReleaseBlockRule, Status, SubtitleProfile, TaskSchedule, UsenetProvider } from '$lib/types';
+  import type { BlocklistItem, BlocklistMutation, BlockTestResult, CustomFormat, FullSettings, IndexerPolicy, IntegrationProbeReport, PolicySettings, QualityDefinition, QualityProfile, ReleaseBlockRule, SpeedTestResult, Status, SubtitleProfile, TaskSchedule, UsenetProvider } from '$lib/types';
 
-  type SettingsTab = 'integrations' | 'providers' | 'indexers' | 'queue' | 'library' | 'rules' | 'quality' | 'formats' | 'filtering' | 'subtitle-profiles' | 'notifications' | 'logs' | 'tasks' | 'media-players' | 'system';
+  type SettingsTab = 'integrations' | 'providers' | 'indexers' | 'queue' | 'library' | 'rules' | 'quality' | 'formats' | 'filtering' | 'subtitle-profiles' | 'notifications' | 'logs' | 'tasks' | 'media-players' | 'speed-test' | 'system';
 
   const tabs: { id: SettingsTab; label: string; short: string; icon: typeof PlugZap }[] = [
     { id: 'integrations',  label: 'Integrations',  short: 'Apps',     icon: PlugZap },
@@ -60,6 +61,7 @@
     { id: 'logs',          label: 'Logs',          short: 'Logs',     icon: ScrollText },
     { id: 'tasks',         label: 'Tasks',         short: 'Tasks',    icon: ClipboardList },
     { id: 'media-players', label: 'Media Players', short: 'Players',  icon: Tv },
+    { id: 'speed-test',    label: 'Speed Test',    short: 'Speed',    icon: Gauge },
     { id: 'system',        label: 'System',        short: 'System',   icon: FolderTree }
   ];
 
@@ -96,6 +98,7 @@
 
   let lastCachePrune: { root: string; filesBefore: number; filesAfter: number; bytesBefore: number; bytesAfter: number; deletedFiles: number; deletedBytes: number; limitBytes: number } | null = null;
   let activeTab: SettingsTab = 'integrations';
+  let speedTestResults: SpeedTestResult[] = [];
 
   let blockQuery = '';
   let blockReasonFilter = 'all';
@@ -319,6 +322,17 @@
       afterSuccess: () => {
         indexerPolicies = indexerPolicies.filter(p => p.id !== id);
         editingPolicy = null;
+      }
+    });
+  }
+
+  // ── Speed Test tab ───────────────────────────────────────────────────────────
+  async function runSpeedTest() {
+    await runAction(() => api.runSpeedTest(), {
+      setWorking: (w) => setBusy('speedtest', w),
+      successMessage: (r) => `${r.throughputMbps.toFixed(0)} Mbps`,
+      afterSuccess: (r) => {
+        speedTestResults = [r, ...speedTestResults].slice(0, 10);
       }
     });
   }
@@ -2722,6 +2736,39 @@
       {:else}
         <div class="empty">Loading settings…</div>
       {/if}
+
+    <!-- SPEED TEST -->
+    {:else if activeTab === 'speed-test'}
+      <div class="grid-2">
+        <Panel title="Internal Streaming Speed Test" subtitle="Streams the largest already-downloaded file through the same read path playback uses, for ~8 seconds, and reports throughput.">
+          <p class="muted">
+            Use this to find the best <strong>Max Download Connections</strong> value (Providers tab): run the test, adjust the setting, restart Drakkar, and run it again — stop once the reported Mbps plateaus.
+          </p>
+          <Button kind="primary" on:click={runSpeedTest} disabled={isBusy('speedtest')}>
+            <Gauge size={16} /> {isBusy('speedtest') ? 'Testing… (~8s)' : 'Run Speed Test'}
+          </Button>
+          {#if draft}
+            <div class="kv-list" style="margin-top: 14px;">
+              <div><span>Current Max Download Connections</span><strong>{draft.usenet.maxDownloadConnections}</strong></div>
+            </div>
+          {/if}
+        </Panel>
+
+        <Panel title="Results" subtitle="Most recent runs, newest first.">
+          {#if speedTestResults.length === 0}
+            <div class="empty">No speed tests run yet.</div>
+          {:else}
+            <div class="kv-list">
+              {#each speedTestResults as r, i}
+                <div>
+                  <span>{r.fileName}{#if i === 0} <StatusPill tone="ok">latest</StatusPill>{/if}</span>
+                  <strong>{r.throughputMbps.toFixed(0)} Mbps · {r.cpuPercent.toFixed(0)}% CPU · {bytes(r.bytesRead)} in {r.durationSeconds.toFixed(1)}s</strong>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </Panel>
+      </div>
 
     <!-- SYSTEM -->
     {:else if activeTab === 'system'}
