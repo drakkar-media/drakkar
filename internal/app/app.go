@@ -701,6 +701,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	}()
 
 	runRecentPass := func(mediaType string) {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
 		sr, err := workflowSvc.SearchRecentPending(ctx, mediaType)
 		if err != nil {
 			logger.Error().Err(err).Str("mediaType", mediaType).Msg("monitoring: recent search failed")
@@ -724,7 +726,22 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// queue_housekeeping: stale-reset first, then retry-failed, every 10 min.
 	// Merging halves goroutine count; 10m is a compromise between old 5m stale
 	// and old 15m retry — stale items reset sooner, failed items retry sooner.
+	// Every scheduled task below bounds its own work with a fresh timeout
+	// derived from the app's root ctx (never cancelled until shutdown)
+	// instead of using that root ctx directly. Confirmed live (2026-07-21
+	// through 2026-07-23, three occurrences): a connection could wedge --
+	// dead TCP peer evading keepalive detection, a stuck lock wait, or
+	// something else entirely -- and with no per-task deadline, nothing
+	// ever forced Go's database/sql to abandon and discard that connection,
+	// so it (and, transitively, the whole pool once enough leaked) stayed
+	// wedged until the process was manually restarted. A context deadline
+	// firing mid-query is guaranteed to make database/sql give up and close
+	// the connection rather than return it to the idle pool, regardless of
+	// why the query never returned on its own -- this is the one guarantee
+	// that doesn't depend on correctly diagnosing the underlying trigger.
 	runQueueHousekeeping := func() {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
 		n, err := db.ResetStaleQueueItems(ctx, 10*time.Minute, 90*time.Minute, 45*time.Minute)
 		if err != nil {
 			logger.Error().Err(err).Msg("monitoring: stale reset error")
@@ -748,6 +765,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 
 	// runSyncOnce syncs Seerr requests.
 	runSyncOnce := func() {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
 		result, err := workflowSvc.SyncRequests(ctx)
 		if err != nil {
 			logger.Error().Err(err).Msg("seerr sync failed")
@@ -764,6 +783,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// Servarr-style automatic behavior uses RSS for discovery and does not
 	// actively search the full missing backlog on a timer.
 	runPendingDispatch := func() {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+		defer cancel()
 		result, err := workflowSvc.DispatchAutomaticPending(ctx)
 		if err != nil {
 			logger.Error().Err(err).Msg("monitoring: pending dispatch error")
@@ -780,6 +801,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// this pushes every unresolved item into the BullMQ search workers so old
 	// content that never appears in RSS feeds gets found and downloaded.
 	runBacklogSearch := func() {
+		ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+		defer cancel()
 		result, err := workflowSvc.SearchPendingLibrary(ctx)
 		if err != nil {
 			logger.Error().Err(err).Msg("backlog search: error")
@@ -807,6 +830,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 
 	// publishing_maintenance: republish pending + reset orphaned, every 30 min.
 	runPublishingMaintenance := func() {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
 		if skip, reason := shouldSkipNonCriticalMaintenance(); skip {
 			logger.Info().Str("task", taskPublishingMaintenance).Str("reason", reason).Msg("scheduler: skipping non-critical task")
 			return
@@ -827,6 +852,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		_ = db.TouchMaintenanceCursor(ctx, taskPublishingMaintenance, time.Now().UTC().Format(time.RFC3339))
 	}
 	runHealthCheck := func() {
+		ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+		defer cancel()
 		entries, err := db.ListHealthEntries(ctx)
 		if err != nil {
 			logger.Error().Err(err).Msg("monitoring: health check list error")
@@ -910,6 +937,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// accumulation worst -- a safety net that only worked when the system
 	// didn't need it.
 	runStorageMaintenance := func() {
+		ctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+		defer cancel()
 		if result, err := maintenanceSvc.PruneStaleReleaseCandidates(ctx); err != nil {
 			logger.Error().Err(err).Msg("monitoring: release candidate prune error")
 		} else if result.DeletedRows > 0 {
@@ -949,6 +978,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// content_maintenance: fill missing episodes + upgrade search, every 6h.
 	// Load-gated so it doesn't compete with active backlog processing.
 	runContentMaintenance := func() {
+		ctx, cancel := context.WithTimeout(ctx, 20*time.Minute)
+		defer cancel()
 		if skip, reason := shouldSkipNonCriticalMaintenance(); skip {
 			logger.Info().Str("task", taskContentMaintenance).Str("reason", reason).Msg("scheduler: skipping non-critical task")
 			return
@@ -978,6 +1009,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	startRecurring(taskSeerrSync, 10*time.Minute, true, runSyncOnce)
 	// Sync Plex-detected shows (partial Seerr media without requests) hourly.
 	startRecurringWithStartupDelay(taskSyncPlexDetected, 60*time.Minute, 90*time.Second, func() {
+		ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		defer cancel()
 		result, err := workflowSvc.SyncPlexDetectedShows(ctx)
 		if err != nil {
 			logger.Error().Err(err).Msg("sync plex detected shows failed")
@@ -1033,6 +1066,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// actually overdue, so it still won't fire on every restart once it's
 	// caught up.
 	startRecurring(taskNZBHealthCheck, 168*time.Hour, shouldRunRecentOnStartup(ctx, db, taskNZBHealthCheck, 168*time.Hour, 0, time.Now().UTC()), func() {
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+		defer cancel()
 		if _, err := maintenanceSvc.DeepNZBHealthCheck(ctx); err != nil {
 			logger.Error().Err(err).Msg("deep nzb health check failed")
 			return
@@ -1040,6 +1075,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		_ = db.TouchMaintenanceCursor(ctx, taskNZBHealthCheck, time.Now().UTC().Format(time.RFC3339))
 	})
 	startRecurringWithStartupDelay(taskArticleHealthCheck, 6*time.Hour, 15*time.Minute, func() {
+		ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+		defer cancel()
 		n, err := workflowSvc.ValidatePublishedArticles(ctx)
 		if err != nil {
 			logger.Error().Err(err).Msg("article health check failed")
