@@ -29,21 +29,45 @@ func (r *DirectNzbReader) Name() string {
 }
 
 func (r *DirectNzbReader) Size() int64 {
+	return r.currentSize()
+}
+
+// currentSize reads r.size under r.mu -- realignSpans updates size and spans
+// together while holding the same lock (direct_reader.go:136-156), so any
+// unguarded read here is a real data race and can also silently use a stale
+// value: confirmed live (2026-07-25) as the cause of intermittent decode
+// corruption during playback. Unlike StoredRarReader.ReadAt (which
+// re-snapshots size/spans every loop iteration via snapshot()), this
+// function used to read r.size exactly once, unguarded, at the very top and
+// never refreshed it -- if a concurrent ReadAt on the same reader instance
+// (e.g. Plex issuing overlapping Range requests) triggered a mid-flight
+// yEnc-offset recalibration via realignSpans, this call's cached `length`
+// bound could go stale relative to the now-shifted spans/size, letting the
+// loop keep copying segment data past where the corrected layout says this
+// read should have stopped -- bytes from the wrong logical file offset
+// landing in the response, decoded by the player as garbage pixels.
+func (r *DirectNzbReader) currentSize() int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.size
 }
 
 func (r *DirectNzbReader) ReadAt(ctx context.Context, dst []byte, offset int64) (int, error) {
-	if offset >= r.size {
+	size := r.currentSize()
+	if offset >= size {
 		return 0, io.EOF
 	}
 	length := int64(len(dst))
-	if offset+length > r.size {
-		length = r.size - offset
+	if offset+length > size {
+		length = size - offset
 	}
 	written := 0
 	current := offset
 	emptyCount := 0
 	for int64(written) < length {
+		if current >= r.currentSize() {
+			break
+		}
 		span, index, err := r.findSpan(current)
 		if err != nil {
 			if written > 0 {
@@ -89,7 +113,7 @@ func (r *DirectNzbReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 			// offsets. The requested position may now fall in a different span —
 			// retry findSpan rather than returning EOF immediately.
 			emptyCount++
-			if emptyCount > 5 || current >= r.size {
+			if emptyCount > 5 || current >= r.currentSize() {
 				if written > 0 {
 					return written, io.EOF
 				}
