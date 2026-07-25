@@ -45,6 +45,19 @@ func ResolveRange(spans []SegmentSpan, offset, length int64) ([]SegmentRange, er
 		if start >= end {
 			continue
 		}
+		// Every span appended after the first must pick up exactly where the
+		// previous one left off. Found during the 2026-07-25 corruption
+		// audit as an unguarded gap: nothing previously checked this, only
+		// that the LAST returned range reached requestEnd -- a gap between
+		// two middle spans (which shouldn't occur by construction today,
+		// since realignSpans/realignSpan always shift every later span by
+		// the same delta to preserve contiguity, but nothing enforced that
+		// invariant here) would have silently dropped/misaligned the bytes
+		// in between instead of surfacing an error, exactly the class of
+		// bug already fixed twice this session via other mechanisms.
+		if len(out) > 0 && start != out[len(out)-1].RangeEnd {
+			return nil, ErrRangeOutsideFile
+		}
 		out = append(out, SegmentRange{
 			SegmentID:        span.SegmentID,
 			MessageID:        span.MessageID,

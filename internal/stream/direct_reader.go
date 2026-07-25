@@ -187,7 +187,18 @@ func (r *DirectNzbReader) StartSession(sessionID string) {
 	if !ok {
 		return
 	}
-	r.manager.Register(sessionID, r.spans, fetcher)
+	// Snapshot under r.mu rather than passing r.spans directly -- found
+	// during the 2026-07-25 corruption audit as the same unguarded-shared-
+	// array class already fixed in ReadAt/realignSpans and in
+	// StoredRarReader.snapshot(); not currently reachable (the sole caller
+	// calls this synchronously before the reader is ever read from), but
+	// left unguarded here would silently reopen the same hazard the moment
+	// that assumption changes.
+	r.mu.Lock()
+	spans := make([]SegmentSpan, len(r.spans))
+	copy(spans, r.spans)
+	r.mu.Unlock()
+	r.manager.Register(sessionID, spans, fetcher)
 }
 
 func (r *DirectNzbReader) NotifyRead(sessionID string, offset int64) {
