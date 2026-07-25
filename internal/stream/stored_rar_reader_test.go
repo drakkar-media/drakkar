@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"testing"
 )
 
@@ -101,5 +102,169 @@ func TestStoredRarReaderRealignsLastSegmentEstimate(t *testing.T) {
 	}
 	if n2 != 8 || string(buf2) != "BBBBBBBB" {
 		t.Fatalf("unexpected re-read result n=%d data=%q", n2, string(buf2))
+	}
+}
+
+// TestStoredRarReaderSnapshotIsIndependentCopy directly guards the aliasing
+// bug fixed alongside DirectNzbReader's race (2026-07-25): snapshot() used
+// to return r.spans itself -- copying only the slice header, not the
+// backing array -- so a snapshot taken BEFORE a realignment would silently
+// change underneath its holder once realignSpan mutated the shared array,
+// even with no concurrency at all. This is deterministic (no goroutines,
+// no timing dependency), unlike the -race concurrency test below whose
+// window is too narrow to hit on every run.
+func TestStoredRarReaderSnapshotIsIndependentCopy(t *testing.T) {
+	reader := NewStoredRarReader("test.mkv", 20, []SegmentSpan{
+		{SegmentID: 1, Start: 0, End: 10, DecodedStart: 0},
+		{SegmentID: 2, Start: 10, End: 20, DecodedStart: 10},
+	}, fetcherStub{}, nil)
+
+	before, beforeSize := reader.snapshot()
+	beforeSpan2 := before[1]
+
+	if !reader.realignSpan(2, SegmentSpan{SegmentID: 2, Start: 10, End: 18}) {
+		t.Fatal("expected realignSpan to report a correction was made")
+	}
+
+	if before[1] != beforeSpan2 {
+		t.Fatalf("snapshot taken before realignSpan was mutated by it: got %+v, want unchanged %+v (snapshot() is aliasing r.spans instead of copying it)", before[1], beforeSpan2)
+	}
+	if beforeSize != 20 {
+		t.Fatalf("unexpected pre-realign size %d", beforeSize)
+	}
+
+	after, afterSize := reader.snapshot()
+	if after[1].End != 18 {
+		t.Fatalf("expected a FRESH snapshot to see the corrected span, got End=%d", after[1].End)
+	}
+	if afterSize != 18 {
+		t.Fatalf("expected a fresh snapshot to see the corrected size 18, got %d", afterSize)
+	}
+}
+
+// concurrentRealignRarFetcher mirrors concurrentRealignFetcher (direct_reader_test.go)
+// for StoredRarReader's coordinate space (SegmentByteStart=0, DecodedStart=Start):
+// segment 2's real decoded size is discovered to be 2 bytes shorter than its
+// estimate on the FIRST fetch of that segment, matching the live "estimate
+// overshoots true size" pattern this reader already self-heals from
+// (TestStoredRarReaderRealignsLastSegmentEstimate above) -- but now exercised
+// concurrently, from multiple goroutines racing realignSpan.
+type concurrentRealignRarFetcher struct {
+	mu    sync.Mutex
+	seen  bool
+	data  map[int64][]byte
+	first map[int64]SegmentSpan
+	real  map[int64]SegmentSpan
+}
+
+func (f *concurrentRealignRarFetcher) FetchRange(ctx context.Context, segment SegmentRange) ([]byte, error) {
+	block, _, err := f.FetchRangeInfo(ctx, segment)
+	return block, err
+}
+
+func (f *concurrentRealignRarFetcher) FetchRangeInfo(ctx context.Context, segment SegmentRange) ([]byte, SegmentSpan, error) {
+	actual := f.real[segment.SegmentID]
+	if segment.SegmentID == 2 {
+		f.mu.Lock()
+		alreadySeen := f.seen
+		f.seen = true
+		f.mu.Unlock()
+		if !alreadySeen {
+			actual = f.first[segment.SegmentID]
+		}
+	}
+	full := f.data[segment.SegmentID]
+	start := int(segment.RangeStart - actual.Start)
+	end := int(segment.RangeEnd - actual.Start)
+	if start < 0 {
+		start = 0
+	}
+	if end > len(full) {
+		end = len(full)
+	}
+	if start > end {
+		start = end
+	}
+	out := make([]byte, end-start)
+	copy(out, full[start:end])
+	return out, actual, nil
+}
+
+// TestStoredRarReaderConcurrentReadAtDuringRealign guards a second, distinct
+// production corruption bug found while investigating residual pixelation
+// after the DirectNzbReader fix (v0.2.63): StoredRarReader.snapshot()
+// returned r.spans directly -- copying only the slice header, not the
+// underlying array -- so every "fresh" snapshot taken by ReadAt (including
+// one held by a concurrent ReadAt on the same reader, e.g. overlapping Plex
+// Range requests) still aliased the SAME backing array realignSpan mutates
+// in place under lock. Run with -race: this must not report a data race, and
+// every concurrent read must return the correct segment's byte content, not
+// another segment's or torn data.
+func TestStoredRarReaderConcurrentReadAtDuringRealign(t *testing.T) {
+	fetcher := &concurrentRealignRarFetcher{
+		data: map[int64][]byte{
+			1: []byte("AAAAAAAAAA"),
+			2: []byte("BBBBBBBB"), // real: 8 bytes, short of the 10-byte estimate
+			3: []byte("CCCCCCCCCC"),
+		},
+		first: map[int64]SegmentSpan{
+			2: {SegmentID: 2, Start: 10, End: 20},
+		},
+		real: map[int64]SegmentSpan{
+			1: {SegmentID: 1, Start: 0, End: 10},
+			2: {SegmentID: 2, Start: 10, End: 18},
+			3: {SegmentID: 3, Start: 20, End: 30},
+		},
+	}
+	reader := NewStoredRarReader("test.mkv", 30, []SegmentSpan{
+		{SegmentID: 1, Start: 0, End: 10, DecodedStart: 0},
+		{SegmentID: 2, Start: 10, End: 20, DecodedStart: 10},
+		{SegmentID: 3, Start: 20, End: 30, DecodedStart: 20},
+	}, fetcher, nil)
+
+	// Offsets chosen to resolve to the same, uniform-content segment
+	// regardless of whether a racing goroutine's realignment (which shifts
+	// segment 2's end, and everything after it, by up to -2) has applied
+	// yet: offset 2 is deep inside segment 1 (untouched by any shift),
+	// offset 12 is within segment 2's real (shortened) content on both
+	// sides of the correction, and offset 26 is deep enough into segment 3
+	// that a -2 shift still lands inside it either way.
+	type probe struct {
+		offset int64
+		want   byte
+	}
+	probes := []probe{{2, 'A'}, {12, 'B'}, {26, 'C'}}
+	const repeats = 20
+
+	var wg sync.WaitGroup
+	results := make([][]byte, len(probes)*repeats)
+	errs := make([]error, len(probes)*repeats)
+	for r := 0; r < repeats; r++ {
+		for i, p := range probes {
+			idx := r*len(probes) + i
+			wg.Add(1)
+			go func(idx int, offset int64) {
+				defer wg.Done()
+				buf := make([]byte, 2)
+				n, err := reader.ReadAt(context.Background(), buf, offset)
+				results[idx] = buf[:n]
+				errs[idx] = err
+			}(idx, p.offset)
+		}
+	}
+	wg.Wait()
+
+	for r := 0; r < repeats; r++ {
+		for i, p := range probes {
+			idx := r*len(probes) + i
+			if errs[idx] != nil {
+				t.Fatalf("offset %d: unexpected error %v", p.offset, errs[idx])
+			}
+			for _, b := range results[idx] {
+				if b != p.want {
+					t.Fatalf("offset %d: got %q, expected all bytes %q (wrong-segment data landed in this read -- corruption)", p.offset, results[idx], string(p.want))
+				}
+			}
+		}
 	}
 }

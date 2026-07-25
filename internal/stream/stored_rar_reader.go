@@ -39,10 +39,24 @@ func (r *StoredRarReader) Size() int64 {
 	return r.size
 }
 
+// snapshot returns an independent COPY of r.spans, not just the slice header.
+// Confirmed live (2026-07-25) as a second, distinct source of the same
+// intermittent decode-corruption bug fixed in DirectNzbReader: returning
+// `r.spans` directly only copies the slice header (pointer+len+cap) -- every
+// caller still aliases the SAME backing array. realignSpan mutates that
+// array's elements in place under r.mu (direct field assignment, not a
+// slice replacement), so a concurrent ReadAt on the same reader (Plex/rclone
+// routinely issue overlapping Range requests for one file) could read
+// torn/in-flight Start/End/DecodedStart values through ResolveRange with no
+// lock of its own. Re-snapshotting every loop iteration (as ReadAt already
+// did) provided no actual protection against this, since every snapshot
+// pointed at the identical live array regardless of when it was taken.
 func (r *StoredRarReader) snapshot() ([]SegmentSpan, int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.spans, r.size
+	out := make([]SegmentSpan, len(r.spans))
+	copy(out, r.spans)
+	return out, r.size
 }
 
 func (r *StoredRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) (int, error) {

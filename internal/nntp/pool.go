@@ -30,6 +30,26 @@ type SessionFactory func(ctx context.Context) (BodySession, error)
 // no playback is active and the background queue is quiet.
 const idleTimeout = 30 * time.Second
 
+// minWarmConns is how many connections keepWarm proactively redials in the
+// background as soon as the sweep closes them, instead of leaving the pool
+// at zero until the next real request pays for a fresh TCP+TLS handshake
+// synchronously. Confirmed live (2026-07-25) as the dominant cause of "video
+// takes a while to start again after a pause": any pause over idleTimeout
+// (very easy to hit -- answering the door, a bathroom break) closed every
+// connection, so resuming playback was never actually a warm resume, it was
+// a full cold start every time. Deliberately small and independent of
+// maxOpen/provider.MaxConnections -- this isn't about download throughput
+// (that's still governed by the scheduler's foreground lane), just about
+// having a couple of connections already sitting ready so the *first* read
+// after a pause doesn't have to wait on a handshake. Keeping only a couple
+// idle, instead of raising idleTimeout itself, preserves the original
+// provider-friendly intent of the 30s sweep for the bulk of connections.
+const minWarmConns = 2
+
+// keepWarmInterval matches the sweep cadence so a connection closed by one
+// sweep tick is typically replaced before the next.
+const keepWarmInterval = idleTimeout / 2
+
 type pooledSession struct {
 	session   BodySession
 	idleSince time.Time
@@ -68,7 +88,67 @@ func NewPooledSource(ctx context.Context, factory SessionFactory, maxOpen int) *
 		freed: make(chan struct{}, maxOpen),
 	}
 	go p.sweepLoop(ctx)
+	go p.keepWarmLoop(ctx)
 	return p
+}
+
+// keepWarmLoop proactively redials up to minWarmConns connections whenever
+// the pool has fewer than that open, so a real request never has to pay for
+// the handshake itself. Runs independently of sweepLoop (though on a
+// matching cadence) and ticks once immediately on startup rather than
+// waiting a full interval, so a freshly-started process has warm connections
+// ready before the first request rather than after keepWarmInterval elapses.
+func (p *PooledSource) keepWarmLoop(ctx context.Context) {
+	warm := minWarmConns
+	if warm > p.maxOpen {
+		warm = p.maxOpen
+	}
+	if warm <= 0 {
+		return
+	}
+	p.keepWarmOnceProtected(ctx, warm)
+	ticker := time.NewTicker(keepWarmInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.keepWarmOnceProtected(ctx, warm)
+		}
+	}
+}
+
+func (p *PooledSource) keepWarmOnceProtected(ctx context.Context, warm int) {
+	defer observability.Recover("nntp-pool-keepwarm")
+	p.keepWarmOnce(ctx, warm)
+}
+
+// keepWarmOnce reserves a slot per missing warm connection up front (under
+// p.mu, mirroring acquire's own accounting) before dialing, so a burst of
+// real acquire() calls racing this can't be starved past maxOpen, and a
+// dial failure cleanly gives the slot back.
+func (p *PooledSource) keepWarmOnce(ctx context.Context, warm int) {
+	for {
+		p.mu.Lock()
+		if p.open >= warm || p.open >= p.maxOpen {
+			p.mu.Unlock()
+			return
+		}
+		p.open++
+		p.mu.Unlock()
+
+		session, err := p.factory(ctx)
+		if err != nil {
+			p.mu.Lock()
+			p.open--
+			p.mu.Unlock()
+			// Provider unreachable or refusing connections -- don't spin;
+			// the next keepWarmInterval tick will retry.
+			return
+		}
+		p.release(session)
+	}
 }
 
 // notifyFreed wakes a parked acquire() waiter after p.open is decremented

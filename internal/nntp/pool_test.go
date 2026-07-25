@@ -29,6 +29,13 @@ func TestPooledSourceReusesSessions(t *testing.T) {
 		return &fakeSession{calls: &calls}, nil
 	}, 2)
 
+	// keepWarmLoop proactively dials up to minWarmConns connections in the
+	// background as soon as the pool is created (independent of any real
+	// call) -- wait for that one-time warm-up to settle before measuring
+	// reuse, otherwise this test races keepWarm's own dial.
+	waitForOpenSessions(t, source, 2)
+	warmedCount := created.Load()
+
 	for i := 0; i < 3; i++ {
 		body, err := source.Body(context.Background(), "<msg>")
 		if err != nil {
@@ -38,12 +45,31 @@ func TestPooledSourceReusesSessions(t *testing.T) {
 			t.Fatalf("got %q", string(body))
 		}
 	}
-	if created.Load() != 1 {
-		t.Fatalf("expected 1 session created, got %d", created.Load())
+	// The real calls above must reuse the already-warmed connections, not
+	// trigger fresh ones.
+	if created.Load() != warmedCount {
+		t.Fatalf("expected no new sessions created beyond the %d warmed at startup, got %d total", warmedCount, created.Load())
 	}
 	if calls.Load() != 3 {
 		t.Fatalf("expected 3 body calls, got %d", calls.Load())
 	}
+}
+
+// waitForOpenSessions polls Stats() until at least `want` connections are
+// open (active+idle) or fails the test after a short timeout -- used to
+// deterministically wait out keepWarmLoop's async startup dial instead of a
+// fixed sleep.
+func waitForOpenSessions(t *testing.T, source *PooledSource, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		active, idle := source.Stats()
+		if active+idle >= want {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d open sessions", want)
 }
 
 type controllableSession struct {
@@ -133,5 +159,49 @@ func TestPooledSourceCapsOpenSessions(t *testing.T) {
 	}
 	if created.Load() > 2 {
 		t.Fatalf("expected <=2 sessions created, got %d", created.Load())
+	}
+}
+
+// TestPooledSourceProactivelyWarmsConnections guards the fix for a real
+// production complaint (2026-07-25): resuming playback after a pause felt
+// like a full cold start every time, because idleTimeout's sweep closes
+// every connection after just 30s idle and nothing redialed them until a
+// real read paid for the handshake itself. keepWarmLoop must proactively
+// establish minWarmConns connections in the background, with zero calls to
+// Body/Stat ever made -- so they're already sitting idle and ready before
+// the first real request arrives.
+func TestPooledSourceProactivelyWarmsConnections(t *testing.T) {
+	var created atomic.Int32
+	source := NewPooledSource(context.Background(), func(ctx context.Context) (BodySession, error) {
+		created.Add(1)
+		return &fakeSession{calls: &atomic.Int32{}}, nil
+	}, 5)
+
+	waitForOpenSessions(t, source, minWarmConns)
+
+	active, idle := source.Stats()
+	if idle < minWarmConns {
+		t.Fatalf("expected at least %d idle warmed connections with zero requests made, got active=%d idle=%d", minWarmConns, active, idle)
+	}
+	if created.Load() < int32(minWarmConns) {
+		t.Fatalf("expected keepWarmLoop to have dialed at least %d connections, got %d", minWarmConns, created.Load())
+	}
+}
+
+// TestPooledSourceKeepWarmRespectsMaxOpen guards against keepWarmLoop
+// over-warming a pool whose maxOpen is smaller than minWarmConns -- it must
+// clamp to maxOpen, not exceed it.
+func TestPooledSourceKeepWarmRespectsMaxOpen(t *testing.T) {
+	var created atomic.Int32
+	source := NewPooledSource(context.Background(), func(ctx context.Context) (BodySession, error) {
+		created.Add(1)
+		return &fakeSession{calls: &atomic.Int32{}}, nil
+	}, 1)
+
+	waitForOpenSessions(t, source, 1)
+	time.Sleep(20 * time.Millisecond) // let any over-eager extra dial happen if the clamp were missing
+
+	if created.Load() > 1 {
+		t.Fatalf("expected keepWarmLoop to clamp to maxOpen=1, got %d sessions created", created.Load())
 	}
 }
