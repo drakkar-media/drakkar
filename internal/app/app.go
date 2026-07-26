@@ -397,7 +397,19 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	seerrClient := seerr.NewClient(cfg.Seerr)
 	hydraClient := hydra.NewClient(cfg.NZBHydra2)
 	hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)
-	hydraClient.SetTransport(privacyMgr.Transport())
+	// Deliberately NOT routed through privacyMgr: NZBHydra2 is a self-hosted
+	// meta-search aggregator, almost always on the same LAN as Drakkar
+	// itself -- Drakkar never talks to a real Usenet indexer directly for
+	// search, only to this local intermediary, which then reaches the real
+	// indexers using its own networking entirely outside Drakkar's control.
+	// Routing this hop through SOCKS5/WireGuard protects nothing (the
+	// identity exposed to the real indexer is NZBHydra2's own, not
+	// Drakkar's) while actively breaking connectivity for WireGuard, since
+	// consumer VPN tunnels essentially never route back to a private LAN
+	// address (confirmed live: a local NZBHydra2 instance timed out
+	// entirely once WireGuard was active). The NZB *file* download later
+	// (HTTPNZBFetcher, below) does reach the real indexer host directly and
+	// stays routed.
 	workflowSvc := workflow.NewService(db, seerrClient, hydraClient)
 	nzbFetcher := workflow.NewHTTPNZBFetcher(privacyMgr.HTTPClient(60*time.Second), &http.Client{Timeout: 60 * time.Second})
 	nzbFetcher.SetExcludedIndexers(cfg.Privacy.ExcludedIndexers)
