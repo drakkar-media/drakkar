@@ -71,12 +71,33 @@ func NewSOCKS5Dialer(cfg SOCKS5Config) (*SOCKS5Dialer, error) {
 }
 
 // DialContext dials address through the configured SOCKS5 proxy, bounding
-// the dial by d.timeout regardless of ctx's own deadline.
+// each attempt by d.timeout regardless of ctx's own deadline.
+//
+// Retries once on failure. Many consumer SOCKS5 proxy hostnames (VPN
+// providers included) resolve to a rotating pool of backend servers behind
+// one DNS name; Go's own multi-address dial fallback only helps when the
+// initial TCP connect fails, not when a specific backend accepts the TCP
+// connection and then resets mid-handshake (confirmed live against a real
+// provider: one backend node behind the same hostname consistently reset
+// the connection during the SOCKS negotiate/auth exchange while others
+// worked). A fresh attempt re-resolves the hostname and may land on a
+// healthy node. Still exclusively via SOCKS5 -- never falls back to Direct.
 func (d *SOCKS5Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	if d == nil || d.dialer == nil {
 		return nil, fmt.Errorf("socks5: not configured")
 	}
-	ctx, cancel := context.WithTimeout(ctx, d.timeout)
-	defer cancel()
-	return d.dialer.DialContext(ctx, network, address)
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		dialCtx, cancel := context.WithTimeout(ctx, d.timeout)
+		conn, err := d.dialer.DialContext(dialCtx, network, address)
+		cancel()
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, lastErr
 }

@@ -1989,22 +1989,40 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			// any Drakkar-specific service being configured.
 			target = "1.1.1.1:443"
 		}
-		testCfg := privacy.Config{
-			Mode: privacy.Mode(body.Mode),
-			SOCKS5: privacy.SOCKS5Config{
-				Host:           body.SOCKS5.Host,
-				Port:           body.SOCKS5.Port,
-				Username:       body.SOCKS5.Username,
-				Password:       body.SOCKS5.Password,
-				TimeoutSeconds: body.SOCKS5.TimeoutSeconds,
-			},
-			WireGuardConfigText:     body.WireGuard.ConfigText,
-			WireGuardTimeoutSeconds: body.WireGuard.TimeoutSeconds,
-		}
+		mode := privacy.Mode(body.Mode)
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
-		if err := privacyMgr.Test(ctx, testCfg, target); err != nil {
-			respondJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+
+		// Secrets (WireGuard's whole config text, SOCKS5's password) are
+		// never round-tripped to the browser once saved -- GET /api/settings
+		// always returns them blank. If the caller is testing the mode
+		// that's already active and didn't supply a fresh secret, they mean
+		// "test what's currently running", not "test this blank candidate"
+		// (which would otherwise fail to even parse). Probe the live active
+		// route instead of building a new one from incomplete data.
+		testingActiveModeWithoutFreshSecret := mode == privacyMgr.Mode() && ((mode == privacy.ModeWireGuard && strings.TrimSpace(body.WireGuard.ConfigText) == "") ||
+			(mode == privacy.ModeSOCKS5 && strings.TrimSpace(body.SOCKS5.Password) == "" && strings.TrimSpace(body.SOCKS5.Username) != ""))
+
+		var testErr error
+		if testingActiveModeWithoutFreshSecret {
+			testErr = privacyMgr.Probe(ctx)
+		} else {
+			testCfg := privacy.Config{
+				Mode: mode,
+				SOCKS5: privacy.SOCKS5Config{
+					Host:           body.SOCKS5.Host,
+					Port:           body.SOCKS5.Port,
+					Username:       body.SOCKS5.Username,
+					Password:       body.SOCKS5.Password,
+					TimeoutSeconds: body.SOCKS5.TimeoutSeconds,
+				},
+				WireGuardConfigText:     body.WireGuard.ConfigText,
+				WireGuardTimeoutSeconds: body.WireGuard.TimeoutSeconds,
+			}
+			testErr = privacyMgr.Test(ctx, testCfg, target)
+		}
+		if testErr != nil {
+			respondJSON(w, http.StatusOK, map[string]any{"ok": false, "error": testErr.Error()})
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"ok": true})

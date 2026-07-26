@@ -22,10 +22,11 @@
   import { toastError, toastSuccess } from '$lib/toast';
   import { bytes as fmt } from '$lib/format';
   import { debounce } from '$lib/debounce';
-  import type { DashboardHome, LibraryItem, Status } from '$lib/types';
+  import type { DashboardHome, LibraryItem, PrivacyStatus, Status } from '$lib/types';
 
   let home: DashboardHome | null = null;
   let status: Status | null = null;
+  let privacyStatus: PrivacyStatus | null = null;
   let loading = true;
   let heroIndex = 0;
   let heroTimer: number;
@@ -40,6 +41,11 @@
     }
     catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
     finally { loading = false; }
+    try {
+      privacyStatus = await api.getPrivacyStatus();
+    } catch {
+      // Non-fatal -- the privacy chip just doesn't render until reachable.
+    }
   }
 
   async function requestItem(item: LibraryItem) {
@@ -195,6 +201,20 @@
             </div>
           {/if}
         {/each}
+        {#if privacyStatus}
+          {@const privacyOk = privacyStatus.mode === 'direct' || privacyStatus.status === 'connected'}
+          <div class="int-chip" class:disabled={privacyStatus.status === 'error'}>
+            <svelte:component
+              this={privacyOk ? CheckCircle : AlertCircle}
+              size={12}
+              class={privacyOk ? 'ok' : 'warn'}
+            />
+            <span>privacy</span>
+            <span class="int-status" class:ok={privacyOk}>
+              {privacyStatus.mode}{privacyStatus.mode !== 'direct' ? ` · ${privacyStatus.status}` : ''}
+            </span>
+          </div>
+        {/if}
       </div>
     {/if}
   {/if}
