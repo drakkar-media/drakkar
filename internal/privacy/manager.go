@@ -215,6 +215,28 @@ func (m *Manager) Test(ctx context.Context, cfg Config, targetAddr string) error
 	return conn.Close()
 }
 
+// Name identifies this Manager as a probe.NamedProber for the integration
+// probe report.
+func (m *Manager) Name() string {
+	return "privacy-routing"
+}
+
+// Probe reports whether the currently active route is actually usable right
+// now. Direct mode always succeeds (nothing to verify). SOCKS5/WireGuard
+// dial a well-known reachable host through the active route -- a failure
+// here means protected traffic is currently blocked, not leaking, since
+// DialContext has no fallback path.
+func (m *Manager) Probe(ctx context.Context) error {
+	if m.Mode() == ModeDirect {
+		return nil
+	}
+	conn, err := m.DialContext(ctx, "tcp", "1.1.1.1:443")
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
 // Close tears down the currently active route (WireGuard tunnel, if any).
 // Used at process shutdown.
 func (m *Manager) Close() {

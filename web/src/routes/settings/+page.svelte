@@ -41,6 +41,7 @@
   import Ban from '@lucide/svelte/icons/ban';
   import ChevronUp from '@lucide/svelte/icons/chevron-up';
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
+  import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import Pencil from '@lucide/svelte/icons/pencil';
   import ExternalLink from '@lucide/svelte/icons/external-link';
@@ -201,12 +202,17 @@
   let logLevelFilter = 'all';
   let logTerm = '';
   let logError = '';
+  const logPageSize = 100;
+  let logPage = 1;
+  let logTotal = 0;
+  $: logTotalPages = Math.max(1, Math.ceil(logTotal / logPageSize));
 
   async function loadLogs() {
     logLoading = true;
     logError = '';
     try {
-      const data = await api.logs({ limit: 500, level: logLevelFilter !== 'all' ? logLevelFilter : undefined });
+      const data = await api.logs({ page: logPage, pageSize: logPageSize, level: logLevelFilter !== 'all' ? logLevelFilter : undefined });
+      logTotal = data.total ?? 0;
       logEntries = (data.lines ?? []).map(({ raw }) => {
         try {
           const obj = JSON.parse(raw);
@@ -215,6 +221,16 @@
       });
     } catch (e) { logError = e instanceof Error ? e.message : String(e); }
     finally { logLoading = false; }
+  }
+
+  function changeLogLevel() {
+    logPage = 1;
+    void loadLogs();
+  }
+
+  function changeLogPage(e: CustomEvent<number>) {
+    logPage = e.detail;
+    void loadLogs();
   }
 
   function fmtLogDate(iso: string) {
@@ -234,6 +250,15 @@
   let taskResults: Record<string, TaskResult> = {};
   let taskSchedules: TaskSchedule[] = [];
   let taskSchedulesLoading = true;
+  // Operations (manual-only actions) collapsed by default -- least
+  // frequently needed, and the automated groups above already show live
+  // schedule status without expanding anything.
+  let collapsedTaskGroups = new Set<string>(['Operations']);
+  function toggleTaskGroup(group: string) {
+    const next = new Set(collapsedTaskGroups);
+    if (next.has(group)) next.delete(group); else next.add(group);
+    collapsedTaskGroups = next;
+  }
 
   // Task IDs match backend task scheduler IDs (internal/app/app.go ListTaskSchedules).
   const taskDefs: TaskDef[] = [
@@ -1854,12 +1879,14 @@
                     </td>
                     <td class="bl-key-cell">
                       <div class="bl-key-top">
-                        <span class="reason-badge neutral">{blocklistKeyLabel(item)}</span>
+                        {#if item.keyType === 'external_url' || item.keyType === 'release_signature'}
+                          <span class="reason-badge neutral">{blocklistKeyLabel(item)}</span>
+                        {/if}
+                        <span class="bl-key mono" title={item.key}>{item.key}</span>
                         <button class="icon-btn" type="button" on:click={() => copyBlocklistKey(item.key)} title="Copy runtime key">
                           <Copy size={13} />
                         </button>
                       </div>
-                      <div class="bl-key mono">{item.key}</div>
                     </td>
                     <td class="bl-context-cell">
                       {#if blocklistContext(item)}
@@ -1873,7 +1900,7 @@
                           </div>
                         {/if}
                       {:else}
-                        <div class="muted">No linked release metadata available.</div>
+                        <span class="muted" title="No linked release metadata available.">—</span>
                       {/if}
                     </td>
                     <td class="muted mono">{item.createdAt ? new Date(item.createdAt).toLocaleDateString('en-GB') : '—'}</td>
@@ -2787,7 +2814,7 @@
           <Search size={14} />
           <input bind:value={logTerm} placeholder="Search logs, service names, request IDs…" class="log-search-input" />
         </div>
-        <select bind:value={logLevelFilter} on:change={() => void loadLogs()} class="log-level-select">
+        <select bind:value={logLevelFilter} on:change={changeLogLevel} class="log-level-select">
           <option value="all">All levels</option>
           <option value="info">Info</option>
           <option value="warn">Warn</option>
@@ -2802,6 +2829,10 @@
         </a>
       </div>
       {#if logError}<div class="log-error">Error: {logError}</div>{/if}
+      <div class="pager-row">
+        <span class="pager-total">{logTotal.toLocaleString()} matching entries</span>
+        <Pagination page={logPage} totalPages={logTotalPages} on:change={changeLogPage} />
+      </div>
       <div class="log-table-wrap">
         <table>
           <thead>
@@ -2832,6 +2863,9 @@
           </tbody>
         </table>
       </div>
+      <div class="pager-row">
+        <Pagination page={logPage} totalPages={logTotalPages} on:change={changeLogPage} />
+      </div>
 
     <!-- TASKS -->
     {:else if activeTab === 'tasks'}
@@ -2855,7 +2889,17 @@
             </thead>
             <tbody>
               {#each taskGroups as group}
-                <tr class="task-group-row"><td colspan="5">{group}</td></tr>
+                {@const groupCollapsed = collapsedTaskGroups.has(group)}
+                <tr class="task-group-row" on:click={() => toggleTaskGroup(group)}>
+                  <td colspan="5">
+                    <span class="task-group-toggle">
+                      <svelte:component this={groupCollapsed ? ChevronRight : ChevronDown} size={14} />
+                      {group}
+                      <span class="task-group-count">{taskDefs.filter(t => t.group === group).length}</span>
+                    </span>
+                  </td>
+                </tr>
+                {#if !groupCollapsed}
                 {#each taskDefs.filter(t => t.group === group) as task}
                   {@const busy = taskRunning[task.id]}
                   {@const result = taskResults[task.id]}
@@ -2903,6 +2947,7 @@
                     </td>
                   </tr>
                 {/each}
+                {/if}
               {/each}
             </tbody>
           </table>
@@ -3057,6 +3102,16 @@
               <div><span>Read-ahead limit</span><strong>{bytes(status.readAheadLimitBytes)}</strong></div>
               <div><span>Hot cache</span><strong>{bytes(status.memoryHotCacheBytes)}</strong></div>
               <div><span>Queue depth</span><strong>{status.backgroundQueueDepth}</strong></div>
+              <div>
+                <span>Privacy routing</span>
+                <strong>
+                  {#if privacyStatus}
+                    {privacyStatus.mode}{privacyStatus.mode !== 'direct' ? ` · ${privacyStatus.status}` : ''}
+                  {:else}
+                    —
+                  {/if}
+                </strong>
+              </div>
             </div>
           {:else}
             <div class="empty">Loading runtime…</div>
@@ -3539,7 +3594,7 @@
   .bl-table th.sortable:hover { color: hsl(var(--foreground)); }
 
   .bl-table td {
-    padding: 10px 14px;
+    padding: 6px 14px;
     border-bottom: 1px solid hsl(0 0% 100% / 0.04);
     font-size: 13px;
     vertical-align: middle;
@@ -3553,8 +3608,17 @@
     align-items: center;
     gap: 8px;
   }
-  .bl-key-top { justify-content: space-between; margin-bottom: 6px; }
-  .bl-key { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: hsl(var(--muted-foreground)); font-size: 11px; }
+  .bl-key-top { min-width: 0; }
+  .bl-key {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: hsl(var(--muted-foreground));
+    font-size: 11px;
+    cursor: default;
+  }
   .bl-context-title {
     font-size: 13px;
     font-weight: 600;
@@ -3881,6 +3945,8 @@
   }
   .log-download-link { display: contents; }
   .log-error { margin-bottom: 10px; padding: 10px 14px; border-radius: 12px; background: hsl(0 72% 51% / 0.15); color: hsl(0 96% 82%); font-size: 13px; }
+  .pager-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 10px 0; }
+  .pager-total { font-size: 13px; color: hsl(var(--muted-foreground)); }
   .log-table-wrap { overflow-x: auto; border: 1px solid hsl(0 0% 100% / 0.08); border-radius: 18px; background: hsl(var(--background) / 0.6); }
   .log-table-wrap table { width: 100%; min-width: 760px; border-collapse: collapse; }
   .log-table-wrap thead { border-bottom: 1px solid hsl(0 0% 100% / 0.06); }
@@ -3907,7 +3973,10 @@
   .task-table-wrap table { width: 100%; min-width: 760px; border-collapse: collapse; }
   .task-table-wrap th, .task-table-wrap td { padding: 12px 10px; border-bottom: 1px solid hsl(0 0% 100% / 0.05); text-align: left; vertical-align: top; }
   .task-table-wrap th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.18em; color: hsl(var(--muted-foreground)); }
+  .task-group-row { cursor: pointer; user-select: none; }
   .task-group-row td { padding-top: 20px; font-size: 12px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: hsl(var(--primary)); }
+  .task-group-toggle { display: inline-flex; align-items: center; gap: 6px; }
+  .task-group-count { font-weight: 500; color: hsl(var(--muted-foreground)); letter-spacing: normal; text-transform: none; }
   .task-row-title { font-weight: 600; }
   .task-row-sub { margin-top: 4px; color: hsl(var(--muted-foreground)); font-size: 12px; }
   .task-result { display: inline-flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; font-family: 'JetBrains Mono', monospace; }

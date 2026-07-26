@@ -2044,25 +2044,34 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 
 	// Recent structured log lines from the application log file.
 	r.Get("/api/logs", func(w http.ResponseWriter, r *http.Request) {
-		limitStr := r.URL.Query().Get("limit")
-		limit := 200
-		if n, err := strconv.Atoi(limitStr); err == nil && n > 0 && n <= 2000 {
-			limit = n
+		pageSize := 200
+		if n, err := strconv.Atoi(r.URL.Query().Get("pageSize")); err == nil && n > 0 && n <= 2000 {
+			pageSize = n
+		} else if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 && n <= 2000 {
+			// Back-compat with the old single-page `limit` param.
+			pageSize = n
+		}
+		page := 1
+		if n, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && n > 0 {
+			page = n
 		}
 		levelFilter := strings.ToLower(r.URL.Query().Get("level"))
 		logFile := config.DefaultLogsPath + "/drakkar.log"
 		data, err := os.ReadFile(logFile)
 		if err != nil {
-			respondJSON(w, http.StatusOK, map[string]any{"lines": []any{}})
+			respondJSON(w, http.StatusOK, map[string]any{"lines": []any{}, "page": page, "pageSize": pageSize, "total": 0})
 			return
 		}
 		rawLines := strings.Split(strings.TrimSpace(string(data)), "\n")
-		// Take the last `limit` lines, apply level filter.
+		// Collect every matching line, newest first, then slice out the
+		// requested page -- avoids the old behavior of only ever being able
+		// to see the most recent `limit` lines with no way to page further
+		// back, which forced the frontend to render everything at once.
 		type LogLine struct {
 			Raw string `json:"raw"`
 		}
-		var out []LogLine
-		for i := len(rawLines) - 1; i >= 0 && len(out) < limit; i-- {
+		var matched []LogLine
+		for i := len(rawLines) - 1; i >= 0; i-- {
 			line := rawLines[i]
 			if line == "" {
 				continue
@@ -2070,13 +2079,18 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			if levelFilter != "" && !strings.Contains(strings.ToLower(line), `"level":"`+levelFilter+`"`) {
 				continue
 			}
-			out = append(out, LogLine{Raw: line})
+			matched = append(matched, LogLine{Raw: line})
 		}
-		// Reverse so newest is last.
-		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-			out[i], out[j] = out[j], out[i]
+		total := len(matched)
+		start := (page - 1) * pageSize
+		if start > total {
+			start = total
 		}
-		respondJSON(w, http.StatusOK, map[string]any{"lines": out})
+		end := start + pageSize
+		if end > total {
+			end = total
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"lines": matched[start:end], "page": page, "pageSize": pageSize, "total": total})
 	})
 	// Quality profiles — CRUD for user-configurable release ranking preferences.
 	r.Get("/api/profiles", func(w http.ResponseWriter, r *http.Request) {

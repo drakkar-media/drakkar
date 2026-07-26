@@ -14,6 +14,7 @@
   import Search from '@lucide/svelte/icons/search';
   import PageHeader from '$lib/components/PageHeader.svelte';
   import Button from '$lib/components/Button.svelte';
+  import Pagination from '$lib/components/Pagination.svelte';
   import { api } from '$lib/api';
 
   type LogEntry = {
@@ -32,12 +33,17 @@
   let levelFilter = 'all';
   let term = '';
   let loadError = '';
+  const pageSize = 100;
+  let page = 1;
+  let total = 0;
+  $: totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   async function load() {
     loading = true;
     loadError = '';
     try {
-      const data = await api.logs({ limit: 500, level: levelFilter !== 'all' ? levelFilter : undefined });
+      const data = await api.logs({ page, pageSize, level: levelFilter !== 'all' ? levelFilter : undefined });
+      total = data.total ?? 0;
       const lines = data.lines ?? [];
       // Parse inline and assign a fresh array so Svelte detects the change.
       entries = lines.map(({ raw }) => {
@@ -84,6 +90,16 @@
     })
     .sort((a, b) => b.time.localeCompare(a.time));
 
+  function changeLevel() {
+    page = 1;
+    void load();
+  }
+
+  function changePage(e: CustomEvent<number>) {
+    page = e.detail;
+    void load();
+  }
+
   onMount(() => {
     void load();
     const timer = window.setInterval(() => {
@@ -111,15 +127,20 @@
 <div class="toolbar">
   <div class="search-wrap">
     <Search size={14} class="search-icon" />
-    <input bind:value={term} placeholder="Search logs, request IDs, service names…" class="search-input" />
+    <input bind:value={term} placeholder="Search this page — time, service, request IDs…" class="search-input" />
   </div>
-  <select bind:value={levelFilter} on:change={() => void load()} class="level-select">
+  <select bind:value={levelFilter} on:change={changeLevel} class="level-select">
     <option value="all">All levels</option>
     <option value="info">Info</option>
     <option value="warn">Warn</option>
     <option value="error">Error</option>
     <option value="debug">Debug</option>
   </select>
+</div>
+
+<div class="pager-row">
+  <span class="pager-total">{total.toLocaleString()} matching entries</span>
+  <Pagination {page} {totalPages} on:change={changePage} />
 </div>
 
 <div class="table-wrap">
@@ -153,7 +174,24 @@
   </table>
 </div>
 
+<div class="pager-row">
+  <Pagination {page} {totalPages} on:change={changePage} />
+</div>
+
 <style>
+  .pager-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin: 10px 0;
+  }
+
+  .pager-total {
+    font-size: 13px;
+    color: hsl(var(--muted-foreground));
+  }
+
   .toolbar {
     display: grid;
     grid-template-columns: 1fr auto;

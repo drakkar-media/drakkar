@@ -315,11 +315,12 @@ export const api = {
   runHealthCheck: () => request<QueuedResult>('/api/health/check', { method: 'POST' }),
   backfillMetadata: () => request<QueuedResult>('/api/library/backfill-metadata', { method: 'POST' }),
   fillMissingEpisodes: () => request<QueuedResult>('/api/library/fill-missing-episodes', { method: 'POST' }),
-  logs: (opts?: { limit?: number; level?: string }) => {
+  logs: (opts?: { page?: number; pageSize?: number; level?: string }) => {
     const params = new URLSearchParams();
-    if (opts?.limit) params.set('limit', String(opts.limit));
+    if (opts?.page) params.set('page', String(opts.page));
+    if (opts?.pageSize) params.set('pageSize', String(opts.pageSize));
     if (opts?.level) params.set('level', opts.level);
-    return request<{ lines: { raw: string }[] }>(`/api/logs?${params.toString()}`);
+    return request<{ lines: { raw: string }[]; page: number; pageSize: number; total: number }>(`/api/logs?${params.toString()}`);
   },
   vfs: (path?: string) => {
     const params = new URLSearchParams();

@@ -16,6 +16,8 @@
   import Clock3 from '@lucide/svelte/icons/clock-3';
   import CheckCircle2 from '@lucide/svelte/icons/check-circle-2';
   import AlertTriangle from '@lucide/svelte/icons/alert-triangle';
+  import ChevronDown from '@lucide/svelte/icons/chevron-down';
+  import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import PageHeader from '$lib/components/PageHeader.svelte';
   import Panel from '$lib/components/Panel.svelte';
   import Button from '$lib/components/Button.svelte';
@@ -37,6 +39,15 @@
 
   let running: Record<string, boolean> = {};
   let results: Record<string, TaskResult> = {};
+  // Operations (manual-only actions) collapsed by default -- these are the
+  // least frequently needed, and the automated groups above them already
+  // show live schedule status at a glance without expanding anything.
+  let collapsedGroups = new Set<string>(['Operations']);
+  function toggleGroup(group: string) {
+    const next = new Set(collapsedGroups);
+    if (next.has(group)) next.delete(group); else next.add(group);
+    collapsedGroups = next;
+  }
   let schedules: TaskSchedule[] = [];
   let schedulesLoading = true;
 
@@ -207,10 +218,19 @@
       </thead>
       <tbody>
         {#each groups as group}
-          <tr class="group-row">
-            <td colspan="5">{group}</td>
+          {@const groupTasks = tasks.filter((t) => t.group === group)}
+          {@const collapsed = collapsedGroups.has(group)}
+          <tr class="group-row" on:click={() => toggleGroup(group)}>
+            <td colspan="5">
+              <span class="group-toggle">
+                <svelte:component this={collapsed ? ChevronRight : ChevronDown} size={14} />
+                {group}
+                <span class="group-count">{groupTasks.length}</span>
+              </span>
+            </td>
           </tr>
-          {#each tasks.filter((t) => t.group === group) as task}
+          {#if !collapsed}
+          {#each groupTasks as task}
             {@const busy = running[task.id]}
             {@const result = results[task.id]}
             {@const schedule = scheduleFor(task)}
@@ -261,6 +281,7 @@
               </td>
             </tr>
           {/each}
+          {/if}
         {/each}
       </tbody>
     </table>
@@ -325,6 +346,11 @@
     color: hsl(var(--muted-foreground));
   }
 
+  .group-row {
+    cursor: pointer;
+    user-select: none;
+  }
+
   .group-row td {
     padding-top: 20px;
     font-size: 12px;
@@ -333,6 +359,19 @@
     text-transform: uppercase;
     color: hsl(var(--primary));
     background: transparent;
+  }
+
+  .group-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .group-count {
+    font-weight: 500;
+    color: hsl(var(--muted-foreground));
+    letter-spacing: normal;
+    text-transform: none;
   }
 
   .row-title {

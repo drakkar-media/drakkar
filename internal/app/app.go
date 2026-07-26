@@ -494,6 +494,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}
 		probeProviders = append(probeProviders, nntp.NewArticleClient(provider, privacyMgr))
 	}
+	probeProviders = append(probeProviders, privacyMgr)
 	subtitleSvc := subtitles.NewService(db, cfg.Subtitles.Languages, subtitleProviders...)
 	policySvc := policy.NewService(db)
 	blocklistSvc := blocklist.NewService(db)
