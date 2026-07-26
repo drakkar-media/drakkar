@@ -6,6 +6,7 @@
 package hydra
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/xml"
@@ -308,6 +309,158 @@ func (c *Client) Probe(ctx context.Context) error {
 	return nil
 }
 
+// origin resolves the configured base URL down to just its scheme+host[:port]
+// -- NZBHydra2's undocumented /internalapi endpoints live at the server
+// root, but the configured URL is the Newznab search base (conventionally
+// ".../api"), so the configured path segment isn't part of these calls.
+func (c *Client) origin() (string, error) {
+	base := strings.TrimSpace(c.getBaseURL())
+	if base == "" {
+		return "", errors.New("nzbhydra2 not configured")
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return "", fmt.Errorf("nzbhydra2 url: %w", err)
+	}
+	return (&url.URL{Scheme: u.Scheme, Host: u.Host}).String(), nil
+}
+
+// ProxyConfig describes the SOCKS5 proxy Drakkar itself is configured to
+// use, as forwarded into NZBHydra2 by SyncProxy.
+type ProxyConfig struct {
+	Host     string
+	Port     int
+	Username string
+	Password string
+}
+
+// SyncProxy pushes Drakkar's own privacy-routing choice into NZBHydra2's
+// native proxy settings via its internal config API, so NZBHydra2's own
+// outbound indexer traffic -- which Drakkar cannot route itself, since
+// NZBHydra2 is a separate process with its own networking entirely outside
+// Drakkar's control -- goes through the same SOCKS5 proxy. Passing
+// enabled=false clears NZBHydra2's proxy back to "no proxy"; NZBHydra2 has
+// no WireGuard proxy type, so callers should pass enabled=false for both
+// Direct and WireGuard mode, and only enabled=true for SOCKS5 mode.
+//
+// NZBHydra2's config API has no per-field PATCH, so this fetches the entire
+// current config, patches only the "main" section's proxy* fields, and
+// writes the whole thing back. Every other field -- including other
+// secrets, which NZBHydra2 masks as the literal string "***UNCHANGED***" on
+// GET -- round-trips untouched; confirmed live against a real instance that
+// NZBHydra2 treats that mask specially server-side and does not overwrite
+// the real stored value when it comes back unchanged, so this is safe even
+// though the intermediate representation briefly holds the mask text for
+// fields this call never intends to change.
+func (c *Client) SyncProxy(ctx context.Context, enabled bool, proxy ProxyConfig) error {
+	origin, err := c.origin()
+	if err != nil {
+		return err
+	}
+
+	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, origin+"/internalapi/config", nil)
+	if err != nil {
+		return err
+	}
+	getResp, err := c.httpClient.Load().Do(getReq)
+	if err != nil {
+		return fmt.Errorf("nzbhydra2 get config: %w", err)
+	}
+	defer getResp.Body.Close()
+	if getResp.StatusCode < 200 || getResp.StatusCode >= 300 {
+		return fmt.Errorf("nzbhydra2 get config status %d", getResp.StatusCode)
+	}
+	body, err := io.ReadAll(getResp.Body)
+	if err != nil {
+		return fmt.Errorf("nzbhydra2 get config: %w", err)
+	}
+
+	var full map[string]json.RawMessage
+	if err := json.Unmarshal(body, &full); err != nil {
+		return fmt.Errorf("nzbhydra2 config: %w", err)
+	}
+	var main map[string]json.RawMessage
+	if err := json.Unmarshal(full["main"], &main); err != nil {
+		return fmt.Errorf("nzbhydra2 config: main section: %w", err)
+	}
+
+	set := func(key string, v any) error {
+		raw, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		main[key] = raw
+		return nil
+	}
+
+	if enabled {
+		if err := set("proxyType", "SOCKS"); err != nil {
+			return err
+		}
+		if err := set("proxyHost", proxy.Host); err != nil {
+			return err
+		}
+		if err := set("proxyPort", proxy.Port); err != nil {
+			return err
+		}
+		if err := set("proxyUsername", proxy.Username); err != nil {
+			return err
+		}
+		if err := set("proxyPassword", proxy.Password); err != nil {
+			return err
+		}
+		if err := set("proxyIgnoreLocal", true); err != nil {
+			return err
+		}
+	} else {
+		if err := set("proxyType", "NONE"); err != nil {
+			return err
+		}
+		if err := set("proxyHost", nil); err != nil {
+			return err
+		}
+		if err := set("proxyUsername", nil); err != nil {
+			return err
+		}
+		if err := set("proxyPassword", nil); err != nil {
+			return err
+		}
+	}
+
+	mainRaw, err := json.Marshal(main)
+	if err != nil {
+		return err
+	}
+	full["main"] = mainRaw
+	newBody, err := json.Marshal(full)
+	if err != nil {
+		return err
+	}
+
+	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, origin+"/internalapi/config", bytes.NewReader(newBody))
+	if err != nil {
+		return err
+	}
+	putReq.Header.Set("Content-Type", "application/json")
+	putResp, err := c.httpClient.Load().Do(putReq)
+	if err != nil {
+		return fmt.Errorf("nzbhydra2 put config: %w", err)
+	}
+	defer putResp.Body.Close()
+	if putResp.StatusCode < 200 || putResp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(putResp.Body)
+		return fmt.Errorf("nzbhydra2 put config status %d: %s", putResp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	var result struct {
+		OK            bool     `json:"ok"`
+		ErrorMessages []string `json:"errorMessages"`
+	}
+	if err := json.NewDecoder(putResp.Body).Decode(&result); err == nil && !result.OK {
+		return fmt.Errorf("nzbhydra2 rejected proxy config: %v", result.ErrorMessages)
+	}
+	return nil
+}
+
 // hydraIndexerConfig is the subset of NZBHydra2's internal config response
 // (GET /internalapi/config) this client cares about. NZBHydra2 doesn't
 // expose its configured sub-indexer list through the public Newznab API
@@ -330,19 +483,10 @@ type hydraIndexerConfig struct {
 // callers should treat that as "list unavailable" and fall back to manual
 // entry rather than failing outright.
 func (c *Client) Indexers(ctx context.Context) ([]string, error) {
-	base := strings.TrimSpace(c.getBaseURL())
-	if base == "" {
-		return nil, errors.New("nzbhydra2 not configured")
-	}
-	// The configured URL is the Newznab search base (conventionally
-	// ".../api"), but /internalapi lives at the server root -- reduce to
-	// just the origin (scheme+host[:port]) before appending it, since the
-	// configured path segment (e.g. "/api") isn't part of this API.
-	u, err := url.Parse(base)
+	origin, err := c.origin()
 	if err != nil {
-		return nil, fmt.Errorf("nzbhydra2 url: %w", err)
+		return nil, err
 	}
-	origin := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, origin+"/internalapi/config", nil)
 	if err != nil {

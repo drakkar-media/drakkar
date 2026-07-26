@@ -419,6 +419,24 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	nzbFetcher.SetExcludedIndexers(cfg.Privacy.ExcludedIndexers)
 	nzbFetcher.SetLocalHost(hostOf(cfg.NZBHydra2.URL))
 	workflowSvc.SetNZBFetcher(nzbFetcher)
+	if cfg.Privacy.SyncNZBHydra2Proxy {
+		// Best-effort and asynchronous, same as the settings-reload path in
+		// live_settings.go -- NZBHydra2 being briefly unreachable at startup
+		// shouldn't delay the rest of Run().
+		go func() {
+			syncCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			proxy := hydra.ProxyConfig{
+				Host:     cfg.Privacy.SOCKS5.Host,
+				Port:     cfg.Privacy.SOCKS5.Port,
+				Username: cfg.Privacy.SOCKS5.Username,
+				Password: cfg.Privacy.SOCKS5.Password,
+			}
+			if err := hydraClient.SyncProxy(syncCtx, cfg.Privacy.Mode == config.PrivacyModeSOCKS5, proxy); err != nil {
+				slog.Warn("nzbhydra2 proxy sync failed", "error", err)
+			}
+		}()
+	}
 	// importWorkers = number of concurrent download-job pipelines (search,
 	// select, fetch NZB, import, publish) processed at once. Deliberately
 	// independent of maxDownloadConnections/the NNTP connection budget --

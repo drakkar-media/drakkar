@@ -616,6 +616,10 @@ export type FullSettings = {
     // Indexers exempted from the privacy tunnel, e.g. ones that are already
     // trusted or that block traffic from VPN/proxy IP ranges.
     excludedIndexers: string[];
+    // When true, pushes the SOCKS5 config into NZBHydra2's own proxy
+    // settings on every save (NZBHydra2 is a separate process Drakkar can't
+    // route traffic for otherwise). Only meaningful for SOCKS5 mode.
+    syncNzbHydra2Proxy: boolean;
   };
 };
 

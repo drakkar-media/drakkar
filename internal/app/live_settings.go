@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -425,6 +426,26 @@ func (c *liveSettingsController) ApplySettings(ctx context.Context, cfg config.S
 	if c.hydraClient != nil {
 		c.hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)
 		c.hydraClient.SetConfig(cfg.NZBHydra2)
+		if cfg.Privacy.SyncNZBHydra2Proxy {
+			// Best-effort and asynchronous: NZBHydra2 being briefly
+			// unreachable shouldn't block a settings save or fail the rest
+			// of this reload sequence.
+			hydraClient := c.hydraClient
+			enabled := cfg.Privacy.Mode == config.PrivacyModeSOCKS5
+			proxy := hydra.ProxyConfig{
+				Host:     cfg.Privacy.SOCKS5.Host,
+				Port:     cfg.Privacy.SOCKS5.Port,
+				Username: cfg.Privacy.SOCKS5.Username,
+				Password: cfg.Privacy.SOCKS5.Password,
+			}
+			go func() {
+				syncCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				if err := hydraClient.SyncProxy(syncCtx, enabled, proxy); err != nil {
+					slog.Warn("nzbhydra2 proxy sync failed", "error", err)
+				}
+			}()
+		}
 	}
 	if c.seerrClient != nil {
 		c.seerrClient.SetConfig(cfg.Seerr)

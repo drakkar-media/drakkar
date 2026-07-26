@@ -736,13 +736,19 @@
             mode: 'direct',
             socks5: { host: '', port: 1080, username: '', password: '', timeoutSeconds: 15 },
             wireguard: { configText: '', timeoutSeconds: 15 },
-            excludedIndexers: []
+            excludedIndexers: [],
+            syncNzbHydra2Proxy: false
           };
-        } else if (draft?.privacy && !draft.privacy.excludedIndexers) {
-          // Older/partial settings.json (or an omitempty gap server-side) can
-          // omit this array entirely -- treated as undefined/null here would
-          // throw on the .join() call in the Privacy Routing tab.
-          draft.privacy.excludedIndexers = [];
+        } else if (draft?.privacy) {
+          if (!draft.privacy.excludedIndexers) {
+            // Older/partial settings.json (or an omitempty gap server-side) can
+            // omit this array entirely -- treated as undefined/null here would
+            // throw on the .join() call in the Privacy Routing tab.
+            draft.privacy.excludedIndexers = [];
+          }
+          if (draft.privacy.syncNzbHydra2Proxy === undefined) {
+            draft.privacy.syncNzbHydra2Proxy = false;
+          }
         }
       }
       try {
@@ -2649,6 +2655,19 @@
               <input type="number" min="1" bind:value={draft.privacy.socks5.timeoutSeconds} />
             </label>
           </div>
+          <div class="flags-grid" style="margin-top:12px">
+            <label class="flag-row">
+              <input type="checkbox" bind:checked={draft.privacy.syncNzbHydra2Proxy} />
+              <div>
+                <strong>Sync NZBHydra2 proxy settings</strong>
+                <span>
+                  Push this SOCKS5 config into NZBHydra2's own proxy settings on save, so its own
+                  outbound indexer traffic is routed too — Drakkar can't route NZBHydra2's traffic
+                  itself, since it's a separate process with its own networking.
+                </span>
+              </div>
+            </label>
+          </div>
         {/if}
 
         {#if draft.privacy.mode === 'wireguard'}
@@ -2656,12 +2675,12 @@
           {#if privacyStatus?.wireguard}
             <div class="field">
               <div class="field-label">Current Configuration</div>
-              <div class="flags-grid" style="grid-template-columns:1fr 1fr">
-                {#if privacyStatus.wireguard.interfaceAddress?.length}<div><strong>Interface Address</strong><span>{privacyStatus.wireguard.interfaceAddress.join(', ')}</span></div>{/if}
-                {#if privacyStatus.wireguard.endpoint}<div><strong>Endpoint</strong><span>{privacyStatus.wireguard.endpoint}</span></div>{/if}
-                {#if privacyStatus.wireguard.allowedIps?.length}<div><strong>Allowed IPs</strong><span>{privacyStatus.wireguard.allowedIps.join(', ')}</span></div>{/if}
-                {#if privacyStatus.wireguard.dns?.length}<div><strong>DNS</strong><span>{privacyStatus.wireguard.dns.join(', ')}</span></div>{/if}
-                {#if privacyStatus.wireguard.persistentKeepalive}<div><strong>Keepalive</strong><span>{privacyStatus.wireguard.persistentKeepalive}s</span></div>{/if}
+              <div class="wg-summary-grid">
+                {#if privacyStatus.wireguard.interfaceAddress?.length}<div><strong>Interface Address</strong><span class="mono">{privacyStatus.wireguard.interfaceAddress.join(', ')}</span></div>{/if}
+                {#if privacyStatus.wireguard.endpoint}<div><strong>Endpoint</strong><span class="mono">{privacyStatus.wireguard.endpoint}</span></div>{/if}
+                {#if privacyStatus.wireguard.allowedIps?.length}<div><strong>Allowed IPs</strong><span class="mono">{privacyStatus.wireguard.allowedIps.join(', ')}</span></div>{/if}
+                {#if privacyStatus.wireguard.dns?.length}<div><strong>DNS</strong><span class="mono">{privacyStatus.wireguard.dns.join(', ')}</span></div>{/if}
+                {#if privacyStatus.wireguard.persistentKeepalive}<div><strong>Keepalive</strong><span class="mono">{privacyStatus.wireguard.persistentKeepalive}s</span></div>{/if}
               </div>
               <p class="field-hint">PrivateKey/PresharedKey are never shown or sent back to the browser.</p>
             </div>
@@ -4025,6 +4044,10 @@
   .flag-row input[type=checkbox] { width: 16px; height: 16px; flex-shrink: 0; margin-top: 2px; accent-color: hsl(var(--primary)); cursor: pointer; }
   .flag-row strong { display: block; font-size: 13px; margin-bottom: 2px; }
   .flag-row span { display: block; font-size: 12px; color: hsl(var(--muted-foreground)); }
+  .wg-summary-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .wg-summary-grid > div { padding: 10px 14px; border-radius: 12px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.03); min-width: 0; }
+  .wg-summary-grid > div strong { display: block; font-size: 11px; margin-bottom: 4px; color: hsl(var(--muted-foreground)); text-transform: uppercase; letter-spacing: 0.04em; }
+  .wg-summary-grid > div span { display: block; font-size: 13px; word-break: break-all; }
   .size-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .size-row label { display: grid; gap: 6px; }
   .size-row span { font-size: 12px; color: hsl(var(--muted-foreground)); }

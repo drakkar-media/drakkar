@@ -72,6 +72,15 @@ type PrivacyConfig struct {
 	SOCKS5           PrivacySOCKS5Config    `json:"socks5"`
 	WireGuard        PrivacyWireGuardConfig `json:"wireguard"`
 	ExcludedIndexers []string               `json:"excludedIndexers"`
+	// SyncNZBHydra2Proxy: when true, push Mode/SOCKS5 into NZBHydra2's own
+	// proxy settings (via its /internalapi/config API) on every settings
+	// save, so NZBHydra2's own outbound indexer traffic -- which Drakkar has
+	// no way to route itself, since NZBHydra2 is a separate process with its
+	// own networking -- goes through the same SOCKS5 proxy. Only SOCKS5 is
+	// pushed: NZBHydra2 has no WireGuard proxy type, so WireGuard/Direct mode
+	// pushes "no proxy" instead. Left false by default since it mutates a
+	// different application's config.
+	SyncNZBHydra2Proxy bool `json:"syncNzbHydra2Proxy"`
 }
 
 // PrivacySOCKS5Config holds the connection settings for routing traffic
@@ -658,8 +667,9 @@ func RedactedSettings(cfg Settings) map[string]any {
 			"providers": redactSubtitleProviders(cfg.Subtitles.Providers),
 		},
 		"privacy": map[string]any{
-			"mode":             cfg.Privacy.Mode,
-			"excludedIndexers": append([]string(nil), cfg.Privacy.ExcludedIndexers...),
+			"mode":               cfg.Privacy.Mode,
+			"excludedIndexers":   append([]string(nil), cfg.Privacy.ExcludedIndexers...),
+			"syncNzbHydra2Proxy": cfg.Privacy.SyncNZBHydra2Proxy,
 			"socks5": map[string]any{
 				"host":     cfg.Privacy.SOCKS5.Host,
 				"port":     cfg.Privacy.SOCKS5.Port,
