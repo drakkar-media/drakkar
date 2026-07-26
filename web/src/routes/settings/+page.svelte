@@ -119,6 +119,9 @@
   let privacyTestResult: { ok: boolean; error?: string } | null = null;
   let wireguardImportOpen = false;
   let wireguardImportText = '';
+  /** Enabled indexer names from NZBHydra2, for the exclusion-list picker. Empty when NZBHydra2 isn't reachable — the UI falls back to manual entry. */
+  let knownIndexerNames: string[] = [];
+  let manualExcludedIndexer = '';
 
   let lastCachePrune: { root: string; filesBefore: number; filesAfter: number; bytesBefore: number; bytesAfter: number; deletedFiles: number; deletedBytes: number; limitBytes: number } | null = null;
   let activeTab: SettingsTab = 'integrations';
@@ -721,6 +724,12 @@
         privacyStatus = await api.getPrivacyStatus();
       } catch {
         // Non-fatal -- the status panel just shows nothing until reachable.
+      }
+      try {
+        const res = await api.listIndexerNames();
+        knownIndexerNames = res.names;
+      } catch {
+        // Non-fatal -- the exclusion-list picker falls back to manual entry.
       }
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
@@ -2706,23 +2715,60 @@
 
         <div class="divider"></div>
         <!--
-          Free-text, comma-separated list rather than a multi-select because indexer
-          names are matched against whatever string the search result reports for
-          "indexer" (not a stable ID) — the operator must type them to match exactly.
-          Parsed back into an array only on change (blur/Enter), and like every other
-          field on this page it only takes effect once Save writes the draft back.
+          Indexer names must match whatever string the search result reports
+          for "indexer" (not a stable ID). Toggled from NZBHydra2's own
+          enabled-indexer list when reachable; always also allows adding a
+          name manually (NZBHydra2 unreachable, or a name that doesn't match
+          exactly). Like every other field on this page, only takes effect
+          once Save writes the draft back.
         -->
         <div class="field">
-          <label class="field-label" for="privacy-excluded">Indexers Excluded From Privacy Routing</label>
-          <input id="privacy-excluded" type="text"
-            value={(draft.privacy.excludedIndexers ?? []).join(', ')}
-            on:change={(e) => {
+          <div class="field-label">Indexers Excluded From Privacy Routing</div>
+          {#if knownIndexerNames.length > 0}
+            <div class="flags-grid">
+              {#each knownIndexerNames as name}
+                <button type="button" class="chip" class:on={(draft.privacy.excludedIndexers ?? []).includes(name)}
+                  on:click={() => { if (draft) draft.privacy.excludedIndexers = profileToggle(draft.privacy.excludedIndexers ?? [], name); }}>
+                  {name}
+                </button>
+              {/each}
+            </div>
+          {:else}
+            <p class="field-hint">NZBHydra2's indexer list isn't available (not configured or unreachable) — add names manually below.</p>
+          {/if}
+          <div class="actions-row" style="margin-top:10px">
+            <input type="text" bind:value={manualExcludedIndexer} placeholder="Add an indexer name manually"
+              on:keydown={(e) => {
+                if (e.key !== 'Enter' || !draft) return;
+                e.preventDefault();
+                const name = manualExcludedIndexer.trim();
+                if (!name) return;
+                if (!(draft.privacy.excludedIndexers ?? []).includes(name)) {
+                  draft.privacy.excludedIndexers = [...(draft.privacy.excludedIndexers ?? []), name];
+                }
+                manualExcludedIndexer = '';
+              }} />
+            <Button kind="ghost" on:click={() => {
               if (!draft) return;
-              draft.privacy.excludedIndexers = (e.currentTarget as HTMLInputElement).value
-                .split(',').map(l => l.trim()).filter(Boolean);
-            }}
-            placeholder="NZBGeek, NZB Finder" />
-          <p class="field-hint">Comma-separated indexer names (as they appear in search results). NZB downloads from these indexers always use a direct connection, regardless of the routing mode above — useful for a private/trusted indexer.</p>
+              const name = manualExcludedIndexer.trim();
+              if (!name) return;
+              if (!(draft.privacy.excludedIndexers ?? []).includes(name)) {
+                draft.privacy.excludedIndexers = [...(draft.privacy.excludedIndexers ?? []), name];
+              }
+              manualExcludedIndexer = '';
+            }}>Add</Button>
+          </div>
+          {#if (draft.privacy.excludedIndexers ?? []).some(n => !knownIndexerNames.includes(n))}
+            <div class="flags-grid" style="margin-top:8px">
+              {#each draft.privacy.excludedIndexers.filter(n => !knownIndexerNames.includes(n)) as name}
+                <button type="button" class="chip on"
+                  on:click={() => { if (draft) draft.privacy.excludedIndexers = profileToggle(draft.privacy.excludedIndexers ?? [], name); }}>
+                  {name} ✕
+                </button>
+              {/each}
+            </div>
+          {/if}
+          <p class="field-hint">NZB downloads from these indexers always use a direct connection, regardless of the routing mode above — useful for a private/trusted indexer.</p>
         </div>
 
         <div class="divider"></div>

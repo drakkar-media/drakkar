@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -305,6 +306,58 @@ func (c *Client) Probe(ctx context.Context) error {
 		return fmt.Errorf("nzbhydra2 caps status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// hydraIndexerConfig is the subset of NZBHydra2's internal config response
+// (GET /internalapi/config) this client cares about. NZBHydra2 doesn't
+// expose its configured sub-indexer list through the public Newznab API
+// (Sonarr/Radarr/Drakkar all see it as a single aggregated indexer), so
+// listing them for the UI requires its own admin-facing internal API --
+// undocumented but stable enough in practice for this read-only use, and
+// this deployment runs it with authType "NONE" (no session required).
+type hydraIndexerConfig struct {
+	Indexers []struct {
+		Name  string `json:"name"`
+		State string `json:"state"` // ENABLED | DISABLED_USER | DISABLED_SYSTEM | DISABLED_SYSTEM_TEMPORARY
+	} `json:"indexers"`
+}
+
+// Indexers returns the names of every indexer currently enabled in
+// NZBHydra2's own configuration, sorted alphabetically -- used to populate
+// a selectable list (e.g. Privacy Routing's per-indexer exclusion list)
+// instead of requiring the operator to type names by hand. Returns an
+// error if NZBHydra2 isn't reachable or the response doesn't parse;
+// callers should treat that as "list unavailable" and fall back to manual
+// entry rather than failing outright.
+func (c *Client) Indexers(ctx context.Context) ([]string, error) {
+	base := strings.TrimRight(c.getBaseURL(), "/")
+	if base == "" {
+		return nil, errors.New("nzbhydra2 not configured")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/internalapi/config", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient.Load().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("nzbhydra2 internal config status %d", resp.StatusCode)
+	}
+	var cfg hydraIndexerConfig
+	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("nzbhydra2 internal config: %w", err)
+	}
+	names := make([]string, 0, len(cfg.Indexers))
+	for _, ix := range cfg.Indexers {
+		if ix.State == "ENABLED" && strings.TrimSpace(ix.Name) != "" {
+			names = append(names, ix.Name)
+		}
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // SearchRecent fetches the most recent releases for mediaType ("movie" or

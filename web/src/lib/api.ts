@@ -297,6 +297,11 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(candidate)
     }),
+  // Enabled indexer names from NZBHydra2's own config, for the Privacy
+  // Routing exclusion-list picker. Empty (with an `error`) when
+  // NZBHydra2 isn't configured/reachable -- callers should fall back to
+  // manual text entry rather than treating that as fatal.
+  listIndexerNames: () => request<{ names: string[]; error?: string }>('/api/indexers/names'),
   healthSummary: () => request<{ total: number; checked: number; healthy: number; neverChecked: number; consistencyIssues: number; uncalibratedNZBFiles: number }>('/api/health/summary'),
   healthEntries: (opts?: { filter?: string; limit?: number; offset?: number }) => {
     const params = new URLSearchParams();

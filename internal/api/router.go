@@ -145,6 +145,14 @@ type CatalogService interface {
 	ReleaseCalendar(ctx context.Context, month string) ([]catalog.CalendarEntry, error)
 }
 
+// IndexerLister lists the indexer names currently enabled in the upstream
+// search provider (NZBHydra2), so the UI can offer a selectable list (e.g.
+// Privacy Routing's per-indexer exclusion list) instead of requiring names
+// to be typed by hand.
+type IndexerLister interface {
+	Indexers(ctx context.Context) ([]string, error)
+}
+
 // WorkflowService defines the operations that drive the media acquisition
 // pipeline end to end: syncing requests from Seerr, searching indexers,
 // selecting/rejecting/retrying release candidates, managing the work queue,
@@ -376,7 +384,7 @@ func (b *EventBroker) Publish(event map[string]any) {
 // so metrics collection remains entirely optional.
 //
 // The returned chi.Router is safe to mount directly as an http.Handler.
-func Router(status StatusService, queue QueueService, workflowSvc WorkflowService, publication PublicationService, maintenance MaintenanceService, cacheSvc CacheService, subtitleSvc SubtitleService, blocklistSvc BlocklistService, probeSvc IntegrationProbeService, catalogSvc CatalogService, broker *EventBroker, healthRepo HealthRepository, streamsProvider StreamsProvider, profilesRepo ProfilesRepository, taskSchedules TaskScheduleProvider, policySvc PolicyService, plexClient *plex.Client, jellyfinClient *jellyfin.Client, settingsSvc SettingsService, privacyMgr *privacy.Manager, userRepo UserRepository, speedTestSvc SpeedTestService, metricsProvider ...MetricsProvider) chi.Router {
+func Router(status StatusService, queue QueueService, workflowSvc WorkflowService, publication PublicationService, maintenance MaintenanceService, cacheSvc CacheService, subtitleSvc SubtitleService, blocklistSvc BlocklistService, probeSvc IntegrationProbeService, catalogSvc CatalogService, broker *EventBroker, healthRepo HealthRepository, streamsProvider StreamsProvider, profilesRepo ProfilesRepository, taskSchedules TaskScheduleProvider, policySvc PolicyService, plexClient *plex.Client, jellyfinClient *jellyfin.Client, settingsSvc SettingsService, privacyMgr *privacy.Manager, indexerLister IndexerLister, userRepo UserRepository, speedTestSvc SpeedTestService, metricsProvider ...MetricsProvider) chi.Router {
 	r := chi.NewRouter()
 	r.Use(corsMiddleware)
 	r.Use(authMiddlewareFor(userRepo))
@@ -2000,6 +2008,20 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+	r.Get("/api/indexers/names", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+		if indexerLister == nil {
+			respondJSON(w, http.StatusOK, map[string]any{"names": []string{}})
+			return
+		}
+		names, err := indexerLister.Indexers(r.Context())
+		if err != nil {
+			// Not fatal -- the frontend falls back to manual entry when this
+			// list is unavailable (e.g. NZBHydra2 not configured/reachable).
+			respondJSON(w, http.StatusOK, map[string]any{"names": []string{}, "error": err.Error()})
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"names": names})
 	}))
 
 	// Streams the largest already-downloaded file through the real playback
