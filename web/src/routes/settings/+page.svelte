@@ -664,9 +664,14 @@
         draft = cloneSettings(fs);
         // Apply frontend defaults for fields that may be absent from older settings.json
         if (draft && !draft.indexer) {
-          draft.indexer = { tvRssSyncIntervalMinutes: 15, movieRssSyncIntervalMinutes: 30, minimumAgeMinutes: 0, retentionDays: 0, maximumSizeMB: 0, searchDelayMs: 2000, backgroundSearchWorkers: 12 };
-        } else if (draft?.indexer && !draft.indexer.backgroundSearchWorkers) {
-          draft.indexer.backgroundSearchWorkers = 12;
+          draft.indexer = { tvRssSyncIntervalMinutes: 15, movieRssSyncIntervalMinutes: 30, minimumAgeMinutes: 0, retentionDays: 0, maximumSizeMB: 0, searchDelayMs: 2000, backgroundSearchWorkers: 12, releaseGraceHours: 12 };
+        } else if (draft?.indexer) {
+          if (!draft.indexer.backgroundSearchWorkers) {
+            draft.indexer.backgroundSearchWorkers = 12;
+          }
+          if (draft.indexer.releaseGraceHours === undefined) {
+            draft.indexer.releaseGraceHours = 12;
+          }
         }
         if (draft && !draft.jellyfin) {
           draft.jellyfin = { url: '', apiKey: '' };
@@ -1392,6 +1397,11 @@
               <span>Background Search Workers</span>
               <input type="number" min="1" bind:value={draft.indexer.backgroundSearchWorkers} />
               <small class="field-hint">Concurrent BullMQ workers used for missing-item and backlog searches. Higher values drain big queues faster but increase Hydra/indexer load. Applies immediately.</small>
+            </label>
+            <label class="form-field">
+              <span>Release Grace Period (hours)</span>
+              <input type="number" min="0" bind:value={draft.indexer.releaseGraceHours} />
+              <small class="field-hint">Don't search for a movie/episode until this many hours after its release/air date — a release posts at a specific time, not literally at midnight the moment the calendar date flips. 0 = search the instant the release day starts. Default: 12. Applies immediately.</small>
             </label>
           </div>
         </Panel>

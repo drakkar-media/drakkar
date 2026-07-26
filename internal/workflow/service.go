@@ -51,12 +51,12 @@ type Repository interface {
 	ListQualityDefinitions(ctx context.Context) ([]database.QualityDefinition, error)
 	GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (database.LibrarySearchInput, error)
 	LookupCandidateHistory(ctx context.Context, libraryItemID int64) (map[string]database.CandidateHistory, error)
-	ListPendingLibrarySearchTargets(ctx context.Context) ([]database.PendingLibrarySearchTarget, error)
+	ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceHours int) ([]database.PendingLibrarySearchTarget, error)
 	CountActiveSearchBacklog(ctx context.Context) (int, error)
 	CountSelectedQueueBacklog(ctx context.Context) (int, error)
 	GetShowWithMissingEpisodes(ctx context.Context, tvShowID int64) (*database.ShowWithMissingEpisodes, error)
 	ListPendingTVShowLibraryItemIDs(ctx context.Context, tvShowID int64) ([]int64, error)
-	ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]database.FailedQueueRetryTarget, error)
+	ListFailedQueueRetryTargets(ctx context.Context, limit int, releaseGraceHours int) ([]database.FailedQueueRetryTarget, error)
 	ListSelectedQueueRetryTargets(ctx context.Context, limit int) ([]database.SelectedQueueRetryTarget, error)
 	ListUpgradableLibraryItems(ctx context.Context) ([]int64, error)
 	ClearFailedQueueItems(ctx context.Context) (int, error)
@@ -123,6 +123,10 @@ type IndexerLimits struct {
 	MinimumAgeMinutes int
 	RetentionDays     int
 	MaximumSizeMB     int
+	// ReleaseGraceHours: don't search for a movie/episode until this many
+	// hours after its release_date/air_date. See config.IndexerConfig's field
+	// of the same name for the full rationale.
+	ReleaseGraceHours int
 }
 
 type Service struct {
@@ -1068,7 +1072,7 @@ func (s *Service) PushPendingToQueue(priority int) {
 		return
 	}
 	ctx := context.Background()
-	targets, err := s.repo.ListPendingLibrarySearchTargets(ctx)
+	targets, err := s.repo.ListPendingLibrarySearchTargets(ctx, s.indexerLimits.ReleaseGraceHours)
 	if err != nil {
 		s.logger.Error().Err(err).Msg("PushPendingToQueue: ListPendingLibrarySearchTargets failed")
 		return
@@ -1101,7 +1105,7 @@ func (s *Service) PushLibraryItemsToQueue(ids []int64, priority int) {
 }
 
 func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, error) {
-	targets, err := s.repo.ListPendingLibrarySearchTargets(ctx)
+	targets, err := s.repo.ListPendingLibrarySearchTargets(ctx, s.indexerLimits.ReleaseGraceHours)
 	if err != nil {
 		return BulkSearchResult{}, err
 	}
@@ -1164,7 +1168,7 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 }
 
 func (s *Service) DispatchAutomaticPending(ctx context.Context) (BulkSearchResult, error) {
-	targets, err := s.repo.ListPendingLibrarySearchTargets(ctx)
+	targets, err := s.repo.ListPendingLibrarySearchTargets(ctx, s.indexerLimits.ReleaseGraceHours)
 	if err != nil {
 		return BulkSearchResult{}, err
 	}
@@ -1537,7 +1541,7 @@ func (s *Service) SearchRecentPending(ctx context.Context, mediaType string) (Bu
 	if err != nil {
 		return BulkSearchResult{}, err
 	}
-	targets, err := s.repo.ListPendingLibrarySearchTargets(ctx)
+	targets, err := s.repo.ListPendingLibrarySearchTargets(ctx, s.indexerLimits.ReleaseGraceHours)
 	if err != nil {
 		return BulkSearchResult{}, err
 	}
@@ -1687,7 +1691,7 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 	// Fetch up to 500 items: restart-interrupted items (stale_worker, interrupted_by_restart)
 	// don't call Hydra and are much faster to process. Hydra calls are capped at 100
 	// per run so we don't flood the indexer while still clearing restart backlogs quickly.
-	targets, err := s.repo.ListFailedQueueRetryTargets(ctx, 500)
+	targets, err := s.repo.ListFailedQueueRetryTargets(ctx, 500, s.indexerLimits.ReleaseGraceHours)
 	if err != nil {
 		return BulkQueueRetryResult{}, err
 	}
@@ -3881,7 +3885,7 @@ func (s *Service) manageQueueItemWithSettings(ctx context.Context, queueItemID i
 }
 
 func (s *Service) ManageFailedQueue(ctx context.Context, action string) (BulkQueueRetryResult, error) {
-	targets, err := s.repo.ListFailedQueueRetryTargets(ctx, 0)
+	targets, err := s.repo.ListFailedQueueRetryTargets(ctx, 0, s.indexerLimits.ReleaseGraceHours)
 	if err != nil {
 		return BulkQueueRetryResult{}, err
 	}

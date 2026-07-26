@@ -756,7 +756,7 @@ func (db *DB) GetQueueRetryTarget(ctx context.Context, queueItemID int64) (Queue
 	return item, nil
 }
 
-func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLibrarySearchTarget, error) {
+func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceHours int) ([]PendingLibrarySearchTarget, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select item.library_item_id, item.media_type, coalesce(item.tv_show_id, 0), coalesce(item.season_number, 0), item.selected, coalesce(item.selected_release_id, 0), coalesce(item.external_url, ''), item.state, item.updated_at
 		from (
@@ -814,21 +814,25 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLib
 			    -- a stalled BullMQ lock cannot block their progress.
 			    or q.state = $3
 			  )
-			  -- Skip movies that haven't been released yet.
+			  -- Skip movies that haven't been released yet -- plus a grace period
+			  -- ($4 hours) past release_date itself, since a release posts at a
+			  -- specific time, not literally at 00:00 local time the calendar
+			  -- date flips.
 			  and not exists (
 			      select 1 from movies m
 			      where m.id = li.movie_id
 			        and m.release_date is not null
-			        and m.release_date > current_date
+			        and m.release_date::timestamp + make_interval(hours => $4::int) > now()
 			  )
-			  -- Skip TV episodes that haven't aired yet (air_date in the future).
-			  -- NULL air_date = unknown, search anyway (mirrors Sonarr behaviour).
-			  -- monitoring_mode='future' explicitly opts into pre-air searching.
+			  -- Skip TV episodes that haven't aired yet (air_date + grace period
+			  -- still in the future). NULL air_date = unknown, search anyway
+			  -- (mirrors Sonarr behaviour). monitoring_mode='future' explicitly
+			  -- opts into pre-air searching.
 			  and (
 			      li.media_type != 'episode'
 			      or ep.id is null
 			      or ep.air_date is null
-			      or ep.air_date <= current_date
+			      or ep.air_date::timestamp + make_interval(hours => $4::int) <= now()
 			      or coalesce(tv.monitoring_mode, 'all') = 'future'
 			  )
 			  -- TV monitoring mode filter (applies only to episode items).
@@ -858,7 +862,7 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context) ([]PendingLib
 			         q.created_at asc,
 			         q.id asc
 		) item
-		order by item.selected desc, item.updated_at asc, item.created_at asc, item.id asc`, QueueRequested, QueueFailed, QueueSelected)
+		order by item.selected desc, item.updated_at asc, item.created_at asc, item.id asc`, QueueRequested, QueueFailed, QueueSelected, releaseGraceHours)
 	if err != nil {
 		return nil, err
 	}
@@ -914,7 +918,7 @@ func (db *DB) CountSelectedQueueBacklog(ctx context.Context) (int, error) {
 // limit caps the result set (0 = unlimited). The scheduled retry pass uses a
 // small limit so each run completes within the timer interval; user-triggered
 // bulk actions pass 0 to process all items.
-func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]FailedQueueRetryTarget, error) {
+func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int, releaseGraceHours int) ([]FailedQueueRetryTarget, error) {
 	query := `
 		select
 			q.id,
@@ -966,12 +970,24 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]Fai
 		    ))
 		    or (q.state = $2 and q.selected_release_id is not null and q.updated_at < now() - interval '2 minutes')
 		  )
+		  -- Skip movies that haven't been released yet (+ grace period); mirrors
+		  -- ListPendingLibrarySearchTargets. Confirmed a real gap live
+		  -- (2026-07-26): this query had no movie release_date check at all, so
+		  -- a failed movie item whose release date later slipped into the
+		  -- future (a real-world delay) would still be retried with no
+		  -- protection, unlike the main pending-search path.
+		  and not exists (
+		      select 1 from movies m
+		      where m.id = li.movie_id
+		        and m.release_date is not null
+		        and m.release_date::timestamp + make_interval(hours => $3::int) > now()
+		  )
 		  -- Skip TV episodes that haven't aired yet; mirrors ListPendingLibrarySearchTargets.
 		  and (
 		      li.media_type != 'episode'
 		      or ep.id is null
 		      or ep.air_date is null
-		      or ep.air_date <= current_date
+		      or ep.air_date::timestamp + make_interval(hours => $3::int) <= now()
 		      or coalesce(tv.monitoring_mode, 'all') = 'future'
 		  )
 		order by
@@ -981,9 +997,9 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]Fai
 			          or (q.state = $2 and q.selected_release_id is not null)
 			     then 0 else 1 end asc,
 			q.updated_at asc, q.id asc`
-	args := []any{QueueFailed, QueueRequested}
+	args := []any{QueueFailed, QueueRequested, releaseGraceHours}
 	if limit > 0 {
-		query += ` LIMIT $3`
+		query += ` LIMIT $4`
 		args = append(args, limit)
 	}
 	rows, err := db.SQL.QueryContext(ctx, query, args...)

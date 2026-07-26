@@ -466,6 +466,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		MinimumAgeMinutes: cfg.Indexer.MinimumAgeMinutes,
 		RetentionDays:     cfg.Indexer.RetentionDays,
 		MaximumSizeMB:     cfg.Indexer.MaximumSizeMB,
+		ReleaseGraceHours: cfg.Indexer.ReleaseGraceHours,
 	})
 	if strings.TrimSpace(cfg.Metadata.TMDB.APIKey) != "" {
 		workflowSvc.SetTMDBClient(tmdb.NewClient(cfg.Metadata))

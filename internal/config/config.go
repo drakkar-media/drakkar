@@ -112,6 +112,18 @@ type IndexerConfig struct {
 	// jobs. Higher values improve backlog throughput when Hydra throttling is low.
 	// Default: 12.
 	BackgroundSearchWorkers int `json:"backgroundSearchWorkers"`
+
+	// ReleaseGraceHours: don't search for a movie/episode until this many hours
+	// after its release_date/air_date (a calendar date with no time-of-day).
+	// The automatic search pipeline already refuses to search anything whose
+	// release/air date is strictly in the future; this adds a further grace
+	// window on top of the release DAY itself, since episodes/movies release
+	// at a specific time (often midnight in another timezone, or a broadcast
+	// slot later in the day), not literally at 00:00 local time -- without a
+	// grace period, an item becomes "searchable" the instant the calendar
+	// flips, well before a real release actually posts to Usenet. 0 preserves
+	// the original release-day behavior. Default: 12.
+	ReleaseGraceHours int `json:"releaseGraceHours"`
 }
 
 func DefaultIndexerConfig() IndexerConfig {
@@ -126,6 +138,7 @@ func DefaultIndexerConfig() IndexerConfig {
 		// Set to 0 to disable (rely purely on NZBHydra2's own rate limiting).
 		SearchDelayMs:           2000,
 		BackgroundSearchWorkers: 10,
+		ReleaseGraceHours:       12,
 	}
 }
 
@@ -328,6 +341,9 @@ func applyDefaults(cfg *Settings) {
 	}
 	if cfg.Indexer.SearchDelayMs <= 0 {
 		cfg.Indexer.SearchDelayMs = DefaultIndexerConfig().SearchDelayMs
+	}
+	if cfg.Indexer.ReleaseGraceHours == 0 {
+		cfg.Indexer.ReleaseGraceHours = DefaultIndexerConfig().ReleaseGraceHours
 	}
 	if len(cfg.Subtitles.Languages) == 0 {
 		cfg.Subtitles.Languages = []string{"en"}

@@ -580,6 +580,7 @@ export type FullSettings = {
     maximumSizeMB: number;
     searchDelayMs: number;
     backgroundSearchWorkers: number;
+    releaseGraceHours: number;
   };
   notifications: {
     discordWebhookUrl: string;

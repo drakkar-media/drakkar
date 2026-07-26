@@ -146,7 +146,7 @@ func (r *repoStub) GetLibrarySearchInput(ctx context.Context, libraryItemID int6
 func (r *repoStub) LookupCandidateHistory(ctx context.Context, libraryItemID int64) (map[string]database.CandidateHistory, error) {
 	return r.history, nil
 }
-func (r *repoStub) ListPendingLibrarySearchTargets(ctx context.Context) ([]database.PendingLibrarySearchTarget, error) {
+func (r *repoStub) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceHours int) ([]database.PendingLibrarySearchTarget, error) {
 	return r.pending, nil
 }
 func (r *repoStub) CountActiveSearchBacklog(ctx context.Context) (int, error) {
@@ -167,7 +167,7 @@ func (r *repoStub) GetShowWithMissingEpisodes(_ context.Context, tvShowID int64)
 func (r *repoStub) ListPendingTVShowLibraryItemIDs(_ context.Context, _ int64) ([]int64, error) {
 	return append([]int64(nil), r.batchCreatedIDs...), nil
 }
-func (r *repoStub) ListFailedQueueRetryTargets(ctx context.Context, limit int) ([]database.FailedQueueRetryTarget, error) {
+func (r *repoStub) ListFailedQueueRetryTargets(ctx context.Context, limit int, releaseGraceHours int) ([]database.FailedQueueRetryTarget, error) {
 	return r.failedQueues, nil
 }
 func (r *repoStub) ListSelectedQueueRetryTargets(ctx context.Context, limit int) ([]database.SelectedQueueRetryTarget, error) {

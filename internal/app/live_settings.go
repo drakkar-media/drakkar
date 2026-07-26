@@ -322,6 +322,7 @@ func (c *liveSettingsController) ApplySettings(_ context.Context, cfg config.Set
 			MinimumAgeMinutes: cfg.Indexer.MinimumAgeMinutes,
 			RetentionDays:     cfg.Indexer.RetentionDays,
 			MaximumSizeMB:     cfg.Indexer.MaximumSizeMB,
+			ReleaseGraceHours: cfg.Indexer.ReleaseGraceHours,
 		})
 	}
 	if c.workQueue != nil {
