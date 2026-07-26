@@ -1139,6 +1139,13 @@ type CalendarEntry struct {
 	PosterURL     string `json:"posterUrl,omitempty"`
 	Available     bool   `json:"available"`
 	QueueState    string `json:"queueState,omitempty"`
+	// SeasonNumber/EpisodeNumber/EpisodeTitle are only populated for
+	// Type=="tv" entries -- Title above is the show's name, not the
+	// episode's, so the calendar previously had no way to show which
+	// season/episode was airing on a given date.
+	SeasonNumber  int    `json:"seasonNumber,omitempty"`
+	EpisodeNumber int    `json:"episodeNumber,omitempty"`
+	EpisodeTitle  string `json:"episodeTitle,omitempty"`
 }
 
 // ReleaseCalendar returns library movies (and optionally episodes) with their
@@ -1165,7 +1172,10 @@ func (s *Service) ReleaseCalendar(ctx context.Context, month string) ([]Calendar
 			coalesce(m.tmdb_id, tv.tmdb_id, 0),
 			coalesce(m.poster_url, tv.poster_url, ''),
 			li.available,
-			coalesce(q.state, '')
+			coalesce(q.state, ''),
+			coalesce(e.season_number, 0),
+			coalesce(e.episode_number, 0),
+			coalesce(e.title, '')
 		from library_items li
 		left join movies m on m.id = li.movie_id
 		left join episodes e on e.id = li.episode_id
@@ -1194,7 +1204,8 @@ func (s *Service) ReleaseCalendar(ctx context.Context, month string) ([]Calendar
 		var e CalendarEntry
 		var dateStr string
 		if err := rows.Scan(&e.LibraryItemID, &e.Type, &e.Title, &dateStr,
-			&e.TmdbID, &e.PosterURL, &e.Available, &e.QueueState); err != nil {
+			&e.TmdbID, &e.PosterURL, &e.Available, &e.QueueState,
+			&e.SeasonNumber, &e.EpisodeNumber, &e.EpisodeTitle); err != nil {
 			return nil, err
 		}
 		e.ID = e.LibraryItemID

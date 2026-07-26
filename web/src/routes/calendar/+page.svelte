@@ -15,6 +15,7 @@
     id: number; libraryItemId: number; type: string; title: string;
     releaseDate: string; tmdbId?: number; posterUrl?: string;
     available: boolean; queueState?: string;
+    seasonNumber?: number; episodeNumber?: number; episodeTitle?: string;
   };
 
   type GridDay = {
@@ -57,6 +58,19 @@
     return new Intl.DateTimeFormat('en-US', {
       weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC'
     }).format(new Date(`${date}T00:00:00Z`));
+  }
+
+  // Short "SxEy" form for the compact grid cell.
+  function episodeCode(e: Entry): string {
+    if (e.type !== 'tv' || !e.seasonNumber || !e.episodeNumber) return '';
+    return `S${e.seasonNumber}E${e.episodeNumber}`;
+  }
+
+  // Fuller "SxEy · Episode Name" form for the detail modal.
+  function episodeLabel(e: Entry): string {
+    const code = episodeCode(e);
+    if (!code) return '';
+    return e.episodeTitle ? `${code} · ${e.episodeTitle}` : code;
   }
 
   function buildGrid(key: string, entries: Entry[]): GridDay[] {
@@ -214,7 +228,9 @@
                 class:entry-available={entry.available}
                 title={statusLabel(entry)}
                 on:click={() => (selected = entry)}>
-                <span class="entry-title">{entry.title}</span>
+                <span class="entry-title">
+                  {entry.title}{#if episodeCode(entry)}<span class="entry-episode"> · {episodeCode(entry)}</span>{/if}
+                </span>
                 {#if entry.available}
                   <span class="entry-dot avail" aria-hidden="true"></span>
                 {:else if entry.queueState === 'failed'}
@@ -263,6 +279,9 @@
                 {s.type === 'movie' ? 'Movie' : 'Episode'}
               </span>
               <h2 class="modal-title">{s.title}</h2>
+              {#if episodeLabel(s)}
+                <p class="modal-episode">{episodeLabel(s)}</p>
+              {/if}
               <p class="modal-date">{longDate(s.releaseDate)}</p>
             </div>
             <button class="icon-btn" on:click={() => (selected = null)} aria-label="Close"><X size={18} /></button>
@@ -385,6 +404,7 @@
     font-size: 11px; font-weight: 700;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0;
   }
+  .entry-episode { font-weight: 500; opacity: .75; }
   .entry-dot {
     width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
   }
@@ -432,6 +452,7 @@
     font-size: 11px; font-weight: 700; margin-bottom: 8px;
   }
   .modal-title { font-size: 1.25rem; font-weight: 700; line-height: 1.25; }
+  .modal-episode { font-size: 13px; font-weight: 600; color: hsl(var(--muted-foreground)); margin-top: 3px; }
   .modal-date { font-size: 13px; color: hsl(var(--muted-foreground)); margin-top: 5px; }
 
   .modal-status-row { display: flex; gap: 8px; flex-wrap: wrap; }

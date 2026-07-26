@@ -340,7 +340,7 @@ export const api = {
   releaseCalendar: (month?: string) => {
     const params = new URLSearchParams();
     if (month) params.set('month', month);
-    return request<{ entries: { id: number; libraryItemId: number; type: string; title: string; releaseDate: string; tmdbId?: number; posterUrl?: string; available: boolean; queueState?: string }[] }>(`/api/release-calendar?${params.toString()}`);
+    return request<{ entries: { id: number; libraryItemId: number; type: string; title: string; releaseDate: string; tmdbId?: number; posterUrl?: string; available: boolean; queueState?: string; seasonNumber?: number; episodeNumber?: number; episodeTitle?: string }[] }>(`/api/release-calendar?${params.toString()}`);
   },
   // Active VFS streams
   streams: () => request<{ sessions: { sessionId: string; virtualFileId: number; fileName: string; fileSizeBytes: number; openedAt: string; currentOffset: number }[] }>('/api/streams'),
