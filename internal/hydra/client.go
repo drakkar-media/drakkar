@@ -330,11 +330,21 @@ type hydraIndexerConfig struct {
 // callers should treat that as "list unavailable" and fall back to manual
 // entry rather than failing outright.
 func (c *Client) Indexers(ctx context.Context) ([]string, error) {
-	base := strings.TrimRight(c.getBaseURL(), "/")
+	base := strings.TrimSpace(c.getBaseURL())
 	if base == "" {
 		return nil, errors.New("nzbhydra2 not configured")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/internalapi/config", nil)
+	// The configured URL is the Newznab search base (conventionally
+	// ".../api"), but /internalapi lives at the server root -- reduce to
+	// just the origin (scheme+host[:port]) before appending it, since the
+	// configured path segment (e.g. "/api") isn't part of this API.
+	u, err := url.Parse(base)
+	if err != nil {
+		return nil, fmt.Errorf("nzbhydra2 url: %w", err)
+	}
+	origin := (&url.URL{Scheme: u.Scheme, Host: u.Host}).String()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, origin+"/internalapi/config", nil)
 	if err != nil {
 		return nil, err
 	}
