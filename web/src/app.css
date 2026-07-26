@@ -3,6 +3,12 @@
 
 /* ─── CSS custom properties (match reference project exactly) ───────────────── */
 :root {
+  /* Tells the browser to render native form-control chrome (select dropdown
+     popups, scrollbars) in dark mode. Without this, the <select> itself
+     picks up our dark styling via `color: inherit`, but the popup list of
+     <option>s falls back to the browser's light native background --
+     white text on a white background, unreadable. */
+  color-scheme: dark;
   --background:        215 36%  4%;
   --foreground:        188 34% 91%;
   --card:              211 31%  7%;
@@ -104,6 +110,14 @@ button, input, textarea, select { font: inherit; color: inherit; }
 textarea {
   min-height: 120px;
   resize: vertical;
+}
+
+select option {
+  /* Belt-and-suspenders alongside :root's color-scheme: dark -- some
+     browsers still render the popup list with the OS theme unless the
+     option itself has an explicit background/color. */
+  background-color: hsl(var(--card));
+  color: hsl(var(--foreground));
 }
 
 select {

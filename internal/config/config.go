@@ -71,7 +71,7 @@ type PrivacyConfig struct {
 	Mode             string                 `json:"mode"`
 	SOCKS5           PrivacySOCKS5Config    `json:"socks5"`
 	WireGuard        PrivacyWireGuardConfig `json:"wireguard"`
-	ExcludedIndexers []string               `json:"excludedIndexers,omitempty"`
+	ExcludedIndexers []string               `json:"excludedIndexers"`
 }
 
 // PrivacySOCKS5Config holds the connection settings for routing traffic
@@ -89,7 +89,7 @@ type PrivacySOCKS5Config struct {
 // RedactSecrets/MergeSecrets below -- the frontend instead reads a
 // sanitized summary from GET /api/settings/privacy/status.
 type PrivacyWireGuardConfig struct {
-	ConfigText     string `json:"configText,omitempty"`
+	ConfigText     string `json:"configText"`
 	TimeoutSeconds int    `json:"timeoutSeconds"`
 }
 
@@ -459,6 +459,12 @@ func applyDefaults(cfg *Settings) {
 	}
 	if cfg.Privacy.WireGuard.TimeoutSeconds <= 0 {
 		cfg.Privacy.WireGuard.TimeoutSeconds = 15
+	}
+	if cfg.Privacy.ExcludedIndexers == nil {
+		// A nil slice marshals to JSON null rather than []; the frontend
+		// always treats this field as an array (e.g. calls .join() on it),
+		// so a genuinely-empty list must still serialize as [].
+		cfg.Privacy.ExcludedIndexers = []string{}
 	}
 }
 

@@ -710,6 +710,11 @@
             wireguard: { configText: '', timeoutSeconds: 15 },
             excludedIndexers: []
           };
+        } else if (draft?.privacy && !draft.privacy.excludedIndexers) {
+          // Older/partial settings.json (or an omitempty gap server-side) can
+          // omit this array entirely -- treated as undefined/null here would
+          // throw on the .join() call in the Privacy Routing tab.
+          draft.privacy.excludedIndexers = [];
         }
       }
       try {
@@ -1027,7 +1032,16 @@
 
   $: configuredCount = integrationEntries.filter(([, v]) => v.configured).length;
   $: enabledProviders = (draft?.usenet.providers ?? []).filter((p) => p.enabled).length;
-  $: defaultProfile = profiles.find((p) => p.isDefault)?.name ?? '—';
+  // Falls back to the Library tab's per-media-type defaults (the mechanism
+  // actually used to assign a profile to new movies/shows) when no quality
+  // profile is flagged is_default -- that flag is only a DB-level fallback
+  // for orphaned items, not what most installs actually configure.
+  $: defaultProfile = profiles.find((p) => p.isDefault)?.name
+    ?? (draft?.library.defaultMovieProfile && draft?.library.defaultTvProfile
+      ? (draft.library.defaultMovieProfile === draft.library.defaultTvProfile
+        ? draft.library.defaultMovieProfile
+        : `${draft.library.defaultMovieProfile} / ${draft.library.defaultTvProfile}`)
+      : draft?.library.defaultMovieProfile || draft?.library.defaultTvProfile || '—');
 </script>
 
 <svelte:head><title>Settings — Drakkar</title></svelte:head>
@@ -2701,7 +2715,7 @@
         <div class="field">
           <label class="field-label" for="privacy-excluded">Indexers Excluded From Privacy Routing</label>
           <input id="privacy-excluded" type="text"
-            value={draft.privacy.excludedIndexers.join(', ')}
+            value={(draft.privacy.excludedIndexers ?? []).join(', ')}
             on:change={(e) => {
               if (!draft) return;
               draft.privacy.excludedIndexers = (e.currentTarget as HTMLInputElement).value
