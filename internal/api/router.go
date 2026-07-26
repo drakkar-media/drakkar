@@ -1867,10 +1867,10 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 	}))
 
 	// Streams the largest already-downloaded file through the real playback
-	// read path for a fixed window and reports throughput/CPU -- mirrors
-	// nzbdav's manual wget-based tuning procedure for finding the best
-	// Max Download Connections value, as a one-click backend operation.
-	// Runs synchronously for ~8s; the frontend shows a busy state while it waits.
+	// read path for a fixed window and reports throughput/CPU -- a one-click
+	// backend operation for finding the best Max Download Connections value,
+	// instead of a manual wget-based tuning procedure. Runs synchronously
+	// for ~8s; the frontend shows a busy state while it waits.
 	r.Post("/api/speedtest", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 		if speedTestSvc == nil {
 			respondError(w, http.StatusServiceUnavailable, errors.New("speed test unavailable"))

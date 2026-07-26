@@ -15,9 +15,9 @@ import (
 var ErrProviderCircuitOpen = errors.New("provider circuit open — recent throttling, cooling down")
 
 // breakerTripThreshold/breakerBaseCooldown/breakerMaxCooldown started out as
-// a direct port of nzbdav's ProviderCircuitBreaker (trip after 3, cool down
-// 60s doubling to a 5-minute cap). Live traffic showed that model doesn't
-// fit Drakkar: with many concurrent calibration/verification goroutines
+// a simple circuit breaker (trip after 3, cool down 60s doubling to a
+// 5-minute cap). Live traffic showed that model doesn't fit Drakkar: with
+// many concurrent calibration/verification goroutines
 // sharing one provider, a single sub-second hiccup produces dozens of
 // "failures" almost simultaneously (observed: 87 in one second), blowing
 // past a threshold of 3 instantly and then locking every caller out for a

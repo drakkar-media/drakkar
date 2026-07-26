@@ -450,9 +450,9 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 		if actualFirst <= 0 {
 			continue
 		}
-		// Fetch the last segment to get the exact total file size — the same
-		// approach nzbdav uses (GetFileSizeAsync fetches the last segment's yEnc
-		// header). This avoids the compounding estimation error for the last segment
+		// Fetch the last segment to get the exact total file size by reading
+		// its yEnc header directly. This avoids the compounding estimation
+		// error for the last segment
 		// that makes the total file size too large, which causes Plex to seek to
 		// positions beyond the real end of file.
 		actualLast := actualFirst // default: same size as other segments
@@ -497,8 +497,8 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 // actualFirstSize is the measured decoded size of segment 1 (applied uniformly
 // to all non-last segments). actualLastSize is the measured decoded size of the
 // final segment — using the real value avoids the file-size overestimation that
-// causes Plex to seek past the real end of file (mirrors nzbdav's behaviour of
-// fetching the last segment's yEnc header for an exact total size).
+// causes Plex to seek past the real end of file (the last segment's yEnc
+// header gives an exact total size instead of relying on the estimate).
 func (db *DB) rescaleFileSegments(ctx context.Context, nzbFileID, actualFirstSize, actualLastSize int64) error {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {

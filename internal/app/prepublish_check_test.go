@@ -2,12 +2,20 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/rs/zerolog"
+
+	"github.com/drakkar-media/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/rclone"
 )
 
 func TestWaitForReadableVideoContainerRejectsPersistentUnreadable(t *testing.T) {
@@ -123,5 +131,72 @@ func TestVerifyOneFileBeforePublishAcceptsValidContainer(t *testing.T) {
 
 	if err := verifyOneFileBeforePublish(context.Background(), path, "good.mkv"); err != nil {
 		t.Fatalf("expected valid container to pass, got %v", err)
+	}
+}
+
+// TestVerifyContentBeforePublishFailNzbWithoutVideo guards the 2026-07-26
+// feature: a release whose entries are all non-video (subtitles, .nfo,
+// sample clips) previously always published successfully regardless of
+// content -- ListVirtualFilesForRelease's own ErrNoVirtualFiles only catches
+// a release with literally ZERO files, and this function's per-file loop
+// only ever validates entries that already look like video, silently
+// succeeding when none do. With failNzbWithoutVideo=true, a release with no
+// recognized playable video file must be rejected instead of published;
+// with it false (the default), behavior is unchanged from before this
+// feature existed.
+func TestVerifyContentBeforePublishFailNzbWithoutVideo(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &database.DB{SQL: sqlDB}
+
+	var libID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('movie', 'prepublish-no-video-check', false)
+		returning id`).Scan(&libID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, external_url, indexer_name)
+		values ($1, 'prepublish-no-video-check', 'http://example/prepublish-no-video', 'test-indexer')
+		returning id`, libID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+	var srID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2) returning id`, libID, rcID,
+	).Scan(&srID); err != nil {
+		t.Fatal(err)
+	}
+	// Only a subtitle file -- no recognized video extension at all.
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, size_bytes, reader_kind)
+		values ($1, $2, 'movie.srt', 4096, 'direct_nzb')`, srID, fmt.Sprintf("releases/%d/movie.srt", srID),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	rt := config.DefaultRuntime()
+	rt.FuseMountPath = t.TempDir()
+	rc := rclone.NewClient("http://127.0.0.1:1") // unreachable; RefreshMountPath's error is discarded by the caller
+	logger := zerolog.Nop()
+
+	if err := verifyContentBeforePublish(ctx, db, rt, rc, srID, false, logger); err != nil {
+		t.Fatalf("expected no error with failNzbWithoutVideo=false (default/original behavior), got %v", err)
+	}
+	if err := verifyContentBeforePublish(ctx, db, rt, rc, srID, true, logger); err == nil {
+		t.Fatal("expected an error with failNzbWithoutVideo=true for a release with no recognized video file")
 	}
 }

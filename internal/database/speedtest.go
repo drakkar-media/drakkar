@@ -9,10 +9,9 @@ import (
 )
 
 // SpeedTestResult reports the outcome of an internal streaming throughput
-// test -- mirrors nzbdav's manual "NzbDav Internal Test" tuning procedure
+// test -- a one-click backend equivalent of a manual tuning procedure
 // (stream an already-downloaded file through the real read path, note the
-// Mbps and CPU usage) as a one-click backend operation instead of a
-// terminal wget command.
+// Mbps and CPU usage) instead of a terminal wget command.
 type SpeedTestResult struct {
 	FileName        string  `json:"fileName"`
 	FileSizeBytes   int64   `json:"fileSizeBytes"`

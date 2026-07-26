@@ -13,8 +13,7 @@ import (
 
 // Client calls the rclone Remote Control (RC) API.
 // It is used to refresh rclone's VFS directory cache after new content is
-// published so Plex sees new files immediately — matching nzbdav's
-// RcloneClient.RefreshVfsPaths() behaviour.
+// published so Plex sees new files immediately.
 type Client struct {
 	rcAddr     string
 	httpClient *http.Client

@@ -23,8 +23,8 @@ var (
 )
 
 // FileDesc holds the filename and size from a par2 FileDescription packet.
-// Used identically to nzbdav: read the primary par2 index file, extract real
-// filenames and authoritative sizes — no repair, no disk writes.
+// Read the primary par2 index file to extract real filenames and
+// authoritative sizes — no repair, no disk writes.
 type FileDesc struct {
 	FileID     [16]byte
 	FileName   string

@@ -82,11 +82,10 @@ func (s *startTrackingSource) startedAt(messageID string) (time.Time, bool) {
 	return t, ok
 }
 
-// TestScheduledSourceBackgroundLaneNotBlockedByForeground guards the
-// nzbdav-parity fix: calibration/health-check (low priority) must get its own
-// dedicated worker lane, never blocked behind a busy foreground (high/medium)
-// lane -- matching nzbdav's health check bypassing its download semaphore
-// entirely. With a single shared worker (the pre-fix behaviour), a
+// TestScheduledSourceBackgroundLaneNotBlockedByForeground guards the fix:
+// calibration/health-check (low priority) must get its own dedicated worker
+// lane, never blocked behind a busy foreground (high/medium) lane. With a
+// single shared worker (the pre-fix behaviour), a
 // long-running high-priority fetch would starve a concurrently-issued
 // low-priority one until the worker freed up; with a dedicated background
 // lane, the low-priority fetch starts immediately regardless.

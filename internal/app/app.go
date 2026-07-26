@@ -340,11 +340,10 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}
 		client := nntp.NewArticleClient(provider)
 		// The pool itself stays at the account's own raw ceiling
-		// (provider.MaxConnections, e.g. 100) -- matching nzbdav, where
-		// ConnectionPool is always sized from the raw provider connection
-		// count, never clamped to "Max Download Connections". That setting
-		// is enforced downstream instead (ScheduledSource's foreground lane,
-		// below), not at the pool itself.
+		// (provider.MaxConnections, e.g. 100) -- always sized from the raw
+		// provider connection count, never clamped to "Max Download
+		// Connections". That setting is enforced downstream instead
+		// (ScheduledSource's foreground lane, below), not at the pool itself.
 		pooled := nntp.NewPooledSource(ctx, client.NewSession, provider.MaxConnections)
 		pooledSources = append(pooledSources, pooled)
 		articleSources = append(articleSources, nntp.NamedArticleSource{
@@ -358,19 +357,17 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		// are never re-fetched from NNTP within the TTL window.
 		cachedFallback := nntp.NewCachedFallbackSource(fallback)
 		// Foreground lane (interactive playback + read-ahead) is capped at
-		// maxDownloadConnections, matching nzbdav's DownloadingNntpClient
-		// PrioritizedSemaphore exactly. Background lane (calibration /
+		// maxDownloadConnections. Background lane (calibration /
 		// health-check) is a separate, independently-sized pool of workers
-		// so it's never blocked behind foreground traffic -- matching
-		// nzbdav's health check bypassing the download semaphore entirely --
-		// but unlike nzbdav's cheap STAT-only health check, Drakkar's does a
-		// full body fetch+decode, so it does NOT get the full account
-		// ceiling the way nzbdav's does; it gets its own bounded lane
-		// instead (same size as the foreground lane is a reasonable,
-		// deliberately modest choice, not a re-derivation of the account
-		// ceiling) to avoid reintroducing the over-concurrency that caused
-		// corrupted reads under heavy load (see calibrate.go's
-		// confirmPermanentCRCMismatch).
+		// so it's never blocked behind foreground traffic -- but since
+		// Drakkar's health check does a full body fetch+decode (not a cheap
+		// STAT-only check), it does NOT get the full account ceiling; it
+		// gets its own bounded lane instead (same size as the foreground
+		// lane is a reasonable, deliberately modest choice, not a
+		// re-derivation of the account ceiling) to avoid reintroducing the
+		// over-concurrency that caused corrupted reads under heavy load
+		// (see calibrate.go's confirmPermanentCRCMismatch and the
+		// 2026-07-19 incident).
 		scheduled := nntp.NewScheduledSourceLanes(ctx, cachedFallback, maxDownloadConnections, maxDownloadConnections, maxDownloadConnections*8)
 		diskDecoded := nntp.NewDiskCachedDecodedSource(scheduled, rt.BlockCachePath, rt.DiskCacheLimitBytes)
 		decoded := nntp.NewCachedDecodedSource(diskDecoded, rt.MemoryHotCacheMaxBytes)
@@ -431,7 +428,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// goroutines exist above it. Confirmed live (2026-07-20): the previous
 	// formula (maxDownloadConnections / 10, capped at 8) silently collapsed
 	// the entire download worker pool to just 1 once maxDownloadConnections
-	// was correctly lowered to nzbdav's safe default of 15 to fix a
+	// was correctly lowered to a safe default of 15 to fix a
 	// different problem (over-concurrency causing corrupted NNTP reads,
 	// v0.2.47-49) -- 15/10 == 1 via integer division. With only one worker,
 	// the whole download pipeline serialized behind it: a single worker
@@ -590,7 +587,14 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		if item.SelectedRelease == nil {
 			return nil
 		}
-		if err := verifyContentBeforePublish(ctx, db, rt, rcloneClient, *item.SelectedRelease, logger); err != nil {
+		// Read live so a settings change takes effect on the next import
+		// without requiring a restart; failure to read just falls back to
+		// the safe default (off, matching pre-existing behavior).
+		failNzbWithoutVideo := false
+		if settings, err := policySvc.Settings(ctx); err == nil {
+			failNzbWithoutVideo = settings.FailNzbWithoutVideo
+		}
+		if err := verifyContentBeforePublish(ctx, db, rt, rcloneClient, *item.SelectedRelease, failNzbWithoutVideo, logger); err != nil {
 			logger.Warn().
 				Err(err).
 				Int64("selectedReleaseId", *item.SelectedRelease).

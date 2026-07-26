@@ -25,9 +25,9 @@ type BodySession interface {
 
 type SessionFactory func(ctx context.Context) (BodySession, error)
 
-// idleTimeout matches nzbdav's ConnectionPool default: close NNTP connections
-// that have been idle for 30 seconds. This frees server-side resources when
-// no playback is active and the background queue is quiet.
+// idleTimeout: close NNTP connections that have been idle for 30 seconds.
+// This frees server-side resources when no playback is active and the
+// background queue is quiet.
 const idleTimeout = 30 * time.Second
 
 // minWarmConns is how many connections keepWarm proactively redials in the
@@ -162,9 +162,9 @@ func (p *PooledSource) notifyFreed() {
 	}
 }
 
-// sweepLoop closes connections idle longer than idleTimeout.
-// Period = idleTimeout/2, matching nzbdav's SweepLoop. Exits when ctx is
-// cancelled (process shutdown) instead of running forever, and recovers a
+// sweepLoop closes connections idle longer than idleTimeout, on a period of
+// idleTimeout/2. Exits when ctx is cancelled (process shutdown) instead of
+// running forever, and recovers a
 // panic from each individual sweep so one bad tick can't silently end the
 // loop and leak idle connections for the rest of the process lifetime.
 func (p *PooledSource) sweepLoop(ctx context.Context) {

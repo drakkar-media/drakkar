@@ -2889,8 +2889,8 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 
 		known := history[strings.TrimSpace(result.Link)]
 		effectiveFailureCount, degraded, durableRejectThreshold := candidateFailurePenaltyProfile(known)
-		// nzbdav-style tolerance: a prior failed download should penalize a
-		// candidate, not immediately disqualify it. Only URLs that have failed
+		// A prior failed download should penalize a candidate, not
+		// immediately disqualify it. Only URLs that have failed
 		// repeatedly for a non-transient reason are durably rejected up front.
 		// Transient exceptions:
 		//   - interrupted_by_restart / stale_worker: process died mid-download.
@@ -3320,9 +3320,9 @@ func (s *Service) importSelectedRelease(ctx context.Context, current database.Re
 		return s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
 	}
 	item.State = database.QueuePreflight
-	// Preflight: verify first segments are reachable on NNTP before publishing.
-	// Mirrors nzbdav's FetchFirstSegmentsStep — catches expired/incomplete NZBs
-	// early and falls back to the next search candidate instead of publishing dead content.
+	// Preflight: verify first segments are reachable on NNTP before publishing --
+	// catches expired/incomplete NZBs early and falls back to the next search
+	// candidate instead of publishing dead content.
 	if s.preflightChecker != nil {
 		if err := s.preflightChecker(ctx, item); err != nil {
 			if shouldIgnorePreflightFailure(err) {

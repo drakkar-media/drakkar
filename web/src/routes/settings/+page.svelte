@@ -1536,7 +1536,7 @@
         </Panel>
       {/if}
 
-      <Panel title="Automatic Queue Management" subtitle="Nzbdav-style actions for failed releases. Applies only to known Drakkar failure reasons.">
+      <Panel title="Automatic Queue Management" subtitle="Automated actions for failed releases. Applies only to known Drakkar failure reasons.">
         {#if policySettings}
           <div class="queue-rules">
             {#each queueDecisionRows as [key, label]}

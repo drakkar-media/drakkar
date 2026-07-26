@@ -59,7 +59,7 @@ type LoggingConfig struct {
 
 // RcloneConfig holds optional rclone remote control settings.
 // When RCAddr is set Drakkar calls vfs/refresh after publishing new content
-// so rclone's directory cache is invalidated immediately — matching nzbdav behaviour.
+// so rclone's directory cache is invalidated immediately.
 type RcloneConfig struct {
 	// RCAddr: rclone remote control address (e.g. "http://drakkar_rclone:5572").
 	// Leave empty to disable VFS refresh (rclone dir-cache-time handles staleness).

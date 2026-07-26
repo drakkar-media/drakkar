@@ -11,26 +11,23 @@ import (
 var ErrSchedulerQueueFull = errors.New("nntp scheduler queue full")
 
 // ScheduledSource dispatches NNTP article fetches using a three-tier priority
-// queue split across two independent worker lanes, matching nzbdav's actual
-// architecture: nzbdav's DownloadingNntpClient PrioritizedSemaphore covers
-// only download/streaming BODY fetches (capped at "Max Download
-// Connections"), while its health check (STAT-only, no body fetch/decode)
-// bypasses that semaphore entirely and uses the raw connection pool directly
-// (HealthCheckService.cs) so it's never blocked behind download/streaming
-// traffic.
+// queue split across two independent worker lanes: a foreground lane for
+// download/streaming BODY fetches (capped at "Max Download Connections"),
+// and a background lane for calibration/health-check work so it's never
+// blocked behind download/streaming traffic.
 //
 //	high   (priority ≥ Interactive=100) — direct player reads     -- foreground lane
 //	medium (priority ≥ ReadAhead=80)   — speculative prefetch     -- foreground lane
 //	low    (priority < 80)             — background calibration / checks -- background lane
 //
-// Drakkar's calibration/health-check does a full body fetch+decode (unlike
-// nzbdav's cheap STAT-only check), so giving it the full pool ceiling the way
-// nzbdav does its STAT checks would reintroduce the over-concurrency that
-// caused corrupted reads under heavy load (see calibrate.go's
-// confirmPermanentCRCMismatch and the 2026-07-19 incident). Instead it gets
-// its own separate, independently-sized worker lane: never blocked behind
-// foreground (high/medium) traffic, but still bounded, not run at up to the
-// full account connection ceiling.
+// Drakkar's calibration/health-check does a full body fetch+decode (a much
+// heavier operation than a cheap STAT-only check), so giving it the full
+// pool ceiling the way a lightweight STAT check safely could would
+// reintroduce the over-concurrency that caused corrupted reads under heavy
+// load (see calibrate.go's confirmPermanentCRCMismatch and the 2026-07-19
+// incident). Instead it gets its own separate, independently-sized worker
+// lane: never blocked behind foreground (high/medium) traffic, but still
+// bounded, not run at up to the full account connection ceiling.
 type ScheduledSource struct {
 	source ArticleSource
 	high   chan fetchRequest
@@ -101,9 +98,9 @@ func NewScheduledSourceLanes(ctx context.Context, source ArticleSource, workers,
 	return s
 }
 
-// SetBackgroundBudget is kept for API compatibility but is now a no-op.
-// nzbdav has no separate background budget — all priorities share the pool
-// and the scheduler's queue ordering provides natural priority.
+// SetBackgroundBudget is kept for API compatibility but is now a no-op --
+// all priorities share the pool and the scheduler's queue ordering provides
+// natural priority, with no separate background budget needed.
 func (s *ScheduledSource) SetBackgroundBudget(_ int, _ func() int) {}
 
 func (s *ScheduledSource) Body(ctx context.Context, messageID string) ([]byte, error) {
@@ -115,7 +112,7 @@ func (s *ScheduledSource) BodyPriority(ctx context.Context, messageID string, pr
 		return nil, errors.New("scheduled source unavailable")
 	}
 	// Fast-fail: cancelled read-ahead requests must not pile up in the medium
-	// queue and delay interactive reads (matches nzbdav's cancellation path).
+	// queue and delay interactive reads.
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
@@ -242,9 +239,8 @@ func (s *ScheduledSource) nextForeground(ctx context.Context) (req fetchRequest,
 
 func (s *ScheduledSource) handleRequestProtected(req fetchRequest) {
 	defer observability.Recover("nntp-scheduler-worker")
-	// Skip cancelled requests immediately (seek happened, context cancelled).
-	// nzbdav removes cancelled waiters from the semaphore queue; we do the
-	// same here before touching the connection pool.
+	// Skip cancelled requests immediately (seek happened, context cancelled)
+	// before ever touching the connection pool.
 	if req.ctx.Err() != nil {
 		select {
 		case req.resultCh <- fetchResult{err: req.ctx.Err()}:
@@ -275,7 +271,7 @@ func (s *ScheduledSource) QueueDepths() (interactive, readAhead, background int)
 
 // next picks the highest-priority pending request, blocking until one is
 // available or ctx is cancelled (process shutdown, reported via ok=false).
-// This mirrors nzbdav's PrioritizedSemaphore release order: High → Medium → Low.
+// Release order: High → Medium → Low.
 func (s *ScheduledSource) next(ctx context.Context) (req fetchRequest, ok bool) {
 	for {
 		select {

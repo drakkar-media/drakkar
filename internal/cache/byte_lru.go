@@ -13,9 +13,9 @@ import (
 // memcpy) -- confirmed via a pprof goroutine dump showing the interactive
 // read that serves the player stuck behind that same pile of read-ahead
 // fetches. Sharding by key hash spreads that contention across independent
-// locks, same principle as .NET's ConcurrentDictionary (see reference
-// nzbdav's ArticleCachingNntpClient, which never uses a single lock over its
-// whole cache). Eviction becomes approximate (per-shard budget, not exact
+// locks, the same principle as .NET's ConcurrentDictionary and other
+// sharded-lock cache designs that never use a single lock over the whole
+// cache. Eviction becomes approximate (per-shard budget, not exact
 // global least-recently-used order) -- an accepted tradeoff in every
 // high-concurrency cache design for this reason.
 const byteLRUShardCount = 32

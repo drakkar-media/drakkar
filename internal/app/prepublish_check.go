@@ -14,17 +14,17 @@ import (
 )
 
 // verifyContentBeforePublish validates every playable video file of a
-// freshly-imported release before it's ever exposed via a symlink — mirroring
-// nzbdav's model of validating full content before the file ever becomes
-// visible, rather than publishing first and discovering corruption later via
-// the periodic health check (which is how "Video: none / Audio: none" items
-// were reaching Plex in the first place).
+// freshly-imported release before it's ever exposed via a symlink — full
+// content is validated before the file ever becomes visible, rather than
+// publishing first and discovering corruption later via the periodic health
+// check (which is how "Video: none / Audio: none" items were reaching Plex
+// in the first place).
 //
 // A fresh import must become readable before publish proceeds. We allow only a
 // short warm-up window here: enough for the content VFS/cache to settle, but
 // not so long that every bad candidate stalls the download queue for nearly a
 // minute before Drakkar tries the next release.
-func verifyContentBeforePublish(ctx context.Context, db *database.DB, rt config.Runtime, rc *rclone.Client, selectedReleaseID int64, logger zerolog.Logger) error {
+func verifyContentBeforePublish(ctx context.Context, db *database.DB, rt config.Runtime, rc *rclone.Client, selectedReleaseID int64, failNzbWithoutVideo bool, logger zerolog.Logger) error {
 	entries, err := db.ListContentMountEntriesForRelease(ctx, selectedReleaseID)
 	if err != nil {
 		// Can't determine the file list — don't block publish on our own
@@ -46,12 +46,14 @@ func verifyContentBeforePublish(ctx context.Context, db *database.DB, rt config.
 	// acceptable, much cheaper tradeoff than the alternative.
 	releaseDir := filepath.Join(rt.FuseMountPath, "content", "releases", fmt.Sprintf("%d", selectedReleaseID))
 	_ = rc.RefreshMountPath(ctx, rt.FuseMountPath, releaseDir)
+	foundPlayable := false
 	for _, e := range entries {
 		if !database.IsPlayableMediaFile(e.FileName, e.SizeBytes) {
 			logger.Debug().Str("file", e.FileName).Int64("sizeBytes", e.SizeBytes).
 				Msg("pre-publish check: skipping non-playable file")
 			continue
 		}
+		foundPlayable = true
 		target := filepath.Join(rt.FuseMountPath, "content", e.Path)
 		if err := verifyOneFileBeforePublish(ctx, target, e.FileName); err != nil {
 			logger.Warn().
@@ -65,6 +67,20 @@ func verifyContentBeforePublish(ctx context.Context, db *database.DB, rt config.
 		} else {
 			logger.Debug().Str("file", e.FileName).Msg("pre-publish check: container header valid")
 		}
+	}
+	// Every existing check above only rejects a release whose entries list is
+	// completely empty (ListVirtualFilesForRelease's own ErrNoVirtualFiles,
+	// checked by the caller) or whose video files are definitively corrupt.
+	// Neither catches a release that has SOME files (subtitles, .nfo, sample
+	// clips, non-video archive contents) but genuinely no recognized video
+	// among them -- that release still has ErrNoVirtualFiles-avoiding entries
+	// and would otherwise publish as "available" with nothing playable. This
+	// opt-in check (FailNzbWithoutVideo, default off to match the original,
+	// unconditional "publish anyway" behavior) closes that gap without
+	// touching the leniency already granted to a merely-inconclusive
+	// container check above.
+	if failNzbWithoutVideo && !foundPlayable {
+		return fmt.Errorf("no_video_content: release contains no recognized playable video file")
 	}
 	return nil
 }
