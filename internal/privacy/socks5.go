@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -33,7 +34,16 @@ type SOCKS5Dialer struct {
 // not support DialContext (golang.org/x/net/proxy can return a dialer that
 // only implements the plain, non-context Dial).
 func NewSOCKS5Dialer(cfg SOCKS5Config) (*SOCKS5Dialer, error) {
-	if cfg.Host == "" || cfg.Port <= 0 {
+	// Trim accidental leading/trailing whitespace from pasted credentials --
+	// a stray trailing space or newline from a copy-paste produces a
+	// same-looking-but-wrong username/password that the proxy rejects with
+	// an auth failure indistinguishable, from the UI, from genuinely wrong
+	// credentials.
+	host := strings.TrimSpace(cfg.Host)
+	username := strings.TrimSpace(cfg.Username)
+	password := strings.TrimSpace(cfg.Password)
+
+	if host == "" || cfg.Port <= 0 {
 		return nil, fmt.Errorf("socks5: host and port are required")
 	}
 	timeoutSeconds := cfg.TimeoutSeconds
@@ -43,11 +53,11 @@ func NewSOCKS5Dialer(cfg SOCKS5Config) (*SOCKS5Dialer, error) {
 	timeout := time.Duration(timeoutSeconds) * time.Second
 
 	var auth *proxy.Auth
-	if cfg.Username != "" {
-		auth = &proxy.Auth{User: cfg.Username, Password: cfg.Password}
+	if username != "" {
+		auth = &proxy.Auth{User: username, Password: password}
 	}
 
-	addr := net.JoinHostPort(cfg.Host, fmt.Sprintf("%d", cfg.Port))
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", cfg.Port))
 	forward := &net.Dialer{Timeout: timeout}
 	base, err := proxy.SOCKS5("tcp", addr, auth, forward)
 	if err != nil {
