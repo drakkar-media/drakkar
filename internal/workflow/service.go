@@ -4779,11 +4779,22 @@ func detectReleaseGroup(title string) string {
 // (matched case-insensitively against a release candidate's IndexerName),
 // which always use DirectClient regardless of the active privacy mode --
 // e.g. a private, already-trusted indexer the user doesn't want routed.
+//
+// It also always uses DirectClient when the fetch URL's host matches the
+// configured NZBHydra2 host (see SetLocalHost). Some NZBHydra2 setups proxy
+// the actual NZB file through NZBHydra2 itself rather than handing back a
+// link straight to the real indexer -- in that case the "getnzb" URL points
+// at the same self-hosted, almost-always-LAN NZBHydra2 instance that search
+// traffic is already deliberately excluded from privacy routing for (see
+// app.go), and routing it through WireGuard breaks connectivity the same
+// way (confirmed live: getnzb fetches to a LAN NZBHydra2 host timed out
+// under WireGuard with "context deadline exceeded" on every download).
 type HTTPNZBFetcher struct {
 	Client       *http.Client
 	DirectClient *http.Client
 
 	excludedIndexers atomic.Pointer[map[string]struct{}]
+	localHost        atomic.Pointer[string]
 }
 
 // NewHTTPNZBFetcher builds a fetcher. Either client may be nil; Fetch falls
@@ -4805,13 +4816,30 @@ func (f *HTTPNZBFetcher) SetExcludedIndexers(names []string) {
 	f.excludedIndexers.Store(&set)
 }
 
-// clientFor selects the HTTP client for indexerName, honoring the live
-// SetExcludedIndexers configuration: excluded indexers always use
-// DirectClient, bypassing privacy routing.
-func (f *HTTPNZBFetcher) clientFor(indexerName string) *http.Client {
-	if set := f.excludedIndexers.Load(); set != nil && f.DirectClient != nil {
-		if _, excluded := (*set)[strings.ToLower(strings.TrimSpace(indexerName))]; excluded {
+// SetLocalHost updates, live, the host (host:port or bare host, matched
+// case-insensitively against the fetch URL's host) that always bypasses
+// privacy routing for NZB downloads -- normally the configured NZBHydra2
+// host. Safe to call concurrently with Fetch. An empty host clears the
+// bypass.
+func (f *HTTPNZBFetcher) SetLocalHost(host string) {
+	host = strings.ToLower(strings.TrimSpace(host))
+	f.localHost.Store(&host)
+}
+
+// clientFor selects the HTTP client for a fetch to targetHost from
+// indexerName, honoring both the live SetExcludedIndexers configuration
+// (excluded indexers always use DirectClient) and SetLocalHost (a fetch
+// URL host matching the configured NZBHydra2 host always uses DirectClient,
+// regardless of indexerName).
+func (f *HTTPNZBFetcher) clientFor(indexerName, targetHost string) *http.Client {
+	if f.DirectClient != nil {
+		if host := f.localHost.Load(); host != nil && *host != "" && strings.EqualFold(*host, targetHost) {
 			return f.DirectClient
+		}
+		if set := f.excludedIndexers.Load(); set != nil {
+			if _, excluded := (*set)[strings.ToLower(strings.TrimSpace(indexerName))]; excluded {
+				return f.DirectClient
+			}
 		}
 	}
 	return f.Client
@@ -4851,11 +4879,11 @@ func (f *HTTPNZBFetcher) Fetch(ctx context.Context, rawURL, indexerName string) 
 	nzbFetchLastTime = time.Now()
 	nzbFetchMu.Unlock()
 
-	client := prepareNZBHTTPClient(f.clientFor(indexerName))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", nil, err
 	}
+	client := prepareNZBHTTPClient(f.clientFor(indexerName, req.URL.Host))
 	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; Drakkar/1.0; +https://github.com/drakkar-media/drakkar)")
 	req.Header.Set("Accept", "application/x-nzb,application/xml,text/xml,application/octet-stream,*/*;q=0.9")
 	req.Header.Set("Accept-Language", "en-US,en;q=0.9")

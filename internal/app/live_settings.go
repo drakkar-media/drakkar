@@ -420,6 +420,7 @@ func (c *liveSettingsController) ApplySettings(ctx context.Context, cfg config.S
 	}
 	if c.nzbFetcher != nil {
 		c.nzbFetcher.SetExcludedIndexers(cfg.Privacy.ExcludedIndexers)
+		c.nzbFetcher.SetLocalHost(hostOf(cfg.NZBHydra2.URL))
 	}
 	if c.hydraClient != nil {
 		c.hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)

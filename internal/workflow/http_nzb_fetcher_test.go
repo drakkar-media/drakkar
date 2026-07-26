@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -66,6 +67,48 @@ func TestHTTPNZBFetcherFollowsRedirectCookieChallenge(t *testing.T) {
 		t.Fatalf("expected original filename fallback from request path, got %q", name)
 	}
 	if string(raw) != "<nzb></nzb>" {
+		t.Fatalf("unexpected nzb body %q", string(raw))
+	}
+}
+
+// brokenTransport simulates a privacy-routed client that cannot reach a LAN
+// host (e.g. WireGuard's tunnel not routing back to a private address).
+type brokenTransport struct{}
+
+func (brokenTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, context.DeadlineExceeded
+}
+
+func TestHTTPNZBFetcherBypassesPrivacyRoutingForLocalHost(t *testing.T) {
+	hydra := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-nzb")
+		_, _ = io.WriteString(w, "<nzb></nzb>")
+	}))
+	defer hydra.Close()
+
+	fetcher := &HTTPNZBFetcher{
+		Client:       &http.Client{Transport: brokenTransport{}},
+		DirectClient: http.DefaultClient,
+	}
+
+	hydraURL, err := url.Parse(hydra.URL)
+	if err != nil {
+		t.Fatalf("parse hydra url: %v", err)
+	}
+
+	// Without SetLocalHost, the fetch to the (self-proxying) NZBHydra2 host
+	// goes through the broken privacy-routed Client and fails, reproducing
+	// the live "context deadline exceeded" bug.
+	if _, _, err := fetcher.Fetch(context.Background(), hydra.URL+"/getnzb", ""); err == nil {
+		t.Fatal("expected fetch through broken privacy-routed client to fail")
+	}
+
+	// Declaring the NZBHydra2 host local routes the same URL through
+	// DirectClient instead, bypassing privacy routing entirely.
+	fetcher.SetLocalHost(hydraURL.Host)
+	if _, raw, err := fetcher.Fetch(context.Background(), hydra.URL+"/getnzb", ""); err != nil {
+		t.Fatalf("expected fetch to succeed once host is marked local, got %v", err)
+	} else if string(raw) != "<nzb></nzb>" {
 		t.Fatalf("unexpected nzb body %q", string(raw))
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	// registers /debug/pprof/* on http.DefaultServeMux; only ever served on
 	// the loopback-only debugServer below, never on a publicly reachable port.
 	_ "net/http/pprof"
@@ -408,11 +409,15 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// consumer VPN tunnels essentially never route back to a private LAN
 	// address (confirmed live: a local NZBHydra2 instance timed out
 	// entirely once WireGuard was active). The NZB *file* download later
-	// (HTTPNZBFetcher, below) does reach the real indexer host directly and
-	// stays routed.
+	// (HTTPNZBFetcher, below) normally does reach the real indexer host
+	// directly and stays routed -- except when NZBHydra2 itself is
+	// configured to proxy the NZB file (its "getnzb" link points back at
+	// NZBHydra2's own host rather than the real indexer), which is the same
+	// LAN-host case as search above; SetLocalHost below carves that out too.
 	workflowSvc := workflow.NewService(db, seerrClient, hydraClient)
 	nzbFetcher := workflow.NewHTTPNZBFetcher(privacyMgr.HTTPClient(60*time.Second), &http.Client{Timeout: 60 * time.Second})
 	nzbFetcher.SetExcludedIndexers(cfg.Privacy.ExcludedIndexers)
+	nzbFetcher.SetLocalHost(hostOf(cfg.NZBHydra2.URL))
 	workflowSvc.SetNZBFetcher(nzbFetcher)
 	// importWorkers = number of concurrent download-job pipelines (search,
 	// select, fetch NZB, import, publish) processed at once. Deliberately
@@ -1171,6 +1176,24 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 // matching recurring-task name; any value other than "tv"/"episode" is
 // treated as a movie, since Seerr's request payloads use varying media type
 // strings that don't need individual enumeration here.
+// hostOf extracts the host[:port] portion of a URL, tolerating a bare
+// host[:port] with no scheme (url.Parse would otherwise misparse it as a
+// path). Returns "" for an empty or unparseable input.
+func hostOf(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return ""
+	}
+	if !strings.Contains(rawURL, "://") {
+		rawURL = "http://" + rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
+
 func maintenanceRecentTaskName(mediaType string) string {
 	switch strings.ToLower(strings.TrimSpace(mediaType)) {
 	case "tv", "episode":
