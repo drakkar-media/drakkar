@@ -8,6 +8,9 @@ import (
 	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
+// ErrSchedulerQueueFull is returned when a priority tier's queue is at
+// capacity and cannot accept another request. Callers should treat this as a
+// transient backpressure signal, not a fetch failure.
 var ErrSchedulerQueueFull = errors.New("nntp scheduler queue full")
 
 // ScheduledSource dispatches NNTP article fetches using a three-tier priority
@@ -33,6 +36,7 @@ type ScheduledSource struct {
 	high   chan fetchRequest
 	medium chan fetchRequest
 	low    chan fetchRequest
+	cancel context.CancelFunc
 }
 
 type fetchRequest struct {
@@ -75,27 +79,36 @@ func NewScheduledSourceLanes(ctx context.Context, source ArticleSource, workers,
 	if queueSize <= 0 {
 		queueSize = workers * 4
 	}
+	schedCtx, cancel := context.WithCancel(ctx)
 	s := &ScheduledSource{
 		source: source,
 		high:   make(chan fetchRequest, queueSize),
 		medium: make(chan fetchRequest, queueSize),
 		low:    make(chan fetchRequest, queueSize),
+		cancel: cancel,
 	}
 	if backgroundWorkers > 0 {
 		for range workers {
-			go s.foregroundWorker(ctx)
+			go s.foregroundWorker(schedCtx)
 		}
 		for range backgroundWorkers {
-			go s.backgroundWorker(ctx)
+			go s.backgroundWorker(schedCtx)
 		}
 	} else {
 		// No dedicated background lane: fall back to one shared pool serving
 		// all three tiers in priority order (matches the pre-split behaviour).
 		for range workers {
-			go s.worker(ctx)
+			go s.worker(schedCtx)
 		}
 	}
 	return s
+}
+
+// Close stops every worker goroutine this ScheduledSource owns. Used when
+// the whole Usenet provider chain is rebuilt at runtime (e.g. a settings
+// change) so the old scheduler's goroutines don't linger forever.
+func (s *ScheduledSource) Close() {
+	s.cancel()
 }
 
 // SetBackgroundBudget is kept for API compatibility but is now a no-op --
@@ -103,10 +116,19 @@ func NewScheduledSourceLanes(ctx context.Context, source ArticleSource, workers,
 // natural priority, with no separate background budget needed.
 func (s *ScheduledSource) SetBackgroundBudget(_ int, _ func() int) {}
 
+// Body fetches an article body at the default interactive priority. Equivalent
+// to BodyPriority with stream.PriorityInteractive.
 func (s *ScheduledSource) Body(ctx context.Context, messageID string) ([]byte, error) {
 	return s.BodyPriority(ctx, messageID, stream.PriorityInteractive)
 }
 
+// BodyPriority enqueues a fetch on the tier selected by priority (see the
+// ScheduledSource doc comment) and blocks until a worker completes it or ctx
+// is cancelled.
+//
+// Errors:
+//   - ErrSchedulerQueueFull: the selected tier's queue was at capacity; the
+//     request was never enqueued.
 func (s *ScheduledSource) BodyPriority(ctx context.Context, messageID string, priority stream.FetchPriority) ([]byte, error) {
 	if s == nil || s.source == nil {
 		return nil, errors.New("scheduled source unavailable")
@@ -137,6 +159,11 @@ func (s *ScheduledSource) BodyPriority(ctx context.Context, messageID string, pr
 	}
 }
 
+// Stat enqueues an existence check on the background (low-priority) lane,
+// since checks are never as latency-sensitive as an interactive read.
+//
+// Errors:
+//   - ErrSchedulerQueueFull: the background queue was at capacity.
 func (s *ScheduledSource) Stat(ctx context.Context, messageID string) error {
 	if s == nil || s.source == nil {
 		return errors.New("scheduled source unavailable")
@@ -237,6 +264,11 @@ func (s *ScheduledSource) nextForeground(ctx context.Context) (req fetchRequest,
 	}
 }
 
+// handleRequestProtected executes req against the underlying source and
+// delivers the result, dropping already-cancelled requests before they touch
+// the connection pool. The resultCh send is non-blocking/select-guarded
+// against req.ctx.Done() so a caller that gave up waiting can never wedge a
+// worker goroutine.
 func (s *ScheduledSource) handleRequestProtected(req fetchRequest) {
 	defer observability.Recover("nntp-scheduler-worker")
 	// Skip cancelled requests immediately (seek happened, context cancelled)

@@ -5,6 +5,9 @@ import (
 	"time"
 )
 
+// Outcome values recorded by RecordSeasonPackAttempt. SeasonPackOutcomeSelected
+// resets the cooldown backoff counter; any other outcome (including
+// SeasonPackOutcomeFailed) increments it.
 const (
 	SeasonPackOutcomeSelected = "selected"
 	SeasonPackOutcomeFailed   = "failed"

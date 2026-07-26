@@ -1,4 +1,15 @@
 <script lang="ts">
+  /**
+   * Displays symlink health, library consistency, and NZB article availability.
+   *
+   * Shows aggregate health stats plus a filterable/paginated table of published
+   * symlinks, and lets an operator trigger a background health check, republish
+   * pending items, or reset orphaned "available" items. Long-running operations
+   * respond immediately with a queued acknowledgement; their real results arrive
+   * later via the `health.check` / `library.republish_pending` /
+   * `library.reset_orphaned` SSE events handled in `onMount`, which reset the
+   * corresponding in-flight flag and trigger a debounced reload.
+   */
   import { onMount } from 'svelte';
   import HeartPulse from '@lucide/svelte/icons/heart-pulse';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';

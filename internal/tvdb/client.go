@@ -1,3 +1,5 @@
+// Package tvdb implements a metadata client for the TheTVDB v4 REST API,
+// used to enrich TV library items with series titles, years, and IMDb IDs.
 package tvdb
 
 import (
@@ -15,34 +17,62 @@ import (
 	"github.com/drakkar-media/drakkar/internal/mediadate"
 )
 
+// Client implements metadata lookups against the TheTVDB v4 API.
+//
+// TheTVDB requires a login exchange (API key -> bearer token) rather than a
+// per-request API key, so Client caches the resulting token under mu for up
+// to 29 days and transparently re-authenticates when it expires or is
+// invalidated. Client is safe for concurrent use.
 type Client struct {
-	apiKey     string
 	baseURL    string
 	httpClient *http.Client
 
 	mu        sync.Mutex
+	apiKey    string
 	token     string
 	tokenTime time.Time
 }
 
+// SeriesDetails is the flattened, application-facing view of a TheTVDB
+// "series extended" response.
 type SeriesDetails struct {
 	Name   string
 	Year   int
 	IMDbID string
 }
 
+// NewClient creates a Client configured with cfg's TVDB API key.
 func NewClient(cfg config.MetadataConfig) *Client {
-	return &Client{
-		apiKey:  strings.TrimSpace(cfg.TVDB.APIKey),
-		baseURL: "https://api4.thetvdb.com/v4",
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+	c := &Client{
+		baseURL:    "https://api4.thetvdb.com/v4",
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
+	c.SetConfig(cfg)
+	return c
 }
 
+// SetConfig updates the API key live, e.g. after a settings save. Clears
+// the cached login token so the next call re-authenticates with the new key.
+func (c *Client) SetConfig(cfg config.MetadataConfig) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.apiKey = strings.TrimSpace(cfg.TVDB.APIKey)
+	c.token = ""
+}
+
+// getAPIKey returns the currently configured API key, or "" if none has
+// been set.
+func (c *Client) getAPIKey() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.apiKey
+}
+
+// Enabled reports whether c is non-nil and has a configured API key. Callers
+// use this to skip TVDB lookups entirely when the integration is disabled,
+// rather than relying on every request failing.
 func (c *Client) Enabled() bool {
-	return c != nil && strings.TrimSpace(c.apiKey) != ""
+	return c != nil && strings.TrimSpace(c.getAPIKey()) != ""
 }
 
 // SeriesDetails fetches series metadata, retrying once with a freshly
@@ -60,6 +90,9 @@ func (c *Client) SeriesDetails(ctx context.Context, tvdbID int64) (SeriesDetails
 	return out, err
 }
 
+// seriesDetailsOnce performs a single series-details request without
+// retrying on 401, returning the response status alongside the result so
+// SeriesDetails can decide whether to re-authenticate and retry.
 func (c *Client) seriesDetailsOnce(ctx context.Context, tvdbID int64) (SeriesDetails, int, error) {
 	req, err := c.newRequest(ctx, http.MethodGet, c.baseURL+"/series/"+strconv.FormatInt(tvdbID, 10)+"/extended", nil)
 	if err != nil {
@@ -90,6 +123,8 @@ func (c *Client) seriesDetailsOnce(ctx context.Context, tvdbID int64) (SeriesDet
 	return out, resp.StatusCode, nil
 }
 
+// newRequest builds an authenticated TVDB API request, obtaining a bearer
+// token via tokenValue (logging in or reusing the cached token as needed).
 func (c *Client) newRequest(ctx context.Context, method, rawURL string, body []byte) (*http.Request, error) {
 	var reader *bytes.Reader
 	if body != nil {
@@ -109,13 +144,18 @@ func (c *Client) newRequest(ctx context.Context, method, rawURL string, body []b
 	return req, nil
 }
 
+// tokenValue returns a valid bearer token, reusing the cached token while it
+// is younger than 29 days (TheTVDB's token lifetime) and logging in for a
+// fresh one otherwise. A login failure yields "" rather than an error, since
+// the resulting request will simply fail its own auth check downstream.
 func (c *Client) tokenValue(ctx context.Context) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.token != "" && time.Since(c.tokenTime) < 29*24*time.Hour {
 		return c.token
 	}
-	token, err := c.login(ctx)
+	apiKey := c.apiKey
+	token, err := c.login(ctx, apiKey)
 	if err != nil {
 		return ""
 	}
@@ -132,8 +172,9 @@ func (c *Client) invalidateToken() {
 	c.token = ""
 }
 
-func (c *Client) login(ctx context.Context) (string, error) {
-	payload := map[string]string{"apikey": c.apiKey}
+// login exchanges apiKey for a fresh TheTVDB bearer token.
+func (c *Client) login(ctx context.Context, apiKey string) (string, error) {
+	payload := map[string]string{"apikey": apiKey}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
@@ -163,6 +204,9 @@ func (c *Client) login(ctx context.Context) (string, error) {
 	return strings.TrimSpace(out.Data.Token), nil
 }
 
+// firstString returns the first non-blank string value found in values
+// under any of keys, trying keys in order — used because TheTVDB's field
+// names vary across API versions/endpoints (e.g. "name" vs "seriesName").
 func firstString(values map[string]any, keys ...string) string {
 	for _, key := range keys {
 		if value, ok := values[key].(string); ok && strings.TrimSpace(value) != "" {
@@ -172,6 +216,8 @@ func firstString(values map[string]any, keys ...string) string {
 	return ""
 }
 
+// firstInt returns the first int-like value (JSON numbers decode as
+// float64) found in values under any of keys, trying keys in order.
 func firstInt(values map[string]any, keys ...string) int {
 	for _, key := range keys {
 		switch value := values[key].(type) {
@@ -184,6 +230,10 @@ func firstInt(values map[string]any, keys ...string) int {
 	return 0
 }
 
+// extractIMDbID resolves an IMDb ID from a TheTVDB series payload, first
+// checking direct imdbId/imdb_id fields and falling back to scanning the
+// remoteIds list for an entry whose source name mentions IMDb — TheTVDB
+// exposes the ID either way depending on the endpoint.
 func extractIMDbID(values map[string]any) string {
 	if imdb := firstString(values, "imdbId", "imdb_id"); imdb != "" {
 		return imdb

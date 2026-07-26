@@ -16,6 +16,10 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// maintenanceOpsService adapts maintenance.Service to the API's maintenance
+// operations contract, adding DeepNZBHealthCheck -- a task that needs
+// database/workflow/publication dependencies the base maintenance.Service
+// does not carry -- alongside the operations it delegates unchanged.
 type maintenanceOpsService struct {
 	base           *maintenance.Service
 	db             *database.DB
@@ -48,6 +52,13 @@ func (s *maintenanceOpsService) DeepNZBHealthCheck(ctx context.Context) (mainten
 	return runNZBHealthCheck(ctx, s.db, s.workflowSvc, s.publicationSvc, s.logger)
 }
 
+// nextDeepHealthCheckDelay computes the interval before an item's next deep
+// health check, scaled to its age: a fresh release is re-checked as soon as
+// an hour later since early corruption is more likely and cheaper to catch,
+// while a release that has survived a month is re-checked only every 30
+// days, since deep checks issue real NNTP article reads and re-validating
+// long-stable content on a short cycle would waste provider connections for
+// little benefit.
 func nextDeepHealthCheckDelay(createdAt time.Time) time.Duration {
 	age := time.Since(createdAt)
 	if age < time.Hour {
@@ -59,6 +70,10 @@ func nextDeepHealthCheckDelay(createdAt time.Time) time.Duration {
 	return age
 }
 
+// shouldRunDeepHealthCheck reports whether item is due for a deep check: an
+// item never checked or already flagged unhealthy always qualifies, while a
+// previously-healthy item is re-checked only once nextDeepHealthCheckDelay's
+// age-scaled interval has elapsed since its last check.
 func shouldRunDeepHealthCheck(now time.Time, item database.DeepHealthCandidate) bool {
 	if item.LastCheckedAt == nil || item.HealthOK == nil {
 		return true
@@ -73,8 +88,6 @@ func shouldRunDeepHealthCheck(now time.Time, item database.DeepHealthCandidate) 
 // condition (timeout, cancellation, NNTP throttle) rather than genuine
 // content corruption/unavailability, so callers can avoid blocklisting a
 // perfectly good release over a provider hiccup.
-// isTransientHealthCheckErr reports whether err is a connection/timing issue
-// worth retrying, versus a definitive verdict on the content itself.
 //
 // Status 430 is NOT transient: per RFC 3977 and Newshosting's own support
 // docs, it means the specific article is gone (past retention or removed),
@@ -99,6 +112,19 @@ func isTransientHealthCheckErr(err error) bool {
 	return strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "provider circuit open")
 }
 
+// runNZBHealthCheckBatch scans up to limit deep-health candidates (0 means
+// no limit) and, for each: repairs a broken publish symlink by
+// re-publishing, skips non-VFS-backed symlinks and items not yet due, then
+// performs a strict decoded-segment read plus video container validation.
+// A definitive failure blocklists the selected release and removes its
+// symlinks so the next candidate can be promoted; a transient failure
+// (timeout, throttle, momentarily-unreadable container) is left for the
+// next scheduled pass rather than penalizing a release that may be fine.
+//
+// Candidates are processed with a deliberate pacing delay between them (see
+// inline comment) to avoid tripping provider rate limiting under a large
+// batch, and force bypasses both the symlink-only short-circuit and the
+// due-date check so a manually-triggered full sweep validates every row.
 func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, publicationSvc *library.Publisher, logger zerolog.Logger, limit int, force bool) (maintenance.Result, error) {
 	result := maintenance.Result{TaskName: "nzb-health-check"}
 	candidates, err := db.ListDeepHealthCandidates(ctx, limit)
@@ -336,6 +362,11 @@ func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workfl
 // blocklisting a release on the strength of it alone.
 var errContainerHeaderUnreadable = errors.New("container header unreadable")
 
+// readContainerHeader opens path and validates its leading bytes against
+// known video container magic numbers. A bounded read deadline guards
+// against a hung FUSE read blocking the health check indefinitely; any
+// open/read failure is wrapped in errContainerHeaderUnreadable so callers
+// can distinguish "content not yet readable" from "content is corrupt".
 func readContainerHeader(path string) error {
 	f, err := os.Open(path)
 	if err != nil {

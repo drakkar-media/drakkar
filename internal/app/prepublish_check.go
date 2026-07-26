@@ -103,6 +103,13 @@ func verifyOneFileBeforePublish(ctx context.Context, target, fileName string) er
 	return nil
 }
 
+// waitForReadableVideoContainer retries readContainerHeader up to attempts
+// times, spaced delay apart, but only while the failure is
+// errContainerHeaderUnreadable -- a definitive "not a valid container"
+// result or ctx cancellation returns immediately rather than exhausting the
+// remaining attempts. This gives a freshly-imported file's VFS/cache a short
+// window to become readable without conflating that warm-up delay with
+// genuine content corruption.
 func waitForReadableVideoContainer(ctx context.Context, path string, attempts int, delay time.Duration) error {
 	if attempts < 1 {
 		attempts = 1

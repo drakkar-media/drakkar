@@ -1,4 +1,13 @@
 <script lang="ts">
+  /**
+   * Displays the download queue (active pipeline jobs) and history (completed
+   * + failed) in tabs, with per-item and bulk retry/blocklist/replace actions,
+   * NZB upload (file or URL), and background-queue pause/resume.
+   *
+   * Refreshes via SSE events and a 15s visibility-gated poll fallback; both
+   * are suppressed while any action button is mid-request (see `anyBusy`)
+   * so a silent background refresh can't stomp an in-flight optimistic change.
+   */
   import { onMount } from 'svelte';
   import LinkIcon from '@lucide/svelte/icons/link';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
@@ -59,6 +68,8 @@
   $: totalSegments = queueItems.reduce((sum, item) => sum + (item.nzbSegmentCount || 0), 0);
   $: queueTotalPages = Math.max(1, Math.ceil(queueItems.length / queuePageSize));
   $: historyTotalPages = Math.max(1, Math.ceil(historyItems.length / historyPageSize));
+  // Clamp back to the last valid page if the list shrinks out from under the
+  // current page (e.g. failed items cleared/retried while on a later page).
   $: if (queuePage > queueTotalPages) queuePage = queueTotalPages;
   $: if (historyPage > historyTotalPages) historyPage = historyTotalPages;
   $: pagedQueueItems = queueItems.slice((queuePage - 1) * queuePageSize, queuePage * queuePageSize);
@@ -85,6 +96,11 @@
     }
   }
 
+  // Silent background refresh (SSE-triggered or polled). Unlike load(), this
+  // keeps existing rows in their current on-screen order — updating them in
+  // place from the fresh data and appending only genuinely new rows — rather
+  // than snapping to the server's order, which would reflow/reorder the list
+  // out from under the user while they're reading it.
   async function refreshItems() {
     try {
       const queue = await api.queue();
@@ -232,6 +248,7 @@
     return value.replaceAll('_', ' ');
   }
 
+  /** Drops any checked history selections whose queue item is no longer in the failed set (e.g. it was retried or cleared), keeping the checkbox state in sync with the data. */
   function retainFailedSelections(nextItems: QueueItem[]) {
     const failedIds = new Set(nextItems.filter((item) => item.state === 'failed').map((item) => item.queueItemId));
     selectedHistoryIds = new Set(Array.from(selectedHistoryIds).filter((id) => failedIds.has(id)));
@@ -271,6 +288,8 @@
       }
       if (!anyBusy()) debouncedRefresh();
     });
+    // Poll fallback in case an SSE event is missed; skipped while any action
+    // is in flight or the tab is backgrounded.
     const timer = window.setInterval(() => {
       if (!anyBusy() && document.visibilityState === 'visible') void refreshItems();
     }, 15000);

@@ -17,12 +17,17 @@ import (
 
 const sabVersion = "4.5.1"
 
+// sabRepository is the persistence dependency of sabHandler: listing queue
+// and history items and dismissing ones the client has already consumed.
 type sabRepository interface {
 	ListSabQueueItems(ctx context.Context, category string, start, limit int) ([]database.SabQueueItem, int, error)
 	ListSabHistoryItems(ctx context.Context, category string, start, limit int) ([]database.SabHistoryItem, int, error)
 	DismissSabItems(ctx context.Context, libraryItemIDs []int64) error
 }
 
+// sabHandler implements a SABnzbd-compatible HTTP API so download-client
+// integrations that only speak the SABnzbd protocol (Sonarr, Radarr) can
+// operate against Drakkar without any changes on their end.
 type sabHandler struct {
 	importFn      func(ctx context.Context, content []byte, filename, mediaType string) (string, error)
 	repo          sabRepository
@@ -58,6 +63,11 @@ func (h *sabHandler) fetchRemote(ctx context.Context, rawURL string) ([]byte, er
 	return fetchRemoteURL(ctx, rawURL)
 }
 
+// ServeHTTP implements the SABnzbd HTTP API: every operation is dispatched
+// by a single "mode" query/form parameter, matching SABnzbd's own endpoint
+// design so Sonarr/Radarr's SABnzbd download-client integration works
+// unmodified against Drakkar. When h.apiKey is configured, requests must
+// present it via the "apikey" param, mirroring SABnzbd's own key check.
 func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.apiKey != "" {
 		key := r.FormValue("apikey")
@@ -120,6 +130,10 @@ func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleGetConfig implements SABnzbd's get_config mode, reporting just
+// enough of the config shape (complete/download dirs, categories) for
+// Sonarr/Radarr's download-client connection test and category setup to
+// succeed.
 func (h *sabHandler) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 	completeDir := filepath.Join(h.fuseMountPath, "content")
 	h.writeJSON(w, map[string]any{
@@ -138,6 +152,9 @@ func (h *sabHandler) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// handleAddFile implements SABnzbd's addfile mode: a multipart NZB upload.
+// It accepts the file under any of nzbFile, nzbfile, or name, since
+// SABnzbd-client implementations disagree on the field name.
 func (h *sabHandler) handleAddFile(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		h.writeError(w, "parse multipart form: "+err.Error())
@@ -220,6 +237,9 @@ func (h *sabHandler) handleAddURL(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, map[string]any{"status": true, "nzo_ids": []string{nzoID}})
 }
 
+// handleQueue implements SABnzbd's queue mode, listing in-progress items as
+// "slots" in the shape Sonarr/Radarr expect. Progress fields (percentage,
+// timeleft, mb/mbleft) are always reported as zero/unknown.
 func (h *sabHandler) handleQueue(w http.ResponseWriter, r *http.Request) {
 	start := intParam(r, "start", 0)
 	limit := intParam(r, "limit", 100)
@@ -267,6 +287,11 @@ func (h *sabHandler) handleQueueDelete(w http.ResponseWriter, r *http.Request) {
 	h.writeJSON(w, map[string]any{"status": true})
 }
 
+// handleHistory implements SABnzbd's history mode, listing completed/failed
+// items as "slots". The "storage" field points at the imported release's
+// path under fuseMountPath — how Sonarr/Radarr locate the file to import —
+// and is only populated once the item reaches an available/degraded state.
+// An optional nzo_ids param restricts the result to specific items.
 func (h *sabHandler) handleHistory(w http.ResponseWriter, r *http.Request) {
 	start := intParam(r, "start", 0)
 	limit := intParam(r, "limit", 100)
@@ -337,6 +362,8 @@ func (h *sabHandler) writeJSON(w http.ResponseWriter, v any) {
 	}
 }
 
+// writeError logs the failure and writes it back in SABnzbd's
+// {"status":false,"error":...} error shape.
 func (h *sabHandler) writeError(w http.ResponseWriter, msg string) {
 	h.log.Warn().Str("error", msg).Msg("sabnzbd api error")
 	w.Header().Set("Content-Type", "application/json")
@@ -413,6 +440,9 @@ func mediaTypeToCat(mediaType string) string {
 	}
 }
 
+// sabQueueStatus collapses Drakkar's internal queue states into the two
+// coarse statuses SABnzbd clients distinguish: "Queued" while searching or
+// ranking, "Downloading" for everything else in progress.
 func sabQueueStatus(state string) string {
 	switch database.QueueState(state) {
 	case database.QueueSearching, database.QueueRanking:
@@ -436,6 +466,9 @@ func filenameFromURL(rawURL string) string {
 	return "download.nzb"
 }
 
+// multipartFilename resolves the NZB filename for an addfile upload from the
+// nzbname param, falling back to the uploaded file's own name, and always
+// guarantees a .nzb suffix.
 func multipartFilename(r *http.Request, fallback string) string {
 	name := strings.TrimSpace(r.FormValue("nzbname"))
 	if name == "" {
@@ -450,6 +483,9 @@ func multipartFilename(r *http.Request, fallback string) string {
 	return name
 }
 
+// sabCategory reads the category from whichever of "cat"/"category" (form or
+// query) the client used — SABnzbd clients are inconsistent about which
+// param name and transport they send it with.
 func sabCategory(r *http.Request) string {
 	cat := strings.TrimSpace(r.FormValue("cat"))
 	if cat == "" {

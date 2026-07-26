@@ -20,7 +20,7 @@ func TestHTTPNZBFetcherRedirect403MentionsIndexerHost(t *testing.T) {
 	}))
 	defer hydra.Close()
 
-	_, _, err := (HTTPNZBFetcher{}).Fetch(context.Background(), hydra.URL+"/getnzb")
+	_, _, err := (&HTTPNZBFetcher{}).Fetch(context.Background(), hydra.URL+"/getnzb", "")
 	if err == nil {
 		t.Fatal("expected fetch error")
 	}
@@ -58,7 +58,7 @@ func TestHTTPNZBFetcherFollowsRedirectCookieChallenge(t *testing.T) {
 	}))
 	defer hydra.Close()
 
-	name, raw, err := (HTTPNZBFetcher{}).Fetch(context.Background(), hydra.URL+"/getnzb")
+	name, raw, err := (&HTTPNZBFetcher{}).Fetch(context.Background(), hydra.URL+"/getnzb", "")
 	if err != nil {
 		t.Fatalf("expected fetch success, got %v", err)
 	}

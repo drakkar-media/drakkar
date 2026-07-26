@@ -11,19 +11,31 @@ import (
 	"github.com/drakkar-media/drakkar/internal/yenc"
 )
 
+// ArticleSource defines the operations required to fetch a raw (still
+// yEnc-encoded) NNTP article body.
+//
+// Implementations must treat messageID as an opaque NNTP message identifier.
 type ArticleSource interface {
 	Body(ctx context.Context, messageID string) ([]byte, error)
 }
 
+// PriorityArticleSource extends ArticleSource with a priority-aware fetch,
+// letting callers signal whether a request is on the interactive playback
+// path or a lower-priority background one.
 type PriorityArticleSource interface {
 	ArticleSource
 	BodyPriority(ctx context.Context, messageID string, priority stream.FetchPriority) ([]byte, error)
 }
 
+// SegmentFetcher resolves stream.SegmentRange requests against a
+// DecodedArticleSource, mapping each requested byte range onto the article's
+// actual decoded content and returning only the bytes that fall within it.
 type SegmentFetcher struct {
 	source DecodedArticleSource
 }
 
+// NewSegmentFetcher creates a SegmentFetcher that resolves segment fetches
+// through source.
 func NewSegmentFetcher(source DecodedArticleSource) *SegmentFetcher {
 	return &SegmentFetcher{source: source}
 }
@@ -65,19 +77,52 @@ func (f *SegmentFetcher) Exists(ctx context.Context, messageID string) error {
 	return err
 }
 
+// FetchRange fetches segment's requested byte range at interactive priority;
+// see FetchRangeInfoPriority.
 func (f *SegmentFetcher) FetchRange(ctx context.Context, segment stream.SegmentRange) ([]byte, error) {
 	return f.FetchRangePriority(ctx, segment, stream.PriorityInteractive)
 }
 
+// FetchRangePriority fetches segment's requested byte range at the given
+// priority, discarding the SegmentSpan that FetchRangeInfoPriority also
+// computes.
 func (f *SegmentFetcher) FetchRangePriority(ctx context.Context, segment stream.SegmentRange, priority stream.FetchPriority) ([]byte, error) {
 	block, _, err := f.FetchRangeInfoPriority(ctx, segment, priority)
 	return block, err
 }
 
+// FetchRangeInfo fetches segment's requested byte range at interactive
+// priority; see FetchRangeInfoPriority.
 func (f *SegmentFetcher) FetchRangeInfo(ctx context.Context, segment stream.SegmentRange) ([]byte, stream.SegmentSpan, error) {
 	return f.FetchRangeInfoPriority(ctx, segment, stream.PriorityInteractive)
 }
 
+// FetchRangeInfoPriority fetches and decodes segment.MessageID's article,
+// then clips the decoded body to the caller-requested [RangeStart, RangeEnd)
+// byte range.
+//
+// The NZB-declared segment offsets (segment.SegmentStart/SegmentEnd) are only
+// estimates; when the article carries a valid yEnc PartInfo header, the
+// actual decoded start/end (info.DecodedStart() and its length) are used
+// instead to compute the returned span and range. Two estimate-vs-actual
+// mismatches are handled without erroring:
+//
+//   - If the true decoded content starts after the estimated RangeStart, an
+//     empty slice is returned along with the actual SegmentSpan so the caller
+//     (DirectNzbReader) can realign its span table and retry.
+//   - If the estimated RangeEnd overruns the true decoded length (yEnc decode
+//     ratio varies slightly per article), the returned range is clamped to
+//     what actually exists rather than failing.
+//
+// Returns:
+//   - []byte: the requested slice of the decoded article, which may be
+//     shorter than requested or empty per the cases above.
+//   - stream.SegmentSpan: the segment's actual decoded start/end, for the
+//     caller to reconcile against its estimated span table.
+//
+// Errors:
+//   - returned when RangeEnd is before RangeStart, or when the underlying
+//     fetch/decode fails.
 func (f *SegmentFetcher) FetchRangeInfoPriority(ctx context.Context, segment stream.SegmentRange, priority stream.FetchPriority) ([]byte, stream.SegmentSpan, error) {
 	if f == nil || f.source == nil {
 		return nil, stream.SegmentSpan{}, errors.New("nntp source unavailable")

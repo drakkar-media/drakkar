@@ -1,4 +1,12 @@
 <script lang="ts">
+  /**
+   * Displays metadata search results (movies and TV shows) for the `?q=` query param
+   * populated by the top bar's search box.
+   *
+   * Re-runs the search reactively whenever the `q` param changes, and none of the
+   * results are library items yet — they're adapted via asLibraryLike so they can
+   * reuse PosterCard.
+   */
   import { page } from '$app/state';
   import SearchIcon from '@lucide/svelte/icons/search';
   import PosterCard from '$lib/components/PosterCard.svelte';
@@ -16,6 +24,7 @@
   // quickly navigates through several ?q= values in a row).
   let searchToken = 0;
 
+  /** Adapts a discover-search result into the LibraryItem shape PosterCard expects. */
   function asLibraryLike(item: DiscoverMediaItem): LibraryItem {
     return {
       id: 0,
@@ -34,6 +43,7 @@
     };
   }
 
+  /** Fetches results for the current `q` param; stale responses are dropped via searchToken. */
   async function loadSearch() {
     const token = ++searchToken;
     query = page.url.searchParams.get('q')?.trim() ?? '';

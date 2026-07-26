@@ -1,4 +1,9 @@
 <script lang="ts">
+  /**
+   * Horizontally scrollable row of PosterCard items (e.g. "Recently Added",
+   * "Trending Movies") with drag-to-scroll, mouse wheel, and keyboard
+   * navigation, plus optional nav-chevron buttons and a "view all" link.
+   */
   import ChevronLeft from '@lucide/svelte/icons/chevron-left';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import PosterCard from '$lib/components/PosterCard.svelte';
@@ -10,6 +15,10 @@
   export let href = '';
   export let linkLabel = 'View All';
   export let itemWidth = 140;
+  /**
+   * Forwarded to each PosterCard; called only when the viewer taps
+   * "request" on a title that isn't in the library yet.
+   */
   export let onRequest: ((item: LibraryItem) => void) | null = null;
 
   let scroller: HTMLDivElement | null = null;

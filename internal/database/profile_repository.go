@@ -8,6 +8,13 @@ import (
 	"time"
 )
 
+// QualityProfile represents a named set of quality-selection rules applied
+// when choosing among release candidates for a library item or media
+// request (allowed resolutions/sources/codecs/languages, size-per-minute
+// bounds, and preference/rejection flags such as PreferProper or RejectCam).
+//
+// At most one profile is expected to have IsDefault set; GetDefaultQualityProfile
+// and ListQualityProfiles rely on is_default ordering to surface it first.
 type QualityProfile struct {
 	ID                              int64     `json:"id"`
 	Name                            string    `json:"name"`
@@ -32,6 +39,13 @@ type QualityProfile struct {
 	UpdatedAt                       time.Time `json:"updatedAt"`
 }
 
+// UnmarshalJSON decodes a QualityProfile, translating the legacy
+// "minSizeMb"/"maxSizeMb" field names into MinMBPerMinute/MaxMBPerMinute.
+//
+// It accepts either the current "minMbPerMinute"/"maxMbPerMinute" keys or the
+// older "minSizeMb"/"maxSizeMb" keys for backward compatibility with
+// previously stored or submitted payloads; when both are present for a given
+// bound, the MbPerMinute variant takes precedence.
 func (p *QualityProfile) UnmarshalJSON(data []byte) error {
 	type Alias QualityProfile
 	aux := struct {
@@ -60,6 +74,9 @@ func (p *QualityProfile) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// QualityDefinition represents the configured size-per-minute range for a
+// single quality tier (e.g. "1080p WEB-DL") within a media type, used to
+// classify a release's bitrate into a named quality bucket.
 type QualityDefinition struct {
 	ID             int64  `json:"id"`
 	MediaType      string `json:"mediaType"`
@@ -70,6 +87,12 @@ type QualityDefinition struct {
 	SortOrder      int    `json:"sortOrder"`
 }
 
+// profileSelectCols is the shared column list for quality_profiles queries,
+// used by both ListQualityProfiles and single-row lookups so all callers stay
+// in sync with scanProfile's column order. Nullable boolean/int columns are
+// coalesced to their historical defaults (e.g. prefer_proper/prefer_repack/
+// reject_cam default to true) so rows created before those columns existed
+// behave the same as if they had been explicitly set.
 const profileSelectCols = ` id, name, is_default, resolutions, sources, codecs, languages,
 	coalesce(audio_formats,'{}'), coalesce(hdr_formats,'{}'),
 	coalesce(exclude_patterns,'{}'),
@@ -79,6 +102,10 @@ const profileSelectCols = ` id, name, is_default, resolutions, sources, codecs, 
 	coalesce(cutoff_resolution,''), coalesce(minimum_age_hours,0),
 	min_mb_per_minute, max_mb_per_minute, created_at, updated_at `
 
+// scanProfile scans a single quality_profiles row selected with
+// profileSelectCols into a QualityProfile. It accepts either *sql.Row or
+// *sql.Rows via the minimal Scan interface so callers can share the same
+// column list and scan logic across single-row and multi-row queries.
 func scanProfile(row interface {
 	Scan(dest ...interface{}) error
 }) (QualityProfile, error) {
@@ -97,6 +124,8 @@ func scanProfile(row interface {
 	return p, err
 }
 
+// ListQualityProfiles returns all quality profiles, with the default profile
+// (if any) first and the remainder ordered alphabetically by name.
 func (db *DB) ListQualityProfiles(ctx context.Context) ([]QualityProfile, error) {
 	rows, err := db.SQL.QueryContext(ctx,
 		`SELECT`+profileSelectCols+`FROM quality_profiles ORDER BY is_default DESC, name ASC`)
@@ -115,6 +144,10 @@ func (db *DB) ListQualityProfiles(ctx context.Context) ([]QualityProfile, error)
 	return out, rows.Err()
 }
 
+// GetQualityProfileByName looks up a quality profile by its exact name.
+//
+// Errors:
+//   - sql.ErrNoRows: no profile with the given name exists.
 func (db *DB) GetQualityProfileByName(ctx context.Context, name string) (QualityProfile, error) {
 	row := db.SQL.QueryRowContext(ctx,
 		`SELECT`+profileSelectCols+`FROM quality_profiles WHERE name=$1`, name)
@@ -192,17 +225,37 @@ func (db *DB) UpsertQualityProfile(ctx context.Context, p QualityProfile) (Quali
 	return scanProfile(row)
 }
 
+// DeleteQualityProfile deletes the quality profile with the given id.
+//
+// The default profile is protected: the delete is scoped to is_default=false,
+// so attempting to delete the current default silently affects zero rows
+// instead of returning an error. Callers must not rely on the returned error
+// to detect a missing or protected id.
 func (db *DB) DeleteQualityProfile(ctx context.Context, id int64) error {
 	_, err := db.SQL.ExecContext(ctx, `DELETE FROM quality_profiles WHERE id=$1 AND is_default=false`, id)
 	return err
 }
 
+// GetDefaultQualityProfile returns the profile flagged as default. If no
+// profile has IsDefault set, it falls back to the alphabetically first
+// profile so callers always get a usable profile when at least one exists.
+//
+// Errors:
+//   - sql.ErrNoRows: no quality profiles exist.
 func (db *DB) GetDefaultQualityProfile(ctx context.Context) (QualityProfile, error) {
 	row := db.SQL.QueryRowContext(ctx,
 		`SELECT`+profileSelectCols+`FROM quality_profiles ORDER BY is_default DESC, name ASC LIMIT 1`)
 	return scanProfile(row)
 }
 
+// GetLibraryItemQualityProfile returns the quality profile assigned to a
+// library item.
+//
+// Returns:
+//   - *QualityProfile: nil, with a nil error, when the item has no
+//     quality_profile_id assigned or references a profile that no longer
+//     exists; callers should treat this as "use the default profile" rather
+//     than an error condition.
 func (db *DB) GetLibraryItemQualityProfile(ctx context.Context, libraryItemID int64) (*QualityProfile, error) {
 	row := db.SQL.QueryRowContext(ctx,
 		`SELECT`+profileSelectCols+`FROM quality_profiles
@@ -218,12 +271,29 @@ func (db *DB) GetLibraryItemQualityProfile(ctx context.Context, libraryItemID in
 	return &p, nil
 }
 
+// SetLibraryItemQualityProfile assigns or clears (profileID == nil) the
+// quality profile used for a library item's release selection.
 func (db *DB) SetLibraryItemQualityProfile(ctx context.Context, libraryItemID int64, profileID *int64) error {
 	_, err := db.SQL.ExecContext(ctx,
 		`UPDATE library_items SET quality_profile_id=$1 WHERE id=$2`, profileID, libraryItemID)
 	return err
 }
 
+// SetMediaRequestQualityProfile assigns a quality profile to the library
+// item associated with a media request, resolving that library item through
+// the request's most recently created matching queue entry (matched by the
+// "seerr-movie-"/"seerr-tv-" idempotency key derived from the request's
+// external id).
+//
+// Parameters:
+//   - profileID: the profile to assign, or nil to clear the assignment.
+//
+// Returns:
+//   - int64: the id of the library item that was updated.
+//
+// Errors:
+//   - sql.ErrNoRows: the request does not resolve to any library item (no
+//     matching queue entry, or the queue entry has no linked library item).
 func (db *DB) SetMediaRequestQualityProfile(ctx context.Context, requestID int64, profileID *int64) (int64, error) {
 	var libraryItemID int64
 	err := db.SQL.QueryRowContext(ctx, `
@@ -252,6 +322,8 @@ func (db *DB) SetMediaRequestQualityProfile(ctx context.Context, requestID int64
 	return libraryItemID, nil
 }
 
+// ListQualityDefinitions returns all quality definitions across all media
+// types, ordered by media type and then by their configured sort order.
 func (db *DB) ListQualityDefinitions(ctx context.Context) ([]QualityDefinition, error) {
 	rows, err := db.SQL.QueryContext(ctx,
 		`SELECT id, media_type, quality_key, title, min_mb_per_minute, max_mb_per_minute, sort_order
@@ -271,6 +343,13 @@ func (db *DB) ListQualityDefinitions(ctx context.Context) ([]QualityDefinition, 
 	return out, rows.Err()
 }
 
+// UpdateQualityDefinition updates the min/max MB-per-minute bounds of an
+// existing quality definition, identified by d.ID. Other fields on d
+// (MediaType, QualityKey, Title, SortOrder) are ignored for the update and
+// are instead populated from the database in the returned value.
+//
+// Errors:
+//   - sql.ErrNoRows: no quality definition with the given id exists.
 func (db *DB) UpdateQualityDefinition(ctx context.Context, d QualityDefinition) (QualityDefinition, error) {
 	var out QualityDefinition
 	err := db.SQL.QueryRowContext(ctx,

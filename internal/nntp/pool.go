@@ -15,6 +15,12 @@ import (
 // callers must not treat this as a definitive permanent-failure signal.
 var ErrArticleMissing = errors.New("article missing")
 
+// BodySession represents a single, already-authenticated NNTP connection.
+//
+// Implementations are not safe for concurrent use -- a session must only be
+// used by whichever caller currently holds it (e.g. the pool serializes
+// access by handing out one session per acquire() and requiring release()
+// or discard() before it can be reused).
 type BodySession interface {
 	Body(ctx context.Context, messageID string) ([]byte, error)
 	// Stat checks article existence without downloading the body.
@@ -23,6 +29,9 @@ type BodySession interface {
 	Close() error
 }
 
+// SessionFactory dials and authenticates a new BodySession, typically
+// ArticleClient.NewSession. PooledSource calls it whenever it needs to grow
+// past its currently-open connection count.
 type SessionFactory func(ctx context.Context) (BodySession, error)
 
 // idleTimeout: close NNTP connections that have been idle for 30 seconds.
@@ -55,6 +64,13 @@ type pooledSession struct {
 	idleSince time.Time
 }
 
+// PooledSource maintains a bounded pool of NNTP connections to a single
+// provider, reusing idle sessions across calls and dialing new ones
+// on demand up to maxOpen. It owns two background goroutines for the
+// lifetime of the pool (sweepLoop and keepWarmLoop) which must be stopped
+// via Close when the pool is no longer needed.
+//
+// Safe for concurrent use.
 type PooledSource struct {
 	factory SessionFactory
 	maxOpen int
@@ -70,12 +86,19 @@ type PooledSource struct {
 	// connection can leave an already-parked waiter blocked forever on a
 	// request context that has no deadline (e.g. a FUSE/WebDAV read).
 	freed chan struct{}
+
+	cancel context.CancelFunc
 }
 
+// NewPooledSource creates a pool bounded at maxOpen connections (coerced to
+// 1 if given <= 0) and starts its background sweep and keep-warm goroutines,
+// scoped to ctx. Callers must call Close when the pool is no longer needed
+// to stop those goroutines.
 func NewPooledSource(ctx context.Context, factory SessionFactory, maxOpen int) *PooledSource {
 	if maxOpen <= 0 {
 		maxOpen = 1
 	}
+	poolCtx, cancel := context.WithCancel(ctx)
 	p := &PooledSource{
 		factory: factory,
 		maxOpen: maxOpen,
@@ -84,12 +107,44 @@ func NewPooledSource(ctx context.Context, factory SessionFactory, maxOpen int) *
 		// concurrent release() calls can fill; without slack, pushing the
 		// kept (non-stale) sessions back can spuriously overflow and close
 		// perfectly healthy connections. See sweepOnce.
-		idle:  make(chan pooledSession, maxOpen*2),
-		freed: make(chan struct{}, maxOpen),
+		idle:   make(chan pooledSession, maxOpen*2),
+		freed:  make(chan struct{}, maxOpen),
+		cancel: cancel,
 	}
-	go p.sweepLoop(ctx)
-	go p.keepWarmLoop(ctx)
+	go p.sweepLoop(poolCtx)
+	go p.keepWarmLoop(poolCtx)
 	return p
+}
+
+// Close permanently decommissions the pool: stops the sweep/keep-warm
+// background goroutines and closes every currently idle session. Used when
+// a provider is removed or replaced at runtime (e.g. a Usenet settings
+// change) so the old pool's goroutines/connections don't linger forever.
+// Sessions already checked out via acquire() are unaffected -- they're
+// simply discarded by whichever caller currently holds them via their own
+// normal release/discard path.
+func (p *PooledSource) Close() {
+	p.cancel()
+	p.DrainIdle()
+}
+
+// DrainIdle closes every currently idle session without stopping the pool
+// itself -- new acquires immediately redial. Used after a routing change
+// (Direct/SOCKS5/WireGuard) so old-route connections don't linger; unlike
+// Close, the pool keeps running (sweep/keep-warm continue).
+func (p *PooledSource) DrainIdle() {
+	for {
+		select {
+		case s := <-p.idle:
+			_ = s.session.Close()
+			p.mu.Lock()
+			p.open--
+			p.mu.Unlock()
+			p.notifyFreed()
+		default:
+			return
+		}
+	}
 }
 
 // keepWarmLoop proactively redials up to minWarmConns connections whenever
@@ -218,6 +273,10 @@ done:
 	}
 }
 
+// Body acquires a pooled session, fetches the article body, and returns the
+// session to the pool on success or discards it (closing the underlying
+// connection) on any error, since an error leaves the connection's protocol
+// state unknown.
 func (p *PooledSource) Body(ctx context.Context, messageID string) ([]byte, error) {
 	if p == nil || p.factory == nil {
 		return nil, errors.New("pooled source unavailable")
@@ -235,6 +294,9 @@ func (p *PooledSource) Body(ctx context.Context, messageID string) ([]byte, erro
 	return body, nil
 }
 
+// Stat acquires a pooled session and checks article existence. Unlike Body,
+// an ErrArticleMissing result still releases the session back to the pool
+// rather than discarding it -- see the inline comment below for why.
 func (p *PooledSource) Stat(ctx context.Context, messageID string) error {
 	if p == nil || p.factory == nil {
 		return errors.New("pooled source unavailable")
@@ -259,6 +321,10 @@ func (p *PooledSource) Stat(ctx context.Context, messageID string) error {
 	return nil
 }
 
+// acquire returns an idle session if one is fresh, dials a new one if the
+// pool has spare capacity, or blocks until a session is released/freed or
+// ctx is cancelled. Every returned session must eventually be passed to
+// release or discard.
 func (p *PooledSource) acquire(ctx context.Context) (BodySession, error) {
 	// Check ctx before borrowing — cancelled read-ahead must not steal
 	// a pooled session from an interactive reader.
@@ -322,6 +388,9 @@ func (p *PooledSource) acquire(ctx context.Context) (BodySession, error) {
 	}
 }
 
+// release returns session to the idle pool for reuse, or discards it if the
+// idle buffer is momentarily full (the buffer is sized with slack for
+// sweepOnce, so this should be rare in steady state).
 func (p *PooledSource) release(session BodySession) {
 	select {
 	case p.idle <- pooledSession{session: session, idleSince: time.Now()}:
@@ -330,6 +399,9 @@ func (p *PooledSource) release(session BodySession) {
 	}
 }
 
+// discard closes session and frees its pool slot, waking any parked acquire
+// waiter via notifyFreed. Used whenever a session's protocol state can no
+// longer be trusted for reuse.
 func (p *PooledSource) discard(session BodySession) {
 	_ = session.Close()
 	p.mu.Lock()

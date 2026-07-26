@@ -31,6 +31,7 @@ import type {
   TaskSchedule,
   PolicySettings,
   FullSettings,
+  PrivacyStatus,
   GrabHistoryEntry,
   CustomFormat,
   User,
@@ -55,6 +56,28 @@ function eventsURL() {
   return `${baseURL()}/api/events`;
 }
 
+/**
+ * Shared fetch wrapper used by every `api.*` call.
+ *
+ * Resolves `path` against {@link baseURL} (server-side default vs. the
+ * browser's own origin), then handles the response uniformly:
+ *
+ * - A `401` redirects to `/login` and throws, so callers never need to
+ *   special-case authentication failures — except for the `/api/auth` and
+ *   `/api/setup` paths themselves, which are exempted to avoid redirect
+ *   loops while logging in or completing first-run setup.
+ * - Any other non-OK status throws an `Error` whose message is the
+ *   response's `error` field when the body is JSON, or the raw response
+ *   text/status line otherwise.
+ * - A `204 No Content` resolves to `undefined` rather than attempting to
+ *   parse an empty body as JSON.
+ *
+ * @param path - API path, including leading `/api/...`.
+ * @param init - Standard `fetch` options (method, headers, body).
+ * @returns The parsed JSON response body, cast to `T`.
+ * @throws {Error} On a `401` (after redirecting to `/login`) or any other
+ * non-OK HTTP status.
+ */
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${baseURL()}${path}`, init);
   if (response.status === 401 && browser && !path.startsWith('/api/auth') && !path.startsWith('/api/setup')) {
@@ -76,6 +99,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+/**
+ * Thin, typed wrappers around every backend REST endpoint, all routed
+ * through {@link request} for consistent auth/error handling.
+ *
+ * Each entry is a one-line fetch wrapper unless documented otherwise; the
+ * function name and return type describe its contract.
+ */
 export const api = {
   status: () => request<Status>('/api/status'),
   dashboardHome: () => request<DashboardHome>('/api/dashboard/home'),
@@ -251,6 +281,22 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(s)
     }),
+  // Live status of the currently-active privacy routing (SOCKS5/WireGuard).
+  getPrivacyStatus: () => request<PrivacyStatus>('/api/settings/privacy/status'),
+  // Validates a not-yet-saved privacy config against the real target before
+  // the user commits to it, so a bad SOCKS5/WireGuard setting doesn't lock
+  // out indexer traffic once saved.
+  testPrivacyConnection: (candidate: {
+    mode: string;
+    socks5?: { host: string; port: number; username?: string; password?: string; timeoutSeconds?: number };
+    wireguard?: { configText?: string; timeoutSeconds?: number };
+    targetAddr?: string;
+  }) =>
+    request<{ ok: boolean; error?: string }>('/api/settings/privacy/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(candidate)
+    }),
   healthSummary: () => request<{ total: number; checked: number; healthy: number; neverChecked: number; consistencyIssues: number; uncalibratedNZBFiles: number }>('/api/health/summary'),
   healthEntries: (opts?: { filter?: string; limit?: number; offset?: number }) => {
     const params = new URLSearchParams();
@@ -279,6 +325,8 @@ export const api = {
   plexTest: () => request<{ ok: boolean; serverName?: string; libraries?: { key: string; title: string; type: string }[]; error?: string }>('/api/plex/test', { method: 'POST' }),
   plexRefresh: () => request<QueuedResult>('/api/plex/refresh', { method: 'POST' }),
   plexLibraries: () => request<{ libraries: { key: string; title: string; type: string }[] }>('/api/plex/libraries'),
+  // Starts a Plex OAuth PIN login; the returned authUrl is opened for the
+  // user while the caller polls plexOauthPoll for completion.
   plexOauthStart: () => request<{ pinId: number; code: string; authUrl: string; clientIdentifier: string }>('/api/plex/oauth/start', { method: 'POST' }),
   plexOauthPoll: (pinId: number) => request<{ authorized: boolean; token?: string }>('/api/plex/oauth/poll', {
     method: 'POST',
@@ -433,6 +481,19 @@ export const api = {
   setupStatus: () => request<{ required: boolean }>('/api/setup/status'),
 };
 
+/**
+ * Opens the shared SSE connection (`/api/events`) and invokes `onMessage`
+ * for each background task event.
+ *
+ * A no-op on the server (SSR): `EventSource` is browser-only. Malformed
+ * event payloads call `onMessage` with no argument rather than throwing, so
+ * one bad message can't kill the subscription.
+ *
+ * @param onMessage - Called with the parsed event, or `undefined` if the
+ * payload failed to parse.
+ * @returns A function that closes the connection. Callers must invoke it on
+ * teardown (e.g. component unmount) to avoid leaking the connection.
+ */
 export function subscribeEvents(onMessage: (event?: BackgroundTaskEvent) => void): () => void {
   if (!browser) {
     return () => {};

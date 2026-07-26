@@ -12,6 +12,16 @@ import (
 	"github.com/drakkar-media/drakkar/internal/yenc"
 )
 
+// DiskCachedDecodedSource wraps an ArticleSource with a disk-backed LRU cache
+// of decoded article bodies, an in-memory companion cache of their yEnc
+// PartInfo headers, and singleflight coalescing of concurrent fetches for the
+// same messageID.
+//
+// Decoding is additionally bounded by decodeSem (see its field comment) so
+// that many concurrent segment fetches don't translate into an unbounded
+// number of concurrent CGO yEnc decodes.
+//
+// DiskCachedDecodedSource is safe for concurrent use.
 type DiskCachedDecodedSource struct {
 	source       ArticleSource
 	cache        *cache.FileCache
@@ -37,6 +47,9 @@ type DiskCachedDecodedSource struct {
 	decodeSem chan struct{}
 }
 
+// NewDiskCachedDecodedSource creates a DiskCachedDecodedSource backed by a
+// disk cache rooted at root and bounded at maxBytes. The decode semaphore is
+// sized to runtime.NumCPU regardless of maxBytes or fetch concurrency.
 func NewDiskCachedDecodedSource(source ArticleSource, root string, maxBytes int64) *DiskCachedDecodedSource {
 	return &DiskCachedDecodedSource{
 		source:       source,
@@ -47,19 +60,33 @@ func NewDiskCachedDecodedSource(source ArticleSource, root string, maxBytes int6
 	}
 }
 
+// DecodedBody fetches messageID's decoded body at interactive priority; see
+// DecodedBodyInfoPriority.
 func (s *DiskCachedDecodedSource) DecodedBody(ctx context.Context, messageID string) ([]byte, error) {
 	return s.DecodedBodyPriority(ctx, messageID, stream.PriorityInteractive)
 }
 
+// DecodedBodyPriority fetches messageID's decoded body, discarding the
+// PartInfo that DecodedBodyInfoPriority also computes.
 func (s *DiskCachedDecodedSource) DecodedBodyPriority(ctx context.Context, messageID string, priority stream.FetchPriority) ([]byte, error) {
 	body, _, err := s.DecodedBodyInfoPriority(ctx, messageID, priority)
 	return body, err
 }
 
+// DecodedBodyInfo fetches messageID's decoded body and PartInfo at
+// interactive priority; see DecodedBodyInfoPriority.
 func (s *DiskCachedDecodedSource) DecodedBodyInfo(ctx context.Context, messageID string) ([]byte, yenc.PartInfo, error) {
 	return s.DecodedBodyInfoPriority(ctx, messageID, stream.PriorityInteractive)
 }
 
+// DecodedBodyInfoPriority returns messageID's decoded body and yEnc PartInfo,
+// serving both from cache when possible.
+//
+// On a disk-cache hit, the body is returned immediately; if the in-memory
+// PartInfo companion entry is missing (e.g. after a process restart, since it
+// is never persisted to disk) it is recovered via fillPartInfoFromRaw. On a
+// miss, the fetch/decode runs through singleflight so concurrent callers for
+// the same messageID share one underlying NNTP fetch and one decode.
 func (s *DiskCachedDecodedSource) DecodedBodyInfoPriority(ctx context.Context, messageID string, priority stream.FetchPriority) ([]byte, yenc.PartInfo, error) {
 	if s == nil || s.source == nil {
 		return nil, yenc.PartInfo{}, errors.New("disk cached source unavailable")
@@ -110,6 +137,12 @@ func (s *DiskCachedDecodedSource) DecodedBodyInfoPriority(ctx context.Context, m
 	return s.fillPartInfoFromRaw(ctx, messageID, priority, value)
 }
 
+// fillPartInfoFromRaw recovers messageID's yEnc PartInfo when a disk-cache
+// hit yielded a decoded body but no in-memory PartInfo companion entry (the
+// companion cache is never persisted, so this happens on every disk-cache hit
+// following a process restart). It refetches the raw article solely to
+// re-parse its yEnc header; decoded is returned unchanged even if the refetch
+// fails, falling back to estimated offsets rather than failing the caller.
 func (s *DiskCachedDecodedSource) fillPartInfoFromRaw(ctx context.Context, messageID string, priority stream.FetchPriority, decoded []byte) ([]byte, yenc.PartInfo, error) {
 	raw, err := s.fetchRaw(ctx, messageID, priority)
 	if err != nil {
@@ -159,6 +192,12 @@ func (s *DiskCachedDecodedSource) storePartInfo(messageID string, info yenc.Part
 	s.partInfo.Put(messageID, encodePartInfo(info))
 }
 
+// Stat reports whether messageID exists, preferring the cheapest available
+// signal: a disk-cache hit is itself proof of existence and is returned
+// without recovering PartInfo or fetching anything further (see the inline
+// comment below for why that matters to earlyChecker's preflight use of this
+// path). Otherwise it defers to the wrapped source's Stat when available,
+// falling back to a full decode only as a last resort.
 func (s *DiskCachedDecodedSource) Stat(ctx context.Context, messageID string) error {
 	if s == nil || s.source == nil {
 		return errors.New("disk cached source unavailable")

@@ -7,10 +7,18 @@ import (
 	"errors"
 )
 
+// Sentinel errors returned by DecodeArticle/DecodeArticleWithInfo,
+// identical between the purego and rapidyenc build variants so callers can
+// match on them regardless of which decoder was compiled in.
 var (
+	// ErrMissingBegin indicates the article body has no "=ybegin " header line.
 	ErrMissingBegin = errors.New("yenc begin header missing")
-	ErrMissingEnd   = errors.New("yenc end footer missing")
-	ErrCRCMismatch  = errors.New("yenc crc mismatch")
+	// ErrMissingEnd indicates the article body has no "=yend " footer line,
+	// or the footer appears before the begin header.
+	ErrMissingEnd = errors.New("yenc end footer missing")
+	// ErrCRCMismatch indicates the decoded payload's CRC32 does not match the
+	// crc32/pcrc32 value declared in the "=yend " footer.
+	ErrCRCMismatch = errors.New("yenc crc mismatch")
 )
 
 // DecoderInfo identifies which decode implementation this binary was built
@@ -21,6 +29,13 @@ func DecoderInfo() string {
 	return "purego (no CGO/rapidyenc build tag)"
 }
 
+// DecodeArticle decodes a yEnc-encoded NNTP article body and verifies its
+// CRC32 against the "=yend " footer.
+//
+// Errors:
+//   - ErrMissingBegin: no "=ybegin " header line found.
+//   - ErrMissingEnd: no "=yend " footer line found after the header.
+//   - ErrCRCMismatch: decoded payload fails CRC verification.
 func DecodeArticle(body []byte) ([]byte, error) {
 	return decodeArticleLines(splitLines(body))
 }
@@ -41,6 +56,15 @@ func DecodeArticleWithInfo(body []byte) ([]byte, PartInfo, error) {
 	return decoded, info, nil
 }
 
+// decodeArticleLines decodes the yEnc data section found within an
+// already-line-split article body.
+//
+// Decoding walks each byte with the yEnc escape rule (a literal '=' escapes
+// the following byte, which is then unmasked by an extra -64 before the
+// common -42 unmask), so a decoded data line's own content — including one
+// that happens to start with ".." — is never reinterpreted as an NNTP
+// dot-stuffing artifact; that unstuffing already happened at the transport
+// layer before this function runs.
 func decodeArticleLines(lines [][]byte) ([]byte, error) {
 	start := -1
 	end := -1

@@ -14,6 +14,9 @@ import (
 	"github.com/drakkar-media/drakkar/internal/tmdb"
 )
 
+// TMDBClient defines the subset of TMDB metadata lookups the catalog
+// service needs to enrich library items and serve the discover/dashboard
+// views.
 type TMDBClient interface {
 	Enabled() bool
 	Search(ctx context.Context, mediaType string, query string) ([]tmdb.MediaSummary, error)
@@ -25,15 +28,24 @@ type TMDBClient interface {
 	TVSeason(ctx context.Context, tmdbID int64, seasonNumber int) (tmdb.TVSeason, error)
 }
 
+// Service builds the media catalog views (dashboard, discover, library
+// listing/detail, release calendar) served to the frontend, combining local
+// library/queue state from the database with optional TMDB metadata.
 type Service struct {
 	db   *database.DB
 	tmdb TMDBClient
 }
 
+// NewService creates a catalog Service. tmdbClient may be a client whose
+// Enabled() returns false (or nil) when TMDB integration is not configured;
+// discover/trending features degrade gracefully in that case while
+// library-only views continue to work.
 func NewService(db *database.DB, tmdbClient TMDBClient) *Service {
 	return &Service{db: db, tmdb: tmdbClient}
 }
 
+// MediaCard is the summary representation of a movie or TV show used in
+// library listings, search results, and dashboard rails.
 type MediaCard struct {
 	ID                int64     `json:"id"`
 	MediaType         string    `json:"mediaType"`
@@ -57,6 +69,8 @@ type MediaCard struct {
 	TVShowID          int64     `json:"-"`
 }
 
+// DashboardHome is the payload for the home/dashboard view: a hero item plus
+// recently-added library content and TMDB trending rails.
 type DashboardHome struct {
 	Hero           *MediaCard  `json:"hero,omitempty"`
 	RecentlyAdded  []MediaCard `json:"recentlyAdded"`
@@ -64,17 +78,21 @@ type DashboardHome struct {
 	TrendingTV     []MediaCard `json:"trendingTv"`
 }
 
+// DiscoverSearchResult holds TMDB search results split by media type.
 type DiscoverSearchResult struct {
 	Movies []MediaCard `json:"movies"`
 	TV     []MediaCard `json:"tv"`
 }
 
+// DiscoverListResult is one page of a TMDB trending/browse listing.
 type DiscoverListResult struct {
 	Page       int         `json:"page"`
 	TotalPages int         `json:"totalPages"`
 	Items      []MediaCard `json:"items"`
 }
 
+// DiscoverDetails is the full TMDB detail view for a single movie or TV
+// show, used by the discover/details page rather than the library.
 type DiscoverDetails struct {
 	MediaType           string      `json:"mediaType"`
 	Title               string      `json:"title"`
@@ -102,6 +120,7 @@ type DiscoverDetails struct {
 	Similar             []MediaCard `json:"similar,omitempty"`
 }
 
+// CastCard summarizes a single cast member for display in DiscoverDetails.
 type CastCard struct {
 	ID         int64  `json:"id,omitempty"`
 	Name       string `json:"name"`
@@ -109,6 +128,8 @@ type CastCard struct {
 	ProfileURL string `json:"profileUrl,omitempty"`
 }
 
+// DiscoverLookup identifies a title to fetch DiscoverDetails for. TMDBID is
+// used directly when known; otherwise resolveTMDBID matches by Title/Year.
 type DiscoverLookup struct {
 	MediaType string
 	Title     string
@@ -117,6 +138,8 @@ type DiscoverLookup struct {
 	IMDbID    string
 }
 
+// LibraryDetail is the full detail view for a single library item,
+// including per-season/episode breakdown for TV shows.
 type LibraryDetail struct {
 	ID                int64          `json:"id"`
 	MediaType         string         `json:"mediaType"`
@@ -139,6 +162,8 @@ type LibraryDetail struct {
 	MonitoringMode    string         `json:"monitoringMode,omitempty"`
 }
 
+// SeasonDetail describes one TV season within LibraryDetail, including its
+// episode-level availability breakdown.
 type SeasonDetail struct {
 	SeasonNumber   int             `json:"seasonNumber"`
 	Name           string          `json:"name"`
@@ -148,6 +173,8 @@ type SeasonDetail struct {
 	Episodes       []EpisodeDetail `json:"episodes"`
 }
 
+// EpisodeDetail describes a single episode's availability status within a
+// SeasonDetail.
 type EpisodeDetail struct {
 	SeasonNumber  int    `json:"seasonNumber"`
 	EpisodeNumber int    `json:"episodeNumber"`
@@ -164,6 +191,8 @@ type showEpisodeRow struct {
 	LibraryItemID int64
 }
 
+// ListLibraryCards returns every movie and TV show in the local library as
+// MediaCards, newest requested first.
 func (s *Service) ListLibraryCards(ctx context.Context) ([]MediaCard, error) {
 	movies, err := s.movieCards(ctx)
 	if err != nil {
@@ -183,6 +212,10 @@ func (s *Service) ListLibraryCards(ctx context.Context) ([]MediaCard, error) {
 	return cards, nil
 }
 
+// DiscoverSearch searches TMDB for movies and TV shows matching query.
+//
+// Errors:
+//   - returns an error when TMDB integration is not configured/enabled.
 func (s *Service) DiscoverSearch(ctx context.Context, query string) (DiscoverSearchResult, error) {
 	if s.tmdb == nil || !s.tmdb.Enabled() {
 		return DiscoverSearchResult{}, fmt.Errorf("tmdb unavailable")
@@ -201,6 +234,8 @@ func (s *Service) DiscoverSearch(ctx context.Context, query string) (DiscoverSea
 	}, nil
 }
 
+// DiscoverList returns one page of TMDB's trending listing for mediaType
+// ("movie" or "tv").
 func (s *Service) DiscoverList(ctx context.Context, mediaType string, page int) (DiscoverListResult, error) {
 	if s.tmdb == nil || !s.tmdb.Enabled() {
 		return DiscoverListResult{}, fmt.Errorf("tmdb unavailable")
@@ -216,6 +251,9 @@ func (s *Service) DiscoverList(ctx context.Context, mediaType string, page int) 
 	}, nil
 }
 
+// DiscoverDetails fetches the full TMDB detail view for the title
+// identified by lookup, resolving a TMDB ID from Title/Year first when one
+// is not already known.
 func (s *Service) DiscoverDetails(ctx context.Context, lookup DiscoverLookup) (DiscoverDetails, error) {
 	if s.tmdb == nil || !s.tmdb.Enabled() {
 		return DiscoverDetails{}, fmt.Errorf("tmdb unavailable")
@@ -288,6 +326,9 @@ func (s *Service) DiscoverDetails(ctx context.Context, lookup DiscoverLookup) (D
 	}
 }
 
+// SearchLibraryCards searches the local library by title, year, IMDb ID, or
+// TMDB ID. Matches are ranked with available items first, then exact title
+// matches, then most recently requested, and capped at 60 results.
 func (s *Service) SearchLibraryCards(ctx context.Context, query string) ([]MediaCard, error) {
 	cards, err := s.ListLibraryCards(ctx)
 	if err != nil {
@@ -400,6 +441,13 @@ func (s *Service) movieCards(ctx context.Context) ([]MediaCard, error) {
 	return out, rows.Err()
 }
 
+// tvCards returns one MediaCard per TV show (not per episode), aggregating
+// across all of a show's episode-level library_items and queue_items rows.
+// availableEpisodes/totalEpisodes drive the "x/y episodes" badge, preferring
+// TMDB's number_of_episodes as the total when known since our own tracked
+// episode rows may be incomplete; queueRank picks the single most relevant
+// queue state across all of a show's episodes (an active download outranks a
+// failure, which outranks a pending request).
 func (s *Service) tvCards(ctx context.Context) ([]MediaCard, error) {
 	rows, err := s.db.SQL.QueryContext(ctx, `
 		select
@@ -493,6 +541,10 @@ func (s *Service) tvCards(ctx context.Context) ([]MediaCard, error) {
 	return out, rows.Err()
 }
 
+// Dashboard builds the home page payload: recently added library items plus
+// TMDB trending rails when TMDB is enabled. The hero item is chosen from
+// recently-added content first, falling back to trending, then to any
+// library card, so the dashboard always has a hero when any content exists.
 func (s *Service) Dashboard(ctx context.Context) (DashboardHome, error) {
 	cards, err := s.ListLibraryCards(ctx)
 	if err != nil {
@@ -530,6 +582,12 @@ func (s *Service) Dashboard(ctx context.Context) (DashboardHome, error) {
 	return out, nil
 }
 
+// recentlyAdded returns the 40 most recently published library items for the
+// dashboard's "recently added" rail. The source union covers two distinct
+// ways an item becomes available: a symlink_publications row (movies and
+// individually-published episodes) or, for season-pack downloads that never
+// get an individual symlink, the library_items row itself. seen deduplicates
+// a library item that could otherwise surface from both branches.
 func (s *Service) recentlyAdded(ctx context.Context) ([]MediaCard, error) {
 	rows, err := s.db.SQL.QueryContext(ctx, `
 		select
@@ -670,6 +728,9 @@ func (s *Service) recentlyAdded(ctx context.Context) ([]MediaCard, error) {
 	return out, rows.Err()
 }
 
+// LibraryDetail returns the full detail view for a single library item. For
+// TV shows this also builds the per-season/episode breakdown via
+// buildTVSeasons.
 func (s *Service) LibraryDetail(ctx context.Context, libraryItemID int64) (LibraryDetail, error) {
 	var (
 		detail         LibraryDetail
@@ -814,6 +875,13 @@ func summariesToCards(items []tmdb.MediaSummary) []MediaCard {
 	return out
 }
 
+// buildTVSeasons builds the per-season/episode breakdown for LibraryDetail.
+// It merges local availability (showEpisodes) with episodes implied by the
+// currently selected release's title/filename (selectedEpisodes), so an
+// episode that is mid-download but has no library_items row yet still shows
+// up rather than appearing as entirely missing. When TMDB is unavailable, not
+// configured, or returns no season data, it falls back to a season list
+// derived purely from local rows via fallbackTVSeasonsFromRows.
 func (s *Service) buildTVSeasons(ctx context.Context, detail LibraryDetail) ([]SeasonDetail, error) {
 	rows, err := s.showEpisodes(ctx, detail.TVShowID)
 	if err != nil {
@@ -897,6 +965,11 @@ func (s *Service) buildTVSeasons(ctx context.Context, detail LibraryDetail) ([]S
 	return out, nil
 }
 
+// selectedEpisodes infers which season/episode combinations the currently
+// selected release covers by pattern-matching its release title and any
+// published file names, since a release in flight has no episodes.available
+// rows yet. It matches explicit SxxEyy markers and, for season-pack releases
+// (seasonPackNumber), assumes episodes 1-24 of that season are covered.
 func (s *Service) selectedEpisodes(ctx context.Context, detail LibraryDetail) map[string]struct{} {
 	out := make(map[string]struct{})
 	if detail.SelectedReleaseID == nil {
@@ -983,6 +1056,10 @@ func (s *Service) showEpisodes(ctx context.Context, tvShowID int64) ([]showEpiso
 	return out, rows.Err()
 }
 
+// fallbackTVSeasonsFromRows builds a season/episode breakdown directly from
+// local database rows, used when TMDB season metadata is unavailable (TMDB
+// disabled, unmatched title, or an API error) so the detail view still shows
+// whatever the library actually has.
 func fallbackTVSeasonsFromRows(rows []showEpisodeRow) []SeasonDetail {
 	if len(rows) == 0 {
 		return nil
@@ -1032,6 +1109,11 @@ func fallbackTVSeasonsFromRows(rows []showEpisodeRow) []SeasonDetail {
 	return out
 }
 
+// seasonPackNumber returns the season number a release title refers to when
+// the title indicates a whole-season pack (e.g. "Season 02" or "S02" combined
+// with "complete"/"pack"), or 0 if the title does not look like a season
+// pack. Used to distinguish a season-pack release from a single episode that
+// happens to match the same "S02" prefix.
 func seasonPackNumber(title string) int {
 	re := regexp.MustCompile(`(?i)(?:season|s)(\d{1,2})`)
 	match := re.FindStringSubmatch(title)
@@ -1078,6 +1160,11 @@ func castCards(items []tmdb.PersonSummary) []CastCard {
 	return out
 }
 
+// resolveTMDBID resolves a DiscoverLookup to a TMDB ID, searching by title
+// when one isn't already known. It prefers a result whose normalized title
+// (and year, if provided) matches exactly, falling back to the first search
+// result so a near-miss (e.g. a retitled release) still resolves rather than
+// failing outright.
 func (s *Service) resolveTMDBID(ctx context.Context, lookup DiscoverLookup) (int64, error) {
 	if lookup.TMDBID > 0 {
 		return lookup.TMDBID, nil
@@ -1112,6 +1199,9 @@ func normalizeSearch(value string) string {
 	return strings.Join(strings.Fields(value), " ")
 }
 
+// queueStateFromRank maps the highest queue_rank seen across a TV show's
+// episodes (see tvCards: 3=actively downloading, 2=failed, 1=requested,
+// 0=none) to the queue state string surfaced on the show's MediaCard.
 func queueStateFromRank(rank int, available bool) string {
 	if available {
 		return string(database.QueueAvailable)

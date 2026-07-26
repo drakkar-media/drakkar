@@ -1,5 +1,8 @@
 import type { LibraryItem } from '$lib/types';
 
+/**
+ * Queue states that map to the `active` ("Downloading") item status.
+ */
 export const ACTIVE_STATES = ['searching','ranking','selected','fetching_nzb','indexing','preflight','publishing','downloading'];
 
 // Status system matches the reference project's Library.tsx groupStatus() exactly:
@@ -12,6 +15,14 @@ export const ACTIVE_STATES = ['searching','ranking','selected','fetching_nzb','i
 
 export type ItemStatus = 'available' | 'partial' | 'active' | 'missing' | 'failed' | 'unreleased';
 
+/**
+ * Sort tier for each {@link ItemStatus}, matching the reference project's
+ * status grouping order (available, then partial/unreleased/active, then
+ * missing/failed).
+ *
+ * `unreleased` and `active` share a tier, as do `missing` and `failed` —
+ * both pairs are visually and operationally equivalent groupings.
+ */
 export const STATUS_ORDER: Record<ItemStatus, number> = {
   available:  0,
   partial:    1,
@@ -21,6 +32,21 @@ export const STATUS_ORDER: Record<ItemStatus, number> = {
   failed:     3,  // same tier as missing — needs retry
 };
 
+/**
+ * Derives the display status of a library item from its queue state and
+ * availability counts.
+ *
+ * Precedence: an in-progress queue state wins over availability (e.g. a
+ * `selected` item counts as `active` even if a prior season is already
+ * `available`), `failed` collapses into `missing` since both require
+ * operator action, and `requested` (queued by Seerr but not yet searched)
+ * maps to `unreleased`. Otherwise falls back to the item's availability and
+ * missing/available episode counts to distinguish `available` from
+ * `partial` from `missing`.
+ *
+ * @param item - Library item to classify.
+ * @returns The status used to group and color the item in list views.
+ */
 export function itemStatus(item: LibraryItem): ItemStatus {
   const s = item.queueState ?? '';
   if (ACTIVE_STATES.includes(s)) return 'active';

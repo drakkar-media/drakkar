@@ -2,6 +2,11 @@ package database
 
 import "context"
 
+// ListIndexerPolicies returns all indexer policies ordered alphabetically by
+// indexer name, including disabled ones.
+//
+// Errors:
+//   - error: any failure executing or scanning the underlying query.
 func (db *DB) ListIndexerPolicies(ctx context.Context) ([]IndexerPolicy, error) {
 	rows, err := db.SQL.QueryContext(ctx,
 		`SELECT id, indexer_name, score_modifier, enabled, note, created_at, updated_at
@@ -21,6 +26,12 @@ func (db *DB) ListIndexerPolicies(ctx context.Context) ([]IndexerPolicy, error) 
 	return out, rows.Err()
 }
 
+// UpsertIndexerPolicy inserts a new policy or updates the existing one for
+// p.IndexerName, which is unique.
+//
+// Returns:
+//   - IndexerPolicy: the row as stored, with CreatedAt/UpdatedAt populated by
+//     the database.
 func (db *DB) UpsertIndexerPolicy(ctx context.Context, p IndexerPolicy) (IndexerPolicy, error) {
 	var out IndexerPolicy
 	err := db.SQL.QueryRowContext(ctx, `
@@ -37,6 +48,11 @@ func (db *DB) UpsertIndexerPolicy(ctx context.Context, p IndexerPolicy) (Indexer
 	return out, err
 }
 
+// UpdateIndexerPolicy overwrites the policy identified by p.ID with the
+// provided field values and refreshes UpdatedAt.
+//
+// Errors:
+//   - sql.ErrNoRows: no indexer policy exists with the given ID.
 func (db *DB) UpdateIndexerPolicy(ctx context.Context, p IndexerPolicy) (IndexerPolicy, error) {
 	var out IndexerPolicy
 	err := db.SQL.QueryRowContext(ctx, `
@@ -49,6 +65,9 @@ func (db *DB) UpdateIndexerPolicy(ctx context.Context, p IndexerPolicy) (Indexer
 	return out, err
 }
 
+// DeleteIndexerPolicy removes the indexer policy identified by id.
+//
+// It is a no-op if no row matches id.
 func (db *DB) DeleteIndexerPolicy(ctx context.Context, id int64) error {
 	_, err := db.SQL.ExecContext(ctx, `DELETE FROM indexer_policies WHERE id=$1`, id)
 	return err

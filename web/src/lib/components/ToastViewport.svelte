@@ -1,4 +1,9 @@
 <script lang="ts">
+  /**
+   * Fixed-position stack of dismissible toast notifications, sourced from
+   * the global `$lib/toast` store. Mount once near the root of the app;
+   * call the toast store's helpers elsewhere to show messages.
+   */
   import X from '@lucide/svelte/icons/x';
   import { dismiss, toasts } from '$lib/toast';
 </script>

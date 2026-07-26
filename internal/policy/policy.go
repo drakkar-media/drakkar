@@ -5,25 +5,30 @@ package policy
 import "strings"
 
 // FailureKey is a canonical category for a queue failure.
+//
+// Classify normalizes the many free-form failure_reason strings written by
+// different subsystems (NNTP, archive extraction, publish, search) into this
+// small fixed set so Decide can apply a single recovery matrix regardless of
+// which component produced the failure.
 type FailureKey string
 
 const (
-	KeyMissingArticles        FailureKey = "missing_articles"
-	KeyUnsupportedArchive     FailureKey = "unsupported_archive"
-	KeyEncryptedArchive       FailureKey = "encrypted_archive"
-	KeyNZBParseFailed         FailureKey = "nzb_parse_failed"
-	KeyNZBFetchFailed         FailureKey = "nzb_fetch_failed"
-	KeyNZBFetch4xx            FailureKey = "nzb_fetch_4xx"    // 401/404/410/451 = permanent auth/not-found, blocklist
-	KeyNZBFetch403            FailureKey = "nzb_fetch_403"    // 403 = quota/rate-limit (e.g. NZBFinder), retry later
-	KeyPreflightFailed        FailureKey = "preflight_failed"
-	KeyPublishFailed          FailureKey = "publish_failed"
-	KeySymlinkFailed          FailureKey = "symlink_failed"
-	KeyNoReleaseFound         FailureKey = "no_release_found"
-	KeyAllCandidatesRejected  FailureKey = "all_candidates_rejected"
-	KeyBadSource              FailureKey = "bad_source"
-	KeyWrongTitle             FailureKey = "wrong_title"
-	KeyInterruptedByRestart   FailureKey = "interrupted_by_restart"
-	KeyUnknown                FailureKey = "unknown"
+	KeyMissingArticles       FailureKey = "missing_articles"
+	KeyUnsupportedArchive    FailureKey = "unsupported_archive"
+	KeyEncryptedArchive      FailureKey = "encrypted_archive"
+	KeyNZBParseFailed        FailureKey = "nzb_parse_failed"
+	KeyNZBFetchFailed        FailureKey = "nzb_fetch_failed"
+	KeyNZBFetch4xx           FailureKey = "nzb_fetch_4xx" // 401/404/410/451 = permanent auth/not-found, blocklist
+	KeyNZBFetch403           FailureKey = "nzb_fetch_403" // 403 = quota/rate-limit (e.g. NZBFinder), retry later
+	KeyPreflightFailed       FailureKey = "preflight_failed"
+	KeyPublishFailed         FailureKey = "publish_failed"
+	KeySymlinkFailed         FailureKey = "symlink_failed"
+	KeyNoReleaseFound        FailureKey = "no_release_found"
+	KeyAllCandidatesRejected FailureKey = "all_candidates_rejected"
+	KeyBadSource             FailureKey = "bad_source"
+	KeyWrongTitle            FailureKey = "wrong_title"
+	KeyInterruptedByRestart  FailureKey = "interrupted_by_restart"
+	KeyUnknown               FailureKey = "unknown"
 )
 
 // Action is the recovery action to take after a failure.
@@ -59,7 +64,7 @@ var defaultMatrix = map[FailureKey]Action{
 	KeyPreflightFailed:       ActionSearchAgain,        // transient preflight → try another release
 	KeyPublishFailed:         ActionRetryLater,         // FUSE publish issue → retry, don't abandon
 	KeySymlinkFailed:         ActionRetryLater,
-	KeyNoReleaseFound:        ActionDoNothing,          // nothing on indexers → wait for next cycle
+	KeyNoReleaseFound:        ActionDoNothing, // nothing on indexers → wait for next cycle
 	KeyAllCandidatesRejected: ActionSearchAgain,
 	KeyBadSource:             ActionBlocklistAndSearch,
 	KeyWrongTitle:            ActionSearchAgain, // bad title match → retry search, don't blocklist valid NZBs

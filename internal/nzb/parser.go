@@ -11,11 +11,15 @@ import (
 	"golang.org/x/net/html/charset"
 )
 
+// Document is the parsed representation of an NZB XML file's root <nzb> element.
 type Document struct {
 	XMLName xml.Name  `xml:"nzb"`
 	Files   []NZBFile `xml:"file"`
 }
 
+// NZBFile is a single <file> entry in an NZB document: one posted file
+// (potentially split across multiple article segments) making up part of
+// the release.
 type NZBFile struct {
 	Subject  string       `xml:"subject,attr"`
 	Poster   string       `xml:"poster,attr"`
@@ -24,6 +28,10 @@ type NZBFile struct {
 	Segments []NZBSegment `xml:"segments>segment"`
 }
 
+// NZBSegment is one <segment> article reference within an NZBFile.
+// DecodedFrom and DecodedTo are not present in the NZB XML (see the xml:"-"
+// tags) -- Parse populates them with each segment's estimated decoded byte
+// offsets within the reconstructed file.
 type NZBSegment struct {
 	Number      int    `xml:"number,attr"`
 	Bytes       int64  `xml:"bytes,attr"`
@@ -40,6 +48,11 @@ type newznabError struct {
 	Description string   `xml:"description,attr"`
 }
 
+// Parse reads and decodes an NZB XML document from r, sorting each file's
+// segments by number and populating their estimated decoded byte offsets.
+// If the payload is actually a Newznab API error response rather than a
+// valid NZB, Parse returns that error's code/description instead of a raw
+// XML decoding failure.
 func Parse(r io.Reader) (*Document, error) {
 	data, err := io.ReadAll(r)
 	if err != nil {
@@ -86,6 +99,10 @@ func estimateDecodedSize(encoded int64) int64 {
 	return int64(float64(encoded) * 0.97)
 }
 
+// ParseSubjectFilename extracts the filename from a Usenet post subject
+// line, preferring the double-quoted segment (e.g. `"movie.mkv" yEnc
+// (1/20)`) and falling back to the first whitespace-delimited field when no
+// quotes are present.
 func ParseSubjectFilename(subject string) string {
 	start := strings.Index(subject, "\"")
 	end := strings.LastIndex(subject, "\"")

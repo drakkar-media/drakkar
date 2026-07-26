@@ -1,3 +1,4 @@
+// Package subdl implements a subtitles.Provider backed by the subdl.com API.
 package subdl
 
 import (
@@ -17,6 +18,10 @@ import (
 	"github.com/drakkar-media/drakkar/internal/subtitleutil"
 )
 
+// Client implements subtitles.Provider against the subdl.com REST API.
+//
+// A Client holds no mutable state beyond its configuration and is safe for
+// concurrent use.
 type Client struct {
 	apiKey      string
 	baseURL     string
@@ -24,6 +29,7 @@ type Client struct {
 	httpClient  *http.Client
 }
 
+// NewClient creates a subdl Client using the configured API key.
 func NewClient(auth config.SubtitleAuth) *Client {
 	return &Client{
 		apiKey:      strings.TrimSpace(auth.APIKey),
@@ -33,10 +39,14 @@ func NewClient(auth config.SubtitleAuth) *Client {
 	}
 }
 
+// Name returns the provider identifier used to route subtitle candidates
+// back to this client (see subtitles.Service.DownloadCandidate).
 func (c *Client) Name() string {
 	return "subdl"
 }
 
+// Probe verifies the client is reachable and the API key is valid by issuing
+// a throwaway search.
 func (c *Client) Probe(ctx context.Context) error {
 	_, err := c.Search(ctx, database.SubtitleSearchInput{
 		MediaType: "movie",
@@ -45,6 +55,12 @@ func (c *Client) Probe(ctx context.Context) error {
 	return err
 }
 
+// Search queries subdl for subtitle candidates matching input, restricted to
+// the given language codes when non-empty.
+//
+// Multi-file archive responses (unpack_files) are expanded into one
+// ProviderCandidate per usable (srt/vtt) entry; single-file responses are
+// included only when their declared format is zip, srt, or vtt.
 func (c *Client) Search(ctx context.Context, input database.SubtitleSearchInput, languages []string) ([]subtitles.ProviderCandidate, error) {
 	u, err := url.Parse(c.baseURL + "/subtitles")
 	if err != nil {
@@ -162,6 +178,9 @@ func (c *Client) Search(ctx context.Context, input database.SubtitleSearchInput,
 	return out, nil
 }
 
+// Download fetches the subtitle (or subtitle archive) at rawURL, capped at
+// 2MiB, and derives a file name from the URL path for extension detection by
+// the caller.
 func (c *Client) Download(ctx context.Context, rawURL string) (string, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -187,6 +206,8 @@ func (c *Client) Download(ctx context.Context, rawURL string) (string, []byte, e
 	return name, body, nil
 }
 
+// normalizeLanguages upper-cases, trims, and deduplicates language codes into
+// the comma-joined form the subdl "languages" query parameter expects.
 func normalizeLanguages(values []string) string {
 	var out []string
 	seen := make(map[string]struct{})
@@ -204,6 +225,8 @@ func normalizeLanguages(values []string) string {
 	return strings.Join(out, ",")
 }
 
+// typeForSearch maps the internal media-type vocabulary to subdl's "type"
+// query parameter values, which distinguish only movie vs tv.
 func typeForSearch(mediaType string) string {
 	switch strings.ToLower(strings.TrimSpace(mediaType)) {
 	case "movie":

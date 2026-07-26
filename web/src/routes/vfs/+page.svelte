@@ -1,4 +1,12 @@
 <script lang="ts">
+  /**
+   * Displays a directory browser for the mounted FUSE virtual filesystem
+   * alongside live active-stream sessions and mount-level metrics.
+   *
+   * Browsing, metrics, and stream data are refetched together on every
+   * navigation and refresh so the sidebar always reflects the currently
+   * displayed directory's mount state.
+   */
   import { onMount } from 'svelte';
   import Folder from '@lucide/svelte/icons/folder';
   import File from '@lucide/svelte/icons/file';

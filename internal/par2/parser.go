@@ -1,3 +1,6 @@
+// Package par2 provides a minimal, read-only parser for par2 recovery-set
+// index files, extracting real filenames and authoritative sizes without
+// performing any repair or disk writes.
 package par2
 
 import "encoding/binary"
@@ -57,6 +60,10 @@ func ParseFileDescs(data []byte) []FileDesc {
 	return out
 }
 
+// parseFileDescBody decodes a FileDesc packet body (see the layout comment
+// above) into a FileDesc. It reports false if the body is too short to
+// contain a FileLength field or if the decoded length is zero, either of
+// which indicates a malformed or unusable packet.
 func parseFileDescBody(body []byte) (FileDesc, bool) {
 	if len(body) < 56 {
 		return FileDesc{}, false

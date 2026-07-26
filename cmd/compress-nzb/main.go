@@ -108,7 +108,9 @@ func main() {
 	log.Printf("done: %d rows processed, %d compressed, %d already compressed — took %s",
 		processed, compressed, skipped, time.Since(start).Round(time.Second))
 
-	// Print final size reduction
+	// beforeBytes is intentionally left at zero: the pre-compression total was
+	// never captured up front, so only the post-run column size is reported
+	// rather than a computed reduction.
 	var beforeBytes, afterBytes int64
 	db.QueryRow(`SELECT coalesce(sum(length(xml)),0) FROM nzb_documents`).Scan(&afterBytes)
 	_ = beforeBytes

@@ -1,4 +1,21 @@
 <script lang="ts">
+  /**
+   * Central settings console covering every configurable subsystem: Integrations,
+   * Providers, Indexers, Queue, Library, Rules, Quality, Custom Formats, Release
+   * Filtering, Subtitle Profiles, Notifications, Privacy Routing, Logs, Tasks,
+   * Media Players, Speed Test, and System — one tab per concern, selected via
+   * `activeTab`.
+   *
+   * Edits use a draft/fullSettings pattern: `loadAll()` fetches the server's
+   * `FullSettings` into `fullSettings` and deep-clones it into `draft`, and every
+   * form control in every tab binds to fields on `draft`. Nothing reaches the
+   * backend until `saveSettings()` PUTs the whole `draft` object and reconciles
+   * both `fullSettings` and `draft` with the server's response. Because `loadAll()`
+   * is re-triggered continuously (SSE events, a 30s poll), it intentionally skips
+   * overwriting `draft` whenever `draft` differs from the last-loaded
+   * `fullSettings` — otherwise an unrelated background event would silently
+   * discard whatever the operator was mid-editing.
+   */
   import { onMount } from 'svelte';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import Wrench from '@lucide/svelte/icons/wrench';
@@ -32,6 +49,8 @@
   import Webhook from '@lucide/svelte/icons/webhook';
   import Languages from '@lucide/svelte/icons/languages';
   import Gauge from '@lucide/svelte/icons/gauge';
+  import ShieldCheck from '@lucide/svelte/icons/shield-check';
+  import Upload from '@lucide/svelte/icons/upload';
   import Button from '$lib/components/Button.svelte';
   import PageHeader from '$lib/components/PageHeader.svelte';
   import Pagination from '$lib/components/Pagination.svelte';
@@ -42,9 +61,9 @@
   import { toastError, toastSuccess } from '$lib/toast';
   import { runAction, confirmed } from '$lib/actions';
   import { debounce } from '$lib/debounce';
-  import type { BlocklistItem, BlocklistMutation, BlockTestResult, CustomFormat, FullSettings, IndexerPolicy, IntegrationProbeReport, PolicySettings, QualityDefinition, QualityProfile, ReleaseBlockRule, SpeedTestResult, Status, SubtitleProfile, TaskSchedule, UsenetProvider } from '$lib/types';
+  import type { BlocklistItem, BlocklistMutation, BlockTestResult, CustomFormat, FullSettings, IndexerPolicy, IntegrationProbeReport, PolicySettings, PrivacyStatus, QualityDefinition, QualityProfile, ReleaseBlockRule, SpeedTestResult, Status, SubtitleProfile, TaskSchedule, UsenetProvider } from '$lib/types';
 
-  type SettingsTab = 'integrations' | 'providers' | 'indexers' | 'queue' | 'library' | 'rules' | 'quality' | 'formats' | 'filtering' | 'subtitle-profiles' | 'notifications' | 'logs' | 'tasks' | 'media-players' | 'speed-test' | 'system';
+  type SettingsTab = 'integrations' | 'providers' | 'indexers' | 'queue' | 'library' | 'rules' | 'quality' | 'formats' | 'filtering' | 'subtitle-profiles' | 'notifications' | 'privacy' | 'logs' | 'tasks' | 'media-players' | 'speed-test' | 'system';
 
   const tabs: { id: SettingsTab; label: string; short: string; icon: typeof PlugZap }[] = [
     { id: 'integrations',  label: 'Integrations',  short: 'Apps',     icon: PlugZap },
@@ -58,6 +77,7 @@
     { id: 'filtering',        label: 'Release Filtering', short: 'Filtering', icon: Ban },
     { id: 'subtitle-profiles', label: 'Subtitle Profiles', short: 'Subtitles', icon: Languages },
     { id: 'notifications', label: 'Notifications',     short: 'Notify',    icon: Webhook },
+    { id: 'privacy',       label: 'Privacy Routing',    short: 'Privacy',   icon: ShieldCheck },
     { id: 'logs',          label: 'Logs',          short: 'Logs',     icon: ScrollText },
     { id: 'tasks',         label: 'Tasks',         short: 'Tasks',    icon: ClipboardList },
     { id: 'media-players', label: 'Media Players', short: 'Players',  icon: Tv },
@@ -95,6 +115,10 @@
   let qualityDefsSaving: Set<number> = new Set();
   let qualitySubTab: 'profiles' | 'definitions' = 'profiles';
   let policySettings: PolicySettings | null = null;
+  let privacyStatus: PrivacyStatus | null = null;
+  let privacyTestResult: { ok: boolean; error?: string } | null = null;
+  let wireguardImportOpen = false;
+  let wireguardImportText = '';
 
   let lastCachePrune: { root: string; filesBefore: number; filesAfter: number; bytesBefore: number; bytesAfter: number; deletedFiles: number; deletedBytes: number; limitBytes: number } | null = null;
   let activeTab: SettingsTab = 'integrations';
@@ -679,6 +703,19 @@
         if (draft && !draft.notifications) {
           draft.notifications = { discordWebhookUrl: '', genericWebhookUrl: '', onGrab: false, onAvailable: true, onFailed: false };
         }
+        if (draft && !draft.privacy) {
+          draft.privacy = {
+            mode: 'direct',
+            socks5: { host: '', port: 1080, username: '', password: '', timeoutSeconds: 15 },
+            wireguard: { configText: '', timeoutSeconds: 15 },
+            excludedIndexers: []
+          };
+        }
+      }
+      try {
+        privacyStatus = await api.getPrivacyStatus();
+      } catch {
+        // Non-fatal -- the status panel just shows nothing until reachable.
       }
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
@@ -709,7 +746,7 @@
       const saved = await api.saveSettings(draft);
       fullSettings = saved;
       draft = cloneSettings(saved);
-      toastSuccess('Settings saved — restart Drakkar to apply connection changes');
+      toastSuccess('Settings saved');
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1261,7 +1298,7 @@
     <!-- PROVIDERS -->
     {:else if activeTab === 'providers'}
       {#if draft}
-        <Panel title="Connection Budget" subtitle="Global NNTP connection limits (requires restart to take effect).">
+        <Panel title="Connection Budget" subtitle="Global NNTP connection limits. Applies immediately after Save.">
           <div class="form-grid form-grid--3col">
             <label class="form-field">
               <span>Max Download Connections</span>
@@ -2515,6 +2552,174 @@
       </Panel>
       {/if}
 
+    <!-- PRIVACY ROUTING -->
+    {:else if activeTab === 'privacy'}
+      {#if draft}
+      <Panel title="Privacy Routing" subtitle="Routes only Usenet and NZB indexer traffic. Plex/Jellyfin/metadata/local traffic always stays direct.">
+        <div class="field">
+          <div class="field-label">Routing Mode</div>
+          <div class="flags-grid">
+            <label class="flag-row">
+              <input type="radio" name="privacy-mode" value="direct" bind:group={draft.privacy.mode} />
+              <div><strong>Direct</strong><span>Usenet and indexer traffic use the normal network connection. No configuration required.</span></div>
+            </label>
+            <label class="flag-row">
+              <input type="radio" name="privacy-mode" value="socks5" bind:group={draft.privacy.mode} />
+              <div><strong>SOCKS5 Proxy</strong><span>Route through a SOCKS5 proxy. Never falls back to Direct if the proxy is unreachable.</span></div>
+            </label>
+            <label class="flag-row">
+              <input type="radio" name="privacy-mode" value="wireguard" bind:group={draft.privacy.mode} />
+              <div><strong>WireGuard VPN</strong><span>In-process userspace WireGuard tunnel. No separate VPN container required.</span></div>
+            </label>
+          </div>
+          <p class="field-hint">Applies immediately after Save — no restart required.</p>
+        </div>
+
+        {#if draft.privacy.mode === 'socks5'}
+          <div class="divider"></div>
+          <div class="form-grid">
+            <label class="form-field">
+              <span>Host</span>
+              <input type="text" bind:value={draft.privacy.socks5.host} placeholder="127.0.0.1" />
+            </label>
+            <label class="form-field">
+              <span>Port</span>
+              <input type="number" min="1" max="65535" bind:value={draft.privacy.socks5.port} />
+            </label>
+            <label class="form-field">
+              <span>Username <small class="field-hint-inline">(optional)</small></span>
+              <input type="text" bind:value={draft.privacy.socks5.username} autocomplete="off" />
+            </label>
+            <label class="form-field">
+              <span>Password <small class="field-hint-inline">(leave blank to keep existing)</small></span>
+              <input type="password" bind:value={draft.privacy.socks5.password} placeholder="••••••••" autocomplete="off" />
+            </label>
+            <label class="form-field">
+              <span>Timeout (seconds)</span>
+              <input type="number" min="1" bind:value={draft.privacy.socks5.timeoutSeconds} />
+            </label>
+          </div>
+        {/if}
+
+        {#if draft.privacy.mode === 'wireguard'}
+          <div class="divider"></div>
+          {#if privacyStatus?.wireguard}
+            <div class="field">
+              <div class="field-label">Current Configuration</div>
+              <div class="flags-grid" style="grid-template-columns:1fr 1fr">
+                {#if privacyStatus.wireguard.interfaceAddress?.length}<div><strong>Interface Address</strong><span>{privacyStatus.wireguard.interfaceAddress.join(', ')}</span></div>{/if}
+                {#if privacyStatus.wireguard.endpoint}<div><strong>Endpoint</strong><span>{privacyStatus.wireguard.endpoint}</span></div>{/if}
+                {#if privacyStatus.wireguard.allowedIps?.length}<div><strong>Allowed IPs</strong><span>{privacyStatus.wireguard.allowedIps.join(', ')}</span></div>{/if}
+                {#if privacyStatus.wireguard.dns?.length}<div><strong>DNS</strong><span>{privacyStatus.wireguard.dns.join(', ')}</span></div>{/if}
+                {#if privacyStatus.wireguard.persistentKeepalive}<div><strong>Keepalive</strong><span>{privacyStatus.wireguard.persistentKeepalive}s</span></div>{/if}
+              </div>
+              <p class="field-hint">PrivateKey/PresharedKey are never shown or sent back to the browser.</p>
+            </div>
+            <div class="divider"></div>
+          {/if}
+          <!--
+            The imported .conf text is staged into `draft.privacy.wireguard.configText`
+            only — it is never sent to the backend by this control. It becomes active
+            only after the user hits the page-level Save button, consistent with the
+            draft/fullSettings pattern documented at the top of this file.
+          -->
+          <div class="field">
+            <label class="field-label" for="wg-import">Import Configuration</label>
+            {#if !wireguardImportOpen}
+              <div class="actions-row">
+                <Button kind="ghost" on:click={() => { wireguardImportOpen = true; wireguardImportText = ''; }}>
+                  <Upload size={14} /> Paste / Upload .conf
+                </Button>
+                {#if draft.privacy.wireguard.configText}<span class="field-hint-inline">A configuration is already saved. Import a new one to replace it.</span>{/if}
+              </div>
+            {:else}
+              <textarea id="wg-import" class="cf-import-textarea" bind:value={wireguardImportText} rows={10}
+                placeholder={"[Interface]\nPrivateKey = ...\nAddress = 10.x.x.x/32\nDNS = ...\n\n[Peer]\nPublicKey = ...\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = vpn.example.com:51820\nPersistentKeepalive = 25"}></textarea>
+              <input type="file" accept=".conf,text/plain" on:change={async (e) => {
+                const file = (e.currentTarget as HTMLInputElement).files?.[0];
+                if (file) wireguardImportText = await file.text();
+              }} />
+              <div class="editor-actions" style="margin-top:10px">
+                <Button kind="ghost" on:click={() => { wireguardImportOpen = false; wireguardImportText = ''; }}>Cancel</Button>
+                <Button kind="primary" on:click={() => {
+                  if (!draft || !wireguardImportText.trim()) return;
+                  draft.privacy.wireguard.configText = wireguardImportText;
+                  wireguardImportOpen = false;
+                  wireguardImportText = '';
+                  toastSuccess('WireGuard configuration staged — click Save to apply');
+                }} disabled={!wireguardImportText.trim()}>Use This Configuration</Button>
+              </div>
+            {/if}
+          </div>
+          <div class="field">
+            <label class="field-label" for="wg-timeout">Connection Timeout (seconds)</label>
+            <input id="wg-timeout" type="number" min="1" bind:value={draft.privacy.wireguard.timeoutSeconds} style="max-width:120px" />
+          </div>
+        {/if}
+
+        {#if draft.privacy.mode !== 'direct'}
+          <div class="divider"></div>
+          <div class="field">
+            <div class="actions-row" style="gap:10px">
+              <Button kind="secondary" on:click={async () => {
+                setBusy('privacy-test', true);
+                privacyTestResult = null;
+                try {
+                  const r = await api.testPrivacyConnection({
+                    mode: draft!.privacy.mode,
+                    socks5: draft!.privacy.socks5,
+                    wireguard: { configText: draft!.privacy.wireguard.configText, timeoutSeconds: draft!.privacy.wireguard.timeoutSeconds }
+                  });
+                  privacyTestResult = r;
+                  if (r.ok) toastSuccess('Privacy route reachable');
+                  else toastError(r.error ?? 'Privacy route test failed');
+                } catch (e) { toastError(e instanceof Error ? e.message : String(e)); }
+                finally { setBusy('privacy-test', false); }
+              }} disabled={isBusy('privacy-test')}>
+                <Wrench size={16} /> Test Connection
+              </Button>
+              {#if privacyTestResult}
+                <StatusPill tone={privacyTestResult.ok ? 'ok' : 'danger'}>{privacyTestResult.ok ? 'Reachable' : 'Unreachable'}</StatusPill>
+              {/if}
+              {#if privacyStatus}
+                <StatusPill tone={privacyStatus.mode === 'direct' ? 'neutral' : privacyStatus.status === 'error' ? 'danger' : 'ok'}>
+                  {privacyStatus.mode} — {privacyStatus.status}
+                </StatusPill>
+              {/if}
+            </div>
+          </div>
+        {/if}
+
+        <div class="divider"></div>
+        <!--
+          Free-text, comma-separated list rather than a multi-select because indexer
+          names are matched against whatever string the search result reports for
+          "indexer" (not a stable ID) — the operator must type them to match exactly.
+          Parsed back into an array only on change (blur/Enter), and like every other
+          field on this page it only takes effect once Save writes the draft back.
+        -->
+        <div class="field">
+          <label class="field-label" for="privacy-excluded">Indexers Excluded From Privacy Routing</label>
+          <input id="privacy-excluded" type="text"
+            value={draft.privacy.excludedIndexers.join(', ')}
+            on:change={(e) => {
+              if (!draft) return;
+              draft.privacy.excludedIndexers = (e.currentTarget as HTMLInputElement).value
+                .split(',').map(l => l.trim()).filter(Boolean);
+            }}
+            placeholder="NZBGeek, NZB Finder" />
+          <p class="field-hint">Comma-separated indexer names (as they appear in search results). NZB downloads from these indexers always use a direct connection, regardless of the routing mode above — useful for a private/trusted indexer.</p>
+        </div>
+
+        <div class="divider"></div>
+        <div class="editor-actions">
+          <Button kind="primary" on:click={saveSettings} disabled={isBusy('save-settings')}>
+            <Save size={15} /> {isBusy('save-settings') ? 'Saving…' : 'Save Privacy Settings'}
+          </Button>
+        </div>
+      </Panel>
+      {/if}
+
     <!-- LOGS -->
     {:else if activeTab === 'logs'}
       <div class="log-toolbar">
@@ -2752,7 +2957,7 @@
       <div class="grid-2">
         <Panel title="Internal Streaming Speed Test" subtitle="Streams the largest already-downloaded file through the same read path playback uses, for ~8 seconds, and reports throughput.">
           <p class="muted">
-            Use this to find the best <strong>Max Download Connections</strong> value (Providers tab): run the test, adjust the setting, restart Drakkar, and run it again — stop once the reported Mbps plateaus.
+            Use this to find the best <strong>Max Download Connections</strong> value (Providers tab): run the test, adjust the setting and Save, and run it again — stop once the reported Mbps plateaus.
           </p>
           <Button kind="primary" on:click={runSpeedTest} disabled={isBusy('speedtest')}>
             <Gauge size={16} /> {isBusy('speedtest') ? 'Testing… (~8s)' : 'Run Speed Test'}

@@ -7,6 +7,16 @@ import (
 	"strings"
 )
 
+// ListLibraryItems returns a summary of every library item, most recently
+// requested first, joined with its current queue state (if any).
+//
+// Each library item has at most one queue_items row (enforced by the
+// UNIQUE(library_item_id) constraint added in migration 000044), so the join
+// is a simple one-to-zero-or-one relationship rather than a fan-out. Items
+// with no queue row yet have a zero-value QueueState and FailureReason.
+//
+// Errors:
+//   - error: any failure returned by the underlying query or row scan.
 func (db *DB) ListLibraryItems(ctx context.Context) ([]LibraryItemSummary, error) {
 	// queue_items has a UNIQUE(library_item_id) constraint (migration 000044),
 	// so there is at most one row per library item -- a plain join is enough;
@@ -59,6 +69,22 @@ func (db *DB) ListLibraryItems(ctx context.Context) ([]LibraryItemSummary, error
 	return out, rows.Err()
 }
 
+// ListReleaseSummaries returns every release candidate considered for the
+// given library item, along with its selection state, archive inspection
+// results, and prior failed-attempt history.
+//
+// Results are ordered with the currently selected candidate first, then by
+// descending score, so the best/active candidate is always at the front.
+// Archive and failed-attempt data are loaded in two additional bulk queries
+// keyed by the selected release and candidate IDs collected from the initial
+// scan, rather than once per row, to avoid an N+1 query pattern.
+//
+// Parameters:
+//   - libraryItemID: identifies the library item whose release candidates
+//     are returned.
+//
+// Errors:
+//   - error: any failure returned by the underlying queries or row scans.
 func (db *DB) ListReleaseSummaries(ctx context.Context, libraryItemID int64) ([]ReleaseSummary, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select
@@ -183,6 +209,11 @@ func (db *DB) ListReleaseSummaries(ctx context.Context, libraryItemID int64) ([]
 	return out, nil
 }
 
+// releaseSummaryExplanations builds the list of human-readable notes shown
+// alongside a release candidate, derived from its selection, rejection,
+// failure-count, and archive-rejection fields. When none of those conditions
+// apply, it returns a single explicit "no rejections" note rather than an
+// empty list, so the UI always has something to display.
 func releaseSummaryExplanations(item ReleaseSummary) []string {
 	out := append([]string{}, item.Explanations...)
 	if item.Selected {

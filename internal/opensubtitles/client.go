@@ -1,3 +1,6 @@
+// Package opensubtitles implements a subtitles.Provider backed by the
+// OpenSubtitles.com REST API, handling authentication token caching and
+// search/download translation to the shared subtitles types.
 package opensubtitles
 
 import (
@@ -21,6 +24,13 @@ import (
 	"github.com/drakkar-media/drakkar/internal/version"
 )
 
+// Client implements subtitles.Provider against the OpenSubtitles.com API.
+//
+// Authentication is optional: if username/password are unset, Search runs
+// unauthenticated (API-key only) since login is only required for
+// Download and for authenticated search quotas. When credentials are
+// present, the session token and the per-account API host it grants are
+// cached and shared across calls; Client is safe for concurrent use.
 type Client struct {
 	apiKey     string
 	username   string
@@ -35,6 +45,10 @@ type Client struct {
 	apiHost   string
 }
 
+// NewClient creates a Client for the OpenSubtitles.com API using the given
+// credentials. Username/password may be empty, in which case authenticated
+// operations (Download, Probe) will fail but unauthenticated Search still
+// works.
 func NewClient(auth config.SubtitleAuth) *Client {
 	return &Client{
 		apiKey:     strings.TrimSpace(auth.APIKey),
@@ -46,15 +60,28 @@ func NewClient(auth config.SubtitleAuth) *Client {
 	}
 }
 
+// Name returns the provider identifier "opensubtitles", used to route
+// stored subtitle candidates back to this provider.
 func (c *Client) Name() string {
 	return "opensubtitles"
 }
 
+// Probe verifies that the configured credentials can authenticate against
+// the OpenSubtitles API, forcing a login if no cached token is available.
+// It is used for connectivity/settings checks rather than by the search or
+// download paths themselves.
 func (c *Client) Probe(ctx context.Context) error {
 	_, err := c.tokenValue(ctx)
 	return err
 }
 
+// Search queries OpenSubtitles for subtitles matching input, preferring a
+// TMDB ID lookup when available and falling back to a title/year query
+// otherwise, restricted to languages when non-empty. Authentication is
+// attempted only if credentials are configured; an anonymous request is
+// sent otherwise. Each matching file is expanded into its own
+// ProviderCandidate since a single OpenSubtitles entry may bundle several
+// files (e.g. one per episode in a season pack).
 func (c *Client) Search(ctx context.Context, input database.SubtitleSearchInput, languages []string) ([]subtitles.ProviderCandidate, error) {
 	reqURL, err := url.Parse(c.apiBaseURL() + "/subtitles")
 	if err != nil {
@@ -148,6 +175,11 @@ func (c *Client) Search(ctx context.Context, input database.SubtitleSearchInput,
 	return out, nil
 }
 
+// Download resolves rawURL — the file ID string previously returned as
+// ProviderCandidate.DownloadURL — through OpenSubtitles' two-step download
+// flow (POST /download to obtain a signed, time-limited link, then GET that
+// link) and returns the subtitle's filename and contents. The response body
+// is capped at 2 MiB, well beyond any legitimate subtitle file size.
 func (c *Client) Download(ctx context.Context, rawURL string) (string, []byte, error) {
 	fileID, err := strconv.ParseInt(strings.TrimSpace(rawURL), 10, 64)
 	if err != nil {
@@ -208,6 +240,11 @@ func (c *Client) Download(ctx context.Context, rawURL string) (string, []byte, e
 	return name, body, nil
 }
 
+// authorize sets the API key and User-Agent headers on req and, when
+// requireToken is set or credentials are configured, attaches a bearer
+// token obtained (or reused) via tokenValue. Search treats a missing token
+// as acceptable (requireToken=false) since it can run unauthenticated;
+// Download requires one.
 func (c *Client) authorize(ctx context.Context, req *http.Request, requireToken bool) error {
 	req.Header.Set("Api-Key", c.apiKey)
 	req.Header.Set("User-Agent", c.userAgent)
@@ -223,6 +260,10 @@ func (c *Client) authorize(ctx context.Context, req *http.Request, requireToken 
 	return nil
 }
 
+// tokenValue returns a cached session token, re-authenticating via login
+// when none is cached or the cached one is older than 11 hours (just under
+// OpenSubtitles' documented 24-hour token lifetime, leaving margin for
+// clock drift and in-flight requests).
 func (c *Client) tokenValue(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -273,6 +314,9 @@ func (c *Client) login(ctx context.Context) (string, string, error) {
 	return strings.TrimSpace(out.Token), strings.TrimSpace(out.BaseURL), nil
 }
 
+// apiBaseURL returns the API host to use for requests: OpenSubtitles may
+// redirect authenticated accounts to a dedicated host on login, so the
+// login-supplied host (once known) takes precedence over the default.
 func (c *Client) apiBaseURL() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -282,6 +326,9 @@ func (c *Client) apiBaseURL() string {
 	return c.baseURL
 }
 
+// normalizeAPIHost turns a bare host or partial URL returned by the login
+// endpoint's base_url field into a fully-qualified "https://.../api/v1"
+// base URL, defaulting to the standard API host when value is empty.
 func normalizeAPIHost(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {

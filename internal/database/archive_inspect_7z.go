@@ -13,8 +13,16 @@ import (
 	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
+// sevenZipCopyCoder is the 7z codec ID for the uncompressed "copy" method --
+// the only method archive inspection can serve byte ranges from without
+// fully decompressing the entry.
 var sevenZipCopyCoder = []byte{0x00}
 
+// inspect7zArchive determines the playable entries of a 7z archive (single-
+// or multi-volume) by presenting all of its volumes concatenated as one
+// virtual byte stream (buildImportedArchiveReader) to the sevenzip library's
+// own header parser, then extracting each entry's real packed byte layout
+// via reflection (inspect7zEntries) since that library doesn't expose it.
 func inspect7zArchive(ctx context.Context, archive *ImportedArchive, fileByName map[string]ImportedNZBFile, fetcher stream.SegmentFetcher) error {
 	readerAt, volumeSizes, totalSize, err := buildImportedArchiveReader(ctx, archive.Volumes, fileByName, fetcher)
 	if err != nil {
@@ -37,6 +45,13 @@ func inspect7zArchive(ctx context.Context, archive *ImportedArchive, fileByName 
 	return nil
 }
 
+// buildImportedArchiveReader concatenates every volume's segments into a
+// single io.ReaderAt spanning the whole logical archive (as sevenzip.NewReader
+// expects for split archives), by offsetting each volume's segment spans by
+// the running total of the volumes before it. Also returns each volume's
+// measured decoded size (volumeSizes, keyed by VolumeIndex) and the total
+// archive size, both needed later to translate a within-archive byte offset
+// back into a specific volume + local offset (splitArchiveRange).
 func buildImportedArchiveReader(ctx context.Context, volumes []ImportedArchiveVolume, fileByName map[string]ImportedNZBFile, fetcher stream.SegmentFetcher) (io.ReaderAt, map[int]int64, int64, error) {
 	spans := make([]stream.SegmentSpan, 0)
 	volumeSizes := make(map[int]int64, len(volumes))
@@ -121,12 +136,24 @@ func inspect7zEntries(reader *sevenzip.Reader, volumeSizes map[int]int64) ([]Imp
 	return out, nil
 }
 
+// sevenZipInspector exposes the packed byte layout (pack stream sizes,
+// position, and per-folder coder/stream metadata) that github.com/bodgit/sevenzip
+// parses internally but does not export. Archive inspection needs that
+// layout to compute each entry's real ArchiveOffset/PackedSizeBytes for byte-
+// range streaming, so it is recovered via reflection into the reader's
+// unexported "si" (stream info) field. This is inherently coupled to that
+// library's internal struct layout and will break if it changes.
 type sevenZipInspector struct {
 	packPosition uint64
 	packSizes    []uint64
 	folders      reflect.Value
 }
 
+// newSevenZipInspector reaches into reader's unexported stream-info fields
+// (packInfo, unpackInfo) via reflection to recover the pack-stream sizes,
+// base pack position, and folder table needed to compute each entry's real
+// byte layout. Returns errArchiveHeadersInvalid if the expected internal
+// fields aren't present, e.g. after an incompatible library upgrade.
 func newSevenZipInspector(reader *sevenzip.Reader) (*sevenZipInspector, error) {
 	if reader == nil {
 		return nil, errArchiveHeadersInvalid
@@ -156,6 +183,14 @@ func newSevenZipInspector(reader *sevenzip.Reader) (*sevenZipInspector, error) {
 	}, nil
 }
 
+// entry builds an ImportedArchiveEntry for file, rejecting anything this
+// inspector can't safely serve byte ranges for: only the single-coder,
+// uncompressed "copy" method exposes a stable packed byte layout, so any
+// other coder (real compression, or an unrecognized coder chain) fails with
+// errArchiveCompressionUnsupported, and an encrypted folder fails with
+// errArchiveEncrypted. The entry's archive-relative byte range is split
+// across volumes via splitArchiveRange since the underlying data may span a
+// multi-volume 7z set.
 func (s *sevenZipInspector) entry(file *sevenzip.File, volumeSizes map[int]int64) (ImportedArchiveEntry, error) {
 	fv := reflect.ValueOf(file).Elem()
 	folder := int(fv.FieldByName("folder").Int())
@@ -191,6 +226,9 @@ func (s *sevenZipInspector) entry(file *sevenzip.File, volumeSizes map[int]int64
 	return entry, nil
 }
 
+// folderCoderInfo returns the coder IDs (in application order) used by the
+// given folder, along with whether any of them is the AES-256 SHA-256
+// encryption coder ({0x06,0xf1,0x07,0x01}).
 func (s *sevenZipInspector) folderCoderInfo(folder int) ([][]byte, bool) {
 	fv := s.folders.Index(folder).Elem()
 	coders := fv.FieldByName("coder")
@@ -208,6 +246,10 @@ func (s *sevenZipInspector) folderCoderInfo(folder int) ([][]byte, bool) {
 	return out, encrypted
 }
 
+// folderOffset returns the absolute archive byte offset where the given
+// folder's packed data begins, computed by summing the pack-stream sizes of
+// every preceding folder (offset from packPosition, the base of the pack
+// section).
 func (s *sevenZipInspector) folderOffset(folder int) int64 {
 	var offset uint64
 	packedOffset := 0
@@ -221,6 +263,11 @@ func (s *sevenZipInspector) folderOffset(folder int) int64 {
 	return int64(s.packPosition + offset)
 }
 
+// splitArchiveRange breaks a single [archiveOffset, archiveOffset+size)
+// span of the logical concatenated multi-volume archive into per-volume
+// ImportedArchiveRange fragments, using volumeSizes to know where each
+// volume's bytes start and end within that logical stream. Returns an error
+// if the known volumes can't fully account for size (e.g. a missing volume).
 func splitArchiveRange(volumeSizes map[int]int64, archiveOffset, size int64) ([]ImportedArchiveRange, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("invalid archive size")
@@ -271,6 +318,10 @@ func splitArchiveRange(volumeSizes map[int]int64, archiveOffset, size int64) ([]
 	return ranges, nil
 }
 
+// sevenZipMethodName renders coderIDs as a human-readable method label:
+// "copy" for the single uncompressed coder, or a "+"-joined list of hex
+// coder IDs otherwise (used only in rejection paths, since entry() already
+// requires the copy method for a successfully returned entry).
 func sevenZipMethodName(coderIDs [][]byte) string {
 	if len(coderIDs) == 1 && bytes.Equal(coderIDs[0], sevenZipCopyCoder) {
 		return "copy"

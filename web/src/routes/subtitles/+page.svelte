@@ -1,4 +1,14 @@
 <script lang="ts">
+  /**
+   * Displays a paginated, filterable library of movies/episodes with their
+   * subtitle coverage, letting operators search or delete subtitles per-item
+   * or in bulk for the current selection.
+   *
+   * Any SSE event triggers a debounced reload (skipped while a search/delete
+   * is in flight). Selection is tracked by library item id and is pruned
+   * against whatever the current page returns, so it does not survive
+   * navigating to a different page.
+   */
   import { onMount } from 'svelte';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import SearchCheck from '@lucide/svelte/icons/search-check';
@@ -38,6 +48,7 @@
   $: selectedCount = selected.size;
   $: allVisibleSelected = items.length > 0 && items.every((item) => selected.has(item.libraryItemId));
 
+  /** Loads the current page/filter set and drops any selected ids that fell off the new page. */
   async function load() {
     loading = true;
     try {
@@ -74,6 +85,7 @@
     selected = next;
   }
 
+  /** Formats a row's display title, including season/episode numbers when the item is a TV episode. */
   function rowLabel(item: SubtitleLibraryRow): string {
     if (item.mediaType === 'movie') return item.title;
     if (item.seasonNumber && item.episodeNumber) {
@@ -99,6 +111,7 @@
     });
   }
 
+  /** Runs search or delete for the whole current selection, then clears it on success. */
   async function bulkAction(action: 'search' | 'delete') {
     if (selectedCount === 0) return;
     const ids = Array.from(selected);

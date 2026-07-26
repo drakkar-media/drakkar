@@ -1,4 +1,10 @@
 <script lang="ts">
+  /**
+   * Poster-first card for a library item or discover result: image, status
+   * bar/badge, title, and year/episode meta. Links to the item's detail
+   * page (or library entry) unless `href` overrides it, and can offer a
+   * quick "request" action for titles not yet in the library.
+   */
   import Tv from '@lucide/svelte/icons/tv';
   import Plus from '@lucide/svelte/icons/plus';
   import { detailsHref } from '$lib/detailsHref';
@@ -7,8 +13,11 @@
 
   export let item: LibraryItem;
   export let href = '';
+  /** Denser layout (smaller padding/title size), for use in tight rows/grids. */
   export let compact = false;
+  /** Hides the status bar/badge overlay, e.g. for placeholder items with no queue state. */
   export let showStatus = true;
+  /** Shows a "request" button; fires only for items not yet in the library (no `id`, but has a `tmdbId`). */
   export let onRequest: ((item: LibraryItem) => void) | null = null;
 
   $: notInLibrary = !item.id && !!item.tmdbId;

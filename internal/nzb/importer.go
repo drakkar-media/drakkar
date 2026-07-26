@@ -1,3 +1,6 @@
+// Package nzb parses NZB documents and imports them into the queue, whether
+// uploaded manually, supplied as a local file path, or fetched automatically
+// by an indexer.
 package nzb
 
 import (
@@ -18,20 +21,29 @@ import (
 )
 
 var (
+	// ErrUploadTooLarge indicates an NZB upload or file exceeded the
+	// configured maximum size before it could be fully read.
 	ErrUploadTooLarge = errors.New("nzb upload too large")
-	ErrEmptyDocument  = errors.New("nzb document empty")
+	// ErrEmptyDocument indicates an NZB upload or file contained zero bytes.
+	ErrEmptyDocument = errors.New("nzb document empty")
 )
 
+// ImportSink is the persistence dependency required to import an NZB: it
+// stores the parsed document and marks the resulting queue item as indexed.
 type ImportSink interface {
 	CreateImportedNZB(ctx context.Context, imported database.ImportedNZB) (database.QueueSnapshot, error)
 	SetImportedNZBIndexed(ctx context.Context, queueItemID int64) error
 }
 
+// Importer stages and parses manually uploaded or locally-provided NZB
+// files before handing them to an ImportSink for persistence.
 type Importer struct {
 	stagingDir     string
 	maxUploadBytes int64
 }
 
+// NewImporter creates an Importer that stages uploads under stagingDir and
+// rejects any input exceeding maxUploadBytes.
 func NewImporter(stagingDir string, maxUploadBytes int64) *Importer {
 	return &Importer{
 		stagingDir:     stagingDir,
@@ -39,6 +51,10 @@ func NewImporter(stagingDir string, maxUploadBytes int64) *Importer {
 	}
 }
 
+// Import stages src (e.g. an HTTP upload) to a temp file under the staging
+// directory while hashing and size-limiting it, then parses and persists the
+// result via sink. Returns ErrEmptyDocument or ErrUploadTooLarge if the
+// size constraints are violated.
 func (i *Importer) Import(ctx context.Context, sink ImportSink, fileName string, src io.Reader) (database.QueueSnapshot, error) {
 	if strings.TrimSpace(fileName) == "" {
 		fileName = "imported.nzb"
@@ -72,10 +88,15 @@ func (i *Importer) Import(ctx context.Context, sink ImportSink, fileName string,
 	return i.importFromOpenFile(ctx, sink, sanitizeFileName(fileName), stageFile, hasher)
 }
 
+// MaxUploadBytes returns the configured maximum accepted upload size, in
+// bytes.
 func (i *Importer) MaxUploadBytes() int64 {
 	return i.maxUploadBytes
 }
 
+// ImportPath imports an NZB that already exists on disk at path, applying
+// the same size checks as Import but reading directly from that file
+// instead of staging a copy first.
 func (i *Importer) ImportPath(ctx context.Context, sink ImportSink, fileName, path string) (database.QueueSnapshot, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -104,6 +125,8 @@ func (i *Importer) ImportPath(ctx context.Context, sink ImportSink, fileName, pa
 	return i.importFromOpenFile(ctx, sink, sanitizeFileName(fileName), file, hasher)
 }
 
+// importFromOpenFile is the shared tail end of Import and ImportPath: it
+// parses an already-open, already-hashed NZB file and persists it via sink.
 func (i *Importer) importFromOpenFile(ctx context.Context, sink ImportSink, fileName string, file *os.File, hasher hash.Hash) (database.QueueSnapshot, error) {
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return database.QueueSnapshot{}, err
@@ -143,6 +166,10 @@ func (i *Importer) importFromOpenFile(ctx context.Context, sink ImportSink, file
 	return queueItem, nil
 }
 
+// BuildImportedNZB parses raw NZB XML into a database.ImportedNZB record
+// without staging it to disk or persisting it via an ImportSink -- for
+// callers (e.g. automated indexer-driven imports) that already have the raw
+// bytes plus an idempotency key in hand.
 func BuildImportedNZB(fileName string, raw []byte, idempotencyKey string, externalURL string) (database.ImportedNZB, error) {
 	document, err := Parse(bytes.NewReader(raw))
 	if err != nil {
@@ -161,6 +188,8 @@ func BuildImportedNZB(fileName string, raw []byte, idempotencyKey string, extern
 	}, nil
 }
 
+// sanitizeFileName strips any directory components from name and
+// substitutes a default when the result is empty or a bare "." or "/".
 func sanitizeFileName(name string) string {
 	name = filepath.Base(strings.TrimSpace(name))
 	if name == "." || name == "/" || name == "" {
@@ -177,6 +206,9 @@ func countSegments(document *Document) int {
 	return total
 }
 
+// importedFiles converts a parsed Document's files into the
+// database.ImportedNZBFile records used for persistence, deriving each
+// file's total size from its segments' decoded offsets.
 func importedFiles(document *Document) []database.ImportedNZBFile {
 	out := make([]database.ImportedNZBFile, 0, len(document.Files))
 	for _, file := range document.Files {
@@ -202,6 +234,8 @@ func importedFiles(document *Document) []database.ImportedNZBFile {
 	return out
 }
 
+// fileSize returns the total decoded file size as the maximum DecodedTo
+// offset across segments.
 func fileSize(segments []NZBSegment) int64 {
 	var end int64
 	for _, segment := range segments {
@@ -212,6 +246,8 @@ func fileSize(segments []NZBSegment) int64 {
 	return end
 }
 
+// ImportHTTPFileName sanitizes a filename supplied via a request header
+// (e.g. an upload's filename field), falling back to a default when absent.
 func ImportHTTPFileName(headerName string) string {
 	headerName = strings.TrimSpace(headerName)
 	if headerName == "" {
@@ -220,6 +256,9 @@ func ImportHTTPFileName(headerName string) string {
 	return sanitizeFileName(headerName)
 }
 
+// ImportRawBodyName extracts and sanitizes the filename parameter from a
+// Content-Disposition header, falling back to a default when the header has
+// no filename.
 func ImportRawBodyName(contentDisposition string) string {
 	for _, part := range strings.Split(contentDisposition, ";") {
 		part = strings.TrimSpace(part)
@@ -232,6 +271,8 @@ func ImportRawBodyName(contentDisposition string) string {
 	return "imported.nzb"
 }
 
+// ValidateUploadLimit returns an error wrapping ErrUploadTooLarge if size
+// exceeds limit.
 func ValidateUploadLimit(size, limit int64) error {
 	if size > limit {
 		return fmt.Errorf("%w: got %d bytes limit %d", ErrUploadTooLarge, size, limit)

@@ -1,3 +1,6 @@
+// Package tmdb implements a metadata client for the TMDB (The Movie
+// Database) REST API, used to enrich library items with titles, artwork,
+// cast, and related-content listings.
 package tmdb
 
 import (
@@ -8,18 +11,44 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/drakkar-media/drakkar/internal/config"
 	"github.com/drakkar-media/drakkar/internal/mediadate"
 )
 
+// Client implements metadata lookups against the TMDB (The Movie Database)
+// REST API.
+//
+// The API key is held behind an atomic.Pointer so SetConfig can update it
+// from a concurrent settings-save request without a mutex while in-flight
+// requests read the previous key to completion. Client is otherwise
+// stateless and safe for concurrent use.
 type Client struct {
-	apiKey     string
+	apiKey     atomic.Pointer[string]
 	baseURL    string
 	httpClient *http.Client
 }
 
+// SetConfig updates the API key live, e.g. after a settings save.
+func (c *Client) SetConfig(cfg config.MetadataConfig) {
+	key := strings.TrimSpace(cfg.TMDB.APIKey)
+	c.apiKey.Store(&key)
+}
+
+// getAPIKey returns the currently configured API key, or "" if none has
+// been set (SetConfig has not yet run or was given a blank key).
+func (c *Client) getAPIKey() string {
+	if v := c.apiKey.Load(); v != nil {
+		return *v
+	}
+	return ""
+}
+
+// MovieDetails is the flattened, application-facing view of a TMDB
+// "movie details" response (with alternative_titles, credits,
+// recommendations, similar, release_dates, and videos appended).
 type MovieDetails struct {
 	Title               string
 	OriginalTitle       string
@@ -48,6 +77,10 @@ type MovieDetails struct {
 	Similar             []MediaSummary
 }
 
+// TVDetails is the flattened, application-facing view of a TMDB "tv
+// details" response (with external_ids, alternative_titles,
+// aggregate_credits, recommendations, similar, content_ratings, and videos
+// appended).
 type TVDetails struct {
 	Name                string
 	OriginalName        string
@@ -79,6 +112,9 @@ type TVDetails struct {
 	Similar             []MediaSummary
 }
 
+// MediaSummary is the compact representation of a movie or TV result used
+// in search, trending, and recommendation/similar listings, where full
+// MovieDetails/TVDetails would be more than the caller needs.
 type MediaSummary struct {
 	Title       string
 	Year        int
@@ -89,6 +125,8 @@ type MediaSummary struct {
 	MediaType   string
 }
 
+// PersonSummary is a single cast member entry attached to MovieDetails or
+// TVDetails.
 type PersonSummary struct {
 	ID         int64
 	Name       string
@@ -96,38 +134,49 @@ type PersonSummary struct {
 	ProfileURL string
 }
 
+// TVSeason lists the episodes of a single season, as returned by
+// Client.TVSeason.
 type TVSeason struct {
 	SeasonNumber int
 	Name         string
 	Episodes     []TVEpisode
 }
 
+// TVEpisode is a single episode entry within a TVSeason.
 type TVEpisode struct {
 	EpisodeNumber int
 	Name          string
 	AirDate       string // "YYYY-MM-DD", may be empty
 }
 
+// ListResult is a single page of a paginated TMDB listing (e.g. trending),
+// as returned by Client.TrendingPage.
 type ListResult struct {
 	Page       int
 	TotalPages int
 	Items      []MediaSummary
 }
 
+// NewClient creates a Client configured with cfg's TMDB API key.
 func NewClient(cfg config.MetadataConfig) *Client {
-	return &Client{
-		apiKey:  strings.TrimSpace(cfg.TMDB.APIKey),
-		baseURL: "https://api.themoviedb.org/3",
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+	c := &Client{
+		baseURL:    "https://api.themoviedb.org/3",
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
+	c.SetConfig(cfg)
+	return c
 }
 
+// Enabled reports whether c is non-nil and has a configured API key. Callers
+// use this to skip TMDB lookups entirely when the integration is disabled,
+// rather than relying on every request failing.
 func (c *Client) Enabled() bool {
-	return c != nil && strings.TrimSpace(c.apiKey) != ""
+	return c != nil && strings.TrimSpace(c.getAPIKey()) != ""
 }
 
+// MovieDetails fetches full metadata for a single movie, including cast,
+// recommendations, similar titles, US content rating, and an official
+// YouTube trailer URL when available.
 func (c *Client) MovieDetails(ctx context.Context, tmdbID int64) (MovieDetails, error) {
 	var payload struct {
 		Title            string  `json:"title"`
@@ -273,6 +322,9 @@ func (c *Client) MovieDetails(ctx context.Context, tmdbID int64) (MovieDetails, 
 	}, nil
 }
 
+// TVDetails fetches full metadata for a single TV series, including cast,
+// recommendations, similar titles, US content rating, and an official
+// YouTube trailer URL when available.
 func (c *Client) TVDetails(ctx context.Context, tmdbID int64) (TVDetails, error) {
 	var payload struct {
 		Name             string  `json:"name"`
@@ -445,6 +497,13 @@ func (c *Client) TVDetails(ctx context.Context, tmdbID int64) (TVDetails, error)
 	}, nil
 }
 
+// Search queries TMDB for movies or TV series matching query.
+//
+// It returns an empty (non-nil) slice without making a request when query is
+// blank.
+//
+// Errors:
+//   - mediaType is neither "movie" nor "tv".
 func (c *Client) Search(ctx context.Context, mediaType string, query string) ([]MediaSummary, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -488,6 +547,10 @@ func (c *Client) Search(ctx context.Context, mediaType string, query string) ([]
 	}
 }
 
+// Trending returns the first page of today's trending movies or TV series.
+//
+// Errors:
+//   - mediaType is neither "movie" nor "tv".
 func (c *Client) Trending(ctx context.Context, mediaType string) ([]MediaSummary, error) {
 	switch strings.ToLower(strings.TrimSpace(mediaType)) {
 	case "movie":
@@ -499,6 +562,11 @@ func (c *Client) Trending(ctx context.Context, mediaType string) ([]MediaSummary
 	}
 }
 
+// TrendingPage returns a single page of today's trending movies or TV
+// series. page values below 1 are treated as 1.
+//
+// Errors:
+//   - mediaType is neither "movie" nor "tv".
 func (c *Client) TrendingPage(ctx context.Context, mediaType string, page int) (ListResult, error) {
 	if page < 1 {
 		page = 1
@@ -515,6 +583,7 @@ func (c *Client) TrendingPage(ctx context.Context, mediaType string, page int) (
 	}
 }
 
+// TVSeason fetches the episode list for a single season of a TV series.
 func (c *Client) TVSeason(ctx context.Context, tmdbID int64, seasonNumber int) (TVSeason, error) {
 	var payload struct {
 		Name         string `json:"name"`
@@ -543,6 +612,8 @@ func (c *Client) TVSeason(ctx context.Context, tmdbID int64, seasonNumber int) (
 	return out, nil
 }
 
+// TVSeasonNumbers returns the season numbers TMDB lists for a TV series,
+// excluding non-positive values (e.g. TMDB's "specials" season 0).
 func (c *Client) TVSeasonNumbers(ctx context.Context, tmdbID int64) ([]int, error) {
 	var payload struct {
 		Seasons []struct {
@@ -562,6 +633,8 @@ func (c *Client) TVSeasonNumbers(ctx context.Context, tmdbID int64) ([]int, erro
 	return out, nil
 }
 
+// trendingPath fetches the first page of a trending listing and discards
+// pagination info, backing the public Trending method.
 func (c *Client) trendingPath(ctx context.Context, path string, mediaType string) ([]MediaSummary, error) {
 	result, err := c.listPath(ctx, path, mediaType, nil)
 	if err != nil {
@@ -570,6 +643,10 @@ func (c *Client) trendingPath(ctx context.Context, path string, mediaType string
 	return result.Items, nil
 }
 
+// listPath fetches a single paginated results listing from path and maps
+// each entry to a MediaSummary, resolving title/year from the movie or TV
+// fields depending on mediaType since TMDB's list endpoints share a result
+// shape across both.
 func (c *Client) listPath(ctx context.Context, path string, mediaType string, values url.Values) (ListResult, error) {
 	var payload struct {
 		Page       int `json:"page"`
@@ -685,6 +762,12 @@ func mapTVResults(items []struct {
 	return out
 }
 
+// get issues an authenticated GET against the TMDB API at path with the
+// given query values, decoding the JSON response body into target.
+//
+// Errors:
+//   - the client has no configured API key (Enabled() is false).
+//   - the response status is outside the 2xx range.
 func (c *Client) get(ctx context.Context, path string, values url.Values, target any) error {
 	if !c.Enabled() {
 		return fmt.Errorf("tmdb client unavailable")
@@ -694,7 +777,7 @@ func (c *Client) get(ctx context.Context, path string, values url.Values, target
 		return err
 	}
 	q := u.Query()
-	q.Set("api_key", c.apiKey)
+	q.Set("api_key", c.getAPIKey())
 	for key, entries := range values {
 		for _, value := range entries {
 			q.Add(key, value)

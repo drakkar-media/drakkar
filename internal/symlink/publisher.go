@@ -1,3 +1,7 @@
+// Package symlink builds Plex/Jellyfin-style library paths for movies and
+// episodes and publishes media into them via symlinks, keeping the
+// publication step atomic and idempotent with respect to the already-linked
+// target.
 package symlink
 
 import (
@@ -18,12 +22,23 @@ func mediaExt(rawFileName string) string {
 	return ".mkv"
 }
 
+// Publisher creates the symlinks that expose downloaded media under a
+// library-friendly path. Publisher holds no state and is safe for
+// concurrent use.
 type Publisher struct{}
 
+// NewPublisher creates a Publisher.
 func NewPublisher() *Publisher {
 	return &Publisher{}
 }
 
+// Publish ensures a symlink exists at finalPath pointing to target.
+//
+// It is a no-op when finalPath already links to target. Otherwise the link
+// is created at a temporary sibling path and atomically renamed into place,
+// so a concurrent reader (e.g. a media server scanning the library) never
+// observes a missing or partially created link, and a crash mid-publish
+// cannot leave finalPath pointing at a stale target.
 func (p *Publisher) Publish(finalPath, target string) error {
 	if err := os.MkdirAll(filepath.Dir(finalPath), 0o755); err != nil {
 		return err
@@ -43,6 +58,10 @@ func (p *Publisher) Publish(finalPath, target string) error {
 	return nil
 }
 
+// MoviePath builds the publication path for a movie, following the
+// "Title (Year) {tmdb-ID}/Title (Year).ext" layout that Plex/Jellyfin use to
+// disambiguate movies sharing a title. tmdbID and year are omitted from the
+// directory/file name when not available (tmdbID <= 0 or year <= 0).
 func MoviePath(root, title string, year int, tmdbID int, rawFileName string) string {
 	ext := mediaExt(rawFileName)
 	var dir, file string
@@ -61,6 +80,10 @@ func MoviePath(root, title string, year int, tmdbID int, rawFileName string) str
 	return filepath.Join(root, dir, file)
 }
 
+// EpisodePath builds the publication path for a TV episode, following the
+// "Show (Year) {tvdb-ID}/Season NN/Show - SNNENN.ext" layout that
+// Plex/Jellyfin use for TV libraries. tvdbID and year are omitted from the
+// show directory name when not available (tvdbID <= 0 or year <= 0).
 func EpisodePath(root, show string, year int, tvdbID int, season, episode int, rawFileName string) string {
 	ext := mediaExt(rawFileName)
 	var dir string
@@ -75,6 +98,8 @@ func EpisodePath(root, show string, year int, tvdbID int, season, episode int, r
 	return filepath.Join(root, dir, fmt.Sprintf("Season %02d", season), file)
 }
 
+// sanitize replaces path-hostile characters in a title/show name so it can
+// be used as a filesystem path component.
 func sanitize(input string) string {
 	replacer := strings.NewReplacer("/", "-", "\\", "-", ":", " -")
 	out := replacer.Replace(strings.TrimSpace(input))

@@ -75,6 +75,9 @@ func (q *WorkQueue) Push(ctx context.Context, libraryItemID int64, priority int)
 	)
 }
 
+// toBullPriority converts the workflow service's priority convention (lower is
+// more urgent, negative values allowed) into BullMQ's convention (1 is the
+// highest priority, 0 is not a valid explicit priority).
 func toBullPriority(priority int) int {
 	if priority < 0 {
 		priority = 0
@@ -88,14 +91,18 @@ func (q *WorkQueue) Depth(ctx context.Context) int64 {
 	return n
 }
 
+// Pause stops the queue from handing out new jobs to workers. Jobs already
+// in flight are not affected.
 func (q *WorkQueue) Pause(ctx context.Context) error {
 	return q.queue.Pause(ctx)
 }
 
+// Resume reverses a prior Pause, allowing the queue to hand out jobs again.
 func (q *WorkQueue) Resume(ctx context.Context) error {
 	return q.queue.Resume(ctx)
 }
 
+// IsPaused reports whether the queue is currently paused.
 func (q *WorkQueue) IsPaused(ctx context.Context) (bool, error) {
 	return q.queue.IsPaused(ctx)
 }

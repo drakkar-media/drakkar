@@ -1,4 +1,10 @@
 <script lang="ts">
+  /**
+   * Displays the first-run setup form for creating Drakkar's initial admin account.
+   *
+   * Shown only when no admin user exists yet; on success it replaces history so the
+   * setup page can't be reached again via the back button.
+   */
   import { goto } from '$app/navigation';
   import DrakkarLogo from '$lib/components/DrakkarLogo.svelte';
 
@@ -11,6 +17,7 @@
   $: passwordMismatch = confirm !== '' && password !== confirm;
   $: canSubmit = username.trim() !== '' && password.length >= 8 && !passwordMismatch && !loading;
 
+  /** Submits the new admin credentials to the setup API and redirects to the dashboard. */
   async function complete() {
     error = '';
     if (password !== confirm) { error = 'Passwords do not match.'; return; }

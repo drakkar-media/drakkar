@@ -26,10 +26,14 @@ type cachedVF struct {
 	name       string
 	readerKind string
 	inlineData []byte
-	size       int64             // virtual file size in bytes
+	size       int64                // virtual file size in bytes
 	spans      []stream.SegmentSpan // canonical spans — callers receive a copy
 }
 
+// DB wraps the application's Postgres connection pool (via pgx/stdlib)
+// together with the shared runtime state -- the NNTP segment fetcher,
+// read-ahead manager, and in-memory virtual-file cache -- used by every
+// query method in this package.
 type DB struct {
 	SQL            *sql.DB
 	SegmentFetcher stream.SegmentFetcher
@@ -79,6 +83,10 @@ func (db *DB) resolveDefaultQualityProfileID(ctx context.Context, mediaType stri
 	return &id
 }
 
+// Open creates a pgxpool-backed *sql.DB and wraps it in a *DB. The pool is
+// tuned with health-checked acquires, TCP keepalives, and server-side
+// statement/lock timeouts (see inline comments below) so a dead peer or a
+// stuck lock holder can never wedge every connection in the pool forever.
 func Open(cfg config.DatabaseConfig) (*DB, error) {
 	dsn := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=disable", cfg.Host, cfg.Port, cfg.Name, cfg.Username, cfg.Password)
 	poolCfg, err := pgxpool.ParseConfig(dsn)
@@ -161,10 +169,14 @@ func Open(cfg config.DatabaseConfig) (*DB, error) {
 	return &DB{SQL: sqlDB, vfCache: make(map[int64]*cachedVF)}, nil
 }
 
+// Ping verifies that the underlying connection pool can reach the database,
+// acquiring and health-checking a connection if necessary.
 func (db *DB) Ping(ctx context.Context) error {
 	return db.SQL.PingContext(ctx)
 }
 
+// Close closes the underlying connection pool. Safe to call on a nil *DB or
+// before Open has assigned SQL.
 func (db *DB) Close() error {
 	if db == nil || db.SQL == nil {
 		return nil
@@ -176,6 +188,12 @@ func (db *DB) Close() error {
 // concurrent migration runs (e.g. two containers starting simultaneously).
 const migrationLockID = 0x6472616b6b617200 // "drakkar\0"
 
+// ApplyMigrations applies every *.sql file in dir that isn't yet recorded in
+// schema_migrations, in filename order, each inside its own transaction. A
+// Postgres advisory lock (migrationLockID) serializes concurrent callers --
+// e.g. two Drakkar instances starting at once -- so only one ever applies a
+// given migration; the rest re-check schema_migrations after acquiring the
+// lock and skip it as a no-op.
 func (db *DB) ApplyMigrations(ctx context.Context, dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {

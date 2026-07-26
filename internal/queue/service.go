@@ -1,3 +1,7 @@
+// Package queue exposes the queue/library read APIs and manual-NZB-import
+// operations used by the HTTP API layer, backed by a Repository
+// implementation (the production database.* store, or MemoryRepository for
+// tests).
 package queue
 
 import (
@@ -16,6 +20,9 @@ import (
 	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
+// Repository defines the persistence operations required by Service: queue
+// and library listings for the UI, and the manual-NZB-import write path.
+// database.Store (production) and MemoryRepository (tests) both implement it.
 type Repository interface {
 	ListQueue(ctx context.Context) ([]database.QueueSnapshot, error)
 	ListLibraryItems(ctx context.Context) ([]database.LibraryItemSummary, error)
@@ -31,12 +38,16 @@ type Repository interface {
 	CancelNZBDocument(ctx context.Context, nzbDocumentID int64) error
 }
 
+// Service is the queue/library read-model and manual-NZB-import facade used
+// by the HTTP API. It delegates all persistence to a Repository and, for
+// import flows, to the shared nzb.Importer for parsing/validation.
 type Service struct {
 	repo           Repository
 	importer       *nzb.Importer
 	postImportHook func(context.Context, database.QueueSnapshot) error
 }
 
+// NewService creates a Service backed by the given Repository and nzb.Importer.
 func NewService(repo Repository, importer *nzb.Importer) *Service {
 	return &Service{
 		repo:     repo,
@@ -44,42 +55,64 @@ func NewService(repo Repository, importer *nzb.Importer) *Service {
 	}
 }
 
+// SetPostImportHook registers a callback invoked after every successful NZB
+// import (via ImportNZB, ImportNZBPath, or ImportNZBForLibraryItem), letting
+// callers (e.g. the workflow service) kick off downstream processing such as
+// preflight/publish without Service depending on those packages directly.
 func (s *Service) SetPostImportHook(fn func(context.Context, database.QueueSnapshot) error) {
 	s.postImportHook = fn
 }
 
+// ListQueue returns all queue items, ordered per the Repository implementation.
 func (s *Service) ListQueue(ctx context.Context) ([]database.QueueSnapshot, error) {
 	return s.repo.ListQueue(ctx)
 }
 
+// ListLibraryItems returns a summary of every tracked library item (movie or
+// TV episode) for the library UI.
 func (s *Service) ListLibraryItems(ctx context.Context) ([]database.LibraryItemSummary, error) {
 	return s.repo.ListLibraryItems(ctx)
 }
 
+// ListReleaseSummaries returns the release candidates considered for the
+// given library item, including the currently selected one if any.
 func (s *Service) ListReleaseSummaries(ctx context.Context, libraryItemID int64) ([]database.ReleaseSummary, error) {
 	return s.repo.ListReleaseSummaries(ctx, libraryItemID)
 }
 
+// ListNZBMountEntries returns the NZB documents that should currently be
+// exposed through the virtual NZB mount (excludes failed/available items).
 func (s *Service) ListNZBMountEntries(ctx context.Context) ([]database.NZBMountEntry, error) {
 	return s.repo.ListNZBMountEntries(ctx)
 }
 
+// ListContentMountEntries returns every virtual content-mount file across all
+// selected releases, for the content filesystem's directory listing.
 func (s *Service) ListContentMountEntries(ctx context.Context) ([]database.ContentMountEntry, error) {
 	return s.repo.ListContentMountEntries(ctx)
 }
 
+// ListContentMountEntriesForRelease returns the virtual content-mount files
+// belonging to a single selected release.
 func (s *Service) ListContentMountEntriesForRelease(ctx context.Context, selectedReleaseID int64) ([]database.ContentMountEntry, error) {
 	return s.repo.ListContentMountEntriesForRelease(ctx, selectedReleaseID)
 }
 
+// OpenVirtualMediaFile opens a readable stream for the given virtual file,
+// used by the streaming/publish path to read media content out of the
+// content mount.
 func (s *Service) OpenVirtualMediaFile(ctx context.Context, virtualFileID int64) (stream.VirtualMediaFile, error) {
 	return s.repo.OpenVirtualMediaFile(ctx, virtualFileID)
 }
 
+// ListCompletedSymlinkEntries returns every published symlink, for the
+// completed-downloads view.
 func (s *Service) ListCompletedSymlinkEntries(ctx context.Context) ([]database.CompletedSymlinkEntry, error) {
 	return s.repo.ListCompletedSymlinkEntries(ctx)
 }
 
+// ImportNZB parses and imports an uploaded NZB file (not yet attached to any
+// library item), then invokes the post-import hook if one is registered.
 func (s *Service) ImportNZB(ctx context.Context, fileName string, src io.Reader) (database.QueueSnapshot, error) {
 	item, err := s.importer.Import(ctx, s.repo, fileName, src)
 	if err != nil {
@@ -131,6 +164,9 @@ func (s *Service) ImportNZBForLibraryItem(ctx context.Context, libraryItemID int
 	return item, nil
 }
 
+// ImportNZBPath imports an NZB file already present on disk at path (e.g.
+// dropped into a watch folder), then invokes the post-import hook if one is
+// registered.
 func (s *Service) ImportNZBPath(ctx context.Context, fileName, path string) (database.QueueSnapshot, error) {
 	item, err := s.importer.ImportPath(ctx, s.repo, fileName, path)
 	if err != nil {
@@ -144,14 +180,25 @@ func (s *Service) ImportNZBPath(ctx context.Context, fileName, path string) (dat
 	return item, nil
 }
 
+// CancelNZB cancels the NZB document identified by nzbDocumentID, marking it
+// failed/cancelled so it stops being served through the virtual NZB mount.
+// This is the method the HTTP API calls.
 func (s *Service) CancelNZB(ctx context.Context, nzbDocumentID int64) error {
 	return s.repo.CancelNZBDocument(ctx, nzbDocumentID)
 }
 
+// CancelNZBDocument is equivalent to CancelNZB. It exists as a
+// Repository-method-named alias for callers that prefer that naming; new
+// callers should use CancelNZB.
 func (s *Service) CancelNZBDocument(ctx context.Context, nzbDocumentID int64) error {
 	return s.repo.CancelNZBDocument(ctx, nzbDocumentID)
 }
 
+// MemoryRepository is an in-memory Repository implementation used by tests
+// (and any other in-process caller) that need queue/library behavior without
+// a real database. It intentionally reproduces simplified versions of the
+// production repository's ID-assignment and state-transition behavior rather
+// than being a full simulation.
 type MemoryRepository struct {
 	items       []database.QueueSnapshot
 	mountByID   map[int64]database.NZBMountEntry
@@ -161,6 +208,7 @@ type MemoryRepository struct {
 	requests    []database.MediaRequestSummary
 }
 
+// NewMemoryRepository creates an empty MemoryRepository.
 func NewMemoryRepository() *MemoryRepository {
 	return &MemoryRepository{
 		mountByID:   make(map[int64]database.NZBMountEntry),
@@ -199,6 +247,11 @@ func (m *MemoryRepository) ListQueue(ctx context.Context) ([]database.QueueSnaps
 	return out, nil
 }
 
+// queueStateRank orders queue items for ListQueue's display sort: active
+// in-flight states rank first (fetching/indexing/preflight/publishing come
+// before searching/requested), terminal states (available, failed) rank
+// last, so the UI surfaces items needing attention or actively progressing
+// ahead of ones already resolved.
 func queueStateRank(state database.QueueState) int {
 	switch state {
 	case database.QueueFetchingNZB:
@@ -485,6 +538,9 @@ func (m *MemoryRepository) CancelNZBDocument(ctx context.Context, nzbDocumentID 
 	return errors.New("nzb document not found")
 }
 
+// DetectUploadName resolves the file name to use for an uploaded NZB,
+// preferring the multipart form field's header name and falling back to
+// parsing the raw request's Content-Disposition header.
 func DetectUploadName(headerName, contentDisposition string) string {
 	if strings.TrimSpace(headerName) != "" {
 		return nzb.ImportHTTPFileName(headerName)

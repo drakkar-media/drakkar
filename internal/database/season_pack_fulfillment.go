@@ -286,6 +286,9 @@ func (db *DB) createSeasonPackEpisodeItem(ctx context.Context, tvShowID int64, s
 	return tx.Commit()
 }
 
+// resolveSeasonPackShow resolves the TV show ID and title for a triggering
+// library item, falling back to a case-insensitive match against
+// tv_shows.title when the item's own episode has no linked show.
 func (db *DB) resolveSeasonPackShow(ctx context.Context, triggeringLibraryItemID int64) (int64, string, error) {
 	var (
 		tvShowID  int64

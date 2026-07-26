@@ -7,10 +7,27 @@ import (
 	"sync"
 )
 
+// SegmentFetcher defines the minimal operation required to retrieve a byte
+// range from an NNTP segment.
+//
+// Implementations must be safe for concurrent use, since a single reader can
+// have multiple ReadAt calls and read-ahead fetches in flight at once.
 type SegmentFetcher interface {
 	FetchRange(ctx context.Context, segment SegmentRange) ([]byte, error)
 }
 
+// DirectNzbReader is a VirtualMediaFile backed directly by a multi-segment
+// NZB (as opposed to a file embedded inside a stored RAR volume, see
+// StoredRarReader). It resolves a requested byte range to the underlying
+// segments via spans, fetching missing data through fetcher.
+//
+// size and spans are self-correcting: the yEnc-decoded size of a segment is
+// only known precisely once it has actually been fetched, so an initial
+// estimate can be wrong. realignSpans corrects size/spans in place once a
+// fetch reveals the segment's true boundaries, shifting every later span by
+// the resulting delta to keep the layout contiguous. All access to size and
+// spans must go through mu; DirectNzbReader is safe for concurrent ReadAt
+// calls.
 type DirectNzbReader struct {
 	name    string
 	size    int64
@@ -20,14 +37,21 @@ type DirectNzbReader struct {
 	mu      sync.Mutex
 }
 
+// NewDirectNzbReader creates a DirectNzbReader for a file spanning the given
+// segments. spans is retained and mutated in place by realignSpans as
+// segments are fetched and their true boundaries become known, so callers
+// must not continue to read or mutate the slice after passing it in.
 func NewDirectNzbReader(name string, size int64, spans []SegmentSpan, fetcher SegmentFetcher, manager *ReadAheadManager) *DirectNzbReader {
 	return &DirectNzbReader{name: name, size: size, spans: spans, fetcher: fetcher, manager: manager}
 }
 
+// Name returns the file's display name.
 func (r *DirectNzbReader) Name() string {
 	return r.name
 }
 
+// Size returns the file's current size, which may have been corrected since
+// construction as realignSpans learned segments' true decoded boundaries.
 func (r *DirectNzbReader) Size() int64 {
 	return r.currentSize()
 }
@@ -52,6 +76,20 @@ func (r *DirectNzbReader) currentSize() int64 {
 	return r.size
 }
 
+// ReadAt fills dst with up to len(dst) bytes starting at offset, fetching
+// whatever underlying NNTP segments are needed to satisfy the range.
+//
+// A short read paired with io.EOF means offset+len(dst) reached or exceeded
+// the file's current size; any other error aborts with whatever was written
+// so far. If a fetch reveals that a span's real boundaries differ from the
+// estimate used to plan the request (self-correction via realignSpans), the
+// loop re-resolves the current position against the corrected layout instead
+// of returning the (possibly now-empty or misaligned) block, up to a small
+// retry budget (emptyCount) to avoid spinning forever if a segment
+// genuinely has no data left to give at this position.
+//
+// Safe for concurrent use; concurrent ReadAt calls on the same reader may
+// each trigger and observe realignment independently.
 func (r *DirectNzbReader) ReadAt(ctx context.Context, dst []byte, offset int64) (int, error) {
 	size := r.currentSize()
 	if offset >= size {
@@ -157,6 +195,13 @@ func (r *DirectNzbReader) spanUnchanged(index int, expected SegmentSpan) bool {
 	return r.spans[index].Start == expected.Start && r.spans[index].End == expected.End
 }
 
+// realignSpans replaces the span at index with actual (the fetcher's real
+// measurement of that segment's decoded boundaries) and shifts every later
+// span's Start/End by the resulting delta, preserving contiguity. It also
+// updates r.size to match the new end of the last span, since a size
+// estimated before any segment was fetched can be wrong in either direction.
+// No-op if index is out of range (e.g. a concurrent realignment already
+// shrank spans past it).
 func (r *DirectNzbReader) realignSpans(index int, actual SegmentSpan) {
 	if index < 0 {
 		return
@@ -179,6 +224,9 @@ func (r *DirectNzbReader) realignSpans(index int, actual SegmentSpan) {
 	r.size = r.spans[len(r.spans)-1].End
 }
 
+// StartSession registers this reader with its ReadAheadManager under
+// sessionID, enabling read-ahead prefetch for the stream. A no-op if the
+// reader has no manager or its fetcher doesn't support prioritized fetches.
 func (r *DirectNzbReader) StartSession(sessionID string) {
 	if r == nil || r.manager == nil {
 		return
@@ -201,6 +249,8 @@ func (r *DirectNzbReader) StartSession(sessionID string) {
 	r.manager.Register(sessionID, spans, fetcher)
 }
 
+// NotifyRead reports the current read position for sessionID to the
+// ReadAheadManager, which uses it to schedule the next prefetch window.
 func (r *DirectNzbReader) NotifyRead(sessionID string, offset int64) {
 	if r == nil || r.manager == nil {
 		return
@@ -208,6 +258,9 @@ func (r *DirectNzbReader) NotifyRead(sessionID string, offset int64) {
 	r.manager.NotifyRead(sessionID, offset)
 }
 
+// Seek cancels any in-flight read-ahead window for sessionID without
+// scheduling a new one at offset; the next NotifyRead (from the interactive
+// read that follows a seek) schedules read-ahead from the correct position.
 func (r *DirectNzbReader) Seek(sessionID string, offset int64) {
 	if r == nil || r.manager == nil {
 		return
@@ -215,6 +268,8 @@ func (r *DirectNzbReader) Seek(sessionID string, offset int64) {
 	r.manager.Seek(sessionID, offset)
 }
 
+// StopSession ends the read-ahead session for sessionID and cancels any
+// in-flight prefetch for it.
 func (r *DirectNzbReader) StopSession(sessionID string) {
 	if r == nil || r.manager == nil {
 		return
@@ -222,6 +277,7 @@ func (r *DirectNzbReader) StopSession(sessionID string) {
 	r.manager.Stop(sessionID)
 }
 
+// RegisterMeta attaches display metadata to the session's read-ahead entry.
 func (r *DirectNzbReader) RegisterMeta(sessionID string, meta SessionMeta) {
 	if r == nil || r.manager == nil {
 		return

@@ -5,8 +5,15 @@ import (
 	"sync"
 )
 
+// FetchFunc retrieves the data for a single SingleFlight key.
 type FetchFunc func(context.Context) ([]byte, error)
 
+// SingleFlight deduplicates concurrent fetches for the same key so that
+// multiple callers requesting the same data (e.g. overlapping read-ahead
+// and interactive reads for the same segment) trigger only one underlying
+// fetch, with all callers sharing its result.
+//
+// SingleFlight is safe for concurrent use.
 type SingleFlight struct {
 	mu      sync.Mutex
 	flights map[string]*flight
@@ -18,6 +25,7 @@ type flight struct {
 	err  error
 }
 
+// NewSingleFlight creates an empty SingleFlight.
 func NewSingleFlight() *SingleFlight {
 	return &SingleFlight{flights: make(map[string]*flight)}
 }

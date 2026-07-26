@@ -49,6 +49,8 @@ type CachedFallbackSource struct {
 	bodyFlight *cache.SingleFlight
 }
 
+// NewCachedFallbackSource wraps inner with an empty missing-article cache and
+// its own statFlight/bodyFlight SingleFlight pairs.
 func NewCachedFallbackSource(inner *FallbackSource) *CachedFallbackSource {
 	return &CachedFallbackSource{
 		inner:      inner,
@@ -58,10 +60,16 @@ func NewCachedFallbackSource(inner *FallbackSource) *CachedFallbackSource {
 	}
 }
 
+// Body fetches messageID at interactive priority; see BodyPriority.
 func (s *CachedFallbackSource) Body(ctx context.Context, messageID string) ([]byte, error) {
 	return s.BodyPriority(ctx, messageID, stream.PriorityInteractive)
 }
 
+// BodyPriority returns messageID's body, short-circuiting with a cached
+// not-found error (without contacting inner) if it was recently classified
+// as missing/throttled. Otherwise it fetches through bodyFlight so
+// concurrent callers for the same messageID share one inner fetch and one
+// missing-cache update.
 func (s *CachedFallbackSource) BodyPriority(ctx context.Context, messageID string, priority stream.FetchPriority) ([]byte, error) {
 	if s.isMissing(messageID) {
 		return nil, errArticleNotFound(messageID)
@@ -77,6 +85,8 @@ func (s *CachedFallbackSource) BodyPriority(ctx context.Context, messageID strin
 	})
 }
 
+// Stat mirrors BodyPriority's missing-cache short-circuit and coalescing,
+// but for an existence check instead of a body fetch.
 func (s *CachedFallbackSource) Stat(ctx context.Context, messageID string) error {
 	if s.isMissing(messageID) {
 		return errArticleNotFound(messageID)
@@ -93,6 +103,8 @@ func (s *CachedFallbackSource) Stat(ctx context.Context, messageID string) error
 	return err
 }
 
+// isMissing reports whether messageID is currently cached as missing,
+// lazily evicting the entry first if its TTL has already expired.
 func (s *CachedFallbackSource) isMissing(messageID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -107,6 +119,7 @@ func (s *CachedFallbackSource) isMissing(messageID string) bool {
 	return true
 }
 
+// markMissing records messageID as missing until ttl elapses.
 func (s *CachedFallbackSource) markMissing(messageID string, ttl time.Duration) {
 	slog.Debug("article cache: marking missing", "messageID", messageID, "ttl", ttl)
 	s.mu.Lock()
@@ -137,6 +150,8 @@ func errArticleNotFound(messageID string) error {
 	return articleNotFoundError(messageID)
 }
 
+// articleNotFoundError is the sentinel error type for a missing-cache hit;
+// see its Is method for why it masquerades as ErrArticleMissing.
 type articleNotFoundError string
 
 func (e articleNotFoundError) Error() string {

@@ -13,10 +13,16 @@ import (
 )
 
 const (
-	CookieName    = "drakkar_session"
+	// CookieName is the name of the HTTP cookie used to carry the session
+	// token.
+	CookieName = "drakkar_session"
+	// SessionExpiry is the lifetime of a newly created session, measured
+	// from creation time.
 	SessionExpiry = 30 * 24 * time.Hour
 )
 
+// Claims identifies the authenticated principal attached to a request
+// context, whether resolved from a session cookie or an API token.
 type Claims struct {
 	UserID   int64
 	Username string
@@ -37,20 +43,28 @@ func GenerateToken() (token, hash string, err error) {
 	return
 }
 
+// HashToken returns the SHA-256 hash of a raw token, hex-encoded. Used both
+// to derive the value stored in the DB from a freshly generated token and to
+// look up a session/API token from the raw value presented by a client.
 func HashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
 }
 
+// HashPassword hashes a plaintext password with bcrypt for storage.
 func HashPassword(password string) (string, error) {
 	h, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	return string(h), err
 }
 
+// CheckPassword reports whether password matches the given bcrypt hash.
 func CheckPassword(hash, password string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
+// SetSessionCookie writes the session cookie for token, expiring at expiry.
+// The cookie is HttpOnly and SameSite=Lax so it is inaccessible to page
+// scripts and is not sent on cross-site requests.
 func SetSessionCookie(w http.ResponseWriter, token string, expiry time.Time) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
@@ -62,6 +76,8 @@ func SetSessionCookie(w http.ResponseWriter, token string, expiry time.Time) {
 	})
 }
 
+// ClearSessionCookie expires the session cookie immediately, logging the
+// client out.
 func ClearSessionCookie(w http.ResponseWriter) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
@@ -73,6 +89,9 @@ func ClearSessionCookie(w http.ResponseWriter) {
 	})
 }
 
+// FromContext retrieves the Claims attached by the auth middleware (or by
+// NewContext in tests). The second return value is false when ctx carries
+// no Claims, e.g. for requests to exempt/unauthenticated routes.
 func FromContext(ctx context.Context) (Claims, bool) {
 	c, ok := ctx.Value(contextKey{}).(Claims)
 	return c, ok
@@ -93,6 +112,9 @@ type SessionLookup interface {
 	TouchAPITokenUsed(ctx context.Context, tokenHash string) error
 }
 
+// apiTokenFromRequest extracts a bearer-style API token from either the
+// X-Api-Key header or a "Bearer <token>" Authorization header, preferring
+// X-Api-Key when both are present. Returns "" when neither is set.
 func apiTokenFromRequest(r *http.Request) string {
 	if token := strings.TrimSpace(r.Header.Get("X-Api-Key")); token != "" {
 		return token

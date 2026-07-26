@@ -1,4 +1,12 @@
 <script lang="ts">
+  /**
+   * Displays the home dashboard: an auto-advancing hero carousel of trending
+   * movies/TV, system status tiles (cache sizes, FUSE mount) and integration
+   * health chips, and media rows for recently-added and trending content.
+   *
+   * Refreshes on SSE events (debounced) and falls back to a 2-minute
+   * visibility-gated poll if an event is missed.
+   */
   import { onMount } from 'svelte';
   import ChevronLeft from '@lucide/svelte/icons/chevron-left';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
@@ -68,6 +76,8 @@
   onMount(() => {
     void loadAll();
     const unsub = subscribeEvents(() => debouncedLoadAll());
+    // Falls back to polling every 2 minutes (only while the tab is visible)
+    // in case an SSE event is missed or the connection drops.
     const t = window.setInterval(() => {
       if (document.visibilityState === 'visible') void loadAll();
     }, 120000);
@@ -75,6 +85,7 @@
   });
 
   $: heroItems = [...(home?.trendingMovies ?? []), ...(home?.trendingTv ?? [])].slice(0, 10);
+  // (Re)starts the hero auto-advance timer whenever the trending set changes.
   $: { if (heroItems.length) startCarousel(heroItems); }
   $: hero = heroItems[heroIndex] ?? heroItems[0];
   $: integrations = status?.integrations;

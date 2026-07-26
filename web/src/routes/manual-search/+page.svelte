@@ -1,4 +1,11 @@
 <script lang="ts">
+  /**
+   * Provides free-text NZBHydra2 search outside the normal candidate pipeline.
+   *
+   * Lets an operator search for any release by title, ranks results by score,
+   * and links directly to each result's NZB. Seeds the query from the `q` URL
+   * parameter on mount so results can be linked to directly.
+   */
   import { onMount } from 'svelte';
   import Search from '@lucide/svelte/icons/search';
   import Download from '@lucide/svelte/icons/download';

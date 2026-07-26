@@ -6,6 +6,10 @@ import (
 	"strings"
 )
 
+// splitLines normalizes CRLF and lone-CR line endings to LF before splitting
+// body into lines, since NNTP article bodies may use either depending on the
+// posting server, and the yEnc header/data parsers assume a single
+// consistent line boundary.
 func splitLines(body []byte) [][]byte {
 	normalized := strings.ReplaceAll(string(body), "\r\n", "\n")
 	normalized = strings.ReplaceAll(normalized, "\r", "\n")

@@ -52,6 +52,9 @@ func pgTextArray(vals []string) string {
 	return "{" + strings.Join(parts, ",") + "}"
 }
 
+// ListMediaRequests returns every Seerr media request (movie or TV) joined
+// with its most recent matching queue item and library item, if any, for
+// display in the incoming-requests UI. Most recent request first.
 func (db *DB) ListMediaRequests(ctx context.Context) ([]MediaRequestSummary, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select
@@ -116,6 +119,10 @@ func (db *DB) ListMediaRequests(ctx context.Context) ([]MediaRequestSummary, err
 	return out, rows.Err()
 }
 
+// DetectMovieSearchConflict reports "metadata_conflict" when libraryItemID's
+// movie shares its (title, release_year) with a different, better-identified
+// movie (one that already has an IMDb ID while this one doesn't) cataloged
+// under a different TMDB ID -- a likely duplicate/misidentified entry.
 func (db *DB) DetectMovieSearchConflict(ctx context.Context, libraryItemID int64) (string, error) {
 	var reason string
 	err := db.SQL.QueryRowContext(ctx, `
@@ -144,6 +151,11 @@ func (db *DB) DetectMovieSearchConflict(ctx context.Context, libraryItemID int64
 	return strings.TrimSpace(reason), nil
 }
 
+// UpsertMovieRequest idempotently records an incoming Seerr movie request:
+// finds or creates the movies/library_items rows for tmdbID and a
+// media_requests row keyed by externalID, then (re)queues the item for
+// search, reviving it if its queue item had previously failed. Returns the
+// library_item ID and whether a new queue entry was created.
 func (db *DB) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID int64, title string, year int) (int64, bool, error) {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
@@ -263,12 +275,18 @@ type MovieEnrichment struct {
 	RawTMDB             []byte // full /movie/:id TMDB JSON response
 }
 
+// EnrichMovieMetadata is a narrow-field convenience wrapper around
+// EnrichMovieFull for callers that only have the basic TMDB fields on hand.
 func (db *DB) EnrichMovieMetadata(ctx context.Context, libraryItemID, tmdbID int64, title string, year int, imdbID string) error {
 	return db.EnrichMovieFull(ctx, libraryItemID, MovieEnrichment{
 		TMDBID: tmdbID, Title: title, Year: year, IMDbID: imdbID,
 	})
 }
 
+// EnrichMovieFull applies a MovieEnrichment payload to the movie backing
+// libraryItemID, overwriting each column only when the incoming value is
+// non-zero/non-empty so a partial payload never clobbers known data with
+// blanks, and syncs library_items.title when a new title is provided.
 func (db *DB) EnrichMovieFull(ctx context.Context, libraryItemID int64, e MovieEnrichment) error {
 	var releaseDate *string
 	if e.ReleaseDate != "" {
@@ -330,6 +348,11 @@ func (db *DB) EnrichMovieFull(ctx context.Context, libraryItemID int64, e MovieE
 	return err
 }
 
+// UpsertEpisodeRequest idempotently records an incoming Seerr TV episode
+// request: resolves or creates the tv_shows row (by tvdb_id, falling back to
+// tmdb_id if tvdb_id already belongs to a different show), the episodes row,
+// and the library_items row, then a media_requests row keyed by externalID,
+// and (re)queues the item for search. Mirrors UpsertMovieRequest.
 func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbID, tmdbID int64, show string, year, season, episode int, episodeTitle string) (int64, bool, error) {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
@@ -491,12 +514,18 @@ type TVShowEnrichment struct {
 	RawTMDB             []byte
 }
 
+// EnrichEpisodeMetadata is a narrow-field convenience wrapper around
+// EnrichTVFull for callers that only have the basic TMDB fields on hand.
 func (db *DB) EnrichEpisodeMetadata(ctx context.Context, libraryItemID, tmdbID int64, show string, year int, imdbID, episodeTitle string) error {
 	return db.EnrichTVFull(ctx, libraryItemID, episodeTitle, TVShowEnrichment{
 		TMDBID: tmdbID, ShowTitle: show, Year: year, IMDbID: imdbID,
 	})
 }
 
+// EnrichTVFull applies a TVShowEnrichment payload to the show backing
+// libraryItemID (and the episode title, if provided), overwriting each
+// column only when non-zero/non-empty, and recomputes library_items.title
+// from the show title and season/episode numbers.
 func (db *DB) EnrichTVFull(ctx context.Context, libraryItemID int64, episodeTitle string, e TVShowEnrichment) error {
 	var firstAirDate, lastAirDate *string
 	if e.FirstAirDate != "" {
@@ -596,6 +625,9 @@ func (db *DB) EnrichTVFull(ctx context.Context, libraryItemID int64, episodeTitl
 	return err
 }
 
+// GetLibrarySearchInput assembles the movie/TV metadata a search pass needs
+// for libraryItemID from whichever of movies/episodes/tv_shows applies, and
+// filters the alternate titles through filterAmbiguousAlternateTitles.
 func (db *DB) GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (LibrarySearchInput, error) {
 	var item LibrarySearchInput
 	err := db.SQL.QueryRowContext(ctx, `
@@ -731,6 +763,8 @@ func (db *DB) filterAmbiguousAlternateTitles(ctx context.Context, titles []strin
 	return out, nil
 }
 
+// GetQueueRetryTarget loads the queue_items/library_items state needed to
+// decide how to retry a specific queue item.
 func (db *DB) GetQueueRetryTarget(ctx context.Context, queueItemID int64) (QueueRetryTarget, error) {
 	var item QueueRetryTarget
 	var selectedRelease sql.NullInt64
@@ -756,6 +790,18 @@ func (db *DB) GetQueueRetryTarget(ctx context.Context, queueItemID int64) (Queue
 	return item, nil
 }
 
+// ListPendingLibrarySearchTargets returns the library items that are due for
+// a Hydra2 search pass right now: unavailable items whose last search is past
+// its cooldown, items with a release already selected but stuck in
+// 'requested' (resume candidates for immediate dispatch), and items stranded
+// in 'selected' with no download started yet. releaseGraceHours delays movies
+// and episodes whose release/air date is still in the future (plus a grace
+// window, since a title can post hours after the nominal calendar date).
+//
+// The retry cooldown escalates with consecutive_failure_searches so an item
+// that has exhausted every known candidate many times over backs off hard
+// instead of being re-searched every pass at the same cadence as a
+// still-plausible pending item, protecting the shared Hydra2 rate limit.
 func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceHours int) ([]PendingLibrarySearchTarget, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select item.library_item_id, item.media_type, coalesce(item.tv_show_id, 0), coalesce(item.season_number, 0), item.selected, coalesce(item.selected_release_id, 0), coalesce(item.external_url, ''), item.state, item.updated_at
@@ -879,6 +925,10 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceH
 	return out, rows.Err()
 }
 
+// CountActiveSearchBacklog returns the number of unavailable library items
+// currently in an active search/download pipeline state (from initial
+// request through publishing). Used to size backlog metrics/alerts, not to
+// select items for processing.
 func (db *DB) CountActiveSearchBacklog(ctx context.Context) (int, error) {
 	var count int
 	err := db.SQL.QueryRowContext(ctx, `
@@ -900,6 +950,9 @@ func (db *DB) CountActiveSearchBacklog(ctx context.Context) (int, error) {
 	return count, err
 }
 
+// CountSelectedQueueBacklog returns the number of unavailable library items
+// currently sitting in the 'selected' state -- a release has been chosen but
+// its download has not yet been dispatched.
 func (db *DB) CountSelectedQueueBacklog(ctx context.Context) (int, error) {
 	var count int
 	err := db.SQL.QueryRowContext(ctx, `
@@ -1020,6 +1073,12 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int, releas
 	return out, rows.Err()
 }
 
+// ListSelectedQueueRetryTargets returns queue items that already have a
+// selected release and just need a download slot: 'selected' items (ready to
+// go), 'failed' items with a selection still attached, and 'requested' items
+// with a selection that have been stuck longer than 2 minutes (BullMQ should
+// already be handling these; this only fast-lanes ones it appears to have
+// dropped). limit caps the result set (0 = unlimited).
 func (db *DB) ListSelectedQueueRetryTargets(ctx context.Context, limit int) ([]SelectedQueueRetryTarget, error) {
 	query := `
 		select
@@ -1068,6 +1127,20 @@ func (db *DB) ListSelectedQueueRetryTargets(ctx context.Context, limit int) ([]S
 	return out, rows.Err()
 }
 
+// upgradeSearchBatchLimit caps how many items a single SearchUpgrades pass
+// processes. Confirmed live (2026-07-21): with no cap, a single run walked
+// every eligible item (thousands, once the cutoff_resolution fix on
+// ListUpgradableLibraryItems stopped excluding already-upgraded ones from the
+// count but the underlying library still had that many upgrade candidates)
+// through NZBHydra2 sequentially, one search every ~2s (the client's global
+// throttle) -- a single content_maintenance pass could run continuously for
+// hours, hammering the indexer non-stop and starving other search traffic of
+// the shared throttle/concurrency budget. ListUpgradableLibraryItems orders
+// by last_searched_at (oldest/never-searched first) so a capped run still
+// makes rotating progress across the whole set instead of reprocessing the
+// same items every cycle.
+const upgradeSearchBatchLimit = 200
+
 // ListUpgradableLibraryItems returns library_item IDs that are available but
 // whose quality profile has allow_upgrade=true and whose latest queue item is
 // still in state 'available' (i.e. not already being re-downloaded).
@@ -1080,19 +1153,7 @@ func (db *DB) ListSelectedQueueRetryTargets(ctx context.Context, limit int) ([]S
 // cutoff, which per the profile's own documented semantics ("once the
 // grabbed release meets this resolution or better, the item is considered
 // at cutoff and won't be upgraded further") should never be searched again.
-// upgradeSearchBatchLimit caps how many items a single SearchUpgrades pass
-// processes. Confirmed live (2026-07-21): with no cap, a single run walked
-// every eligible item (thousands, once the cutoff_resolution fix above
-// stopped excluding already-upgraded ones from the count but the underlying
-// library still had that many upgrade candidates) through NZBHydra2
-// sequentially, one search every ~2s (the client's global throttle) -- a
-// single content_maintenance pass could run continuously for hours,
-// hammering the indexer non-stop and starving other search traffic of the
-// shared throttle/concurrency budget. Ordering by last_searched_at (oldest/
-// never-searched first) means a capped run still makes rotating progress
-// across the whole set instead of reprocessing the same items every cycle.
-const upgradeSearchBatchLimit = 200
-
+// Results are capped at upgradeSearchBatchLimit; see that constant for why.
 func (db *DB) ListUpgradableLibraryItems(ctx context.Context) ([]int64, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select li.id, qp.cutoff_resolution, coalesce(rc.resolution, '')
@@ -1137,6 +1198,12 @@ func (db *DB) ListUpgradableLibraryItems(ctx context.Context) ([]int64, error) {
 	return out, rows.Err()
 }
 
+// LookupCandidateHistory returns, keyed by external_url, the highest recorded
+// failure_count and most recent non-empty failure reason across every
+// release_candidates row this library item has ever had for that URL. This
+// lets a fresh search result be scored/penalized against a release's known
+// prior failure history even though the earlier release_candidates row(s)
+// may since have been deleted by a subsequent search pass.
 func (db *DB) LookupCandidateHistory(ctx context.Context, libraryItemID int64) (map[string]CandidateHistory, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select
@@ -1533,6 +1600,8 @@ func (db *DB) PromoteExistingCandidate(ctx context.Context, libraryItemID int64)
 	return &selectedReleaseID, nil
 }
 
+// GetGrabHistory returns the most recent 50 grab_history entries for a
+// library item (every release that was ever selected for it), newest first.
 func (db *DB) GetGrabHistory(ctx context.Context, libraryItemID int64) ([]GrabHistoryEntry, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT id, library_item_id, release_candidate_id, title, indexer_name, score, resolution, grabbed_at
@@ -1560,6 +1629,16 @@ func (db *DB) GetGrabHistory(ctx context.Context, libraryItemID int64) ([]GrabHi
 	return out, rows.Err()
 }
 
+// MarkLibrarySearchFailed marks a library item's queue entry as failed with
+// reason (defaulting to "search_error" when blank) and clears any
+// selected_releases row for it so the item re-enters the normal search cycle
+// on the next pass instead of getting stuck retrying the same failed
+// release.
+//
+// Takes lockLibraryItemQueueRow first: this used to run as two bare,
+// unlocked statements outside any transaction, letting a concurrent locked
+// writer (e.g. FailSelectedReleaseAndPromoteNext installing a fresh
+// selection) commit a real selected_releases row in the gap between them.
 func (db *DB) MarkLibrarySearchFailed(ctx context.Context, libraryItemID int64, reason string) error {
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
@@ -1606,6 +1685,14 @@ func (db *DB) MarkLibrarySearchFailed(ctx context.Context, libraryItemID int64, 
 	return tx.Commit()
 }
 
+// summarizeSearchFailureReason derives a single failure_reason string for a
+// search pass that selected nothing. Returns "" if any candidate was left
+// unrejected (the caller should not be marking the item failed at all in that
+// case), "no_releases" when the search produced nothing, a specific
+// "all_candidates_<reason>" when every rejection shares the same reason, and
+// the generic "all_candidates_archive_rejected"/"all_candidates_rejected"
+// buckets when rejections are mixed, so the UI/alerts get a stable, coarse
+// reason instead of an unbounded set of per-candidate strings.
 func summarizeSearchFailureReason(candidates []SearchCandidateRecord) string {
 	if len(candidates) == 0 {
 		return "no_releases"
@@ -1645,6 +1732,10 @@ func summarizeSearchFailureReason(candidates []SearchCandidateRecord) string {
 	return "all_candidates_rejected"
 }
 
+// GetSelectedReleaseSummary loads the full display/decision state for a
+// selected_releases row: the underlying release_candidates fields, aggregate
+// archive/virtual-file counts and statuses, and the stored NZB document
+// reference, if any.
 func (db *DB) GetSelectedReleaseSummary(ctx context.Context, selectedReleaseID int64) (ReleaseSummary, error) {
 	var item ReleaseSummary
 	var nzbDocument sql.NullInt64
@@ -1753,6 +1844,13 @@ func (db *DB) GetLatestSelectedReleaseSummaryByLibraryItem(ctx context.Context, 
 	return &item, nil
 }
 
+// GetStoredNZBDocument returns the most recently stored NZB document for a
+// selected release, decompressing its XML payload before returning it.
+// Defaults FileName to "selected.nzb" when the source document had no name.
+//
+// Errors:
+//   - returns a descriptive error (not sql.ErrNoRows) when no document has
+//     been stored yet, since callers surface this message directly.
 func (db *DB) GetStoredNZBDocument(ctx context.Context, selectedReleaseID int64) (StoredNZBDocument, error) {
 	var item StoredNZBDocument
 	err := db.SQL.QueryRowContext(ctx, `
@@ -1883,6 +1981,18 @@ func activateReleaseCandidate(ctx context.Context, tx *sql.Tx, libraryItemID, re
 	return selectedReleaseID, nil
 }
 
+// SelectReleaseCandidate performs a manual/user-driven selection of a
+// specific release_candidates row: it replaces the library item's current
+// selection (if any), clears any prior rejection on the candidate, and
+// purges blocklist entries matching the release's signature so a
+// user-selected release is never immediately re-blocked by its own past
+// rejection. See activateReleaseCandidate for the shared transaction steps
+// and lockLibraryItemQueueRow for why this must serialize against other
+// selection functions.
+//
+// Returns (nil, nil) if the candidate was already replaced by a newer
+// search or a concurrent selection before this call could act on it -- this
+// is treated as "already handled" rather than an error.
 func (db *DB) SelectReleaseCandidate(ctx context.Context, releaseCandidateID int64) (*ReleaseSummary, error) {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
@@ -1931,14 +2041,29 @@ func (db *DB) SelectReleaseCandidate(ctx context.Context, releaseCandidateID int
 	return &item, nil
 }
 
+// PromoteBestRetryCandidate automatically promotes the best still-usable,
+// non-blocklisted candidate for a library item (lowest failure_count, then
+// highest score) to selected. Used by automatic retry paths, as opposed to
+// SelectReleaseCandidate's manual, user-driven selection.
 func (db *DB) PromoteBestRetryCandidate(ctx context.Context, libraryItemID int64) (*ReleaseSummary, error) {
 	return db.promoteRetryCandidate(ctx, libraryItemID, 0, false)
 }
 
+// PromoteAlternativeRetryCandidate is PromoteBestRetryCandidate but excludes
+// excludeReleaseCandidateID from consideration -- used when the caller
+// already knows that specific candidate isn't viable (e.g. it just failed)
+// and wants the next-best alternative instead.
 func (db *DB) PromoteAlternativeRetryCandidate(ctx context.Context, libraryItemID int64, excludeReleaseCandidateID int64) (*ReleaseSummary, error) {
 	return db.promoteRetryCandidate(ctx, libraryItemID, excludeReleaseCandidateID, true)
 }
 
+// promoteRetryCandidate implements PromoteBestRetryCandidate and
+// PromoteAlternativeRetryCandidate: it picks the best eligible, non-selected,
+// non-blocklisted candidate with a known URL for libraryItemID (optionally
+// excluding excludeReleaseCandidateID) via scanNextViableCandidate, and
+// activates it through activateReleaseCandidate. Returns (nil, nil) when no
+// eligible candidate exists, or when a concurrent selection wins the race
+// before the final read.
 func (db *DB) promoteRetryCandidate(ctx context.Context, libraryItemID int64, excludeReleaseCandidateID int64, excludeCurrent bool) (*ReleaseSummary, error) {
 	// Preload before opening the transaction -- see FailSelectedReleaseAndPromoteNext,
 	// which does the same to avoid holding release_candidates write locks
@@ -2029,6 +2154,20 @@ func (db *DB) promoteRetryCandidate(ctx context.Context, libraryItemID int64, ex
 	return &item, nil
 }
 
+// RejectReleaseCandidate marks a candidate rejected with reason, persists a
+// blocklist entry for it when shouldPersistBlocklistReason(reason) allows,
+// and -- only if this candidate was still the library item's active
+// selection at the time the row lock was acquired -- promotes the next
+// viable, non-blocklisted candidate in its place (or marks the queue item
+// failed if none remains).
+//
+// The rejection and its blocklist entry are always applied regardless of
+// whether this candidate is still selected. The promote-next step is
+// skipped if a concurrent caller already superseded the selection between
+// this function's initial read and its row lock, since re-deriving and
+// promoting a "next" candidate from that stale premise risks inserting a
+// second selected_releases row for a candidate a concurrent winner already
+// picked.
 func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int64, reason string) (*ReleaseSummary, error) {
 	// Preload before opening the transaction -- see FailSelectedReleaseAndPromoteNext,
 	// which does the same to avoid holding release_candidates write locks
@@ -2195,6 +2334,11 @@ func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int
 	return &item, nil
 }
 
+// RestoreReleaseCandidate clears a candidate's rejected flag/reason and
+// removes any blocklist entries matching its release signature, undoing a
+// prior RejectReleaseCandidate/FailSelectedReleaseAndPromoteNext rejection.
+// It does not re-select the candidate; the item's normal search/selection
+// flow decides that afterwards.
 func (db *DB) RestoreReleaseCandidate(ctx context.Context, releaseCandidateID int64) error {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
@@ -2246,6 +2390,11 @@ func (db *DB) RestoreReleaseCandidate(ctx context.Context, releaseCandidateID in
 	return tx.Commit()
 }
 
+// RestoreRejectedReleaseCandidates is the bulk form of RestoreReleaseCandidate:
+// it clears rejected/reject_reason on every rejected candidate for a library
+// item and removes their blocklist entries in one transaction, returning how
+// many rows were restored. Like RestoreReleaseCandidate, it does not select
+// any candidate.
 func (db *DB) RestoreRejectedReleaseCandidates(ctx context.Context, libraryItemID int64) (RejectedReleaseRestoreResult, error) {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
@@ -2330,6 +2479,13 @@ func (db *DB) RestoreRejectedReleaseCandidates(ctx context.Context, libraryItemI
 	return RejectedReleaseRestoreResult{LibraryItemID: libraryItemID, Restored: restored}, nil
 }
 
+// SkipReleaseCandidate is the user-facing "skip this release" action: it
+// resolves the candidate's currently-selected_releases row and fails it via
+// FailSelectedReleaseAndPromoteNext with reason "manual_skip", which promotes
+// the next viable candidate in its place.
+//
+// Errors:
+//   - the candidate is not currently selected (no matching selected_releases row).
 func (db *DB) SkipReleaseCandidate(ctx context.Context, releaseCandidateID int64) (*ReleaseSummary, error) {
 	var selectedReleaseID int64
 	if err := db.SQL.QueryRowContext(ctx, `
@@ -2345,6 +2501,29 @@ func (db *DB) SkipReleaseCandidate(ctx context.Context, releaseCandidateID int64
 	return db.FailSelectedReleaseAndPromoteNext(ctx, selectedReleaseID, "manual_skip")
 }
 
+// FailSelectedReleaseAndPromoteNext is the central "this release didn't
+// work" path used by both automatic failure handling (fetch/import/health
+// check failures) and manual skip/reject actions that funnel through it. It
+// records the failure against the candidate (incrementing failure_count,
+// and durably rejecting it when isHardRejectReason(reason) is true),
+// inserts a failed_releases row, deletes the selected_releases row, and
+// promotes the next viable, non-blocklisted candidate via
+// scanNextViableCandidate -- or marks the queue item failed if none remain.
+// Blocklist entries are collected during the transaction but only flushed
+// (flushBlocklistKeys) after commit, since that read/write is decoupled
+// from the caller's context and must not hold row locks.
+//
+// Re-verifies under the row lock that selectedReleaseID is still the
+// library item's current selection before acting: the initial lookup runs
+// before the lock is acquired, so a concurrent caller (e.g. a manual
+// reject/skip racing this background failure) may have already superseded
+// it. If so, this is a no-op (returns nil, nil) rather than re-deriving and
+// re-promoting a "next" candidate from a stale premise, which would risk
+// duplicate-inserting a selected_releases row for a candidate the winner
+// already picked.
+//
+// Returns (nil, nil) both when there is nothing left to promote and when a
+// concurrent write already resolved this selection.
 func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedReleaseID int64, reason string) (*ReleaseSummary, error) {
 	// Cap at 90s: deleting nzb_documents and their cascaded nzb_files rows for
 	// a large release can take significant time. 90s gives headroom without
@@ -2718,6 +2897,18 @@ func isPermanentFetchStatusReason(r string) bool {
 		!strings.Contains(r, "status 429")
 }
 
+// isHardRejectReason reports whether reason describes a failure that proves
+// this specific candidate can never succeed on retry (a structural/permanent
+// property of the posted content, or the synthetic "too_many_failures" giveup
+// signal from candidateFailurePenaltyProfile), as opposed to a transient
+// network/account condition worth retrying. FailSelectedReleaseAndPromoteNext
+// uses this to decide whether to set release_candidates.rejected=true
+// immediately rather than just incrementing failure_count.
+//
+// Deliberately not identical to shouldPersistBlocklistReason:
+// "too_many_failures" gives up on this one candidate without saying anything
+// about whether the underlying content is bad, so it must never blocklist a
+// re-posted sibling under a different indexer/URL.
 func isHardRejectReason(reason string) bool {
 	r := strings.TrimSpace(strings.ToLower(reason))
 	if isPermanentArchiveRejectReason(r) {
@@ -2750,6 +2941,13 @@ func isHardRejectReason(reason string) bool {
 	return isPermanentFetchStatusReason(r)
 }
 
+// shouldPersistBlocklistReason reports whether a failure reason should be
+// written to blocklist_items so a re-posted sibling release (same content,
+// different indexer/URL) is also prevented from being selected. Manual
+// rejections ("manual_"-prefixed) and permanent archive/content/article
+// failures qualify; transient conditions (indexer hiccups, rate limits) do
+// not, since blocklisting those would poison future searches against
+// releases nothing has actually proven bad.
 func shouldPersistBlocklistReason(reason string) bool {
 	r := strings.TrimSpace(strings.ToLower(reason))
 	// "manual_"-prefixed reasons (a user explicitly rejecting a release via
@@ -2769,6 +2967,12 @@ func shouldPersistBlocklistReason(reason string) bool {
 	return isPermanentFetchStatusReason(r)
 }
 
+// isPermanentArchiveRejectReason reports whether reason describes a
+// structural, permanent property of the posted archive/content (encrypted,
+// unsupported compression, invalid headers, no video/publishable file)
+// rather than a transient fetch/process failure -- the same segments will
+// produce the same result on every retry, so these are treated as hard
+// rejects by both isHardRejectReason and shouldPersistBlocklistReason.
 func isPermanentArchiveRejectReason(reason string) bool {
 	switch strings.TrimSpace(strings.ToLower(reason)) {
 	case "archive_encrypted", "archive_solid_unsupported", "archive_compression_unsupported",
@@ -2791,6 +2995,10 @@ func isPermanentArchiveRejectReason(reason string) bool {
 	}
 }
 
+// blocklistKeyForExternalURL builds the exact-URL blocklist key variant --
+// the tightest of the blocklist key levels (see blocklistKeysForRelease),
+// matching only a byte-identical re-fetch of the same URL rather than a
+// re-posted sibling under a different URL.
 func blocklistKeyForExternalURL(rawURL string) string {
 	return "external_url:" + strings.TrimSpace(rawURL)
 }
@@ -2811,6 +3019,13 @@ func sizeDateBuckets(sizeBytes int64, postedAt time.Time) (sizeBucket, dateBucke
 	return sizeBucket, dateBucket
 }
 
+// blocklistReleaseSignatureKey builds the most specific release-matching
+// blocklist key: normalized title + indexer + size bucket + date bucket.
+// Distinguishes releases from different indexers with otherwise identical
+// titles/sizes/dates. See blocklistReleaseFamilyKey and
+// blocklistReleasePatternKey for progressively looser variants; all three
+// are checked so a candidate can be blocked by whichever level of match its
+// prior rejection recorded.
 func blocklistReleaseSignatureKey(title, indexerName string, sizeBytes int64, postedAt time.Time) string {
 	normalizedTitle := NormalizeReleaseTitle(title)
 	if normalizedTitle == "" {
@@ -2826,6 +3041,10 @@ func blocklistReleaseSignatureKey(title, indexerName string, sizeBytes int64, po
 	}, "|")
 }
 
+// blocklistReleaseFamilyKey builds a looser release-matching blocklist key
+// than blocklistReleaseSignatureKey: normalized title + size bucket + date
+// bucket, deliberately omitting the indexer, so the same content re-posted
+// to a different indexer still matches.
 func blocklistReleaseFamilyKey(title string, sizeBytes int64, postedAt time.Time) string {
 	normalizedTitle := NormalizeReleaseTitle(title)
 	if normalizedTitle == "" {
@@ -2839,6 +3058,12 @@ func blocklistReleaseFamilyKey(title string, sizeBytes int64, postedAt time.Time
 	}, "|")
 }
 
+// blocklistReleasePatternKey builds the loosest release-matching blocklist
+// key: title reduced to normalizeReleasePattern's canonical
+// season/episode + resolution + source tokens (dropping scene-group/edition
+// noise) plus size and date buckets. Catches the same release re-posted
+// under a slightly reworded title (e.g. a different scene group tag) that
+// blocklistReleaseFamilyKey's plain normalized-title match would miss.
 func blocklistReleasePatternKey(title string, sizeBytes int64, postedAt time.Time) string {
 	pattern := normalizeReleasePattern(title)
 	if pattern == "" {
@@ -2885,6 +3110,14 @@ func resolveMediaScopeKey(ctx context.Context, q sqlRowQuerier, libraryItemID in
 	return fmt.Sprintf("item:%d", libraryItemID), nil
 }
 
+// blocklistKeysForRelease returns every scoped blocklist key variant that
+// could match this release, from most to least specific (exact URL, exact
+// signature, loose pattern, loose family). A candidate is blocked if ANY of
+// these keys has a live entry, so a single rejection recorded under one
+// variant (e.g. by exact URL) still catches a re-posted sibling matched only
+// by a looser variant later. See blocklistReleaseSignatureKey,
+// blocklistReleasePatternKey, and blocklistReleaseFamilyKey for what each
+// level actually matches.
 func blocklistKeysForRelease(scopeKey, title, externalURL, indexerName string, sizeBytes int64, postedAt time.Time) []string {
 	keys := make([]string, 0, 4)
 	if strings.TrimSpace(externalURL) != "" {
@@ -2925,6 +3158,10 @@ func globalBlocklistKeysForRelease(title, externalURL, indexerName string, sizeB
 	return keys
 }
 
+// blockedReleaseReason reports whether candidate matches any live blocklist
+// entry, checking both scopeKey-prefixed keys (blocklistKeysForRelease) and
+// unprefixed global keys (globalBlocklistKeysForRelease, written by the
+// manual blocklist admin API) -- a candidate can be blocked by either.
 func blockedReleaseReason(scopeKey string, blocked map[string]string, candidate SearchCandidateRecord) (string, bool) {
 	for _, key := range blocklistKeysForRelease(scopeKey, candidate.Title, candidate.ExternalURL, candidate.IndexerName, candidate.SizeBytes, candidate.PostedAt) {
 		if reason, ok := blocked[key]; ok {
@@ -2939,11 +3176,27 @@ func blockedReleaseReason(scopeKey string, blocked map[string]string, candidate 
 	return "", false
 }
 
+// NormalizeReleaseTitle folds a release title down to lowercase words
+// separated by single spaces, treating dots/underscores/hyphens/brackets as
+// word separators, so two scene-release titles that differ only in
+// punctuation/casing convention (e.g. "Show.Name.S01E01" vs "Show Name
+// S01E01") normalize to the same string. Used as the basis for every
+// blocklist key variant and for candidate-merge title comparisons.
 func NormalizeReleaseTitle(value string) string {
 	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ", "{", " ", "}", " ")
 	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(strings.TrimSpace(value)))), " ")
 }
 
+// normalizeReleasePattern reduces a normalized release title to its
+// season/episode token (if any) plus a single canonical resolution token and
+// a single canonical source token, dropping everything else (scene group,
+// edition tags, audio codec, etc). This is deliberately the loosest release
+// match used by the blocklist: it lets a re-posted release under a
+// differently-worded title (different group tag, reordered words) still be
+// recognized as "the same release" by blocklistReleasePatternKey. Word order
+// in the output follows the input; season/episode tokens stop the fallthrough
+// "keep any other word" branch (!sawEpisode) so trailing metadata after the
+// episode marker doesn't leak into the pattern.
 func normalizeReleasePattern(value string) string {
 	tokens := strings.Fields(NormalizeReleaseTitle(value))
 	if len(tokens) == 0 {
@@ -2979,6 +3232,8 @@ func normalizeReleasePattern(value string) string {
 	return strings.Join(out, " ")
 }
 
+// isSeasonEpisodeToken reports whether token looks like a season/episode
+// marker in either "sNNeNN" (S01E01) or "NxNN" (1x01) form.
 func isSeasonEpisodeToken(token string) bool {
 	if len(token) >= 6 && token[0] == 's' {
 		hasE := false
@@ -3028,6 +3283,15 @@ func canonicalSourceToken(token string) string {
 	}
 }
 
+// loadBlocklistMap returns the live (non-expired) blocklist as a key->reason
+// map, served from blocklistCache when the cache is younger than 30s and
+// refreshed from the database otherwise (see the blocklistCache doc comment
+// for why). Functions that need to preload this map before opening a
+// transaction specifically to avoid holding release_candidates write locks
+// during a large, uncached read (e.g. FailSelectedReleaseAndPromoteNext,
+// promoteRetryCandidate) call loadBlocklistMapUncached instead, since a
+// transaction-scoped read should reflect the database at query time, not
+// whatever happened to be cached moments earlier.
 func loadBlocklistMap(ctx context.Context, q sqlQuerier) (map[string]string, error) {
 	const cacheTTL = 30 * time.Second
 	blocklistCacheMu.Lock()
@@ -3079,10 +3343,17 @@ type sqlQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
+// sqlRowQuerier is satisfied by both *sql.DB and *sql.Tx; used by helpers
+// like resolveMediaScopeKey that only ever need a single-row lookup.
 type sqlRowQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// loadBlocklistMapUncached is loadBlocklistMap without the 30s cache --
+// always issues a fresh query. Used by callers that must read the blocklist
+// before opening a transaction that will subsequently take write locks on
+// release_candidates, since running this same query inside that transaction
+// would hold those locks for the duration of a large (1500+ row) read.
 func loadBlocklistMapUncached(ctx context.Context, q sqlQuerier) (map[string]string, error) {
 	rows, err := q.QueryContext(ctx, `
 		select key, reason
@@ -3143,6 +3414,14 @@ func invalidateBlocklistCache() {
 	blocklistCacheMu.Unlock()
 }
 
+// BlocklistQueueSelectedRelease persists blocklist_items entries for a queue
+// item's failed search/download outcome. When the item has a currently
+// selected release, only that release's signature keys are blocked. When
+// there is no selection (e.g. a search that ended with every candidate
+// rejected), every rejected candidate with a known URL is blocklisted
+// instead, so none of them are reconsidered on the next search pass.
+// ttlDays follows flushBlocklistKeys's convention: 0 is permanent, >0 expires
+// after that many days.
 func (db *DB) BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int64, reason string, ttlDays int) error {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
@@ -3237,6 +3516,15 @@ func (db *DB) BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int
 	return tx.Commit()
 }
 
+// ClearQueueSelectedRelease removes a queue item's selected release (if any),
+// deleting its selected_releases row (cascading to NZB/archive data), and
+// either leaves the queue state as-is (a selection existed, so the item can
+// be re-dispatched by the normal retry loop) or resets the item to
+// 'requested' (no selection existed, so a failed item stops looping forever
+// in AutoManageFailedQueue and re-enters the normal search cycle). Takes
+// lockLibraryItemQueueRow and re-reads the selection under that lock, since a
+// concurrent selector/promoter may change it between the initial lookup and
+// the lock being acquired.
 func (db *DB) ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) error {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
@@ -3314,6 +3602,10 @@ func (db *DB) ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) 
 	return tx.Commit()
 }
 
+// RequeueSelectedRelease resets a queue item that already has a selected
+// release back to 'requested' so the dispatcher picks it up again (e.g.
+// after a stale-worker/restart interruption); it is a no-op if the item has
+// no selected_release_id.
 func (db *DB) RequeueSelectedRelease(ctx context.Context, queueItemID int64) error {
 	_, err := db.SQL.ExecContext(ctx, `
 		update queue_items
@@ -3455,6 +3747,8 @@ type ShowWithMissingEpisodes struct {
 	ShowTitle string
 }
 
+// MissingEpisodeBatchInput describes one TMDB-reported episode to upsert via
+// EnsureEpisodeLibraryItemsBatch.
 type MissingEpisodeBatchInput struct {
 	SeasonNumber  int    `json:"season_number"`
 	EpisodeNumber int    `json:"episode_number"`
@@ -3506,6 +3800,9 @@ func (db *DB) ListShowsWithMissingEpisodes(ctx context.Context) ([]ShowWithMissi
 	return out, rows.Err()
 }
 
+// GetShowWithMissingEpisodes returns the single-show form of
+// ListShowsWithMissingEpisodes, or nil if tvShowID has no TMDB ID or does not
+// exist.
 func (db *DB) GetShowWithMissingEpisodes(ctx context.Context, tvShowID int64) (*ShowWithMissingEpisodes, error) {
 	var s ShowWithMissingEpisodes
 	err := db.SQL.QueryRowContext(ctx, `
@@ -3523,6 +3820,11 @@ func (db *DB) GetShowWithMissingEpisodes(ctx context.Context, tvShowID int64) (*
 	return &s, nil
 }
 
+// ListPendingTVShowLibraryItemIDs returns library_item IDs for tvShowID's
+// unavailable episodes still in an active queue state (requested, failed, or
+// selected), ordered oldest-searched first, for a caller (e.g. a
+// newly-discovered season) that wants to prioritize dispatching search work
+// for this show.
 func (db *DB) ListPendingTVShowLibraryItemIDs(ctx context.Context, tvShowID int64) ([]int64, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select distinct li.id

@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/drakkar-media/drakkar/internal/auth"
+	"github.com/go-chi/chi/v5"
 )
 
 func mountSetupRoutes(r chi.Router, repo UserRepository) {
@@ -14,6 +14,9 @@ func mountSetupRoutes(r chi.Router, repo UserRepository) {
 	r.Post("/api/setup/complete", handleSetupComplete(repo))
 }
 
+// handleSetupStatus reports whether first-run setup is still required (true
+// when zero users exist), which the frontend uses to decide whether to show
+// the setup wizard instead of the login form.
 func handleSetupStatus(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		n, err := repo.CountUsers(r.Context())
@@ -28,6 +31,10 @@ func handleSetupStatus(repo UserRepository) http.HandlerFunc {
 	}
 }
 
+// handleSetupComplete provisions the first admin account and immediately
+// logs it in via a session cookie. Gated on zero users existing, so once any
+// account has been created this always responds 409 and cannot be reused to
+// mint further admins.
 func handleSetupComplete(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Only allowed when no users exist yet.

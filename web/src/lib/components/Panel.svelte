@@ -1,7 +1,13 @@
 <script lang="ts">
+  /**
+   * Generic card/section container with an optional title, subtitle, and an
+   * "actions" slot in the header, plus a default slot for body content.
+   * Used as the standard content wrapper across dashboard and settings pages.
+   */
   export let title = '';
   export let subtitle = '';
   export let wide = false;
+  /** Removes the body's top padding, for content that should sit flush against the header (e.g. a table). */
   export let flush = false;
 </script>
 

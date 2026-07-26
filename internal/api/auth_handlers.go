@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/drakkar-media/drakkar/internal/auth"
 	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/go-chi/chi/v5"
 )
 
 // UserRepository covers user + session operations needed by auth handlers.
@@ -60,6 +60,11 @@ func mountUserRoutes(r chi.Router, repo UserRepository) {
 	r.Put("/api/users/{id}/password", handleChangePassword(repo))
 }
 
+// handleLogin verifies a username/password pair, then issues a new session:
+// a random token is generated, only its hash is persisted, and the raw token
+// is set on the response as the session cookie with a lifetime of
+// auth.SessionExpiry. Responds 401 on any lookup failure or password
+// mismatch, without distinguishing the two.
 func handleLogin(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
@@ -94,6 +99,9 @@ func handleLogin(repo UserRepository) http.HandlerFunc {
 	}
 }
 
+// handleLogout deletes the caller's server-side session (looked up by the
+// hashed cookie value) and clears the session cookie. Always succeeds, even
+// with no cookie or an already-expired/deleted session.
 func handleLogout(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie(auth.CookieName)
@@ -105,6 +113,8 @@ func handleLogout(repo UserRepository) http.HandlerFunc {
 	}
 }
 
+// handleMe returns the caller's identity as resolved from request context by
+// the auth middleware; 401 if the request carries no valid session/token.
 func handleMe() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := auth.FromContext(r.Context())
@@ -121,6 +131,8 @@ func handleMe() http.HandlerFunc {
 	}
 }
 
+// handleListAPITokens lists API tokens belonging to the authenticated
+// caller only; it never exposes another user's tokens.
 func handleListAPITokens(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := auth.FromContext(r.Context())
@@ -140,6 +152,9 @@ func handleListAPITokens(repo UserRepository) http.HandlerFunc {
 	}
 }
 
+// handleCreateAPIToken mints a new API token for the authenticated caller.
+// The raw token value is returned in this response only — only its hash is
+// ever persisted, so this is the caller's one chance to see it.
 func handleCreateAPIToken(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := auth.FromContext(r.Context())
@@ -186,6 +201,8 @@ func handleCreateAPIToken(repo UserRepository) http.HandlerFunc {
 	}
 }
 
+// handleDeleteAPIToken deletes an API token, scoped to the authenticated
+// caller's own tokens (claims.UserID) so one user cannot delete another's.
 func handleDeleteAPIToken(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := auth.FromContext(r.Context())
@@ -205,6 +222,7 @@ func handleDeleteAPIToken(repo UserRepository) http.HandlerFunc {
 	}
 }
 
+// handleListUsers requires the admin role and returns every user account.
 func handleListUsers(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := auth.FromContext(r.Context())
@@ -224,6 +242,8 @@ func handleListUsers(repo UserRepository) http.HandlerFunc {
 	}
 }
 
+// handleCreateUser requires the admin role and creates a new account,
+// defaulting Role to "user" when the request omits it.
 func handleCreateUser(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := auth.FromContext(r.Context())
@@ -259,6 +279,8 @@ func handleCreateUser(repo UserRepository) http.HandlerFunc {
 	}
 }
 
+// handleDeleteUser requires the admin role and refuses to delete the
+// caller's own account, preventing an admin from locking themselves out.
 func handleDeleteUser(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		claims, ok := auth.FromContext(r.Context())
@@ -282,6 +304,8 @@ func handleDeleteUser(repo UserRepository) http.HandlerFunc {
 	}
 }
 
+// handleChangePassword lets a user change their own password, or an admin
+// change any user's password.
 func handleChangePassword(repo UserRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id, ok := parseInt64PathID(w, r)

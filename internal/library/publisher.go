@@ -14,8 +14,13 @@ import (
 	"github.com/drakkar-media/drakkar/internal/symlink"
 )
 
+// ErrNoVirtualFiles is returned when a selected release has no virtual files
+// to publish, e.g. because import/repair hasn't produced any yet.
 var ErrNoVirtualFiles = errors.New("selected release has no publishable virtual files")
 
+// Repository defines the database operations required to publish selected
+// releases as host-visible library symlinks and to track/repair that
+// publication state.
 type Repository interface {
 	ListVirtualFilesForRelease(ctx context.Context, selectedReleaseID int64) ([]database.ReleaseVirtualFile, error)
 	ListSelectedReleasesForPublication(ctx context.Context) ([]int64, error)
@@ -30,6 +35,10 @@ type Repository interface {
 	CreateSeasonPackEpisodeItems(ctx context.Context, selectedReleaseID, triggeringLibraryItemID int64) error
 }
 
+// Publisher publishes the virtual (Usenet-backed) files of a selected
+// release into the host-visible movie/TV library as symlinks, keeping
+// rclone's VFS cache and the configured media servers (Plex/Jellyfin) in
+// sync as publications are created or repaired.
 type Publisher struct {
 	repo                  Repository
 	runtime               config.Runtime
@@ -39,6 +48,7 @@ type Publisher struct {
 	mediaServerNotifyHook func(context.Context, int64) error
 }
 
+// BulkRepublishResult summarizes the outcome of RepublishPendingLibrary.
 type BulkRepublishResult struct {
 	Processed        int     `json:"processed"`
 	Republished      int     `json:"republished"`
@@ -47,6 +57,10 @@ type BulkRepublishResult struct {
 	FailedLibrary    []int64 `json:"failedLibrary,omitempty"`
 }
 
+// NewPublisher creates a Publisher backed by repo, using runtime's library
+// paths as symlink targets. rcloneRCAddr configures the rclone remote-control
+// client used to invalidate VFS caches after publishing; an empty value
+// disables VFS refresh calls (see rclone.Client).
 func NewPublisher(repo Repository, runtime config.Runtime, rcloneRCAddr string) *Publisher {
 	return &Publisher{
 		repo:    repo,
@@ -56,6 +70,10 @@ func NewPublisher(repo Repository, runtime config.Runtime, rcloneRCAddr string) 
 	}
 }
 
+// SetPostPublishHook registers a callback invoked once per affected library
+// item after a fresh publish (isNew=true), used to trigger subtitle search
+// and publish. It is not invoked for startup rebuilds or repair republishes;
+// see SetMediaServerNotifyHook for the hook that covers those cases.
 func (p *Publisher) SetPostPublishHook(fn func(context.Context, int64) error) {
 	p.postPublishHook = fn
 }
@@ -68,7 +86,7 @@ func (p *Publisher) SetMediaServerNotifyHook(fn func(context.Context, int64) err
 	p.mediaServerNotifyHook = fn
 }
 
-// PublishSelectedRelease publishes virtual files for a selected release.
+// publishSelectedRelease publishes virtual files for a selected release.
 // isNew should be true for fresh publishes (creates per-episode items for season
 // packs) and false for startup rebuilds (skip redundant episode item creation).
 // notifyMediaServers requests a Plex/Jellyfin refresh even when isNew is
@@ -183,6 +201,10 @@ func (p *Publisher) PublishSelectedRelease(ctx context.Context, selectedReleaseI
 	return p.publishSelectedRelease(ctx, selectedReleaseID, true, false)
 }
 
+// RebuildPublications republishes every release currently pending
+// publication. Intended for startup, to restore symlinks/VFS state after a
+// restart without re-running per-episode item creation or re-notifying media
+// servers about releases they already know about.
 func (p *Publisher) RebuildPublications(ctx context.Context) error {
 	selectedReleaseIDs, err := p.repo.ListSelectedReleasesForPublication(ctx)
 	if err != nil {
@@ -200,6 +222,12 @@ func (p *Publisher) RebuildPublications(ctx context.Context) error {
 	return nil
 }
 
+// RepublishLibraryItem re-publishes the symlink(s) for a single library item,
+// used to repair a missing or stale symlink. It always notifies configured
+// media servers, since a targeted repair means they never learned about the
+// correct file otherwise. Season-pack episodes (which have no selected
+// release of their own) are resolved back to their source release and
+// published directly rather than republishing the whole pack.
 func (p *Publisher) RepublishLibraryItem(ctx context.Context, libraryItemID int64) error {
 	selectedReleaseIDs, err := p.repo.ListSelectedReleasesByLibraryItem(ctx, libraryItemID)
 	if err != nil {
@@ -280,6 +308,10 @@ func (p *Publisher) republishEpisodeFromSourceRelease(ctx context.Context, libra
 	return nil
 }
 
+// RepublishPendingLibrary republishes every library item currently flagged
+// as pending republish (e.g. after a bulk repair scan identifies missing
+// symlinks). Individual item failures are recorded in the returned
+// BulkRepublishResult rather than aborting the batch.
 func (p *Publisher) RepublishPendingLibrary(ctx context.Context) (BulkRepublishResult, error) {
 	targets, err := p.repo.ListPendingRepublishTargets(ctx)
 	if err != nil {
@@ -390,6 +422,10 @@ func (p *Publisher) fulfillSeasonPackEpisodes(ctx context.Context, selectedRelea
 	}
 }
 
+// libraryPathFor computes the host-visible library symlink path for file,
+// based on its media type and metadata. Returns "" when the file lacks
+// enough metadata (title/year/ID, or season/episode for TV) to construct a
+// path, signaling the caller to skip publishing a symlink for it.
 func (p *Publisher) libraryPathFor(file database.ReleaseVirtualFile) string {
 	switch strings.ToLower(file.MediaType) {
 	case "movie":

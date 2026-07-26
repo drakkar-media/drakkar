@@ -56,6 +56,10 @@ func DetectImportedArchives(files []ImportedNZBFile) []ImportedArchive {
 	return out
 }
 
+// detectArchiveVolume tries each known archive naming convention in turn and
+// reports the archive group key, kind, and volume descriptor for the first
+// one that matches. Returns ok=false for filenames that aren't part of any
+// recognized RAR/7z volume set.
 func detectArchiveVolume(name string) (string, string, ImportedArchiveVolume, bool) {
 	if key, volume, ok := detectRARVolume(name); ok {
 		return key, "rar", volume, true
@@ -66,6 +70,14 @@ func detectArchiveVolume(name string) (string, string, ImportedArchiveVolume, bo
 	return "", "", ImportedArchiveVolume{}, false
 }
 
+// detectRARVolume recognizes the three RAR volume naming conventions in use:
+// modern "*.partNN.rar" (1-indexed in the filename, stored 0-indexed),
+// a lone "*.rar" (single-volume archive, index 0), and legacy "*.rNN"
+// continuation volumes. Legacy numbering is offset by +1 (VolumeIndex =
+// number+1) because the first volume of that scheme is the separate ".rar"
+// file (index 0); ".r00" is the second volume (index 1), ".r01" the third,
+// and so on -- the archive group key returned is the shared basename all
+// volumes of the set sort under.
 func detectRARVolume(name string) (string, ImportedArchiveVolume, bool) {
 	base := filepath.Base(strings.TrimSpace(name))
 	lower := strings.ToLower(base)
@@ -95,6 +107,9 @@ func detectRARVolume(name string) (string, ImportedArchiveVolume, bool) {
 	return "", ImportedArchiveVolume{}, false
 }
 
+// detect7zVolume recognizes a lone "*.7z" (single-volume archive, index 0) or
+// a "*.7z.NNN" split-volume continuation part (1-indexed in the filename,
+// stored 0-indexed), returning the shared basename as the archive group key.
 func detect7zVolume(name string) (string, ImportedArchiveVolume, bool) {
 	base := filepath.Base(strings.TrimSpace(name))
 	lower := strings.ToLower(base)

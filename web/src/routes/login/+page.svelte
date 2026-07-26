@@ -1,4 +1,11 @@
 <script lang="ts">
+  /**
+   * Renders the sign-in form and authenticates against the session cookie API.
+   *
+   * Posts credentials to `/api/auth/login`; on success it redirects to the
+   * dashboard, replacing the current history entry so the login page is not
+   * reachable via back navigation.
+   */
   import { goto } from '$app/navigation';
   import DrakkarLogo from '$lib/components/DrakkarLogo.svelte';
 

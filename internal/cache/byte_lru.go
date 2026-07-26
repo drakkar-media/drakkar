@@ -20,6 +20,15 @@ import (
 // high-concurrency cache design for this reason.
 const byteLRUShardCount = 32
 
+// ByteLRU is an in-memory, size-bounded LRU cache of byte slices.
+//
+// It shards its storage across byteLRUShardCount independent locks (keyed by
+// a hash of the cache key) to avoid the single-mutex contention that made
+// this cache a bottleneck under concurrent streaming load. Eviction is exact
+// LRU order within a shard but only approximate globally, since each shard
+// enforces its own byte budget independently.
+//
+// ByteLRU is safe for concurrent use.
 type ByteLRU struct {
 	seed   maphash.Seed
 	shards [byteLRUShardCount]*byteLRUShard
@@ -38,6 +47,9 @@ type byteEntry struct {
 	value []byte
 }
 
+// NewByteLRU creates a ByteLRU with maxBytes total capacity, divided evenly
+// across the internal shards. A maxBytes <= 0 disables eviction (unbounded
+// cache).
 func NewByteLRU(maxBytes int64) *ByteLRU {
 	perShard := maxBytes / byteLRUShardCount
 	if maxBytes > 0 && perShard < 1 {
@@ -69,6 +81,10 @@ func (c *ByteLRU) Get(key string) ([]byte, bool) {
 	return c.shardFor(key).get(key)
 }
 
+// Put stores a clone of value under key, evicting least-recently-used
+// entries from the same shard if doing so exceeds that shard's byte budget.
+// The input slice is copied, so the caller's buffer can be reused or
+// mutated after Put returns without affecting the cached value.
 func (c *ByteLRU) Put(key string, value []byte) {
 	c.shardFor(key).put(key, value)
 }

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,13 +25,13 @@ const (
 
 // Event carries the data for a notification.
 type Event struct {
-	Type        EventType
-	Title       string
-	MediaType   string // "movie" or "episode"
-	Resolution  string
-	Indexer     string
-	Score       int
-	FailReason  string
+	Type       EventType
+	Title      string
+	MediaType  string // "movie" or "episode"
+	Resolution string
+	Indexer    string
+	Score      int
+	FailReason string
 }
 
 // Config holds per-provider notification settings.
@@ -48,49 +49,73 @@ type Config struct {
 }
 
 // Notifier dispatches notifications according to Config.
+//
+// Notifier is safe for concurrent use. Config is held behind an
+// atomic.Pointer so SetConfig can hot-swap settings (e.g. after a settings
+// save) without locking, and concurrent Send calls always observe a
+// consistent, fully-populated Config rather than a partially updated one.
 type Notifier struct {
-	cfg    Config
+	cfg    atomic.Pointer[Config]
 	client *http.Client
 	log    *slog.Logger
 }
 
+// New creates a Notifier configured with cfg and log.
+//
+// If log is nil, slog.Default() is used instead.
 func New(cfg Config, log *slog.Logger) *Notifier {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Notifier{
-		cfg:    cfg,
+	n := &Notifier{
 		client: &http.Client{Timeout: 10 * time.Second},
 		log:    log,
 	}
+	n.SetConfig(cfg)
+	return n
+}
+
+// SetConfig updates notification settings live, e.g. after a settings save.
+func (n *Notifier) SetConfig(cfg Config) {
+	n.cfg.Store(&cfg)
+}
+
+// getConfig returns the currently active Config, or the zero value if
+// SetConfig has never been called (all providers disabled).
+func (n *Notifier) getConfig() Config {
+	if v := n.cfg.Load(); v != nil {
+		return *v
+	}
+	return Config{}
 }
 
 // Send dispatches an event to all configured providers.
 // Errors are logged but not returned — notifications are best-effort.
 func (n *Notifier) Send(ctx context.Context, ev Event) {
-	if !n.shouldSend(ev.Type) {
+	cfg := n.getConfig()
+	if !n.shouldSend(cfg, ev.Type) {
 		return
 	}
-	if n.cfg.DiscordWebhookURL != "" {
-		if err := n.sendDiscord(ctx, ev); err != nil {
+	if cfg.DiscordWebhookURL != "" {
+		if err := n.sendDiscord(ctx, cfg, ev); err != nil {
 			n.log.Warn("discord notification failed", "error", err, "event", ev.Type)
 		}
 	}
-	if n.cfg.GenericWebhookURL != "" {
-		if err := n.sendGeneric(ctx, ev); err != nil {
+	if cfg.GenericWebhookURL != "" {
+		if err := n.sendGeneric(ctx, cfg, ev); err != nil {
 			n.log.Warn("webhook notification failed", "error", err, "event", ev.Type)
 		}
 	}
 }
 
-func (n *Notifier) shouldSend(t EventType) bool {
+func (n *Notifier) shouldSend(cfg Config, t EventType) bool {
 	switch t {
 	case EventGrab:
-		return n.cfg.OnGrab
+		return cfg.OnGrab
 	case EventAvailable:
-		return n.cfg.OnAvailable
+		return cfg.OnAvailable
 	case EventFailed:
-		return n.cfg.OnFailed
+		return cfg.OnFailed
 	}
 	return false
 }
@@ -115,7 +140,7 @@ type discordPayload struct {
 	Embeds   []discordEmbed `json:"embeds"`
 }
 
-func (n *Notifier) sendDiscord(ctx context.Context, ev Event) error {
+func (n *Notifier) sendDiscord(ctx context.Context, cfg Config, ev Event) error {
 	color, label := eventMeta(ev.Type)
 	embed := discordEmbed{
 		Title: fmt.Sprintf("%s – %s", label, ev.Title),
@@ -131,7 +156,7 @@ func (n *Notifier) sendDiscord(ctx context.Context, ev Event) error {
 		embed.Fields = append(embed.Fields, discordEmbedField{Name: "Reason", Value: ev.FailReason, Inline: false})
 	}
 	payload := discordPayload{Username: "Drakkar", Embeds: []discordEmbed{embed}}
-	return n.post(ctx, n.cfg.DiscordWebhookURL, payload)
+	return n.post(ctx, cfg.DiscordWebhookURL, payload)
 }
 
 // ── Generic webhook ──────────────────────────────────────────────────────────
@@ -146,7 +171,7 @@ type genericPayload struct {
 	FailReason string `json:"failReason,omitempty"`
 }
 
-func (n *Notifier) sendGeneric(ctx context.Context, ev Event) error {
+func (n *Notifier) sendGeneric(ctx context.Context, cfg Config, ev Event) error {
 	payload := genericPayload{
 		EventType:  string(ev.Type),
 		Title:      ev.Title,
@@ -156,7 +181,7 @@ func (n *Notifier) sendGeneric(ctx context.Context, ev Event) error {
 		Score:      ev.Score,
 		FailReason: ev.FailReason,
 	}
-	return n.post(ctx, n.cfg.GenericWebhookURL, payload)
+	return n.post(ctx, cfg.GenericWebhookURL, payload)
 }
 
 // ── HTTP helper ──────────────────────────────────────────────────────────────

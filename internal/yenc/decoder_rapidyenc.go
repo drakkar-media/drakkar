@@ -10,6 +10,9 @@ import (
 	rapidyenc "github.com/mnightingale/rapidyenc"
 )
 
+// Sentinel errors returned by DecodeArticle/DecodeArticleWithInfo, identical
+// to the purego build's errors of the same name (see decoder_purego.go) so
+// callers can match on them regardless of which decoder was compiled in.
 var (
 	ErrMissingBegin = errors.New("yenc begin header missing")
 	ErrMissingEnd   = errors.New("yenc end footer missing")
@@ -23,6 +26,15 @@ func DecoderInfo() string {
 	return "rapidyenc (" + rapidyenc.DecodeKernel() + ")"
 }
 
+// DecodeArticle decodes a yEnc-encoded NNTP article body via the
+// rapidyenc SIMD decoder and verifies its CRC32 against the "=yend " footer,
+// matching the purego build's function of the same name — see
+// decoder_purego.go.
+//
+// Errors:
+//   - ErrMissingBegin: no "=ybegin " header line found.
+//   - ErrMissingEnd: no "=yend " footer line found after the header.
+//   - ErrCRCMismatch: decoded payload fails CRC verification.
 func DecodeArticle(body []byte) ([]byte, error) {
 	return decodeArticleRapid(body, splitLines(body))
 }
@@ -40,6 +52,14 @@ func DecodeArticleWithInfo(body []byte) ([]byte, PartInfo, error) {
 	return decoded, info, nil
 }
 
+// decodeArticleRapid decodes body via the rapidyenc C library and verifies
+// its CRC32 against the footer found in lines.
+//
+// rapidyenc.Decoder expects an NNTP multiline-body stream terminated by the
+// standard ".\r\n" end marker, which has already been stripped by the
+// transport layer by the time body reaches this package — the terminator is
+// re-appended here purely to satisfy the decoder's framing, not to signal
+// real dot-stuffed content.
 func decodeArticleRapid(body []byte, lines [][]byte) ([]byte, error) {
 	stream := make([]byte, 0, len(body)+3)
 	stream = append(stream, body...)
@@ -62,6 +82,10 @@ func decodeArticleRapid(body []byte, lines [][]byte) ([]byte, error) {
 	return response.Data, nil
 }
 
+// mapRapidYencError translates rapidyenc's own error types (and, as a
+// fallback, its error message text for cases the library does not expose a
+// typed error for) into this package's sentinel errors, so callers see the
+// same error values regardless of which decoder build is active.
 func mapRapidYencError(err error) error {
 	if err == nil {
 		return nil

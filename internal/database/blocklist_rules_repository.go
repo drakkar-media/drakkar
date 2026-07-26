@@ -2,6 +2,9 @@ package database
 
 import "context"
 
+// ListReleaseBlockRules returns every release block rule (both built-in
+// defaults and custom user rules), source-priority first then grouped by
+// type and pattern.
 func (db *DB) ListReleaseBlockRules(ctx context.Context) ([]ReleaseBlockRule, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT id, rule_type, pattern, media_type, action, score_penalty, enabled, source, note, created_at, updated_at
@@ -23,6 +26,9 @@ func (db *DB) ListReleaseBlockRules(ctx context.Context) ([]ReleaseBlockRule, er
 	return out, rows.Err()
 }
 
+// UpsertReleaseBlockRule inserts a new user-defined release block rule. It
+// always creates the rule with source 'custom' -- only custom rules can be
+// created through this path; built-in default rules are seeded separately.
 func (db *DB) UpsertReleaseBlockRule(ctx context.Context, r ReleaseBlockRule) (ReleaseBlockRule, error) {
 	var out ReleaseBlockRule
 	err := db.SQL.QueryRowContext(ctx, `

@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 )
 
+// ListVirtualFilesForRelease returns every virtual file published under the
+// given selected release, joined with the owning library item's movie or
+// episode metadata, ordered by path.
 func (db *DB) ListVirtualFilesForRelease(ctx context.Context, selectedReleaseID int64) ([]ReleaseVirtualFile, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select
@@ -87,6 +90,9 @@ func (db *DB) DeleteSymlinkPublicationsForLibraryItem(ctx context.Context, libra
 	return paths, rows.Err()
 }
 
+// UpsertSymlinkPublication creates the symlink_publications row for a
+// (library item, library path) pair, or repoints an existing one at a new
+// virtual file and target path.
 func (db *DB) UpsertSymlinkPublication(ctx context.Context, libraryItemID, virtualFileID int64, libraryPath, targetPath string) error {
 	_, err := db.SQL.ExecContext(ctx, `
 		insert into symlink_publications (library_item_id, virtual_file_id, library_path, target_path)
@@ -100,6 +106,8 @@ func (db *DB) UpsertSymlinkPublication(ctx context.Context, libraryItemID, virtu
 	return err
 }
 
+// MarkReleaseAvailable marks the queue item and its library item available
+// for the given selected release.
 func (db *DB) MarkReleaseAvailable(ctx context.Context, selectedReleaseID int64) error {
 	// Clear failure_reason too: without this, an item that failed on an
 	// earlier candidate and later succeeded on a different one keeps
@@ -123,6 +131,8 @@ func (db *DB) MarkReleaseAvailable(ctx context.Context, selectedReleaseID int64)
 	return err
 }
 
+// ListCompletedSymlinkEntries returns every symlink_publications row, with
+// Name derived from the library path's base filename.
 func (db *DB) ListCompletedSymlinkEntries(ctx context.Context) ([]CompletedSymlinkEntry, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select id, library_path, target_path
@@ -152,6 +162,8 @@ type SymlinkPublication struct {
 	TargetPath  string
 }
 
+// GetSymlinkPathsForLibraryItem returns the published symlink library paths
+// for the given library item.
 func (db *DB) GetSymlinkPathsForLibraryItem(ctx context.Context, libraryItemID int64) ([]string, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select library_path
@@ -172,6 +184,8 @@ func (db *DB) GetSymlinkPathsForLibraryItem(ctx context.Context, libraryItemID i
 	return out, rows.Err()
 }
 
+// ListSymlinkPublications returns every symlink_publications row, ordered by
+// library path.
 func (db *DB) ListSymlinkPublications(ctx context.Context) ([]SymlinkPublication, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select library_path, target_path
@@ -193,6 +207,9 @@ func (db *DB) ListSymlinkPublications(ctx context.Context) ([]SymlinkPublication
 	return out, rows.Err()
 }
 
+// ListSelectedReleasesForPublication returns selected_release IDs that still
+// need publication work: those with a queue item mid-pipeline, or marked
+// available/degraded but still missing a symlink_publications row.
 func (db *DB) ListSelectedReleasesForPublication(ctx context.Context) ([]int64, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select distinct vf.selected_release_id
@@ -227,6 +244,9 @@ func (db *DB) ListSelectedReleasesForPublication(ctx context.Context) ([]int64, 
 	return out, rows.Err()
 }
 
+// ListSelectedReleasesByLibraryItem returns all selected_release IDs for a
+// library item that have virtual files, sorted so the release the current
+// queue item points to comes last and wins any publish-time overwrite.
 func (db *DB) ListSelectedReleasesByLibraryItem(ctx context.Context, libraryItemID int64) ([]int64, error) {
 	// The DISTINCT + sort_rank must live in the inner query together --
 	// Postgres rejects "for SELECT DISTINCT, ORDER BY expressions must
@@ -393,6 +413,10 @@ func (db *DB) FindSourceSelectedReleaseForItem(ctx context.Context, libraryItemI
 	return id, err
 }
 
+// ListPendingRepublishTargets returns library items whose publication state
+// needs reconciling: still mid-pipeline and not yet available, marked
+// available but missing a symlink, or available with a symlink that no
+// longer points at the current selected release.
 func (db *DB) ListPendingRepublishTargets(ctx context.Context) ([]PendingRepublishTarget, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		-- Items stuck in active queue states but not yet marked available

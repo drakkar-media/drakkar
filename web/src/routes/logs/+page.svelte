@@ -1,4 +1,13 @@
 <script lang="ts">
+  /**
+   * Displays recent backend log lines with level/text filtering and download.
+   *
+   * Polls the log API every 30s while the tab is visible. Entries are parsed
+   * from raw JSON log lines into plain objects up front and reassigned as a
+   * fresh array on every load — this avoids a Svelte 5 legacy-mode reactivity
+   * gap where a derived `rawLines → parsed → filtered` chain failed to
+   * re-trigger; see inline comments below for why this shape was chosen.
+   */
   import { onMount } from 'svelte';
   import Download from '@lucide/svelte/icons/download';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';

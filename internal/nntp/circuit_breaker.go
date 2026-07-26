@@ -60,6 +60,8 @@ type providerCircuitBreaker struct {
 	state map[string]*breakerState
 }
 
+// newProviderCircuitBreaker creates an empty breaker with no providers
+// recorded as unhealthy.
 func newProviderCircuitBreaker() *providerCircuitBreaker {
 	return &providerCircuitBreaker{state: make(map[string]*breakerState)}
 }

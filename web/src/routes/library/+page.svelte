@@ -1,4 +1,16 @@
 <script lang="ts">
+  /**
+   * Displays the monitored media library as a filterable, paginated poster grid.
+   *
+   * Supports searching by title, filtering by kind (movie/TV) and state
+   * (available/downloading/missing), and triggering background Seerr sync and
+   * pending-search jobs. Filter/page state is mirrored to the URL query string
+   * (see `syncUrl`/`onMount`) so links are bookmarkable and shareable. While a
+   * background job is in flight, incoming SSE events and the 30s polling
+   * refresh are suppressed to avoid clobbering the "working" state; a
+   * debounced reload picks up the result once the job's completion event
+   * arrives.
+   */
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';

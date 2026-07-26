@@ -1,7 +1,12 @@
 <script lang="ts">
+  /**
+   * Compact stat tile: a label, a large value, and an optional detail line.
+   * Used in dashboard-style summary grids.
+   */
   export let label = '';
   export let value: string | number = '';
   export let detail = '';
+  /** Highlights the card with an accent border/background, for a standout metric. */
   export let accent = false;
 </script>
 

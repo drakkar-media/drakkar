@@ -7,6 +7,8 @@ import (
 	"strings"
 )
 
+// ListSubtitleFiles returns all subtitle_files rows for a library item,
+// ordered by language, provider, and path.
 func (db *DB) ListSubtitleFiles(ctx context.Context, libraryItemID int64) ([]SubtitleFileSummary, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select id, library_item_id, provider, language, path, created_at
@@ -30,6 +32,8 @@ func (db *DB) ListSubtitleFiles(ctx context.Context, libraryItemID int64) ([]Sub
 	return out, rows.Err()
 }
 
+// ListSubtitleCandidates returns all subtitle_candidates rows for a library
+// item, best-scoring first.
 func (db *DB) ListSubtitleCandidates(ctx context.Context, libraryItemID int64) ([]SubtitleCandidateSummary, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select id, library_item_id, provider, language, title, release_name, format, hearing_impaired, score, external_id, download_url, created_at
@@ -66,6 +70,7 @@ func (db *DB) ListSubtitleCandidates(ctx context.Context, libraryItemID int64) (
 	return out, rows.Err()
 }
 
+// GetSubtitleCandidate returns the subtitle_candidates row with the given ID.
 func (db *DB) GetSubtitleCandidate(ctx context.Context, candidateID int64) (SubtitleCandidateSummary, error) {
 	var item SubtitleCandidateSummary
 	err := db.SQL.QueryRowContext(ctx, `
@@ -89,6 +94,8 @@ func (db *DB) GetSubtitleCandidate(ctx context.Context, candidateID int64) (Subt
 	return item, err
 }
 
+// ListPublicationPathsForLibraryItem returns the published symlink library
+// paths for a library item, ordered by path.
 func (db *DB) ListPublicationPathsForLibraryItem(ctx context.Context, libraryItemID int64) ([]string, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select library_path
@@ -112,6 +119,9 @@ func (db *DB) ListPublicationPathsForLibraryItem(ctx context.Context, libraryIte
 	return out, rows.Err()
 }
 
+// GetSubtitleSearchInput returns the movie/show/episode identifying
+// metadata for a library item, used to build subtitle-provider search
+// queries.
 func (db *DB) GetSubtitleSearchInput(ctx context.Context, libraryItemID int64) (SubtitleSearchInput, error) {
 	var item SubtitleSearchInput
 	err := db.SQL.QueryRowContext(ctx, `
@@ -146,6 +156,8 @@ func (db *DB) GetSubtitleSearchInput(ctx context.Context, libraryItemID int64) (
 	return item, err
 }
 
+// ReplaceSubtitleCandidates atomically replaces all subtitle_candidates rows
+// for a library item and provider with the given list.
 func (db *DB) ReplaceSubtitleCandidates(ctx context.Context, libraryItemID int64, provider string, candidates []SubtitleCandidateRecord) error {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
@@ -191,6 +203,8 @@ func (db *DB) ReplaceSubtitleCandidates(ctx context.Context, libraryItemID int64
 	return nil
 }
 
+// ReplaceSubtitleFiles atomically replaces all subtitle_files rows for a
+// library item, provider, and language with the given list of paths.
 func (db *DB) ReplaceSubtitleFiles(ctx context.Context, libraryItemID int64, provider, language string, paths []string) error {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
@@ -338,6 +352,10 @@ func (db *DB) ListSubtitleLibrary(ctx context.Context, filter SubtitleLibraryFil
 	}, nil
 }
 
+// DeleteSubtitleFile deletes every subtitle_files row sharing the same
+// library item, provider, and language as the given subtitle ID -- the
+// whole subtitle group, not just that one row -- and returns the group's
+// paths for the caller to remove from disk.
 func (db *DB) DeleteSubtitleFile(ctx context.Context, subtitleID int64) (SubtitleDeleteGroup, error) {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {

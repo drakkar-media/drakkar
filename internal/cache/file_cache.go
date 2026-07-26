@@ -41,11 +41,13 @@ type fileCacheEntry struct {
 	size int64
 }
 
+// DirStats summarizes the current size of a FileCache directory.
 type DirStats struct {
 	Files int   `json:"files"`
 	Bytes int64 `json:"bytes"`
 }
 
+// PruneResult reports the effect of a manual FileCache.Prune call.
 type PruneResult struct {
 	Root         string `json:"root"`
 	FilesBefore  int    `json:"filesBefore"`
@@ -57,6 +59,9 @@ type PruneResult struct {
 	LimitBytes   int64  `json:"limitBytes"`
 }
 
+// NewFileCache creates a FileCache rooted at the given directory with a
+// total size budget of maxBytes. The directory's existing contents (if any)
+// are not indexed until the first Get/Put/Stats call, via ensureSeeded.
 func NewFileCache(root string, maxBytes int64) *FileCache {
 	return &FileCache{
 		root:     root,
@@ -112,6 +117,10 @@ func (c *FileCache) ensureSeeded() error {
 	return c.seedErr
 }
 
+// Get reads the cached value for key from disk, if present. A cache hit
+// updates the file's mtime and moves it to the most-recently-used end of
+// the eviction order. A missing file is reported as (nil, false, nil), not
+// an error.
 func (c *FileCache) Get(key string) ([]byte, bool, error) {
 	if err := c.ensureSeeded(); err != nil {
 		return nil, false, err
@@ -134,6 +143,9 @@ func (c *FileCache) Get(key string) ([]byte, bool, error) {
 	return data, true, nil
 }
 
+// Put writes value to disk under key via a write-to-temp-then-rename
+// sequence (so a concurrent Get never observes a partially written file),
+// updates the in-memory size index, and triggers Trim to enforce maxBytes.
 func (c *FileCache) Put(key string, value []byte) error {
 	if err := c.ensureSeeded(); err != nil {
 		return err
@@ -166,6 +178,7 @@ func (c *FileCache) Put(key string, value []byte) error {
 	return c.Trim()
 }
 
+// Stats returns the current file count and total size tracked by the cache.
 func (c *FileCache) Stats() (DirStats, error) {
 	if err := c.ensureSeeded(); err != nil {
 		return DirStats{}, err
@@ -210,6 +223,9 @@ func (c *FileCache) Trim() error {
 	}
 }
 
+// Prune forces an eviction pass (via Trim) and reports the before/after
+// size and file count. Intended for manual/administrative invocation
+// outside the normal Put-triggered eviction path.
 func (c *FileCache) Prune() (PruneResult, error) {
 	before, err := c.Stats()
 	if err != nil {

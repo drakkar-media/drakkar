@@ -9,8 +9,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/drakkar-media/drakkar/internal/privacy/wireguard"
 )
 
+// Default* constants provide the fallback values applied by applyDefaults
+// and DefaultRuntime when settings.json omits a field or is being created
+// for the first time (see LoadOrCreate). They mirror the Docker Compose
+// volume layout under /mnt/drakkar and /app/data.
 const (
 	DefaultSettingsPath         = "/app/data/settings.json"
 	DefaultFuseMountPath        = "/mnt/drakkar/vfs"
@@ -34,6 +40,9 @@ const (
 	DefaultArticleBufferSize    = 40
 )
 
+// Settings is the complete, persisted application configuration. It is the
+// on-disk (settings.json) and in-memory representation of every user-facing
+// setting, and is loaded via Load/LoadOrCreate and persisted via Save.
 type Settings struct {
 	Database      DatabaseConfig      `json:"database"`
 	Valkey        ValkeyConfig        `json:"valkey"`
@@ -49,7 +58,46 @@ type Settings struct {
 	Notifications NotificationsConfig `json:"notifications"`
 	Rclone        RcloneConfig        `json:"rclone"`
 	Logging       LoggingConfig       `json:"logging"`
+	Privacy       PrivacyConfig       `json:"privacy"`
 }
+
+// PrivacyConfig selects how Usenet/NNTP and NZB-indexer HTTP traffic is
+// routed: "direct" (today's behavior, default), "socks5", or "wireguard".
+// Exactly one mode is active at a time. ExcludedIndexers lists indexer
+// names (matched against a release candidate's IndexerName) whose NZB
+// downloads always use a direct connection regardless of Mode -- useful
+// for a private/trusted indexer the user doesn't want routed.
+type PrivacyConfig struct {
+	Mode             string                 `json:"mode"`
+	SOCKS5           PrivacySOCKS5Config    `json:"socks5"`
+	WireGuard        PrivacyWireGuardConfig `json:"wireguard"`
+	ExcludedIndexers []string               `json:"excludedIndexers,omitempty"`
+}
+
+// PrivacySOCKS5Config holds the connection settings for routing traffic
+// through a SOCKS5 proxy when PrivacyConfig.Mode is PrivacyModeSOCKS5.
+type PrivacySOCKS5Config struct {
+	Host           string `json:"host"`
+	Port           int    `json:"port"`
+	Username       string `json:"username,omitempty"`
+	Password       string `json:"password,omitempty"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
+}
+
+// PrivacyWireGuardConfig stores the raw imported .conf text server-side.
+// ConfigText is never round-tripped with its secrets intact -- see
+// RedactSecrets/MergeSecrets below -- the frontend instead reads a
+// sanitized summary from GET /api/settings/privacy/status.
+type PrivacyWireGuardConfig struct {
+	ConfigText     string `json:"configText,omitempty"`
+	TimeoutSeconds int    `json:"timeoutSeconds"`
+}
+
+const (
+	PrivacyModeDirect    = "direct"
+	PrivacyModeSOCKS5    = "socks5"
+	PrivacyModeWireGuard = "wireguard"
+)
 
 // LoggingConfig controls the runtime log verbosity, hot-reloadable without a
 // restart. Level accepts "trace", "debug", "info" (default), "warn", "error".
@@ -126,6 +174,10 @@ type IndexerConfig struct {
 	ReleaseGraceHours int `json:"releaseGraceHours"`
 }
 
+// DefaultIndexerConfig returns the IndexerConfig defaults applied by
+// applyDefaults when settings.json omits (or zero-values) an indexer field.
+// Values mirror Sonarr/Radarr's own indexer defaults where an equivalent
+// setting exists.
 func DefaultIndexerConfig() IndexerConfig {
 	return IndexerConfig{
 		TvRssSyncIntervalMinutes:    15,
@@ -155,6 +207,7 @@ type JellyfinConfig struct {
 	APIKey string `json:"apiKey"` // Jellyfin API key
 }
 
+// DatabaseConfig holds the PostgreSQL connection settings.
 type DatabaseConfig struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
@@ -163,12 +216,17 @@ type DatabaseConfig struct {
 	Password string `json:"password"`
 }
 
+// ValkeyConfig holds the Valkey (Redis-compatible) connection settings used
+// for caching and the BullMQ-backed background job queues.
 type ValkeyConfig struct {
 	Host     string `json:"host"`
 	Port     int    `json:"port"`
 	Password string `json:"password"`
 }
 
+// ServiceConfig holds the connection and cache-tuning settings shared by the
+// NZBHydra2 and Seerr integrations. Search/feed results are cached for the
+// configured TTLs to avoid re-querying the upstream service on every request.
 type ServiceConfig struct {
 	URL                   string `json:"url"`
 	APIKey                string `json:"apiKey"`
@@ -177,6 +235,8 @@ type ServiceConfig struct {
 	FeedMaxResults        int    `json:"feedMaxResults"`
 }
 
+// UsenetConfig controls download concurrency and holds the list of
+// configured Usenet (NNTP) providers used for article retrieval.
 type UsenetConfig struct {
 	MaxDownloadConnections int              `json:"maxDownloadConnections"`
 	StreamingPriorityPct   int              `json:"streamingPriorityPercent"`
@@ -184,6 +244,10 @@ type UsenetConfig struct {
 	Providers              []UsenetProvider `json:"providers"`
 }
 
+// UsenetProvider describes a single NNTP server connection. Enabled allows a
+// provider to be kept in configuration while temporarily excluded from use;
+// disabled and unreachable-looking providers (missing host/credentials) are
+// skipped when wiring up article clients (see app.go).
 type UsenetProvider struct {
 	Name           string `json:"name"`
 	Host           string `json:"host"`
@@ -198,6 +262,8 @@ type UsenetProvider struct {
 	Enabled        bool   `json:"enabled"`
 }
 
+// MetadataConfig holds the TMDB/TVDB API credentials and metadata lookup
+// settings used to enrich library items with titles, artwork, and air dates.
 type MetadataConfig struct {
 	TMDB          APIKeyConfig `json:"tmdb"`
 	TVDB          APIKeyConfig `json:"tvdb"`
@@ -205,21 +271,30 @@ type MetadataConfig struct {
 	CacheTTLHours int          `json:"cacheTtlHours"`
 }
 
+// LibraryConfig holds the default quality profiles applied to newly added
+// movies and TV shows when no profile is explicitly selected.
 type LibraryConfig struct {
 	DefaultMovieProfile string `json:"defaultMovieProfile"`
 	DefaultTvProfile    string `json:"defaultTvProfile"`
 }
 
+// APIKeyConfig wraps a single API key credential for a metadata provider.
 type APIKeyConfig struct {
 	APIKey string `json:"apiKey"`
 }
 
+// SubtitlesConfig controls whether subtitle downloading is enabled, which
+// languages to fetch, and the per-provider credentials keyed by provider
+// name (e.g. "subdl", "opensubtitles").
 type SubtitlesConfig struct {
 	Enabled   bool                    `json:"enabled"`
 	Languages []string                `json:"languages"`
 	Providers map[string]SubtitleAuth `json:"providers"`
 }
 
+// SubtitleAuth holds the enable flag and credentials for one subtitle
+// provider. Not every provider uses every field (e.g. API-key-only
+// providers leave Username/Password empty).
 type SubtitleAuth struct {
 	Enabled  bool   `json:"enabled"`
 	APIKey   string `json:"apiKey"`
@@ -227,6 +302,10 @@ type SubtitleAuth struct {
 	Password string `json:"password"`
 }
 
+// Runtime holds the process-level filesystem paths and cache size limits
+// that are fixed for the lifetime of the process (unlike Settings, which is
+// hot-reloadable). These are derived from command-line flags/environment at
+// startup, defaulting to the Default* constants via DefaultRuntime.
 type Runtime struct {
 	SettingsPath           string
 	HTTPAddress            string
@@ -247,6 +326,8 @@ type Runtime struct {
 	NZBUploadLimitBytes    int64
 }
 
+// DefaultRuntime returns a Runtime populated with the Docker-Compose-
+// compatible default paths and cache limits.
 func DefaultRuntime() Runtime {
 	return Runtime{
 		SettingsPath:           DefaultSettingsPath,
@@ -269,6 +350,17 @@ func DefaultRuntime() Runtime {
 	}
 }
 
+// Load reads and parses the settings file at path.
+//
+// Unknown JSON fields are rejected to catch typos/renames in settings.json.
+// After decoding, applyDefaults fills any zero-valued field with its
+// documented default and validate enforces required fields and cross-field
+// constraints.
+//
+// Errors:
+//   - returns a wrapped os.ErrNotExist-compatible error if path does not
+//     exist (see LoadOrCreate, which handles that case).
+//   - returns a parse or validation error otherwise.
 func Load(path string) (Settings, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -309,6 +401,10 @@ func LoadOrCreate(path string) (Settings, error) {
 	return Load(path)
 }
 
+// defaultSettings builds the minimal Settings written to disk the first time
+// LoadOrCreate runs. Only the fields with no safe zero-value default
+// (database/valkey connection info) are set explicitly; everything else is
+// filled in by applyDefaults.
 func defaultSettings() Settings {
 	s := Settings{}
 	s.Database = DatabaseConfig{Host: "postgres", Port: 5432, Name: "drakkar", Username: "drakkar", Password: "change-me"}
@@ -317,6 +413,10 @@ func defaultSettings() Settings {
 	return s
 }
 
+// applyDefaults mutates cfg in place, replacing zero-valued fields with
+// their documented defaults. It is idempotent and safe to call on both
+// freshly-decoded settings (Load) and settings about to be persisted (Save),
+// so a partially-specified settings.json always ends up fully populated.
 func applyDefaults(cfg *Settings) {
 	if cfg == nil {
 		return
@@ -351,8 +451,20 @@ func applyDefaults(cfg *Settings) {
 	if cfg.Logging.Level == "" {
 		cfg.Logging.Level = "info"
 	}
+	if cfg.Privacy.Mode == "" {
+		cfg.Privacy.Mode = PrivacyModeDirect
+	}
+	if cfg.Privacy.SOCKS5.TimeoutSeconds <= 0 {
+		cfg.Privacy.SOCKS5.TimeoutSeconds = 15
+	}
+	if cfg.Privacy.WireGuard.TimeoutSeconds <= 0 {
+		cfg.Privacy.WireGuard.TimeoutSeconds = 15
+	}
 }
 
+// validate enforces required fields and cross-field constraints on cfg,
+// collecting every problem found rather than failing on the first, so a
+// single validation error can report all of them at once.
 func validate(cfg Settings) error {
 	var problems []string
 	if cfg.Database.Host == "" {
@@ -397,6 +509,20 @@ func validate(cfg Settings) error {
 			problems = append(problems, prefix+".maxConnections must be positive")
 		}
 	}
+	switch cfg.Privacy.Mode {
+	case "", PrivacyModeDirect:
+	case PrivacyModeSOCKS5:
+		if cfg.Privacy.SOCKS5.Host == "" || cfg.Privacy.SOCKS5.Port <= 0 {
+			problems = append(problems, "privacy.socks5.host and privacy.socks5.port are required when privacy.mode is socks5")
+		}
+	case PrivacyModeWireGuard:
+		if _, err := wireguard.ParseConfig(cfg.Privacy.WireGuard.ConfigText); err != nil {
+			problems = append(problems, fmt.Sprintf("privacy.wireguard.configText: %v", err))
+		}
+	default:
+		problems = append(problems, fmt.Sprintf("privacy.mode %q is not one of direct, socks5, wireguard", cfg.Privacy.Mode))
+	}
+
 	if len(problems) > 0 {
 		return errors.New(strings.Join(problems, "; "))
 	}
@@ -414,6 +540,14 @@ func validateURL(name, raw string) error {
 	return nil
 }
 
+// ValidatePaths checks that the configured library/cache/staging paths do
+// not overlap the FUSE mount itself.
+//
+// Writing into the FUSE-mounted virtual filesystem (rather than the real
+// backing directories it exposes) would corrupt the virtual view or create
+// unresolvable recursive paths, so every configured path must live outside
+// rt.FuseMountPath. The movie library path is additionally required to live
+// under /mnt/drakkar, matching the expected volume layout.
 func ValidatePaths(rt Runtime) error {
 	abs := func(path string) string {
 		out, err := filepath.Abs(path)
@@ -468,6 +602,11 @@ func Save(path string, cfg Settings) error {
 	return nil
 }
 
+// RedactedSettings builds a read-only, display-safe view of cfg for the
+// /api/status endpoint: every credential is replaced with the literal
+// string "***" so it is unambiguously masked rather than merely absent.
+// Unlike RedactSecrets (which blanks fields for a round-trippable edit
+// form), this output is never intended to be sent back to Save/MergeSecrets.
 func RedactedSettings(cfg Settings) map[string]any {
 	return map[string]any{
 		"database": map[string]any{
@@ -511,6 +650,19 @@ func RedactedSettings(cfg Settings) map[string]any {
 			"enabled":   cfg.Subtitles.Enabled,
 			"languages": append([]string(nil), cfg.Subtitles.Languages...),
 			"providers": redactSubtitleProviders(cfg.Subtitles.Providers),
+		},
+		"privacy": map[string]any{
+			"mode":             cfg.Privacy.Mode,
+			"excludedIndexers": append([]string(nil), cfg.Privacy.ExcludedIndexers...),
+			"socks5": map[string]any{
+				"host":     cfg.Privacy.SOCKS5.Host,
+				"port":     cfg.Privacy.SOCKS5.Port,
+				"username": cfg.Privacy.SOCKS5.Username,
+				"password": "***",
+			},
+			"wireguard": map[string]any{
+				"configured": cfg.Privacy.WireGuard.ConfigText != "",
+			},
 		},
 	}
 }
@@ -561,6 +713,8 @@ func RedactSecrets(cfg Settings) Settings {
 	redacted.Metadata.TVDB.APIKey = ""
 	redacted.Plex.Token = ""
 	redacted.Jellyfin.APIKey = ""
+	redacted.Privacy.SOCKS5.Password = ""
+	redacted.Privacy.WireGuard.ConfigText = ""
 
 	providers := make([]UsenetProvider, len(cfg.Usenet.Providers))
 	copy(providers, cfg.Usenet.Providers)
@@ -611,6 +765,12 @@ func MergeSecrets(current, incoming Settings) Settings {
 	}
 	if merged.Jellyfin.APIKey == "" {
 		merged.Jellyfin.APIKey = current.Jellyfin.APIKey
+	}
+	if merged.Privacy.SOCKS5.Password == "" {
+		merged.Privacy.SOCKS5.Password = current.Privacy.SOCKS5.Password
+	}
+	if merged.Privacy.WireGuard.ConfigText == "" {
+		merged.Privacy.WireGuard.ConfigText = current.Privacy.WireGuard.ConfigText
 	}
 
 	currentProvidersByName := make(map[string]UsenetProvider, len(current.Usenet.Providers))

@@ -1,4 +1,12 @@
 <script lang="ts">
+  /**
+   * Displays the paginated TMDB trending list (movies or TV, per the
+   * `mediaType` route param) with a "Load More" button.
+   *
+   * Reloads from page 1 whenever the route's mediaType changes (see the
+   * `routeKey` reactive block below), since this component instance is
+   * reused across /discover/movie ↔ /discover/tv navigations.
+   */
   import { page } from '$app/state';
   import PosterCard from '$lib/components/PosterCard.svelte';
   import { api } from '$lib/api';
@@ -14,6 +22,7 @@
   let mediaType: 'movie' | 'tv' = 'movie';
   let routeKey = '';
 
+  /** Adapts a TMDB discover result into the LibraryItem shape PosterCard expects, marked as not-in-library. */
   function asLibraryLike(item: DiscoverMediaItem): LibraryItem {
     return {
       id: 0,
@@ -55,6 +64,8 @@
     loadingMore = true;
     try {
       const result = await api.discoverList(mediaType, currentPage + 1);
+      // TMDB's trending pages can overlap (an item shifting pages between
+      // requests), so de-dupe the appended page against what's already shown.
       const seen = new Set(items.map((item) => `${item.mediaType}:${item.tmdbId ?? item.title}`));
       for (const item of result.items) {
         const key = `${item.mediaType}:${item.tmdbId ?? item.title}`;
@@ -72,6 +83,8 @@
     }
   }
 
+  // Re-run the initial load when navigating between mediaType route values,
+  // since SvelteKit reuses this component instance rather than remounting it.
   $: {
     const nextKey = page.params.mediaType ?? 'movie';
     if (nextKey !== routeKey) {

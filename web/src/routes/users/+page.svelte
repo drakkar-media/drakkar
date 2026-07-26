@@ -1,4 +1,11 @@
 <script lang="ts">
+  /**
+   * Displays operator account management (create/delete users, reset
+   * passwords) and personal API token management.
+   *
+   * A newly-created token's raw secret is only ever available in `createdToken`
+   * right after creation — the backend doesn't return it again afterwards.
+   */
   import { onMount } from 'svelte';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import Shield from '@lucide/svelte/icons/shield';

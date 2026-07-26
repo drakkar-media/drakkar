@@ -9,7 +9,11 @@ import CalendarDays from '@lucide/svelte/icons/calendar-days';
 import Users from '@lucide/svelte/icons/users';
 import Captions from '@lucide/svelte/icons/captions';
 
-// All nav items — shown in sidebar on desktop and in mobile drawer
+/**
+ * All primary navigation destinations, shown in the desktop sidebar and the
+ * mobile drawer. Order determines both display order and which items are
+ * promoted to {@link mobilePrimaryItems}.
+ */
 export const navItems = [
   { href: '/dashboard',  label: 'Dashboard',  icon: Gauge },
   { href: '/library',    label: 'Library',    icon: LibraryBig },
@@ -23,5 +27,8 @@ export const navItems = [
   { href: '/settings',   label: 'Settings',   icon: Settings2 },
 ] as const;
 
-// First 5 shown in mobile bottom bar; rest in drawer
+/**
+ * The first 5 {@link navItems}, shown directly in the mobile bottom bar.
+ * Remaining items are reachable only through the mobile drawer.
+ */
 export const mobilePrimaryItems = navItems.slice(0, 5);

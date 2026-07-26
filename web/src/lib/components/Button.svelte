@@ -1,4 +1,9 @@
 <script lang="ts">
+  /**
+   * Standard clickable button with primary/secondary/ghost/danger visual
+   * variants. Forwards event listeners and extra attributes, so it can be
+   * used as a drop-in replacement for a native <button>.
+   */
   export let kind: 'primary' | 'secondary' | 'ghost' | 'danger' = 'secondary';
   export let type: 'button' | 'submit' = 'button';
   export let disabled = false;

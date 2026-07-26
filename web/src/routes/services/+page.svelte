@@ -1,4 +1,13 @@
 <script lang="ts">
+  /**
+   * Displays connection/readiness status for every backend-dependent service
+   * (NZBHydra2, usenet providers, Seerr, metadata sources, VFS mount) plus
+   * live runtime metrics (NNTP connections, active streams, disk cache).
+   *
+   * State reloads on a debounced SSE event listener. "Probe Integrations"
+   * actively re-checks connectivity and refreshes status once the probe
+   * completes, rather than relying solely on cached configured/enabled flags.
+   */
   import { onMount } from 'svelte';
   import Database from '@lucide/svelte/icons/database';
   import FolderTree from '@lucide/svelte/icons/folder-tree';

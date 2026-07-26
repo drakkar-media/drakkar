@@ -23,7 +23,6 @@ import (
 
 	"os"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/drakkar-media/drakkar/internal/auth"
 	"github.com/drakkar-media/drakkar/internal/cache"
 	"github.com/drakkar-media/drakkar/internal/catalog"
@@ -38,31 +37,44 @@ import (
 	"github.com/drakkar-media/drakkar/internal/observability"
 	"github.com/drakkar-media/drakkar/internal/plex"
 	"github.com/drakkar-media/drakkar/internal/policy"
+	"github.com/drakkar-media/drakkar/internal/privacy"
 	"github.com/drakkar-media/drakkar/internal/probe"
 	"github.com/drakkar-media/drakkar/internal/seerr"
 	"github.com/drakkar-media/drakkar/internal/stream"
 	intsub "github.com/drakkar-media/drakkar/internal/subtitles"
 	"github.com/drakkar-media/drakkar/internal/version"
 	"github.com/drakkar-media/drakkar/internal/workflow"
+	"github.com/go-chi/chi/v5"
 )
 
+// StatusService defines the operation the router uses to report the
+// service's overall runtime status (health, version, active integrations).
 type StatusService interface {
 	Status() Status
 }
 
+// MetricsProvider defines the operations required to expose a snapshot of
+// runtime metrics. Router accepts zero or more, so metrics collection is
+// optional in deployments/tests that don't wire one up.
 type MetricsProvider interface {
 	Collect() metrics.Snapshot
 }
 
+// StreamsProvider defines the operations required to inspect and terminate
+// active media streaming sessions from the API/dashboard.
 type StreamsProvider interface {
 	ActiveSessions() []stream.SessionSnapshot
 	Stop(sessionID string)
 }
 
+// SpeedTestService defines the operation required to run an on-demand
+// Usenet provider speed test.
 type SpeedTestService interface {
 	RunSpeedTest(ctx context.Context) (database.SpeedTestResult, error)
 }
 
+// HealthRepository defines the read/write operations the router needs for
+// the health and consistency-check dashboards.
 type HealthRepository interface {
 	HealthSummary(ctx context.Context) (database.HealthSummary, error)
 	ListHealthEntries(ctx context.Context) ([]database.HealthEntry, error)
@@ -71,6 +83,11 @@ type HealthRepository interface {
 	RecordHealthCheck(ctx context.Context, publicationID int64, ok bool) error
 }
 
+// ProfilesRepository defines the persistence operations backing quality
+// profiles/definitions, custom formats, release block rules, indexer
+// policies, subtitle profiles, and the SABnzbd-compatible queue/history
+// views. It is the single dependency shared by handlers_profiles.go and
+// sabnzbd_handlers.go.
 type ProfilesRepository interface {
 	ListQualityProfiles(ctx context.Context) ([]database.QualityProfile, error)
 	UpsertQualityProfile(ctx context.Context, p database.QualityProfile) (database.QualityProfile, error)
@@ -104,6 +121,8 @@ type ProfilesRepository interface {
 	DismissSabItems(ctx context.Context, libraryItemIDs []int64) error
 }
 
+// QueueService defines the operations required to list, import, and cancel
+// download-queue items.
 type QueueService interface {
 	ListQueue(ctx context.Context) ([]database.QueueSnapshot, error)
 	ListLibraryItems(ctx context.Context) ([]database.LibraryItemSummary, error)
@@ -113,6 +132,8 @@ type QueueService interface {
 	CancelNZB(ctx context.Context, nzbDocumentID int64) error
 }
 
+// CatalogService defines the read operations backing the dashboard, library
+// browsing/search, discover (TMDB/TVDB lookup), and release-calendar views.
 type CatalogService interface {
 	Dashboard(ctx context.Context) (catalog.DashboardHome, error)
 	ListLibraryCards(ctx context.Context) ([]catalog.MediaCard, error)
@@ -124,6 +145,12 @@ type CatalogService interface {
 	ReleaseCalendar(ctx context.Context, month string) ([]catalog.CalendarEntry, error)
 }
 
+// WorkflowService defines the operations that drive the media acquisition
+// pipeline end to end: syncing requests from Seerr, searching indexers,
+// selecting/rejecting/retrying release candidates, managing the work queue,
+// backfilling metadata, and importing NZBs pushed from external clients
+// (e.g. the SABnzbd-compatible shim). It is the largest and most central
+// dependency of Router.
 type WorkflowService interface {
 	ListRequests(ctx context.Context) ([]database.MediaRequestSummary, error)
 	SyncRequests(ctx context.Context) (workflow.SyncResult, error)
@@ -156,22 +183,35 @@ type WorkflowService interface {
 	ResetOrphanedAvailableItems(ctx context.Context) (workflow.ResetOrphanedAvailableItemsResult, error)
 	PushMissingLibraryItemsToSeerr(ctx context.Context) (workflow.PushMissingToSeerrResult, error)
 	SyncPlexDetectedShows(ctx context.Context) (workflow.SyncPlexDetectedResult, error)
+	// ClaimURLForFetch atomically claims rawURL for a live fetch, returning
+	// true if another caller already holds the claim (and this caller must
+	// skip its own fetch to avoid a duplicate download from the indexer).
+	// Backed by Postgres so the claim survives a process restart, unlike an
+	// in-memory-only dedup guard.
 	ClaimURLForFetch(ctx context.Context, rawURL string) bool
 }
 
+// PublicationService defines the operations required to (re)publish library
+// items to the media server (Plex/Jellyfin) after their files change.
 type PublicationService interface {
 	RepublishLibraryItem(ctx context.Context, libraryItemID int64) error
 	RepublishPendingLibrary(ctx context.Context) (library.BulkRepublishResult, error)
 }
 
+// MaintenanceService defines the operation required to run a deep,
+// on-demand NZB health check across the library.
 type MaintenanceService interface {
 	DeepNZBHealthCheck(ctx context.Context) (maintenance.Result, error)
 }
 
+// CacheService defines the operation required to prune the on-disk segment
+// cache.
 type CacheService interface {
 	Prune(ctx context.Context) (cache.PruneResult, error)
 }
 
+// SubtitleService defines the operations required to list, search for,
+// download, and manage subtitles for library items.
 type SubtitleService interface {
 	ListSubtitles(ctx context.Context, libraryItemID int64) ([]database.SubtitleFileSummary, error)
 	ListCandidates(ctx context.Context, libraryItemID int64) ([]database.SubtitleCandidateSummary, error)
@@ -183,6 +223,9 @@ type SubtitleService interface {
 	ListLibraryState(ctx context.Context, filter database.SubtitleLibraryFilter) (database.SubtitleLibraryPage, error)
 }
 
+// BlocklistService defines the operations required to list, create, update,
+// and clear blocklist entries that prevent specific releases from being
+// re-selected.
 type BlocklistService interface {
 	List(ctx context.Context) ([]database.BlocklistItemSummary, error)
 	ListPaged(ctx context.Context, f database.BlocklistFilter) (database.BlocklistPage, error)
@@ -194,10 +237,16 @@ type BlocklistService interface {
 	ClearByReason(ctx context.Context, reason string) (database.BlocklistClearResult, error)
 }
 
+// IntegrationProbeService defines the operation required to actively probe
+// configured external integrations (indexer, metadata providers, media
+// servers) and report their reachability.
 type IntegrationProbeService interface {
 	Probe(ctx context.Context) (probe.Report, error)
 }
 
+// TaskSchedule describes one recurring background task for the
+// tasks/schedules dashboard: its display grouping, configured interval, and
+// most recent run outcome.
 type TaskSchedule struct {
 	ID           string     `json:"id"`
 	Label        string     `json:"label"`
@@ -208,15 +257,21 @@ type TaskSchedule struct {
 	LastRunState string     `json:"lastRunState"`
 }
 
+// TaskScheduleProvider defines the operation required to enumerate the
+// scheduled background tasks and their last-run status.
 type TaskScheduleProvider interface {
 	ListTaskSchedules(ctx context.Context) ([]TaskSchedule, error)
 }
 
+// PolicyService defines the operations required to read and update
+// ranking/selection policy settings (e.g. scoring weights, tie-break rules).
 type PolicyService interface {
 	Settings(ctx context.Context) (policy.Settings, error)
 	Update(ctx context.Context, input policy.Settings) (policy.Settings, error)
 }
 
+// SettingsService defines the operations required to read and update the
+// application's runtime configuration.
 type SettingsService interface {
 	GetSettings(ctx context.Context) (config.Settings, error)
 	UpdateSettings(ctx context.Context, cfg config.Settings) (config.Settings, error)
@@ -234,11 +289,21 @@ type libraryPageResponse struct {
 	CountActive    int                 `json:"countActive"`
 }
 
+// EventBroker fans out server-sent events (SSE) to every connected client,
+// used by the frontend to receive live updates (queue mutations, release
+// actions) without polling.
+//
+// EventBroker is safe for concurrent use. A nil *EventBroker is valid and
+// Publish becomes a no-op, so the broker is optional wherever it's threaded
+// through.
 type EventBroker struct {
 	mu      sync.Mutex
 	clients map[chan []byte]struct{}
 }
 
+// Status reports the service's overall runtime state: version, health,
+// active integrations, and the runtime configuration relevant to the
+// frontend (cache/read-ahead limits, FUSE mount path).
 type Status struct {
 	Service              string         `json:"service"`
 	Version              string         `json:"version"`
@@ -253,6 +318,8 @@ type Status struct {
 	BackgroundQueueDepth int            `json:"backgroundQueueDepth"`
 }
 
+// Integrations reports the enabled/configured state of every external
+// integration the service can use.
 type Integrations struct {
 	Seerr             IntegrationStatus            `json:"seerr"`
 	NZBHydra2         IntegrationStatus            `json:"nzbhydra2"`
@@ -263,6 +330,9 @@ type Integrations struct {
 	SubtitleProviders map[string]IntegrationStatus `json:"subtitleProviders"`
 }
 
+// IntegrationStatus reports whether a single external integration is
+// enabled and fully configured (e.g. has the credentials it needs to
+// function), with a human-readable Detail explaining the current state.
 type IntegrationStatus struct {
 	Enabled    bool   `json:"enabled"`
 	Configured bool   `json:"configured"`
@@ -270,10 +340,15 @@ type IntegrationStatus struct {
 	Count      int    `json:"count,omitempty"`
 }
 
+// NewEventBroker creates an EventBroker with no connected clients.
 func NewEventBroker() *EventBroker {
 	return &EventBroker{clients: make(map[chan []byte]struct{})}
 }
 
+// Publish encodes event as JSON and delivers it to every currently
+// connected SSE client. Delivery is best-effort: a client whose buffered
+// channel is full is skipped rather than blocking the publisher. Safe to
+// call on a nil broker.
 func (b *EventBroker) Publish(event map[string]any) {
 	if b == nil {
 		return
@@ -289,7 +364,19 @@ func (b *EventBroker) Publish(event map[string]any) {
 	}
 }
 
-func Router(status StatusService, queue QueueService, workflowSvc WorkflowService, publication PublicationService, maintenance MaintenanceService, cacheSvc CacheService, subtitleSvc SubtitleService, blocklistSvc BlocklistService, probeSvc IntegrationProbeService, catalogSvc CatalogService, broker *EventBroker, healthRepo HealthRepository, streamsProvider StreamsProvider, profilesRepo ProfilesRepository, taskSchedules TaskScheduleProvider, policySvc PolicyService, plexClient *plex.Client, jellyfinClient *jellyfin.Client, settingsSvc SettingsService, userRepo UserRepository, speedTestSvc SpeedTestService, metricsProvider ...MetricsProvider) chi.Router {
+// Router builds and returns the complete HTTP router for the service.
+//
+// It wires every dependency (queue, workflow, catalog, subtitles,
+// blocklist, health, profiles, settings, auth, etc.) to its corresponding
+// route group and registers session/API-key auth and CORS middleware. Most
+// service dependencies are interfaces so callers (production wiring and
+// tests) can supply partial or nil implementations; individual handlers
+// respond 501/503 when a required dependency is nil rather than panicking,
+// except where noted at the specific handler. metricsProvider is variadic
+// so metrics collection remains entirely optional.
+//
+// The returned chi.Router is safe to mount directly as an http.Handler.
+func Router(status StatusService, queue QueueService, workflowSvc WorkflowService, publication PublicationService, maintenance MaintenanceService, cacheSvc CacheService, subtitleSvc SubtitleService, blocklistSvc BlocklistService, probeSvc IntegrationProbeService, catalogSvc CatalogService, broker *EventBroker, healthRepo HealthRepository, streamsProvider StreamsProvider, profilesRepo ProfilesRepository, taskSchedules TaskScheduleProvider, policySvc PolicyService, plexClient *plex.Client, jellyfinClient *jellyfin.Client, settingsSvc SettingsService, privacyMgr *privacy.Manager, userRepo UserRepository, speedTestSvc SpeedTestService, metricsProvider ...MetricsProvider) chi.Router {
 	r := chi.NewRouter()
 	r.Use(corsMiddleware)
 	r.Use(authMiddlewareFor(userRepo))
@@ -1865,6 +1952,55 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		publishMutation("settings.update", map[string]any{})
 		respondJSON(w, http.StatusOK, config.RedactSecrets(cfg))
 	}))
+	r.Get("/api/settings/privacy/status", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+		if privacyMgr == nil {
+			respondError(w, http.StatusServiceUnavailable, errors.New("privacy routing unavailable"))
+			return
+		}
+		respondJSON(w, http.StatusOK, privacyMgr.Status())
+	}))
+	r.Post("/api/settings/privacy/test", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+		if privacyMgr == nil {
+			respondError(w, http.StatusServiceUnavailable, errors.New("privacy routing unavailable"))
+			return
+		}
+		var body struct {
+			Mode       string                        `json:"mode"`
+			SOCKS5     config.PrivacySOCKS5Config    `json:"socks5"`
+			WireGuard  config.PrivacyWireGuardConfig `json:"wireguard"`
+			TargetAddr string                        `json:"targetAddr"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			respondError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+			return
+		}
+		target := strings.TrimSpace(body.TargetAddr)
+		if target == "" {
+			// Default probe target: a well-known, always-reachable HTTPS host.
+			// Good enough to prove the route itself works without depending on
+			// any Drakkar-specific service being configured.
+			target = "1.1.1.1:443"
+		}
+		testCfg := privacy.Config{
+			Mode: privacy.Mode(body.Mode),
+			SOCKS5: privacy.SOCKS5Config{
+				Host:           body.SOCKS5.Host,
+				Port:           body.SOCKS5.Port,
+				Username:       body.SOCKS5.Username,
+				Password:       body.SOCKS5.Password,
+				TimeoutSeconds: body.SOCKS5.TimeoutSeconds,
+			},
+			WireGuardConfigText:     body.WireGuard.ConfigText,
+			WireGuardTimeoutSeconds: body.WireGuard.TimeoutSeconds,
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+		defer cancel()
+		if err := privacyMgr.Test(ctx, testCfg, target); err != nil {
+			respondJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
 
 	// Streams the largest already-downloaded file through the real playback
 	// read path for a fixed window and reports throughput/CPU -- a one-click
@@ -2382,6 +2518,11 @@ func authMiddlewareFor(repo UserRepository) func(http.Handler) http.Handler {
 	return auth.Middleware(repo, exempt)
 }
 
+// ServeHTTP streams events to a single SSE client for the lifetime of the
+// connection: an initial "ready" event, then a "message" event for every
+// published event and a "heartbeat" every 20s to keep the connection alive
+// through intermediate proxies. Returns once the request context is
+// canceled (client disconnect).
 func (b *EventBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -2421,6 +2562,10 @@ func (b *EventBroker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// corsMiddleware allows cross-origin requests (needed when the frontend is
+// served from a different host/port than the API, e.g. local dev) while
+// only granting credentialed (cookie-bearing) access to requests whose
+// Origin matches the request's own Host.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
@@ -2479,12 +2624,17 @@ func libStatusPriority(item catalog.MediaCard) int {
 	return 3
 }
 
+// respondJSON writes payload as a JSON response body with the given status
+// code, used by every handler in this package as the standard success
+// response shape.
 func respondJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
+// respondError writes err as the standard {"error": "..."} JSON error body
+// with the given status code.
 func respondError(w http.ResponseWriter, status int, err error) {
 	respondJSON(w, status, map[string]any{
 		"error": err.Error(),
@@ -2519,6 +2669,9 @@ func requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// StatusFromConfig builds the Status reported via /api/status from the
+// current runtime configuration. Settings are redacted (secrets stripped)
+// before being embedded, since Status is served over the API.
 func StatusFromConfig(rt config.Runtime, cfg config.Settings, startedAt time.Time, healthy bool) Status {
 	return Status{
 		Service:             "drakkar",
@@ -2534,6 +2687,10 @@ func StatusFromConfig(rt config.Runtime, cfg config.Settings, startedAt time.Tim
 	}
 }
 
+// integrationStatusFromConfig derives the enabled/configured state of every
+// external integration from the current configuration, without making any
+// network calls (unlike IntegrationProbeService.Probe, which actively
+// checks reachability).
 func integrationStatusFromConfig(cfg config.Settings) Integrations {
 	subtitleProviders := make(map[string]IntegrationStatus, len(cfg.Subtitles.Providers))
 	configuredSubtitleProviders := 0
@@ -2614,6 +2771,8 @@ func integrationStatusFromConfig(cfg config.Settings) Integrations {
 	}
 }
 
+// integrationStatus builds an IntegrationStatus, choosing configuredDetail
+// or missingDetail as the human-readable Detail depending on configured.
 func integrationStatus(enabled, configured bool, missingDetail, configuredDetail string) IntegrationStatus {
 	status := IntegrationStatus{
 		Enabled:    enabled,
@@ -2627,6 +2786,10 @@ func integrationStatus(enabled, configured bool, missingDetail, configuredDetail
 	return status
 }
 
+// subtitleProviderStatus classifies a single subtitle provider's
+// credentials, distinguishing a missing API key from an incomplete
+// username/password pair so the status detail points at the specific
+// missing field.
 func subtitleProviderStatus(provider config.SubtitleAuth) IntegrationStatus {
 	switch {
 	case !provider.Enabled:
@@ -2642,6 +2805,8 @@ func subtitleProviderStatus(provider config.SubtitleAuth) IntegrationStatus {
 	}
 }
 
+// usenetDetail builds the human-readable detail string for the Usenet
+// integration status from provider counts.
 func usenetDetail(enabled, configured int) string {
 	switch {
 	case enabled == 0:
@@ -2653,6 +2818,9 @@ func usenetDetail(enabled, configured int) string {
 	}
 }
 
+// importNZBRequest imports an NZB from the request body, dispatching to the
+// multipart form path when the client uploaded it as multipart/form-data
+// and otherwise treating the entire body as the raw NZB document.
 func importNZBRequest(r *http.Request, queue QueueService) (database.QueueSnapshot, error) {
 	contentType := r.Header.Get("Content-Type")
 	if strings.HasPrefix(contentType, "multipart/form-data") {
@@ -2662,6 +2830,8 @@ func importNZBRequest(r *http.Request, queue QueueService) (database.QueueSnapsh
 	return queue.ImportNZB(r.Context(), fileName, r.Body)
 }
 
+// importMultipartNZB imports the NZB uploaded under the "file" form field of
+// a multipart/form-data request.
 func importMultipartNZB(r *http.Request, queue QueueService) (database.QueueSnapshot, error) {
 	if err := r.ParseMultipartForm(2 << 20); err != nil {
 		return database.QueueSnapshot{}, err
@@ -2674,6 +2844,8 @@ func importMultipartNZB(r *http.Request, queue QueueService) (database.QueueSnap
 	return queue.ImportNZB(r.Context(), multipartFileName(header), file)
 }
 
+// multipartFileName resolves the uploaded file's name, falling back to a
+// generic name when header is nil (no file part present).
 func multipartFileName(header *multipart.FileHeader) string {
 	if header == nil {
 		return "imported.nzb"
@@ -2681,6 +2853,9 @@ func multipartFileName(header *multipart.FileHeader) string {
 	return nzb.ImportHTTPFileName(header.Filename)
 }
 
+// uploadSubtitleRequest uploads a subtitle for libraryItemID from either a
+// multipart/form-data body (file + language field) or, for simple clients,
+// a raw body with language/fileName supplied as query parameters.
 func uploadSubtitleRequest(r *http.Request, subtitles SubtitleService, libraryItemID int64) (intsub.UploadResult, error) {
 	contentType := r.Header.Get("Content-Type")
 	if strings.HasPrefix(contentType, "multipart/form-data") {
@@ -2703,6 +2878,8 @@ func uploadSubtitleRequest(r *http.Request, subtitles SubtitleService, libraryIt
 	return subtitles.UploadSubtitle(r.Context(), libraryItemID, language, fileName, r.Body)
 }
 
+// parseManualBlocklistMutation decodes a manual blocklist create/update
+// request body and derives the entry's dedup key via manualBlocklistKey.
 func parseManualBlocklistMutation(r *http.Request) (database.BlocklistMutation, error) {
 	var body struct {
 		Key          string     `json:"key"`
@@ -2729,6 +2906,13 @@ func parseManualBlocklistMutation(r *http.Request) (database.BlocklistMutation, 
 	}, nil
 }
 
+// manualBlocklistKey builds the blocklist dedup key for a manually created
+// entry. Supported keyTypes are "raw" (caller-supplied literal key),
+// "external_url" (keyed on the release's URL), and "release_signature"
+// (keyed on a normalized title/indexer/size-bucket/date-bucket tuple, so
+// near-duplicate re-postings of the same release still collide on the same
+// key). An unrecognized keyType is rejected rather than silently falling
+// back to "raw".
 func manualBlocklistKey(keyType, rawKey, externalURL, releaseTitle, indexerName string, sizeMB int64, postedDate string) (string, error) {
 	switch strings.TrimSpace(keyType) {
 	case "", "raw":
@@ -2766,7 +2950,11 @@ func manualBlocklistKey(keyType, rawKey, externalURL, releaseTitle, indexerName 
 	}
 }
 
-
+// validateReleaseBlockRule validates a release block rule's type, media
+// type, action, and pattern before it is persisted. Pattern is required for
+// every type except "missing_release_group" (which matches releases that
+// have no group at all, so no pattern applies), and a "regex" type's
+// pattern must compile.
 func validateReleaseBlockRule(r database.ReleaseBlockRule) error {
 	validTypes := map[string]bool{"release_group": true, "title_pattern": true, "regex": true, "missing_release_group": true}
 	if !validTypes[r.Type] {

@@ -538,7 +538,7 @@ type fetcherStub struct {
 	raw      []byte
 }
 
-func (f fetcherStub) Fetch(ctx context.Context, rawURL string) (string, []byte, error) {
+func (f fetcherStub) Fetch(ctx context.Context, rawURL, indexerName string) (string, []byte, error) {
 	return f.fileName, f.raw, nil
 }
 
@@ -546,7 +546,7 @@ func (f fetcherStub) Fetch(ctx context.Context, rawURL string) (string, []byte, 
 // how many times (if any) a real fetch was attempted.
 type countingFetcherFunc func(ctx context.Context, rawURL string) (string, []byte, error)
 
-func (f countingFetcherFunc) Fetch(ctx context.Context, rawURL string) (string, []byte, error) {
+func (f countingFetcherFunc) Fetch(ctx context.Context, rawURL, indexerName string) (string, []byte, error) {
 	return f(ctx, rawURL)
 }
 
@@ -1800,7 +1800,7 @@ type countingFetcherStub struct {
 	calls    *int
 }
 
-func (f countingFetcherStub) Fetch(ctx context.Context, rawURL string) (string, []byte, error) {
+func (f countingFetcherStub) Fetch(ctx context.Context, rawURL, indexerName string) (string, []byte, error) {
 	*f.calls++
 	return f.fileName, f.raw, nil
 }
@@ -3126,7 +3126,7 @@ type sequenceFetcher struct {
 	index   int
 }
 
-func (f *sequenceFetcher) Fetch(ctx context.Context, rawURL string) (string, []byte, error) {
+func (f *sequenceFetcher) Fetch(ctx context.Context, rawURL, indexerName string) (string, []byte, error) {
 	result := f.results[f.index]
 	if f.index < len(f.results)-1 {
 		f.index++

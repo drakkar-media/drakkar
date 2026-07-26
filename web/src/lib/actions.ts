@@ -1,10 +1,22 @@
 import { toastError, toastSuccess } from './toast';
 
-// Wraps the "set a working flag, call the API, toast the result, reload,
-// toast on failure, always clear the working flag" shape that was
-// copy-pasted across most page action handlers (confirm dialogs before
-// destructive actions are the caller's responsibility — do that before
-// calling run).
+/**
+ * Runs an API call with the "set a working flag, call the API, toast the
+ * result, run a follow-up, always clear the working flag" shape that was
+ * copy-pasted across most page action handlers.
+ *
+ * Confirming destructive actions (e.g. via {@link confirmed}) is the
+ * caller's responsibility and must happen before invoking this function.
+ *
+ * @param fn - The API call to perform.
+ * @param opts.setWorking - Toggled true before `fn` runs and false again once
+ * it settles, regardless of outcome.
+ * @param opts.successMessage - Builds the toast message from `fn`'s result.
+ * @param opts.afterSuccess - Optional follow-up (e.g. reloading page data),
+ * run only when `fn` succeeds.
+ * @returns The result of `fn`, or `undefined` if it threw — the error is
+ * toasted rather than rethrown.
+ */
 export async function runAction<T>(
   fn: () => Promise<T>,
   opts: {
@@ -27,10 +39,16 @@ export async function runAction<T>(
   }
 }
 
-// Shared guard for destructive actions, replacing the
-// `if (typeof window !== 'undefined' && !window.confirm(message)) return;`
-// line copy-pasted at ~21 call sites. Skips confirmation only when `window`
-// is unavailable (SSR) — never the case for these client-only handlers.
+/**
+ * Shared guard for destructive actions, replacing the
+ * `if (typeof window !== 'undefined' && !window.confirm(message)) return;`
+ * line copy-pasted at ~21 call sites.
+ *
+ * @param message - Confirmation prompt shown to the user.
+ * @returns Whether the action should proceed. Confirmation is skipped (and
+ * `true` returned) only when `window` is unavailable (SSR) — never the case
+ * for these client-only handlers.
+ */
 export function confirmed(message: string): boolean {
   return typeof window === 'undefined' || window.confirm(message);
 }

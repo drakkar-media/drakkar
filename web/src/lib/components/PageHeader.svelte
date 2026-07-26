@@ -1,4 +1,8 @@
 <script lang="ts">
+  /**
+   * Page-level heading with an optional subtitle and a right-aligned action
+   * slot. Used at the top of most route pages.
+   */
   export let title = '';
   export let subtitle = '';
 </script>

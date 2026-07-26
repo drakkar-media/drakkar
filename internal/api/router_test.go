@@ -20,6 +20,7 @@ import (
 	"github.com/drakkar-media/drakkar/internal/library"
 	"github.com/drakkar-media/drakkar/internal/maintenance"
 	"github.com/drakkar-media/drakkar/internal/nzb"
+	"github.com/drakkar-media/drakkar/internal/privacy"
 	"github.com/drakkar-media/drakkar/internal/probe"
 	"github.com/drakkar-media/drakkar/internal/queue"
 	intsub "github.com/drakkar-media/drakkar/internal/subtitles"
@@ -445,7 +446,7 @@ const sampleNZB = `<?xml version="1.0" encoding="UTF-8"?>
 
 func TestImportNZBEndpoint(t *testing.T) {
 	queueSvc := queue.NewService(queue.NewMemoryRepository(), nzb.NewImporter(t.TempDir(), 1024*1024))
-	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/nzbs/import", strings.NewReader(sampleNZB))
 	req.Header.Set("Content-Disposition", `attachment; filename="dune.nzb"`)
@@ -484,7 +485,7 @@ func TestImportURLEndpointSkipsRecentlyDispatchedURL(t *testing.T) {
 		claimedURL = rawURL
 		return true // already dispatched -- caller must not fetch
 	}}
-	router := Router(statusStub{}, queueSvc, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	body, _ := json.Marshal(map[string]string{"url": remote.URL + "/dune.nzb"})
 	req := httptest.NewRequest(http.MethodPost, "/api/nzbs/import-url", bytes.NewReader(body))
@@ -517,7 +518,7 @@ func TestImportURLEndpointClaimsURLBeforeFetching(t *testing.T) {
 		claimedURL = rawURL
 		return false // not already claimed -- caller may proceed to fetch
 	}}
-	router := Router(statusStub{}, queueSvc, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	const testURL = "http://127.0.0.1:1/dune.nzb"
 	body, _ := json.Marshal(map[string]string{"url": testURL})
@@ -552,7 +553,7 @@ func TestCancelNZBEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/nzbs/"+itoa(*item.NZBDocumentID), nil)
 	rec := httptest.NewRecorder()
@@ -572,7 +573,7 @@ func TestCancelNZBEndpoint(t *testing.T) {
 func TestQueueEndpointIncludesWorkQueueStatus(t *testing.T) {
 	queueSvc := queue.NewService(queue.NewMemoryRepository(), nzb.NewImporter(t.TempDir(), 1024*1024))
 	workflowSvc := workflowStub{workQueue: workflow.WorkQueueStatus{Paused: true, Depth: 7}}
-	router := Router(statusStub{}, queueSvc, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/queue", nil)
 	rec := httptest.NewRecorder()
@@ -588,7 +589,7 @@ func TestQueueEndpointIncludesWorkQueueStatus(t *testing.T) {
 
 func TestQueuePauseResumeEndpoints(t *testing.T) {
 	workflowSvc := workflowStub{workQueue: workflow.WorkQueueStatus{Paused: false, Depth: 3}}
-	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	pauseReq := httptest.NewRequest(http.MethodPost, "/api/queue/pause", nil)
 	pauseRec := httptest.NewRecorder()
@@ -617,7 +618,7 @@ func TestLibraryEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	libraryReq := httptest.NewRequest(http.MethodGet, "/api/library", nil)
 	libraryRec := httptest.NewRecorder()
@@ -740,7 +741,7 @@ func TestWorkflowEndpoints(t *testing.T) {
 			{Name: "seerr", OK: true, Detail: "ok", CheckedAt: time.Now().UTC(), DurationMS: 12},
 		},
 	}}
-	router := Router(statusStub{}, queueSvc, workflowSvc, pub, maint, cacheSvc, subtitles, blocklist, probes, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, queueSvc, workflowSvc, pub, maint, cacheSvc, subtitles, blocklist, probes, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	requestsReq := httptest.NewRequest(http.MethodGet, "/api/requests", nil)
 	requestsRec := httptest.NewRecorder()
@@ -953,7 +954,7 @@ func TestWorkflowEndpoints(t *testing.T) {
 func TestSABAPIAddFileAliasAcceptsLowercaseFieldAndNzbname(t *testing.T) {
 	importCall := &sabImportCall{}
 	workflowSvc := workflowStub{importCall: importCall}
-	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -1016,7 +1017,7 @@ func TestQueueActionEndpoint(t *testing.T) {
 	workflowSvc := workflowStub{
 		queueAct: workflow.QueueManageResult{QueueItemID: 4, Action: "remove_blocklist_and_search"},
 	}
-	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/queue/4/action", strings.NewReader(`{"action":"remove_blocklist_and_search"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -1035,7 +1036,7 @@ func TestQueueBulkActionEndpoint(t *testing.T) {
 	workflowSvc := workflowStub{
 		queueBulk: workflow.BulkQueueRetryResult{Processed: 2, Retried: 2, Failed: 0, ProcessedQueues: []int64{4, 5}},
 	}
-	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/queue/bulk-action", strings.NewReader(`{"queueItemIds":[4,5],"action":"remove_and_blocklist"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -1052,7 +1053,7 @@ func TestQueueBulkActionEndpoint(t *testing.T) {
 
 func TestRequestProfileEndpoint(t *testing.T) {
 	profiles := &profilesStub{requestLibraryID: 42}
-	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, profiles, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, profiles, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPut, "/api/requests/7/profile", strings.NewReader(`{"profileId":3}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -1074,7 +1075,7 @@ func TestSearchUpgradesEndpoint(t *testing.T) {
 	workflowSvc := workflowStub{
 		upgrades: workflow.UpgradeSearchResult{Checked: 4, Upgraded: 2, Failed: 1},
 	}
-	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/library/search-upgrades", nil)
 	rec := httptest.NewRecorder()
@@ -1092,7 +1093,7 @@ func TestManualBlocklistCreateEndpoint(t *testing.T) {
 	blocklist := &blocklistStub{
 		created: database.BlocklistItemSummary{ID: 21, Key: "external_url:https://example.invalid/a.nzb", Reason: "manual"},
 	}
-	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, blocklist, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, blocklist, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "/api/blocklist/manual", strings.NewReader(`{"keyType":"external_url","externalUrl":"https://example.invalid/a.nzb","reason":"manual"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -1112,7 +1113,7 @@ func TestManualBlocklistUpdateEndpoint(t *testing.T) {
 	blocklist := &blocklistStub{
 		updated: database.BlocklistItemSummary{ID: 9, Key: "release_signature:dune 2021|nzb finder|7000|2026-06-14", Reason: "manual"},
 	}
-	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, blocklist, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, blocklist, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodPut, "/api/blocklist/9", strings.NewReader(`{"keyType":"raw","key":"release_signature:dune 2021|nzb finder|7000|2026-06-14","reason":"manual"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -1134,7 +1135,7 @@ func itoa(value int64) string {
 
 func TestCustomFormatsImportEndpoint(t *testing.T) {
 	profiles := &profilesStub{}
-	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, profiles, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, profiles, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	body := `[{"name":"BluRay","pattern":"(?i)bluray","score":50,"enabled":true}]`
 	req := httptest.NewRequest(http.MethodPost, "/api/custom-formats/import", strings.NewReader(body))
@@ -1149,7 +1150,7 @@ func TestCustomFormatsImportEndpoint(t *testing.T) {
 
 func TestIndexerPoliciesEndpoints(t *testing.T) {
 	profiles := &profilesStub{}
-	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, profiles, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, profiles, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	// GET list
 	req := httptest.NewRequest(http.MethodGet, "/api/indexer-policies", nil)
@@ -1179,7 +1180,7 @@ func TestIndexerPoliciesEndpoints(t *testing.T) {
 
 func TestSubtitleProfilesEndpoints(t *testing.T) {
 	profiles := &profilesStub{}
-	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, profiles, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, profiles, nil, nil, nil, nil, nil, nil, nil, nil)
 
 	// GET list
 	req := httptest.NewRequest(http.MethodGet, "/api/subtitle-profiles", nil)
@@ -1197,5 +1198,51 @@ func TestSubtitleProfilesEndpoints(t *testing.T) {
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("POST /api/subtitle-profiles expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPrivacyStatusAndTestEndpoints(t *testing.T) {
+	mgr := privacy.NewManager()
+	router := Router(statusStub{}, nil, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, mgr, nil, nil, nil)
+
+	adminCtx := auth.NewContext(context.Background(), auth.Claims{UserID: 1, Username: "admin", Role: "admin"})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/settings/privacy/status", nil).WithContext(adminCtx)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/settings/privacy/status expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var status privacy.Status
+	if err := json.NewDecoder(rec.Body).Decode(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status.Mode != privacy.ModeDirect {
+		t.Fatalf("expected default mode direct, got %s", status.Mode)
+	}
+
+	// Unauthenticated requests must be rejected.
+	req2 := httptest.NewRequest(http.MethodGet, "/api/settings/privacy/status", nil)
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for unauthenticated request, got %d", rec2.Code)
+	}
+
+	// Test endpoint against an unreachable SOCKS5 proxy must report ok=false,
+	// never silently succeed as if it were direct.
+	body := `{"mode":"socks5","socks5":{"host":"127.0.0.1","port":1,"timeoutSeconds":1},"targetAddr":"127.0.0.1:1"}`
+	req3 := httptest.NewRequest(http.MethodPost, "/api/settings/privacy/test", strings.NewReader(body)).WithContext(adminCtx)
+	rec3 := httptest.NewRecorder()
+	router.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("POST /api/settings/privacy/test expected 200, got %d: %s", rec3.Code, rec3.Body.String())
+	}
+	var result map[string]any
+	if err := json.NewDecoder(rec3.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := result["ok"].(bool); ok {
+		t.Fatal("expected ok=false for an unreachable proxy")
 	}
 }

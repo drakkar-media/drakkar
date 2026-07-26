@@ -1,4 +1,13 @@
 <script lang="ts">
+  /**
+   * Manages quality profiles used to rank and filter release candidates.
+   *
+   * Lists existing profiles in a sidebar and edits the selected one — ranked
+   * resolution/source/codec/audio/HDR preference lists, language chips,
+   * release flags, upgrade rules, and size limits — saving or deleting via the
+   * profiles API. Deleting a profile requires confirmation and is disallowed
+   * for the default profile.
+   */
   import { onMount } from 'svelte';
   import Plus from '@lucide/svelte/icons/plus';
   import Trash2 from '@lucide/svelte/icons/trash-2';

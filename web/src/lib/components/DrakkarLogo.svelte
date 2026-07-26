@@ -1,4 +1,10 @@
 <script lang="ts">
+  /**
+   * Renders the Drakkar brand mark as a scalable inline SVG icon.
+   *
+   * Used as the logo throughout the app shell (sidebar, mobile drawer,
+   * topbar avatar).
+   */
   export let size: number = 24;
 </script>
 

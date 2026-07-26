@@ -213,6 +213,10 @@ export type TaskSchedule = {
   lastRunState: string;
 };
 
+/**
+ * Automated response applied to a queue item when housekeeping detects a
+ * given failure/decision reason (see {@link PolicySettings.queueDecisionActions}).
+ */
 export type QueueDecisionAction =
   | 'do_nothing'
   | 'remove'
@@ -221,6 +225,7 @@ export type QueueDecisionAction =
   | 'search_again';
 
 export type PolicySettings = {
+  /** Keyed by queue failure/decision reason code. */
   queueDecisionActions: Record<string, QueueDecisionAction>;
   ignoredPatterns: string[];
   duplicateNzbBehavior: string;
@@ -528,6 +533,13 @@ export type QueuedResult = { queued: boolean };
 
 export type BlocklistMutation = {
   key: string;
+  /**
+   * How `key` should be matched against future release candidates:
+   * `raw` for an exact stored value, `external_url` to block a specific
+   * indexer URL, or `release_signature` to block by normalized
+   * title/size/indexer fingerprint. Omitted when the backend should derive
+   * it from the other fields.
+   */
   keyType?: 'raw' | 'external_url' | 'release_signature';
   externalUrl?: string;
   releaseTitle?: string;
@@ -552,6 +564,14 @@ export type UsenetProvider = {
   enabled: boolean;
 };
 
+/**
+ * Complete backend configuration, as read from and written to
+ * `/api/settings`.
+ *
+ * Mirrors the server-side settings struct; sensitive fields (passwords, API
+ * keys, WireGuard config text) are returned to authenticated clients as-is
+ * and are expected to be redacted/masked by the UI, not by this type.
+ */
 export type FullSettings = {
   database: { host: string; port: number; name: string; username: string; password: string };
   valkey: { host: string; port: number; password: string };
@@ -588,6 +608,37 @@ export type FullSettings = {
     onGrab: boolean;
     onAvailable: boolean;
     onFailed: boolean;
+  };
+  privacy: {
+    mode: 'direct' | 'socks5' | 'wireguard';
+    socks5: { host: string; port: number; username: string; password: string; timeoutSeconds: number };
+    wireguard: { configText: string; timeoutSeconds: number };
+    // Indexers exempted from the privacy tunnel, e.g. ones that are already
+    // trusted or that block traffic from VPN/proxy IP ranges.
+    excludedIndexers: string[];
+  };
+};
+
+/**
+ * Live status of the currently-active privacy routing tunnel.
+ *
+ * `protectedTraffic` lists which outbound traffic categories (e.g. indexer,
+ * NNTP) are actually routed through the tunnel — not all traffic is
+ * necessarily protected depending on `mode` and settings. `wireguard` is
+ * populated only when `mode` is `'wireguard'` and the interface is up.
+ */
+export type PrivacyStatus = {
+  mode: 'direct' | 'socks5' | 'wireguard';
+  status: string;
+  protectedTraffic: string[];
+  endpoint?: string;
+  error?: string;
+  wireguard?: {
+    interfaceAddress?: string[];
+    dns?: string[];
+    endpoint?: string;
+    allowedIps?: string[];
+    persistentKeepalive?: number;
   };
 };
 

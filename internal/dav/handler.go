@@ -78,6 +78,11 @@ func Handler(db ContentProvider, movieLibPath, tvLibPath string) http.Handler {
 	})
 }
 
+// contentFS is a read-only webdav.FileSystem backed by the database rather
+// than a real directory tree. It serves two independent namespaces under a
+// single root: /content (streamed release files, resolved per-request) and
+// /completed-symlinks (a mirror of the published library's .rclonelink
+// files, rebuilt from ListSymlinkPublications and cached -- see getTree).
 type contentFS struct {
 	db           ContentProvider
 	movieLibPath string
@@ -138,8 +143,8 @@ func (f *contentFS) getTree(ctx context.Context) (*treeNode, error) {
 
 // parsedPath is the result of decomposing a WebDAV path.
 type parsedPath struct {
-	section   string // "content", "completed-symlinks", or ""
-	rest      string // everything after the section
+	section string // "content", "completed-symlinks", or ""
+	rest    string // everything after the section
 }
 
 func splitPath(name string) parsedPath {
@@ -220,10 +225,10 @@ type bytesFile struct {
 	pos int64
 }
 
-func (f *bytesFile) Close() error                       { return nil }
-func (f *bytesFile) Write(_ []byte) (int, error)        { return 0, os.ErrPermission }
+func (f *bytesFile) Close() error                         { return nil }
+func (f *bytesFile) Write(_ []byte) (int, error)          { return 0, os.ErrPermission }
 func (f *bytesFile) Readdir(_ int) ([]os.FileInfo, error) { return nil, os.ErrInvalid }
-func (f *bytesFile) Stat() (os.FileInfo, error)         { return f.fi, nil }
+func (f *bytesFile) Stat() (os.FileInfo, error)           { return f.fi, nil }
 
 func (f *bytesFile) Seek(offset int64, whence int) (int64, error) {
 	var newPos int64
@@ -574,6 +579,10 @@ type treeNode struct {
 	children map[string]*treeNode
 }
 
+// buildTree converts the flat list of symlink publications into a nested
+// treeNode structure mirroring their library-relative directory layout, with
+// each publication represented as a single "<name>.rclonelink" leaf file
+// whose content is the rclone symlink target path.
 func (f *contentFS) buildTree(pubs []database.SymlinkPublication) *treeNode {
 	root := &treeNode{children: make(map[string]*treeNode)}
 	for _, pub := range pubs {
@@ -601,6 +610,10 @@ func (f *contentFS) buildTree(pubs []database.SymlinkPublication) *treeNode {
 	return root
 }
 
+// relPath maps an absolute library path to its path relative to the
+// /completed-symlinks root, rewriting known movie/TV library roots to their
+// "movies/" or "tv/" prefix and falling back to just the base name for any
+// other path. Returns "" when libraryPath has no usable base name.
 func (f *contentFS) relPath(libraryPath string) string {
 	if f.movieLibPath != "" && strings.HasPrefix(libraryPath, f.movieLibPath+"/") {
 		return "movies/" + strings.TrimPrefix(libraryPath, f.movieLibPath+"/")

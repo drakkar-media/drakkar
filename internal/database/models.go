@@ -2,6 +2,9 @@ package database
 
 import "time"
 
+// QueueState represents the pipeline stage of a queue_items row, progressing
+// from the initial request through search, ranking, selection, download, and
+// publishing (or degraded/failed on error).
 type QueueState string
 
 const (
@@ -18,6 +21,8 @@ const (
 	QueueFailed      QueueState = "failed"
 )
 
+// QueueSnapshot is a read model combining a queue_items row with its library
+// item and (if selected) NZB metadata, used by the dashboard/API layer.
 type QueueSnapshot struct {
 	QueueItemID     int64      `json:"queueItemId"`
 	LibraryItemID   int64      `json:"libraryItemId"`
@@ -34,6 +39,9 @@ type QueueSnapshot struct {
 	UpdatedAt       time.Time  `json:"updatedAt"`
 }
 
+// ImportedNZB holds the fully parsed contents of a manually-imported NZB --
+// its files, segments, and any inspected archive structure -- ready to be
+// persisted.
 type ImportedNZB struct {
 	FileName       string
 	XML            []byte
@@ -46,6 +54,7 @@ type ImportedNZB struct {
 	MediaType      string // overrides default "manual_nzb" when set
 }
 
+// SabQueueItem models one row of the SABnzbd-compatible queue API response.
 type SabQueueItem struct {
 	LibraryItemID int64
 	Title         string
@@ -53,6 +62,7 @@ type SabQueueItem struct {
 	State         string
 }
 
+// SabHistoryItem models one row of the SABnzbd-compatible history API response.
 type SabHistoryItem struct {
 	LibraryItemID     int64
 	Title             string
@@ -63,6 +73,8 @@ type SabHistoryItem struct {
 	TotalBytes        int64
 }
 
+// ImportedNZBFile is one file entry within an ImportedNZB, with its yEnc
+// segments in order.
 type ImportedNZBFile struct {
 	FileName      string
 	Subject       string
@@ -72,6 +84,8 @@ type ImportedNZBFile struct {
 	Segments      []ImportedNZBSegment
 }
 
+// ImportedNZBSegment is one yEnc-encoded article within an ImportedNZBFile,
+// with its decoded byte range within the reassembled file.
 type ImportedNZBSegment struct {
 	Number             int
 	MessageID          string
@@ -80,6 +94,9 @@ type ImportedNZBSegment struct {
 	DecodedEndOffset   int64
 }
 
+// ImportedArchive is the parsed archive structure (e.g. multi-volume RAR)
+// detected while inspecting an ImportedNZB, prior to being persisted into the
+// archives/archive_volumes/archive_entries tables.
 type ImportedArchive struct {
 	Kind         string
 	Status       string
@@ -88,15 +105,19 @@ type ImportedArchive struct {
 	Entries      []ImportedArchiveEntry
 }
 
+// ImportedArchiveVolume is one physical volume file of a multi-volume
+// archive, in the order it must be reassembled.
 type ImportedArchiveVolume struct {
 	Path        string
 	VolumeIndex int
 }
 
+// ImportedArchiveEntry is one file packed inside an archive, with the byte
+// ranges (Ranges) needed to reassemble it across volumes.
 type ImportedArchiveEntry struct {
 	Path              string
-	SizeBytes         int64
-	PackedSizeBytes   int64
+	SizeBytes         int64 // uncompressed size of the entry's real content
+	PackedSizeBytes   int64 // compressed/stored size the entry occupies inside the archive volumes
 	CompressionMethod string
 	Encrypted         bool
 	Solid             bool
@@ -105,6 +126,9 @@ type ImportedArchiveEntry struct {
 	Ranges            []ImportedArchiveRange
 }
 
+// ImportedArchiveRange is one contiguous slice of an archive entry's data as
+// it lives inside a single volume: EntryOffset is the position within the
+// reassembled entry, ArchiveOffset is the position within that volume file.
 type ImportedArchiveRange struct {
 	VolumeIndex   int
 	EntryOffset   int64
@@ -112,6 +136,8 @@ type ImportedArchiveRange struct {
 	LengthBytes   int64
 }
 
+// NZBMountEntry is one NZB document exposed through the WebDAV mount, keyed
+// by its current queue State so the mount can reflect in-progress items.
 type NZBMountEntry struct {
 	DocumentID int64
 	FileName   string
@@ -119,15 +145,19 @@ type NZBMountEntry struct {
 	State      QueueState
 }
 
+// ContentMountEntry is one virtual file exposed through the WebDAV content
+// mount.
 type ContentMountEntry struct {
 	VirtualFileID     int64
 	SelectedReleaseID int64
 	Path              string
 	FileName          string
 	SizeBytes         int64
-	ReaderKind        string
+	ReaderKind        string // "inline", "direct_nzb", or "stored_rar" -- selects the stream.VirtualMediaFile implementation
 }
 
+// ReleaseVirtualFile is a virtual file joined with its release and media
+// metadata (movie or show), used to build the mount's directory layout.
 type ReleaseVirtualFile struct {
 	VirtualFileID     int64
 	SelectedReleaseID int64
@@ -145,12 +175,16 @@ type ReleaseVirtualFile struct {
 	EpisodeNumber     int
 }
 
+// CompletedSymlinkEntry is one published symlink exposed through the
+// completed-downloads mount.
 type CompletedSymlinkEntry struct {
 	PublicationID int64
 	Name          string
 	TargetPath    string
 }
 
+// LibraryItemSummary is the API representation of a library item's overview
+// row, combining its request and queue state for list views.
 type LibraryItemSummary struct {
 	ID                int64      `json:"id"`
 	MediaType         string     `json:"mediaType"`
@@ -162,6 +196,9 @@ type LibraryItemSummary struct {
 	SelectedReleaseID *int64     `json:"selectedReleaseId,omitempty"`
 }
 
+// ReleaseSummary is the API representation of a selected or candidate
+// release, combining scoring, archive contents, and failure history for the
+// release-detail UI.
 type ReleaseSummary struct {
 	SelectedReleaseID     int64                   `json:"selectedReleaseId"`
 	ReleaseCandidateID    int64                   `json:"releaseCandidateId"`
@@ -192,11 +229,15 @@ type ReleaseSummary struct {
 	NZBFileName           string                  `json:"nzbFileName,omitempty"`
 }
 
+// FailedReleaseAttempt records one past failure of a release candidate, kept
+// for display in the release-detail UI's failure history.
 type FailedReleaseAttempt struct {
 	Reason    string    `json:"reason"`
 	CreatedAt time.Time `json:"createdAt"`
 }
 
+// ReleaseArchiveSummary is the API representation of one archive contained in
+// a release (see ImportedArchive).
 type ReleaseArchiveSummary struct {
 	Kind         string                `json:"kind"`
 	Status       string                `json:"status"`
@@ -205,10 +246,12 @@ type ReleaseArchiveSummary struct {
 	Entries      []ReleaseArchiveEntry `json:"entries,omitempty"`
 }
 
+// ReleaseArchiveEntry is the API representation of an archive entry (see
+// ImportedArchiveEntry).
 type ReleaseArchiveEntry struct {
 	Path                string `json:"path"`
-	SizeBytes           int64  `json:"sizeBytes"`
-	PackedSizeBytes     int64  `json:"packedSizeBytes"`
+	SizeBytes           int64  `json:"sizeBytes"`       // uncompressed size of the entry's real content
+	PackedSizeBytes     int64  `json:"packedSizeBytes"` // compressed/stored size the entry occupies inside the archive volumes
 	CompressionMethod   string `json:"compressionMethod"`
 	Encrypted           bool   `json:"encrypted"`
 	Solid               bool   `json:"solid"`
@@ -216,6 +259,8 @@ type ReleaseArchiveEntry struct {
 	SourceArchiveOffset int64  `json:"sourceArchiveOffset"`
 }
 
+// MediaRequestSummary is the API representation of a single incoming media
+// request (movie or show) and the queue state it has progressed to.
 type MediaRequestSummary struct {
 	ID                 int64      `json:"id"`
 	ExternalID         string     `json:"externalId"`
@@ -229,6 +274,8 @@ type MediaRequestSummary struct {
 	CreatedAt          time.Time  `json:"createdAt"`
 }
 
+// SubtitleFileSummary is the API representation of a downloaded subtitle file
+// already stored for a library item.
 type SubtitleFileSummary struct {
 	ID            int64     `json:"id"`
 	LibraryItemID int64     `json:"libraryItemId"`
@@ -238,6 +285,8 @@ type SubtitleFileSummary struct {
 	CreatedAt     time.Time `json:"createdAt"`
 }
 
+// SubtitleCandidateSummary is the API representation of a subtitle result
+// returned by a provider search, not yet downloaded.
 type SubtitleCandidateSummary struct {
 	ID              int64     `json:"id"`
 	LibraryItemID   int64     `json:"libraryItemId"`
@@ -253,6 +302,8 @@ type SubtitleCandidateSummary struct {
 	CreatedAt       time.Time `json:"createdAt"`
 }
 
+// BlocklistItemSummary is the API representation of a single blocklist entry,
+// joined with the release/library context it was blocked from when available.
 type BlocklistItemSummary struct {
 	ID                int64      `json:"id"`
 	Key               string     `json:"key"`
@@ -268,12 +319,15 @@ type BlocklistItemSummary struct {
 	PostedAt          *time.Time `json:"postedAt,omitempty"`
 }
 
+// BlocklistMutation carries the fields accepted when a client manually adds a
+// key to the blocklist.
 type BlocklistMutation struct {
 	Key       string     `json:"key"`
 	Reason    string     `json:"reason"`
 	ExpiresAt *time.Time `json:"expiresAt,omitempty"`
 }
 
+// BlocklistPage is one page of a paginated blocklist listing.
 type BlocklistPage struct {
 	Items      []BlocklistItemSummary `json:"items"`
 	Page       int                    `json:"page"`
@@ -282,6 +336,7 @@ type BlocklistPage struct {
 	TotalPages int                    `json:"totalPages"`
 }
 
+// BlocklistStats summarizes the blocklist for dashboard display.
 type BlocklistStats struct {
 	Total    int            `json:"total"`
 	Expired  int            `json:"expired"`
@@ -289,6 +344,9 @@ type BlocklistStats struct {
 	ByReason map[string]int `json:"byReason"`
 }
 
+// SearchCandidateRecord is a single indexer search result prior to being
+// persisted as a release_candidates row, carrying the fields needed for
+// scoring, deduplication, and merge-by-(indexer, title, size) comparison.
 type SearchCandidateRecord struct {
 	Title                 string
 	ExternalURL           string
@@ -306,6 +364,8 @@ type SearchCandidateRecord struct {
 	Resolution            string
 }
 
+// GrabHistoryEntry records one release grab (selection) event for a library
+// item, used to render the grab-history UI.
 type GrabHistoryEntry struct {
 	ID                 int64     `json:"id"`
 	LibraryItemID      int64     `json:"libraryItemId"`
@@ -317,6 +377,9 @@ type GrabHistoryEntry struct {
 	GrabbedAt          time.Time `json:"grabbedAt"`
 }
 
+// CustomFormat is a user- or system-defined scoring rule matched against
+// release titles (e.g. a preferred/avoided release group or encode) that
+// adds or subtracts from a candidate's ranking score.
 type CustomFormat struct {
 	ID      int64  `json:"id"`
 	Name    string `json:"name"`
@@ -326,6 +389,8 @@ type CustomFormat struct {
 	Source  string `json:"source"`
 }
 
+// ReleaseBlockRule is a rule that rejects or penalizes release candidates
+// matching a pattern (e.g. a banned release group), scoped to a media type.
 type ReleaseBlockRule struct {
 	ID           int64     `json:"id"`
 	Type         string    `json:"type"`
@@ -340,6 +405,9 @@ type ReleaseBlockRule struct {
 	UpdatedAt    time.Time `json:"updatedAt"`
 }
 
+// SubtitleProfile is a named set of subtitle search preferences (languages,
+// hearing-impaired preference, exact-language requirement) that can be
+// assigned as a library item's default.
 type SubtitleProfile struct {
 	ID                    int64     `json:"id"`
 	Name                  string    `json:"name"`
@@ -351,6 +419,8 @@ type SubtitleProfile struct {
 	UpdatedAt             time.Time `json:"updatedAt"`
 }
 
+// IndexerPolicy applies a per-indexer score adjustment (or disables the
+// indexer entirely) during candidate ranking.
 type IndexerPolicy struct {
 	ID            int64     `json:"id"`
 	IndexerName   string    `json:"indexerName"`
@@ -361,12 +431,17 @@ type IndexerPolicy struct {
 	UpdatedAt     time.Time `json:"updatedAt"`
 }
 
+// CandidateHistory is a release candidate's prior failure record, looked up
+// by external URL so a repeat candidate can inherit its failure count instead
+// of retrying from zero.
 type CandidateHistory struct {
 	ExternalURL       string
 	FailureCount      int
 	LastFailureReason string
 }
 
+// StoredNZBDocument is the persisted NZB document backing an already-selected
+// release, as opposed to ImportedNZB which represents one still being parsed.
 type StoredNZBDocument struct {
 	SelectedReleaseID int64
 	FileName          string
@@ -374,6 +449,8 @@ type StoredNZBDocument struct {
 	XML               []byte
 }
 
+// SubtitleLibraryFilter carries the filter and pagination parameters for
+// listing library items in the subtitle-management UI.
 type SubtitleLibraryFilter struct {
 	MediaType   string
 	Search      string
@@ -382,6 +459,8 @@ type SubtitleLibraryFilter struct {
 	PageSize    int
 }
 
+// SubtitleLibraryRow is one library item row in the subtitle-management
+// listing, summarizing its subtitle coverage.
 type SubtitleLibraryRow struct {
 	LibraryItemID  int64     `json:"libraryItemId"`
 	MediaType      string    `json:"mediaType"`
@@ -395,6 +474,7 @@ type SubtitleLibraryRow struct {
 	RequestedAt    time.Time `json:"requestedAt"`
 }
 
+// SubtitleLibraryPage is one page of a paginated subtitle-library listing.
 type SubtitleLibraryPage struct {
 	Items      []SubtitleLibraryRow `json:"items"`
 	Page       int                  `json:"page"`
@@ -403,6 +483,9 @@ type SubtitleLibraryPage struct {
 	TotalPages int                  `json:"totalPages"`
 }
 
+// SubtitleDeleteGroup batches the subtitle file paths for one
+// provider/language combination on a library item so they can be deleted
+// together.
 type SubtitleDeleteGroup struct {
 	LibraryItemID int64
 	Provider      string
@@ -410,6 +493,8 @@ type SubtitleDeleteGroup struct {
 	Paths         []string
 }
 
+// SubtitleSearchInput carries the metadata needed to query subtitle providers
+// for a specific library item.
 type SubtitleSearchInput struct {
 	LibraryItemID int64
 	MediaType     string
@@ -423,6 +508,8 @@ type SubtitleSearchInput struct {
 	TVDBID        int64
 }
 
+// SubtitleCandidateRecord is a single provider search result prior to being
+// persisted as a subtitle_candidates row.
 type SubtitleCandidateRecord struct {
 	Provider        string
 	Language        string
@@ -435,6 +522,8 @@ type SubtitleCandidateRecord struct {
 	DownloadURL     string
 }
 
+// LibrarySearchInput carries the metadata needed to query indexers for a
+// release matching a specific library item.
 type LibrarySearchInput struct {
 	LibraryItemID   int64
 	MediaType       string
@@ -455,12 +544,16 @@ type LibrarySearchInput struct {
 	RuntimeMinutes  int      // movie runtime; 0 for episodes/unknown; used for MB/min size checks
 }
 
+// SymlinkPublicationRecord identifies a completed download's publication,
+// mapping its library path to the on-disk target the symlink must point to.
 type SymlinkPublicationRecord struct {
 	ID          int64
 	LibraryPath string
 	TargetPath  string
 }
 
+// QueueRetryTarget identifies a queue_items row eligible for a retry pass,
+// with the fields needed to re-run selection for it.
 type QueueRetryTarget struct {
 	QueueItemID       int64
 	LibraryItemID     int64
@@ -470,6 +563,8 @@ type QueueRetryTarget struct {
 	State             QueueState
 }
 
+// PendingLibrarySearchTarget is a library item awaiting (or mid-) search,
+// returned by the periodic pending-search scan.
 type PendingLibrarySearchTarget struct {
 	LibraryItemID     int64      `json:"libraryItemId"`
 	MediaType         string     `json:"mediaType"`
@@ -482,6 +577,8 @@ type PendingLibrarySearchTarget struct {
 	UpdatedAt         time.Time  `json:"updatedAt"`
 }
 
+// FailedQueueRetryTarget is a queue item in the failed state considered for
+// an automatic retry pass.
 type FailedQueueRetryTarget struct {
 	QueueItemID           int64  `json:"queueItemId"`
 	LibraryItemID         int64  `json:"libraryItemId"`
@@ -490,20 +587,28 @@ type FailedQueueRetryTarget struct {
 	CandidateFailureCount int    `json:"candidateFailureCount"`
 }
 
+// SelectedQueueRetryTarget is a minimal row for a queue item in the selected
+// state, used to check whether it's stalled and needs a retry.
 type SelectedQueueRetryTarget struct {
 	QueueItemID   int64      `json:"queueItemId"`
 	LibraryItemID int64      `json:"libraryItemId"`
 	State         QueueState `json:"state"`
 }
 
+// PendingRepublishTarget is a library item flagged for re-publication (e.g.
+// after a symlink target changed), returned by the pending-republish scan.
 type PendingRepublishTarget struct {
 	LibraryItemID int64 `json:"libraryItemId"`
 }
 
+// BlocklistClearResult reports how many blocklist entries a bulk-clear
+// operation removed.
 type BlocklistClearResult struct {
 	Cleared int `json:"cleared"`
 }
 
+// RejectedReleaseRestoreResult reports how many previously-rejected release
+// candidates were restored to eligibility for a library item.
 type RejectedReleaseRestoreResult struct {
 	LibraryItemID int64 `json:"libraryItemId"`
 	Restored      int   `json:"restored"`

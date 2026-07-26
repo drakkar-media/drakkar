@@ -1,4 +1,14 @@
 <script lang="ts">
+  /**
+   * Displays imported Seerr request records alongside their linked library/queue
+   * state, with controls to sync from Seerr, run a pending-library search, and
+   * override each request's quality profile.
+   *
+   * Reloads are driven by a debounced SSE event listener plus a 30s fallback
+   * poll (paused when the tab isn't visible). The sync/search actions only
+   * queue background jobs — their real result counts arrive later via SSE
+   * events handled in onMount, not on the initial response.
+   */
   import { onMount } from 'svelte';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import SearchCheck from '@lucide/svelte/icons/search-check';
@@ -80,6 +90,7 @@
     }
   }
 
+  /** Persists a per-request quality-profile override, then mirrors it into local state; a failed save falls back to a full reload to stay in sync with the server. */
   async function setProfile(requestID: number, nextValue: string) {
     profileSaving = { ...profileSaving, [requestID]: true };
     try {

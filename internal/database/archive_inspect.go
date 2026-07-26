@@ -17,11 +17,20 @@ import (
 	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
+// inspectHeaderLimit is the initial (and typically sufficient) number of
+// bytes fetched from a RAR volume's start to parse its headers.
+// inspectHeaderLimitMax is the largest prefix inspectRARWithRetries will ever
+// fetch before giving up, for archives with unusually large or numerous
+// headers.
 const (
 	inspectHeaderLimit    = 256 * 1024
 	inspectHeaderLimitMax = 64 * 1024 * 1024
 )
 
+// Sentinel errors surfaced as an ImportedArchive's RejectReason. They
+// distinguish why an archive couldn't be made playable so the UI/logs can
+// explain it, and so shouldRetryRARInspect can tell a truncated header read
+// (worth retrying with a larger prefix) from a genuine format problem.
 var (
 	errArchiveHeadersInvalid         = errors.New("archive_headers_invalid")
 	errArchiveCompressionUnsupported = errors.New("archive_compression_unsupported")
@@ -45,6 +54,14 @@ func fetchRangeBackground(ctx context.Context, fetcher stream.SegmentFetcher, se
 	return fetcher.FetchRange(ctx, segment)
 }
 
+// inspectImportedArchives resolves each archive's playability by inspecting
+// its RAR/7z headers over NNTP, up to maxParallelInspections concurrently
+// with a per-archive 45s timeout. If fetcher is nil (no NNTP access
+// configured yet), every archive is left in "pending" status rather than
+// rejected, so it can be inspected later once a fetcher is available. Par2
+// index files are fetched and parsed once up front (enrichFileByNameFromPar2)
+// so all archive inspections benefit from the authoritative sizes/aliases
+// without redoing that work per archive.
 func inspectImportedArchives(ctx context.Context, archives []ImportedArchive, files []ImportedNZBFile, fetcher stream.SegmentFetcher) []ImportedArchive {
 	if len(archives) == 0 {
 		return nil
@@ -91,6 +108,11 @@ func inspectImportedArchives(ctx context.Context, archives []ImportedArchive, fi
 	return out
 }
 
+// inspectArchive validates that archive's volumes form a contiguous,
+// zero-based sequence before dispatching to the kind-specific inspector
+// (inspectRARArchive or inspect7zArchive). A gap in the volume sequence means
+// the NZB is missing a part, so inspection fails fast with
+// errArchiveHeadersInvalid rather than attempting a doomed header parse.
 func inspectArchive(ctx context.Context, archive *ImportedArchive, fileByName map[string]ImportedNZBFile, fetcher stream.SegmentFetcher) error {
 	if archive == nil {
 		return nil
@@ -139,6 +161,29 @@ func reconcileStoreMethodSize(e *ImportedArchiveEntry, totalVolumeBytes int64) {
 	e.PackedSizeBytes = e.SizeBytes
 }
 
+// inspectRARArchive determines the playable entries of a multi-volume RAR
+// archive by combining two independent strategies, since neither is reliable
+// alone:
+//
+//  1. The "legacy" flow: parse only the first volume's headers, which for
+//     well-formed archives already describes every entry's total size, and
+//     derive byte ranges across all volumes from per-volume sizes and
+//     detected continuation offsets (assignArchiveRanges). Kept as the
+//     fallback result (legacyEntries) for older scene archives where
+//     continuation volumes don't expose their own standalone file headers.
+//  2. The "per-volume" flow: parse every volume's own headers independently
+//     (inspectRARWithRetries per volume) and reassemble each entry's ranges
+//     from the per-volume fragments (aggregateRARVolumeEntries). This is
+//     preferred when available because it derives each volume's real
+//     contribution to an entry directly from that volume's own header,
+//     rather than propagating a single first-volume size estimate forward.
+//
+// The per-volume result is used whenever more per-volume entries were found
+// than the first-volume parse alone produced; otherwise the legacy result is
+// used. A failure to parse an individual continuation volume's headers
+// (errArchiveHeadersInvalid/errArchiveVideoNotFound) is tolerated and that
+// volume is simply skipped from the per-volume flow, since the legacy flow
+// can still cover it.
 func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName map[string]ImportedNZBFile, fetcher stream.SegmentFetcher) error {
 	first, ok := fileByName[archive.Volumes[0].Path]
 	if !ok {
@@ -214,6 +259,13 @@ func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName
 	return nil
 }
 
+// inspectRARWithRetries parses file's RAR headers from a prefix of its
+// decoded bytes, growing the prefix through successively larger limits
+// (inspectHeaderLimit up to inspectHeaderLimitMax) until parsing succeeds or
+// the whole file has been fetched. Starting small keeps the common case
+// (small headers) cheap; retrying larger only kicks in for
+// errArchiveHeadersInvalid/errArchiveVideoNotFound, which can mean the
+// initial prefix simply didn't reach every file header yet.
 func inspectRARWithRetries(ctx context.Context, file ImportedNZBFile, fetcher stream.SegmentFetcher) ([]ImportedArchiveEntry, error) {
 	available := importedFileEffectiveSize(ctx, file, fetcher)
 	if available <= 0 {
@@ -253,6 +305,10 @@ func shouldRetryRARInspect(err error) bool {
 	return errors.Is(err, errArchiveHeadersInvalid) || errors.Is(err, errArchiveVideoNotFound)
 }
 
+// normalizeArchiveFetchError reclassifies a segment-fetch error as
+// errNNTPArticleUnavailable when its message indicates a missing NNTP
+// article, so callers can distinguish "the release itself is gone" from a
+// genuine archive-format problem.
 func normalizeArchiveFetchError(err error) error {
 	if err == nil {
 		return nil
@@ -416,6 +472,30 @@ func rar4FindDataStart(raw []byte) (int64, error) {
 	return 0, errArchiveHeadersInvalid
 }
 
+// aggregateRARVolumeEntries reassembles one ImportedArchiveEntry per file
+// path from the independent per-volume header parses produced by
+// inspectRARArchive's per-volume flow. For each path, the per-volume
+// fragments are sorted by volume order and concatenated into a single
+// Ranges list, clamping each fragment's declared PackedSizeBytes to the
+// actual bytes available in that volume (volumeSizes) since a header-
+// declared size can overrun what the volume really contains.
+//
+// Fragments for the same path must agree on compression method,
+// encryption, and solid flag, and must appear in strictly increasing volume
+// order -- any violation is treated as an unreconcilable layout
+// (errArchiveHeadersInvalid) rather than guessed at.
+//
+// After accumulating all fragments, SizeBytes (the header-declared unpacked
+// size) is reconciled against PackedSizeBytes (the sum of each volume's own,
+// capacity-clamped contribution -- effectively measured, not estimated):
+//   - A difference of 16 bytes or less is treated as harmless rounding: the
+//     accumulated packed size wins and the last range absorbs the residual.
+//   - For store method (m0, where packed and unpacked are mathematically
+//     required to be equal), any larger disagreement means the header field
+//     is simply wrong -- in either direction, too large (a corrupt
+//     unpacked-size field) or too small (an undercounted declared size that
+//     would otherwise truncate the last bytes of every stream) -- so the
+//     accumulated PackedSizeBytes always wins over the declared SizeBytes.
 func aggregateRARVolumeEntries(parts []ImportedArchiveEntry, volumeSizes map[int]int64) ([]ImportedArchiveEntry, error) {
 	if len(parts) == 0 {
 		return nil, errArchiveHeadersInvalid
@@ -594,6 +674,11 @@ func enrichFileByNameFromPar2(ctx context.Context, files []ImportedNZBFile, file
 	}
 }
 
+// readImportedFilePrefix fetches the first limit decoded bytes of file over
+// NNTP by resolving them to segment ranges (stream.ResolveRange) and fetching
+// each at background priority. Returns an error if fewer than limit bytes
+// could be assembled, so callers never silently operate on a truncated
+// header.
 func readImportedFilePrefix(ctx context.Context, file ImportedNZBFile, limit int64, fetcher stream.SegmentFetcher) ([]byte, error) {
 	size := importedFileSegmentEnd(file)
 	if file.FileSizeBytes > size {
@@ -686,6 +771,16 @@ func rar5ReadVint(data []byte, pos int) (int64, int) {
 	return 0, 0
 }
 
+// inspectRAR5 walks a RAR5 volume's header blocks (as parsed from a decoded
+// byte prefix) and collects one ImportedArchiveEntry per file header found.
+// Any encryption header (type 4) rejects the whole archive immediately
+// (errArchiveEncrypted). Once a playable entry (video extension) is seen, it
+// must be uncompressed, non-solid, and unencrypted, or inspection fails with
+// the specific unsupported-feature error -- non-playable entries (nfo, sfv,
+// etc.) are collected but never fail inspection on their own. Returns
+// errArchiveVideoNotFound if headers parsed cleanly but no playable entry
+// was found, distinguishing "not a video release" from a corrupt/truncated
+// parse (errArchiveHeadersInvalid).
 func inspectRAR5(raw []byte) ([]ImportedArchiveEntry, error) {
 	if len(raw) < 8 || string(raw[:8]) != "Rar!\x1a\x07\x01\x00" {
 		return nil, errArchiveHeadersInvalid
@@ -782,6 +877,10 @@ done:
 	return entries, nil
 }
 
+// parseRAR5FileHeader decodes a single RAR5 file-header block's fields
+// (size, name, compression method, solid flag) into an ImportedArchiveEntry.
+// isDir reports whether the header describes a directory rather than a file,
+// so the caller can skip it.
 func parseRAR5FileHeader(raw []byte, pos, end int, dataStart, dataAreaSize int64) (ImportedArchiveEntry, bool, error) {
 	fileFlags, n := rar5ReadVint(raw, pos)
 	if n == 0 || pos+n > end {
@@ -863,6 +962,11 @@ func parseRAR5FileHeader(raw []byte, pos, end int, dataStart, dataAreaSize int64
 	}, isDir, nil
 }
 
+// inspectRAR4 walks a RAR4 volume's header blocks and collects one
+// ImportedArchiveEntry per file header (type 0x74), tracking archive-level
+// flags from the main header (type 0x73) for encryption/solid detection.
+// Same playable-entry feature gating and errArchiveVideoNotFound semantics
+// as inspectRAR5.
 func inspectRAR4(raw []byte) ([]ImportedArchiveEntry, error) {
 	if len(raw) < 13 || string(raw[:7]) != "Rar!\x1a\x07\x00" {
 		return nil, errArchiveHeadersInvalid
@@ -919,6 +1023,9 @@ func inspectRAR4(raw []byte) ([]ImportedArchiveEntry, error) {
 	return entries, nil
 }
 
+// parseRAR4FileHeader decodes a single RAR4 file-header block's fields into
+// an ImportedArchiveEntry, also returning the packed size so the caller can
+// skip past this header's data block to the next header.
 func parseRAR4FileHeader(body []byte, headFlags, mainFlags uint16, dataOffset int64) (ImportedArchiveEntry, int64, error) {
 	if len(body) < 25 {
 		return ImportedArchiveEntry{}, 0, errArchiveHeadersInvalid
@@ -954,6 +1061,16 @@ func parseRAR4FileHeader(body []byte, headFlags, mainFlags uint16, dataOffset in
 	}, int64(packedSize), nil
 }
 
+// assignArchiveRanges builds each entry's byte Ranges across volumes for the
+// "legacy" first-volume-only inspection flow: starting from the entry's own
+// VolumeIndex/ArchiveOffset (as parsed from the first volume's headers), it
+// consumes PackedSizeBytes worth of data by walking forward through
+// successive volumes, using each continuation volume's detected data-start
+// offset (volumeDataOffsets, from fetchContinuationOffsets) instead of
+// assuming data begins at offset 0. If the known volumes can't fully account
+// for PackedSizeBytes (e.g. a missing/unreadable continuation volume),
+// Ranges is cleared to nil so hasCompleteArchiveMapping rejects the entry
+// rather than serving a truncated file.
 func assignArchiveRanges(entries []ImportedArchiveEntry, volumeSizes map[int]int64, volumeDataOffsets map[int]int64) {
 	for i := range entries {
 		entry := &entries[i]
@@ -998,6 +1115,9 @@ func assignArchiveRanges(entries []ImportedArchiveEntry, volumeSizes map[int]int
 	}
 }
 
+// validatePlayableArchiveEntries rejects the archive (errArchiveHeadersInvalid)
+// if any playable (video) entry lacks a complete, gapless byte-range mapping.
+// Non-playable entries are not required to have one.
 func validatePlayableArchiveEntries(entries []ImportedArchiveEntry) error {
 	for _, entry := range entries {
 		if !isPlayableArchiveEntry(entry.Path) {
@@ -1010,6 +1130,11 @@ func validatePlayableArchiveEntries(entries []ImportedArchiveEntry) error {
 	return nil
 }
 
+// hasCompleteArchiveMapping reports whether entry.Ranges forms a contiguous,
+// gapless covering of exactly entry.PackedSizeBytes -- i.e. each range's
+// EntryOffset picks up exactly where the previous one's coverage ended, with
+// no overlaps, gaps, or shortfall. An entry with zero PackedSizeBytes is
+// trivially complete only if it also has no ranges.
 func hasCompleteArchiveMapping(entry ImportedArchiveEntry) bool {
 	if entry.PackedSizeBytes < 0 {
 		return false

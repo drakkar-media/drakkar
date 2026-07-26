@@ -1,4 +1,10 @@
 <script lang="ts">
+  /**
+   * Prev/next (and optional first/last) pager for a numbered page range.
+   * Renders nothing when there's only one page. Stateless: dispatches a
+   * `change` event with the target page number and relies on the caller to
+   * update the `page` prop in response.
+   */
   import { createEventDispatcher } from 'svelte';
 
   export let page: number = 1;

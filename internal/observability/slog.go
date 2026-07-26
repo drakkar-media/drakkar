@@ -22,6 +22,8 @@ func NewSlogHandler(logger zerolog.Logger) slog.Handler {
 	return &ZerologSlogHandler{logger: logger}
 }
 
+// Enabled reports whether a record at level would be emitted, mapping slog's
+// level scale onto zerolog's and comparing against the live global level.
 func (h *ZerologSlogHandler) Enabled(_ context.Context, level slog.Level) bool {
 	var zl zerolog.Level
 	switch {
@@ -42,6 +44,10 @@ func (h *ZerologSlogHandler) Enabled(_ context.Context, level slog.Level) bool {
 	return zerolog.GlobalLevel() <= zl
 }
 
+// Handle converts an slog.Record into a zerolog event at the equivalent
+// level, translating each attribute to zerolog's typed field methods where a
+// direct mapping exists (error, int, float64, bool) and falling back to a
+// string representation otherwise.
 func (h *ZerologSlogHandler) Handle(_ context.Context, r slog.Record) error {
 	var ev *zerolog.Event
 	switch {
@@ -76,6 +82,8 @@ func (h *ZerologSlogHandler) Handle(_ context.Context, r slog.Record) error {
 	return nil
 }
 
+// WithAttrs returns a new handler whose underlying logger has attrs bound as
+// permanent string fields on every subsequent event.
 func (h *ZerologSlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	ctx := h.logger.With()
 	for _, a := range attrs {
@@ -84,6 +92,9 @@ func (h *ZerologSlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	return &ZerologSlogHandler{logger: ctx.Logger()}
 }
 
+// WithGroup returns a new handler whose underlying logger tags every
+// subsequent event with a "group" field set to name. Unlike slog's own
+// group semantics, attribute keys are not nested/prefixed by the group.
 func (h *ZerologSlogHandler) WithGroup(name string) slog.Handler {
 	return &ZerologSlogHandler{logger: h.logger.With().Str("group", name).Logger()}
 }

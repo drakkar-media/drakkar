@@ -20,6 +20,8 @@ type SegmentSizer interface {
 	DecodedSize(ctx context.Context, messageID string) (int64, error)
 }
 
+// SegmentChecker confirms whether an NNTP article still exists via a cheap
+// STAT-style check, without downloading its body.
 type SegmentChecker interface {
 	Exists(ctx context.Context, messageID string) error
 }
@@ -73,6 +75,10 @@ func (db *DB) loadNZBFirstLastSegmentPairs(ctx context.Context, nzbDocumentID in
 	}}, nil
 }
 
+// shouldValidateNZBSubject reports whether an NZB file's subject names a file
+// worth a reachability check. Metadata/image files (.par2, .sfv, .nfo,
+// images) and sample clips are excluded since their absence doesn't affect
+// playability.
 func shouldValidateNZBSubject(subject string) bool {
 	name := parseNZBSubjectFilename(subject)
 	if name == "" {
@@ -92,6 +98,9 @@ func shouldValidateNZBSubject(subject string) bool {
 	return true
 }
 
+// parseNZBSubjectFilename extracts the filename from a Usenet subject line,
+// preferring a quoted substring and falling back to the first
+// whitespace-delimited field.
 func parseNZBSubjectFilename(subject string) string {
 	start := strings.Index(subject, "\"")
 	end := strings.LastIndex(subject, "\"")

@@ -1,4 +1,8 @@
 <script lang="ts">
+  /**
+   * Redirects immediately to /downloads — the queue view now lives there.
+   * Uses replaceState so this redirect page doesn't linger in browser history.
+   */
   import { goto } from '$app/navigation';
   import { onMount } from 'svelte';
 

@@ -1,4 +1,15 @@
 <script lang="ts">
+  /**
+   * Displays the scheduled-task control plane: automated background jobs
+   * (indexing, publishing, maintenance) driven by the backend scheduler, plus
+   * manually-triggered "Operations" tasks with no scheduled counterpart.
+   *
+   * Schedule state polls every 30s (paused when the tab is hidden). Running
+   * state and results for manual tasks are also kept live via SSE — most
+   * manual tasks only queue background work, so their real outcome arrives
+   * later through the backgroundKinds / backgroundResultUpdates maps below
+   * rather than the initial API response.
+   */
   import { onMount } from 'svelte';
   import Play from '@lucide/svelte/icons/play';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
@@ -68,6 +79,7 @@
     }
   }
 
+  /** Runs a task and records its immediate result; for queued background operations this is later overwritten with the real outcome via backgroundResultUpdates. */
   async function runTask(task: TaskDef) {
     running = { ...running, [task.id]: true };
     const ranAt = new Date().toISOString();

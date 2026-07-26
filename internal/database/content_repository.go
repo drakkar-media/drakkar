@@ -58,6 +58,9 @@ func computeSpans(messageIDs []string, decodedSegmentSize, lastDecodedSize, segm
 	return spans
 }
 
+// storedRarRangeSource is one contiguous slice of a stored_rar entry's data as
+// it lives inside a specific RAR volume: EntryOffset is the position within
+// the reassembled entry, ArchiveOffset is the position within that volume file.
 type storedRarRangeSource struct {
 	VolumePath    string
 	EntryOffset   int64
@@ -65,6 +68,8 @@ type storedRarRangeSource struct {
 	LengthBytes   int64
 }
 
+// storedRarNZBSource is the underlying nzb_files segment layout for one RAR
+// volume, used to recompute that volume's spans on demand.
 type storedRarNZBSource struct {
 	MessageIDs         []string
 	DecodedSegmentSize int64
@@ -72,11 +77,18 @@ type storedRarNZBSource struct {
 	FileSizeBytes      int64
 }
 
+// storedRarVolumeMeta identifies one archive_volumes row by its file path and
+// order within the archive.
 type storedRarVolumeMeta struct {
 	Path        string
 	VolumeIndex int
 }
 
+// buildStoredRarSpans assembles the full ordered SegmentSpan list for a
+// stored_rar virtual file by computing each volume's spans independently (via
+// computeSpans) and concatenating them in entry order, re-keying
+// Start/End/SegmentID so the result reads as one continuous virtual byte
+// stream across volume boundaries.
 func buildStoredRarSpans(sources map[string]storedRarNZBSource, ranges []storedRarRangeSource) []stream.SegmentSpan {
 	if len(ranges) == 0 || len(sources) == 0 {
 		return nil
@@ -130,6 +142,9 @@ func buildStoredRarSpans(sources map[string]storedRarNZBSource, ranges []storedR
 	return out
 }
 
+// storedRarSourceSize returns the total decoded byte size of a RAR volume's
+// underlying NZB data, preferring calibrated segment sizes and falling back
+// to the header-derived FileSizeBytes when segment data isn't available.
 func storedRarSourceSize(source storedRarNZBSource) int64 {
 	if source.FileSizeBytes > 0 && (len(source.MessageIDs) == 0 || source.DecodedSegmentSize <= 0) {
 		return source.FileSizeBytes
@@ -150,6 +165,12 @@ func storedRarSourceSize(source storedRarNZBSource) int64 {
 	return total + source.DecodedSegmentSize
 }
 
+// reconstructStoredRarRanges rebuilds an entry's range layout from the full
+// ordered volume list, starting at (startVolumePath, startArchiveOffset) and
+// consuming successive volumes until entrySize bytes are accounted for.
+// continuationOffsets overrides the assumed offset-0 start for volumes after
+// the first, when a per-volume RAR header precedes the data. Returns nil if
+// the remaining volumes can't cover entrySize.
 func reconstructStoredRarRanges(
 	sources map[string]storedRarNZBSource,
 	volumes []storedRarVolumeMeta,
@@ -214,6 +235,10 @@ func reconstructStoredRarRanges(
 	return ranges
 }
 
+// detectStoredRarContinuationOffsets live-probes the first bytes of each RAR
+// volume after startVolumePath and parses the RAR4/RAR5 header to learn the
+// real byte offset where entry data begins, correcting the naive assumption
+// that continuation volumes start at offset 0.
 func (db *DB) detectStoredRarContinuationOffsets(ctx context.Context, sources map[string]storedRarNZBSource, volumes []storedRarVolumeMeta, startVolumePath string) map[string]int64 {
 	if db.SegmentFetcher == nil || len(volumes) == 0 {
 		return nil
@@ -267,6 +292,8 @@ func (db *DB) detectStoredRarContinuationOffsets(ctx context.Context, sources ma
 	return offsets
 }
 
+// ListContentMountEntriesForRelease returns the virtual files belonging to a
+// single selected release, ordered by path.
 func (db *DB) ListContentMountEntriesForRelease(ctx context.Context, selectedReleaseID int64) ([]ContentMountEntry, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select vf.id, vf.selected_release_id, vf.path, vf.file_name, vf.size_bytes, vf.reader_kind
@@ -288,6 +315,8 @@ func (db *DB) ListContentMountEntriesForRelease(ctx context.Context, selectedRel
 	return out, rows.Err()
 }
 
+// ListContentMountEntries returns every virtual file across all releases,
+// ordered by release then path, for building the full WebDAV mount tree.
 func (db *DB) ListContentMountEntries(ctx context.Context) ([]ContentMountEntry, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select
@@ -322,6 +351,12 @@ func (db *DB) ListContentMountEntries(ctx context.Context) ([]ContentMountEntry,
 	return out, rows.Err()
 }
 
+// OpenVirtualMediaFile opens a virtual media file for streaming, dispatching
+// by reader_kind (inline, direct_nzb, or stored_rar) to the matching
+// stream.VirtualMediaFile implementation. Metadata and segment spans come
+// from the in-memory VF cache (see loadVFCache) rather than a fresh query per
+// call; each open receives its own copy of the cached spans so a reader's
+// mid-read span adjustments never mutate the shared cache entry.
 func (db *DB) OpenVirtualMediaFile(ctx context.Context, virtualFileID int64) (stream.VirtualMediaFile, error) {
 	entry, err := db.loadVFCache(ctx, virtualFileID)
 	if err != nil {
@@ -484,6 +519,13 @@ func (db *DB) verifyLastSpanBoundary(ctx context.Context, spans []stream.Segment
 	return corrected
 }
 
+// loadStoredRarSpansUncorrected loads the persisted archive_ranges layout for
+// a stored_rar virtual file and rebuilds its span table. When the persisted
+// ranges' total size doesn't match the entry's recorded size_bytes (offsets
+// derived from RAR headers at import time can drift from the true decoded
+// layout), it trims an overshoot or reconstructs the missing volumes for an
+// undershoot from the full volume list, falling back to nil if no
+// reconstruction matches.
 func (db *DB) loadStoredRarSpansUncorrected(ctx context.Context, virtualFileID int64) ([]stream.SegmentSpan, error) {
 	var (
 		selectedReleaseID  int64
@@ -668,6 +710,9 @@ func (db *DB) InvalidateVFCacheForNZBFile(_ int64) {
 	db.vfCacheMu.Unlock()
 }
 
+// unavailableSegmentFetcher is a stub stream.SegmentFetcher used when
+// db.SegmentFetcher hasn't been configured, so direct_nzb/stored_rar reads
+// fail with a clear error instead of a nil-pointer panic.
 type unavailableSegmentFetcher struct{}
 
 func (unavailableSegmentFetcher) FetchRange(ctx context.Context, segment stream.SegmentRange) ([]byte, error) {
@@ -693,12 +738,16 @@ func (db *DB) ListAllVirtualFiles(ctx context.Context) ([]VirtualFileEntry, erro
 	return out, rows.Err()
 }
 
+// VirtualFileEntry is a lightweight (id, name, size) projection of a
+// virtual_files row for WebDAV directory listings.
 type VirtualFileEntry struct {
 	ID       int64
 	FileName string
 	Size     int64
 }
 
+// spanFileSize returns the total virtual file size implied by spans -- the
+// maximum End across all spans, not their combined length.
 func spanFileSize(spans []stream.SegmentSpan) int64 {
 	var end int64
 	for _, span := range spans {

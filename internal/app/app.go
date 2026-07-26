@@ -36,6 +36,7 @@ import (
 	"github.com/drakkar-media/drakkar/internal/opensubtitles"
 	"github.com/drakkar-media/drakkar/internal/plex"
 	"github.com/drakkar-media/drakkar/internal/policy"
+	"github.com/drakkar-media/drakkar/internal/privacy"
 	"github.com/drakkar-media/drakkar/internal/probe"
 	"github.com/drakkar-media/drakkar/internal/queue"
 	"github.com/drakkar-media/drakkar/internal/rclone"
@@ -76,6 +77,10 @@ const (
 	nonCriticalQueueDepthLimit    = 500
 )
 
+// boundedTVRSSInterval converts a configured TV RSS sync interval to a
+// duration, clamping it to a 15-minute floor so a misconfigured or
+// zero/negative value can't make the sync task poll the feed too
+// aggressively.
 func boundedTVRSSInterval(minutes int) time.Duration {
 	interval := time.Duration(minutes) * time.Minute
 	if interval < 15*time.Minute {
@@ -84,6 +89,10 @@ func boundedTVRSSInterval(minutes int) time.Duration {
 	return interval
 }
 
+// boundedMovieRSSInterval converts a configured movie RSS sync interval to a
+// duration, clamping it to a 30-minute floor for the same reason as
+// boundedTVRSSInterval; movies use a longer floor since their feed churns
+// less frequently than TV.
 func boundedMovieRSSInterval(minutes int) time.Duration {
 	interval := time.Duration(minutes) * time.Minute
 	if interval < 30*time.Minute {
@@ -121,11 +130,21 @@ func refreshPlexPathWithRetry(ctx context.Context, client *plex.Client, sectionK
 	return lastErr
 }
 
+// runtimeStatus is a mutex-guarded holder of the most recently computed
+// api.Status, shared between the periodic status refresh and the HTTP
+// status endpoint so a request never blocks on recomputing it. Safe for
+// concurrent use.
 type runtimeStatus struct {
 	mu     sync.RWMutex
 	status api.Status
 }
 
+// fileSettingsService implements the API's settings persistence contract
+// backed by the on-disk settings file at path. UpdateSettings merges secrets
+// from the currently-saved config into the incoming update (so a client that
+// omits a secret field doesn't blank it out), persists the merged result,
+// and -- when applier is set -- re-applies the new settings to every live
+// component via liveSettingsController.ApplySettings before returning.
 type fileSettingsService struct {
 	path    string
 	mu      sync.Mutex
@@ -134,12 +153,17 @@ type fileSettingsService struct {
 	}
 }
 
+// GetSettings loads and returns the settings currently persisted on disk.
 func (s *fileSettingsService) GetSettings(_ context.Context) (config.Settings, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return config.Load(s.path)
 }
 
+// UpdateSettings persists cfg, merging in secrets from the currently-saved
+// settings so a client omitting a secret field does not blank it out, then
+// re-applies the merged settings to every live component when an applier is
+// configured. See fileSettingsService's type comment for the full contract.
 func (s *fileSettingsService) UpdateSettings(_ context.Context, cfg config.Settings) (config.Settings, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -163,6 +187,11 @@ func (s *fileSettingsService) UpdateSettings(_ context.Context, cfg config.Setti
 	return loaded, nil
 }
 
+// taskScheduleStatusService reports the API's task-schedule view: the
+// static list of automated maintenance/indexing tasks combined with each
+// task's last-run timestamp from the database and the live RSS sync
+// intervals most recently applied via SetRSSIntervals. Safe for concurrent
+// use.
 type taskScheduleStatusService struct {
 	mu                          sync.RWMutex
 	db                          *database.DB
@@ -170,18 +199,25 @@ type taskScheduleStatusService struct {
 	movieRssSyncIntervalMinutes int
 }
 
+// Status returns the most recently stored api.Status snapshot.
 func (s *runtimeStatus) Status() api.Status {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.status
 }
 
+// SetStatus replaces the stored api.Status snapshot, making it visible to
+// subsequent Status callers.
 func (s *runtimeStatus) SetStatus(status api.Status) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.status = status
 }
 
+// ListTaskSchedules returns the static list of automated maintenance/indexing
+// tasks, annotated with each task's last-run time from the database's
+// maintenance cursors and the live RSS sync intervals most recently applied
+// via SetRSSIntervals.
 func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]api.TaskSchedule, error) {
 	s.mu.RLock()
 	tvRSSInterval := s.tvRssSyncIntervalMinutes
@@ -222,6 +258,9 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 	return defs, nil
 }
 
+// SetRSSIntervals records the currently-configured TV and movie RSS sync
+// intervals so subsequent ListTaskSchedules calls report the live schedule
+// rather than the value the service was constructed with.
 func (s *taskScheduleStatusService) SetRSSIntervals(tvMinutes, movieMinutes int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -229,6 +268,15 @@ func (s *taskScheduleStatusService) SetRSSIntervals(tvMinutes, movieMinutes int)
 	s.movieRssSyncIntervalMinutes = movieMinutes
 }
 
+// Run constructs and runs the entire Drakkar application: it loads
+// configuration, wires up every subsystem (database, Usenet fetch pipeline,
+// workflow/search/download queues, library publishing, WebDAV/HTTP APIs,
+// metrics, and all recurring maintenance tasks), and then blocks serving
+// traffic until ctx is canceled, performing an ordered graceful shutdown of
+// the HTTP, WebDAV, and debug servers before returning.
+//
+// Run is meant to be called once per process at startup; it is not
+// re-entrant and does not support being called again after it returns.
 func Run(ctx context.Context, logger zerolog.Logger) error {
 	// Route all slog output (nntp, library, api packages) through the same
 	// zerolog logger so every line shares the same color/format.
@@ -281,6 +329,17 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}
 	}
 
+	privacyMgr := privacy.NewManager()
+	defer privacyMgr.Close()
+	if err := privacyMgr.Reload(ctx, privacyManagerConfig(cfg.Privacy)); err != nil {
+		// A syntactically-valid-at-save-time WireGuard config can still fail
+		// to initialize at startup (e.g. transient DNS/network issue) --
+		// don't block the whole app from starting over that; log and leave
+		// the manager on its zero-value Direct default. The next settings
+		// save (or a future retry mechanism) can bring the route up.
+		logger.Error().Err(err).Msg("privacy: failed to initialize configured route at startup; falling back to direct until settings are re-saved")
+	}
+
 	db, err := database.Open(cfg.Database)
 	if err != nil {
 		return err
@@ -292,102 +351,23 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	if err := db.ApplyMigrations(ctx, filepath.Join(".", "migrations")); err != nil {
 		return err
 	}
-	var scheduledSrc *nntp.ScheduledSource
 	db.ReadAhead = stream.NewReadAheadManager(rt.ReadAheadLimitBytes)
 	db.ReadAhead.SetArticleBufferSize(cfg.Usenet.ArticleBufferSize)
-	var (
-		articleSources         []nntp.NamedArticleSource
-		pooledSources          []*nntp.PooledSource
-		totalWorkers           int
-		maxDownloadConnections int
-	)
-	for _, provider := range cfg.Usenet.Providers {
-		if !provider.Enabled || provider.Host == "" {
-			continue
-		}
-		totalWorkers += max(provider.MaxConnections, 1)
+	// dynamicArticleSrc wraps the whole Usenet fetch pipeline (per-provider
+	// pools -> fallback -> scheduler -> disk/RAM caches) behind a
+	// swap-pointer, mirroring dynamicWorkQueue's pattern, so a Usenet
+	// provider settings change can rebuild it and swap it in live.
+	dynamicArticleSrc := newDynamicArticleSource(rt, logger)
+	dynamicArticleSrc.Rebuild(ctx, cfg.Usenet, privacyMgr)
+	db.SegmentFetcher = dynamicArticleSrc
+	if maxConns, pct := dynamicArticleSrc.ConnectionBudget(); maxConns > 0 {
+		db.ReadAhead.SetConnectionBudget(maxConns, pct)
 	}
-	if len(cfg.Usenet.Providers) > 0 {
-		maxDownloadConnections = cfg.Usenet.MaxDownloadConnections
-		if maxDownloadConnections <= 0 {
-			maxDownloadConnections = totalWorkers
+	privacyMgr.OnDrain(func() {
+		for _, p := range dynamicArticleSrc.Pools() {
+			p.DrainIdle()
 		}
-		if maxDownloadConnections > totalWorkers {
-			maxDownloadConnections = totalWorkers
-		}
-		// The foreground and background scheduler lanes (below) are each
-		// sized at maxDownloadConnections, but both draw from the SAME
-		// per-provider connection pool (sized at the raw account ceiling,
-		// totalWorkers) -- the pool itself has no priority awareness, so
-		// "background never blocks foreground" only actually holds if the
-		// pool has enough spare capacity for both lanes to run at once.
-		// Found in the 2026-07-19 audit: with zero headroom (e.g.
-		// totalWorkers==2*maxDownloadConnections), a background burst can
-		// legitimately exhaust the pool and make foreground/playback fetches
-		// wait behind it -- the opposite of the dual-lane design's intent.
-		// This doesn't change behavior; it just makes an otherwise-silent
-		// misconfiguration visible.
-		if lacksSchedulerLaneHeadroom(totalWorkers, maxDownloadConnections) {
-			logger.Warn().
-				Int("maxDownloadConnections", maxDownloadConnections).
-				Int("totalProviderConnections", totalWorkers).
-				Msg("usenet: foreground + background NNTP lanes (2x maxDownloadConnections) have little or no headroom against the shared connection pool (sum of provider maxConnections) -- a background calibration/health-check burst could delay foreground playback fetches; consider raising provider maxConnections or lowering maxDownloadConnections")
-		}
-	}
-	for _, provider := range cfg.Usenet.Providers {
-		if !provider.Enabled || provider.Host == "" {
-			continue
-		}
-		client := nntp.NewArticleClient(provider)
-		// The pool itself stays at the account's own raw ceiling
-		// (provider.MaxConnections, e.g. 100) -- always sized from the raw
-		// provider connection count, never clamped to "Max Download
-		// Connections". That setting is enforced downstream instead
-		// (ScheduledSource's foreground lane, below), not at the pool itself.
-		pooled := nntp.NewPooledSource(ctx, client.NewSession, provider.MaxConnections)
-		pooledSources = append(pooledSources, pooled)
-		articleSources = append(articleSources, nntp.NamedArticleSource{
-			Name:   provider.Name,
-			Source: pooled,
-		})
-	}
-	if len(articleSources) > 0 {
-		fallback := nntp.NewFallbackSource(articleSources, 1)
-		// Wrap with a 24-hour missing-article cache so known-expired (430) IDs
-		// are never re-fetched from NNTP within the TTL window.
-		cachedFallback := nntp.NewCachedFallbackSource(fallback)
-		// Foreground lane (interactive playback + read-ahead) is capped at
-		// maxDownloadConnections. Background lane (calibration /
-		// health-check) is a separate, independently-sized pool of workers
-		// so it's never blocked behind foreground traffic -- but since
-		// Drakkar's health check does a full body fetch+decode (not a cheap
-		// STAT-only check), it does NOT get the full account ceiling; it
-		// gets its own bounded lane instead (same size as the foreground
-		// lane is a reasonable, deliberately modest choice, not a
-		// re-derivation of the account ceiling) to avoid reintroducing the
-		// over-concurrency that caused corrupted reads under heavy load
-		// (see calibrate.go's confirmPermanentCRCMismatch and the
-		// 2026-07-19 incident).
-		scheduled := nntp.NewScheduledSourceLanes(ctx, cachedFallback, maxDownloadConnections, maxDownloadConnections, maxDownloadConnections*8)
-		diskDecoded := nntp.NewDiskCachedDecodedSource(scheduled, rt.BlockCachePath, rt.DiskCacheLimitBytes)
-		decoded := nntp.NewCachedDecodedSource(diskDecoded, rt.MemoryHotCacheMaxBytes)
-		db.SegmentFetcher = nntp.NewSegmentFetcher(decoded)
-		db.ReadAhead.SetConnectionBudget(maxDownloadConnections, cfg.Usenet.StreamingPriorityPct)
-		scheduledSrc = scheduled
-		// Evict stale missing-article cache entries hourly.
-		go func() {
-			ticker := time.NewTicker(time.Hour)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					cachedFallback.Evict()
-				}
-			}
-		}()
-	}
+	})
 
 	newValkeyClient := func() *redis.Client {
 		return redis.NewClient(&redis.Options{
@@ -417,7 +397,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	seerrClient := seerr.NewClient(cfg.Seerr)
 	hydraClient := hydra.NewClient(cfg.NZBHydra2)
 	hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)
+	hydraClient.SetTransport(privacyMgr.Transport())
 	workflowSvc := workflow.NewService(db, seerrClient, hydraClient)
+	nzbFetcher := workflow.NewHTTPNZBFetcher(privacyMgr.HTTPClient(60*time.Second), &http.Client{Timeout: 60 * time.Second})
+	nzbFetcher.SetExcludedIndexers(cfg.Privacy.ExcludedIndexers)
+	workflowSvc.SetNZBFetcher(nzbFetcher)
 	// importWorkers = number of concurrent download-job pipelines (search,
 	// select, fetch NZB, import, publish) processed at once. Deliberately
 	// independent of maxDownloadConnections/the NNTP connection budget --
@@ -465,12 +449,14 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		MaximumSizeMB:     cfg.Indexer.MaximumSizeMB,
 		ReleaseGraceHours: cfg.Indexer.ReleaseGraceHours,
 	})
-	if strings.TrimSpace(cfg.Metadata.TMDB.APIKey) != "" {
-		workflowSvc.SetTMDBClient(tmdb.NewClient(cfg.Metadata))
-	}
-	if strings.TrimSpace(cfg.Metadata.TVDB.APIKey) != "" {
-		workflowSvc.SetTVDBClient(tvdb.NewClient(cfg.Metadata))
-	}
+	// Always construct TMDB/TVDB clients (even with an empty key at startup)
+	// -- Client.Enabled() already gates real usage on a non-empty key, and
+	// SetConfig lets a key added later via Settings take effect live instead
+	// of requiring a restart.
+	tmdbClient := tmdb.NewClient(cfg.Metadata)
+	tvdbClient := tvdb.NewClient(cfg.Metadata)
+	workflowSvc.SetTMDBClient(tmdbClient)
+	workflowSvc.SetTVDBClient(tvdbClient)
 	publicationSvc := library.NewPublisher(db, rt, cfg.Rclone.RCAddr)
 	rcloneClient := rclone.NewClient(cfg.Rclone.RCAddr)
 	maintenanceSvc := &maintenanceOpsService{
@@ -481,7 +467,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		logger:         logger,
 	}
 	cacheSvc := cache.NewService(cache.NewFileCache(rt.BlockCachePath, rt.DiskCacheLimitBytes))
-	catalogSvc := catalog.NewService(db, tmdb.NewClient(cfg.Metadata))
+	catalogSvc := catalog.NewService(db, tmdbClient)
 	var subtitleProviders []subtitles.Provider
 	var probeProviders []probe.NamedProber
 	if strings.TrimSpace(cfg.Seerr.URL) != "" && strings.TrimSpace(cfg.Seerr.APIKey) != "" {
@@ -506,7 +492,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		if !provider.Enabled || strings.TrimSpace(provider.Host) == "" || strings.TrimSpace(provider.Username) == "" || strings.TrimSpace(provider.Password) == "" {
 			continue
 		}
-		probeProviders = append(probeProviders, nntp.NewArticleClient(provider))
+		probeProviders = append(probeProviders, nntp.NewArticleClient(provider, privacyMgr))
 	}
 	subtitleSvc := subtitles.NewService(db, cfg.Subtitles.Languages, subtitleProviders...)
 	policySvc := policy.NewService(db)
@@ -634,34 +620,42 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	db.SetDefaultProfileNames(cfg.Library.DefaultMovieProfile, cfg.Library.DefaultTvProfile)
 	broker := api.NewEventBroker()
 
-	// live metrics collector — reads NNTP pool + scheduler + disk cache at query time
-	var pooledSrcs []*nntp.PooledSource
-	if len(pooledSources) > 0 {
-		pooledSrcs = pooledSources
-	}
+	// live metrics collector — reads NNTP pool + scheduler + disk cache at
+	// query time, via dynamicArticleSrc so a Usenet provider rebuild never
+	// leaves metrics pinned to an already-closed pool/scheduler.
 	blockCache := cache.NewFileCache(rt.BlockCachePath, rt.DiskCacheLimitBytes)
 	metricsColl := &liveMetricsCollector{
 		readAhead:  db.ReadAhead,
-		pools:      pooledSrcs,
-		scheduled:  scheduledSrc,
+		articleSrc: dynamicArticleSrc,
 		blockCache: blockCache,
 	}
 	taskScheduleSvc := &taskScheduleStatusService{db: db, tvRssSyncIntervalMinutes: cfg.Indexer.TvRssSyncIntervalMinutes, movieRssSyncIntervalMinutes: cfg.Indexer.MovieRssSyncIntervalMinutes}
 	recentTaskMgr := newRecurringTaskManager(ctx, logger)
 	liveSettings := &liveSettingsController{
-		rt:            rt,
-		startedAt:     startedAt,
-		status:        statusSvc,
-		taskSchedules: taskScheduleSvc,
-		workflowSvc:   workflowSvc,
-		hydraClient:   hydraClient,
-		workQueue:     wq,
-		recentTasks:   recentTaskMgr,
+		rt:             rt,
+		startedAt:      startedAt,
+		status:         statusSvc,
+		taskSchedules:  taskScheduleSvc,
+		workflowSvc:    workflowSvc,
+		hydraClient:    hydraClient,
+		workQueue:      wq,
+		recentTasks:    recentTaskMgr,
+		privacyMgr:     privacyMgr,
+		nzbFetcher:     nzbFetcher,
+		seerrClient:    seerrClient,
+		tmdbClient:     tmdbClient,
+		tvdbClient:     tvdbClient,
+		plexClient:     plexClient,
+		jellyfinClient: jellyfinClient,
+		notifier:       notifier,
+		rcloneClient:   rcloneClient,
+		articleSrc:     dynamicArticleSrc,
+		readAhead:      db.ReadAhead,
 	}
 
 	server := &http.Server{
 		Addr:              rt.HTTPAddress,
-		Handler:           api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, jellyfinClient, &fileSettingsService{path: rt.SettingsPath, applier: liveSettings}, db, db, metricsColl),
+		Handler:           api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, jellyfinClient, &fileSettingsService{path: rt.SettingsPath, applier: liveSettings}, privacyMgr, db, db, metricsColl),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -1160,6 +1154,10 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	}
 }
 
+// maintenanceRecentTaskName maps a Seerr/Hydra media type string to the
+// matching recurring-task name; any value other than "tv"/"episode" is
+// treated as a movie, since Seerr's request payloads use varying media type
+// strings that don't need individual enumeration here.
 func maintenanceRecentTaskName(mediaType string) string {
 	switch strings.ToLower(strings.TrimSpace(mediaType)) {
 	case "tv", "episode":
@@ -1179,6 +1177,13 @@ func lacksSchedulerLaneHeadroom(totalWorkers, maxDownloadConnections int) bool {
 	return totalWorkers <= 2*maxDownloadConnections
 }
 
+// shouldRunRecentOnStartup reports whether a recurring RSS sync task should
+// fire immediately at startup rather than waiting for its first regular
+// interval tick. It returns true whenever no valid last-run cursor exists,
+// and otherwise compares the cursor's age against the larger of floor and
+// ttl -- so a task that hasn't run recently (e.g. after a restart shortly
+// following a previous run) still waits out at least floor/ttl before
+// re-running, rather than syncing on every process restart.
 func shouldRunRecentOnStartup(ctx context.Context, db *database.DB, taskName string, floor time.Duration, ttl time.Duration, now time.Time) bool {
 	if ttl <= 0 {
 		ttl = floor
@@ -1220,16 +1225,27 @@ func max(a, b int) int {
 	return b
 }
 
+// liveMetricsCollector gathers a point-in-time metrics.Snapshot from the
+// application's live components (the current Usenet fetch pipeline's
+// connection pools and scheduler queues, the block cache, and active stream
+// count) for the metrics endpoint. Reads through dynamicArticleSource so a
+// live Usenet settings reload is reflected without recreating the collector.
 type liveMetricsCollector struct {
 	readAhead  *stream.ReadAheadManager
-	pools      []*nntp.PooledSource
-	scheduled  *nntp.ScheduledSource
+	articleSrc *dynamicArticleSource
 	blockCache *cache.FileCache
 }
 
+// Collect implements api.MetricsProvider by aggregating current NNTP pool,
+// scheduler queue-depth, cache, and active-stream stats into a single
+// snapshot.
 func (c *liveMetricsCollector) Collect() metrics.Snapshot {
 	var nntpStats metrics.NNTPStats
-	for _, p := range c.pools {
+	var pools []*nntp.PooledSource
+	if c.articleSrc != nil {
+		pools = c.articleSrc.Pools()
+	}
+	for _, p := range pools {
 		open, idle := p.Stats()
 		inUse := open - idle
 		if inUse < 0 {
@@ -1239,8 +1255,12 @@ func (c *liveMetricsCollector) Collect() metrics.Snapshot {
 		nntpStats.Idle += int64(idle)
 	}
 	var queueStats metrics.QueueStats
-	if c.scheduled != nil {
-		interactive, readAhead, background := c.scheduled.QueueDepths()
+	var scheduled *nntp.ScheduledSource
+	if c.articleSrc != nil {
+		scheduled = c.articleSrc.Scheduled()
+	}
+	if scheduled != nil {
+		interactive, readAhead, background := scheduled.QueueDepths()
 		queueStats.Interactive = int64(interactive)
 		queueStats.Background = int64(readAhead + background)
 	}

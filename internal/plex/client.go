@@ -10,16 +10,33 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/drakkar-media/drakkar/internal/mediaserver"
 )
 
+type plexEndpoint struct {
+	serverURL string
+	token     string
+}
+
 // Client calls the Plex HTTP API.
+//
+// The server URL and token are held behind an atomic.Pointer so that
+// SetConfig can swap them in place (e.g. when the user updates Plex settings
+// or completes OAuth) without disrupting requests already in flight on other
+// goroutines. Client is safe for concurrent use.
 type Client struct {
-	serverURL  string
-	token      string
+	endpoint   atomic.Pointer[plexEndpoint]
 	httpClient *http.Client
+}
+
+// SetConfig atomically replaces the server URL and token used by subsequent
+// requests, allowing configuration to be hot-reloaded (e.g. after a settings
+// save) without recreating the Client or interrupting in-flight requests.
+func (c *Client) SetConfig(serverURL, token string) {
+	c.endpoint.Store(&plexEndpoint{serverURL: strings.TrimRight(serverURL, "/"), token: token})
 }
 
 // Library is a Plex library section.
@@ -39,16 +56,29 @@ type TestResult struct {
 	Error      string    `json:"error,omitempty"`
 }
 
+// NewClient creates a Client targeting the given Plex server URL, authenticated
+// with the given token. Either value may be empty; use SetConfig later to
+// supply them once available, and Enabled to check readiness before use.
 func NewClient(serverURL, token string) *Client {
-	return &Client{
-		serverURL:  strings.TrimRight(serverURL, "/"),
-		token:      token,
-		httpClient: &http.Client{Timeout: 15 * time.Second},
-	}
+	c := &Client{httpClient: &http.Client{Timeout: 15 * time.Second}}
+	c.SetConfig(serverURL, token)
+	return c
 }
 
+func (c *Client) getEndpoint() plexEndpoint {
+	if e := c.endpoint.Load(); e != nil {
+		return *e
+	}
+	return plexEndpoint{}
+}
+
+// Enabled reports whether both a server URL and a token are configured.
+// Every method that talks to Plex treats a disabled client as a no-op rather
+// than an error, since Plex integration is optional and its absence is not a
+// failure condition.
 func (c *Client) Enabled() bool {
-	return c != nil && strings.TrimSpace(c.serverURL) != "" && strings.TrimSpace(c.token) != ""
+	e := c.getEndpoint()
+	return c != nil && strings.TrimSpace(e.serverURL) != "" && strings.TrimSpace(e.token) != ""
 }
 
 // Test verifies connectivity and returns the server name + library list.
@@ -151,6 +181,9 @@ func (c *Client) RefreshPathAuto(ctx context.Context, preferredSectionKey, fileP
 	return firstErr
 }
 
+// matchingLibrariesForPath returns the libraries whose root Location covers
+// filePath, matched by exact equality or path-prefix containment. A file can
+// match more than one library location.
 func matchingLibrariesForPath(libs []Library, filePath string) []Library {
 	filePath = filepath.Clean(filePath)
 	var out []Library
@@ -205,5 +238,6 @@ func (c *Client) refreshSection(ctx context.Context, sectionKey string) error {
 }
 
 func (c *Client) get(ctx context.Context, path string, out interface{}) error {
-	return mediaserver.Get(ctx, c.httpClient, c.serverURL, path, "X-Plex-Token", c.token, "plex", out)
+	e := c.getEndpoint()
+	return mediaserver.Get(ctx, c.httpClient, e.serverURL, path, "X-Plex-Token", e.token, "plex", out)
 }

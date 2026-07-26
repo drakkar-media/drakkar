@@ -5,8 +5,15 @@ import (
 	"strings"
 )
 
+// SettingsKey is the app_settings key under which the user-configurable
+// queue policy Settings are persisted.
 const SettingsKey = "queue_policies"
 
+// QueueDecisionAction is a user-configurable recovery action applied to a
+// queue item once a failure has been mapped to a decision key via
+// DecisionKeyForReason. Unlike the fixed Action matrix in policy.go, these
+// actions are stored per-reason-key in Settings and can be overridden by the
+// user.
 type QueueDecisionAction string
 
 const (
@@ -17,6 +24,12 @@ const (
 	QueueActionSearchAgain              QueueDecisionAction = "search_again"
 )
 
+// Settings holds the user-configurable queue policy, persisted as a single
+// app_settings row keyed by SettingsKey. Zero-value fields (empty string,
+// zero int, empty/nil map or slice) are treated by mergeSettings as "not set"
+// and fall back to DefaultSettings, except FailNzbWithoutVideo, which is
+// always taken verbatim from the override since false is a meaningful,
+// distinct choice from "unset".
 type Settings struct {
 	QueueDecisionActions map[string]QueueDecisionAction `json:"queueDecisionActions"`
 	IgnoredPatterns      []string                       `json:"ignoredPatterns"`
@@ -27,19 +40,34 @@ type Settings struct {
 	BlocklistTTLDays     int                            `json:"blocklistTtlDays"`
 }
 
+// Store defines the app-settings persistence operations required by Service.
+//
+// Implementations must treat a missing key as GetAppSetting returning
+// (false, nil) rather than an error, since Service relies on that to fall
+// back to DefaultSettings for a first-run/unconfigured install.
 type Store interface {
 	GetAppSetting(ctx context.Context, key string, dst any) (bool, error)
 	PutAppSetting(ctx context.Context, key string, value any) error
 }
 
+// Service reads and writes the queue policy Settings, merging any stored
+// overrides on top of DefaultSettings so that new default keys introduced in
+// later versions are always present even for installs with an older stored
+// settings blob.
 type Service struct {
 	store Store
 }
 
+// NewService creates a Service backed by the given Store.
 func NewService(store Store) *Service {
 	return &Service{store: store}
 }
 
+// Settings returns the effective queue policy: DefaultSettings merged with
+// any overrides persisted under SettingsKey.
+//
+// A nil Service or nil store (e.g. in tests) yields DefaultSettings with no
+// error, so callers do not need to special-case an unconfigured store.
 func (s *Service) Settings(ctx context.Context) (Settings, error) {
 	settings := DefaultSettings()
 	if s == nil || s.store == nil {
@@ -53,6 +81,11 @@ func (s *Service) Settings(ctx context.Context) (Settings, error) {
 	return mergeSettings(settings, stored), nil
 }
 
+// Update merges input on top of DefaultSettings and persists the result under
+// SettingsKey, returning the effective settings actually stored.
+//
+// A nil Service or nil store returns the merged settings without persisting,
+// matching Settings' no-op behavior for an unconfigured store.
 func (s *Service) Update(ctx context.Context, input Settings) (Settings, error) {
 	settings := mergeSettings(DefaultSettings(), input)
 	if s == nil || s.store == nil {
@@ -64,6 +97,11 @@ func (s *Service) Update(ctx context.Context, input Settings) (Settings, error) 
 	return settings, nil
 }
 
+// DefaultSettings returns the built-in queue policy applied when the user has
+// not overridden a given key. QueueDecisionActions covers both
+// Sonarr/Radarr-compatible failure keys (for behavioral parity with the
+// reference implementation) and Drakkar-native keys for failure modes that
+// have no Sonarr/Radarr equivalent.
 func DefaultSettings() Settings {
 	return Settings{
 		DuplicateNzbBehavior: "mark_failed",
@@ -125,6 +163,11 @@ func DefaultSettings() Settings {
 	}
 }
 
+// mergeSettings overlays override onto base, keeping base's value for any
+// field left at its zero value in override (see Settings for the
+// FailNzbWithoutVideo exception). QueueDecisionActions is merged key-by-key
+// rather than wholesale replaced, so a partial override cannot silently drop
+// the default action for a key it doesn't mention.
 func mergeSettings(base, override Settings) Settings {
 	out := base
 	if override.DuplicateNzbBehavior != "" {
@@ -160,6 +203,9 @@ func mergeSettings(base, override Settings) Settings {
 	return out
 }
 
+// Merge overlays override onto base using the same zero-value-means-unset
+// semantics as Service.Update. Exported for callers that need to merge
+// settings without going through a Service/Store.
 func Merge(base, override Settings) Settings {
 	return mergeSettings(base, override)
 }
@@ -262,6 +308,9 @@ func DecisionKeyForReason(reason string) string {
 	}
 }
 
+// ActionForReason resolves the user-configured QueueDecisionAction for a raw
+// failure reason. It falls back to QueueActionDoNothing if the reason maps to
+// no known decision key, or if settings has no override for that key.
 func ActionForReason(settings Settings, reason string) QueueDecisionAction {
 	key := DecisionKeyForReason(reason)
 	if key == "" {

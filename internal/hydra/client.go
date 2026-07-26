@@ -1,3 +1,8 @@
+// Package hydra implements the search-provider client for NZBHydra2, the
+// meta-indexer that aggregates results across the user's configured Usenet
+// indexers. It speaks the Newznab-compatible API (JSON or RSS/XML), adding
+// Radarr/Sonarr-equivalent pagination, caching, request coalescing, and
+// rate-limit backoff on top.
 package hydra
 
 import (
@@ -11,6 +16,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/drakkar-media/drakkar/internal/config"
@@ -22,6 +28,9 @@ import (
 // explicitly configured by the user.
 var defaultSearchInterval time.Duration
 
+// ErrRateLimited is returned (optionally wrapped) when NZBHydra2 responds
+// with 429 or when a call is made while an active cooldown (see
+// startCooldown) is still in effect.
 var ErrRateLimited = errors.New("nzbhydra2 rate limited")
 
 const (
@@ -45,10 +54,21 @@ var (
 	}
 )
 
+// Client is a search-provider client for a single NZBHydra2 instance.
+//
+// It owns request throttling/concurrency limiting, response caching with
+// single-flight coalescing of identical concurrent requests, and rate-limit
+// backoff, so callers can issue searches without individually managing any
+// of that. The target URL/API key and outbound HTTP transport can be
+// updated live via SetConfig/SetTransport (e.g. after a settings save)
+// without disrupting in-flight requests.
+//
+// Client is safe for concurrent use.
 type Client struct {
+	cfgMu      sync.RWMutex
 	baseURL    string
 	apiKey     string
-	httpClient *http.Client
+	httpClient atomic.Pointer[http.Client]
 
 	searchInterval time.Duration // 0 = no throttle (Sonarr/Radarr behaviour)
 
@@ -86,6 +106,8 @@ type Client struct {
 	feedFlight   *hydraFlight
 }
 
+// cachedResults is a cache entry shared by the search and feed caches, along
+// with the wall-clock time it expires.
 type cachedResults struct {
 	results   []SearchResult
 	expiresAt time.Time
@@ -99,6 +121,8 @@ type hydraFlight struct {
 	flights map[string]*hydraFlightCall
 }
 
+// hydraFlightCall tracks a single in-flight fetch: followers block on done
+// and then read results/err once the leader has populated them.
 type hydraFlightCall struct {
 	done    chan struct{}
 	results []SearchResult
@@ -144,6 +168,8 @@ func (f *hydraFlight) Do(ctx context.Context, key string, fn func(context.Contex
 	return cloneResults(active.results), active.err
 }
 
+// SearchResult is a single release returned by NZBHydra2, normalized from
+// either its JSON or RSS/XML response format.
 type SearchResult struct {
 	Title        string
 	Link         string
@@ -155,6 +181,10 @@ type SearchResult struct {
 	Passworded   bool
 }
 
+// SearchRequest describes a single Search call's query parameters. IMDbID/
+// TMDBID/TVDBID and SeasonNumber/EpisodeNumber are optional identifier-based
+// refinements layered on top of (or instead of) a free-text Query, mirroring
+// how Radarr/Sonarr build their own indexer queries.
 type SearchRequest struct {
 	MediaType     string
 	Query         string
@@ -165,6 +195,12 @@ type SearchRequest struct {
 	EpisodeNumber int
 }
 
+// NewClient creates a Client for the NZBHydra2 instance described by cfg.
+//
+// It applies a default feed result limit when cfg.FeedMaxResults is unset
+// and initializes the outbound HTTP transport with a 30s timeout; use
+// SetTransport afterward to route requests through a custom transport (e.g.
+// a privacy proxy).
 func NewClient(cfg config.ServiceConfig) *Client {
 	searchCacheTTL := time.Duration(cfg.SearchCacheTTLSeconds) * time.Second
 	if searchCacheTTL < 0 {
@@ -186,12 +222,9 @@ func NewClient(cfg config.ServiceConfig) *Client {
 	// Usenet indexers, so this client-side cap only needs to bound Drakkar's own
 	// worker pool, not re-implement indexer rate limiting from scratch.
 	const maxConcurrentSearches = 3
-	return &Client{
-		baseURL: strings.TrimRight(cfg.URL, "/"),
-		apiKey:  cfg.APIKey,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+	c := &Client{
+		baseURL:        strings.TrimRight(cfg.URL, "/"),
+		apiKey:         cfg.APIKey,
 		searchInterval: defaultSearchInterval,
 		searchSem:      make(chan struct{}, maxConcurrentSearches),
 		searchCacheTTL: searchCacheTTL,
@@ -202,6 +235,34 @@ func NewClient(cfg config.ServiceConfig) *Client {
 		searchFlight:   newHydraFlight(),
 		feedFlight:     newHydraFlight(),
 	}
+	c.httpClient.Store(&http.Client{Timeout: 30 * time.Second})
+	return c
+}
+
+// SetTransport swaps the underlying HTTP transport (e.g. to route through
+// privacy.Manager) live, without disturbing any other client state.
+func (c *Client) SetTransport(transport http.RoundTripper) {
+	c.httpClient.Store(&http.Client{Timeout: 30 * time.Second, Transport: transport})
+}
+
+// SetConfig updates the target URL/API key live, e.g. after a settings save.
+func (c *Client) SetConfig(cfg config.ServiceConfig) {
+	c.cfgMu.Lock()
+	c.baseURL = strings.TrimRight(cfg.URL, "/")
+	c.apiKey = cfg.APIKey
+	c.cfgMu.Unlock()
+}
+
+func (c *Client) getBaseURL() string {
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return c.baseURL
+}
+
+func (c *Client) getAPIKey() string {
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return c.apiKey
 }
 
 // SetSearchDelay configures the minimum delay between consecutive Hydra API
@@ -212,10 +273,13 @@ func (c *Client) SetSearchDelay(d time.Duration) {
 	c.rateMu.Unlock()
 }
 
+// Name returns the provider identifier used in logs and error messages.
 func (c *Client) Name() string {
 	return "nzbhydra2"
 }
 
+// Probe verifies connectivity to NZBHydra2 by requesting its capabilities
+// endpoint. It does not consume the search rate limit or cache.
 func (c *Client) Probe(ctx context.Context) error {
 	u, err := c.apiURL()
 	if err != nil {
@@ -223,8 +287,8 @@ func (c *Client) Probe(ctx context.Context) error {
 	}
 	q := u.Query()
 	q.Set("t", "caps")
-	if c.apiKey != "" {
-		q.Set("apikey", c.apiKey)
+	if apiKey := c.getAPIKey(); apiKey != "" {
+		q.Set("apikey", apiKey)
 	}
 	u.RawQuery = q.Encode()
 
@@ -232,7 +296,7 @@ func (c *Client) Probe(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.httpClient.Load().Do(req)
 	if err != nil {
 		return err
 	}
@@ -243,6 +307,11 @@ func (c *Client) Probe(ctx context.Context) error {
 	return nil
 }
 
+// SearchRecent fetches the most recent releases for mediaType ("movie" or
+// "episode"/"tv"), used to populate the RSS-style recent-releases feed.
+// Results are served from the feed cache when fresh, and concurrent calls
+// for the same mediaType are coalesced via feedFlight so only one actually
+// reaches NZBHydra2.
 func (c *Client) SearchRecent(ctx context.Context, mediaType string) ([]SearchResult, error) {
 	if cached, ok := c.lookupFeedCache(mediaType); ok {
 		return cached, nil
@@ -261,8 +330,8 @@ func (c *Client) SearchRecent(ctx context.Context, mediaType string) ([]SearchRe
 		q.Set("cat", recentCategory(mediaType))
 		q.Set("limit", fmt.Sprintf("%d", c.feedMaxResults))
 		q.Set("extended", "1")
-		if c.apiKey != "" {
-			q.Set("apikey", c.apiKey)
+		if apiKey := c.getAPIKey(); apiKey != "" {
+			q.Set("apikey", apiKey)
 		}
 		u.RawQuery = q.Encode()
 		results, err := c.doSearchRequest(ctx, u)
@@ -352,8 +421,8 @@ func (c *Client) Search(ctx context.Context, request SearchRequest) ([]SearchRes
 		}
 		q.Set("limit", fmt.Sprintf("%d", searchPageSize))
 		q.Set("extended", "1")
-		if c.apiKey != "" {
-			q.Set("apikey", c.apiKey)
+		if apiKey := c.getAPIKey(); apiKey != "" {
+			q.Set("apikey", apiKey)
 		}
 
 		// Acquire concurrency slot — limits simultaneous in-flight NZBHydra2
@@ -404,7 +473,7 @@ func (c *Client) doSearchRequest(ctx context.Context, u *url.URL) ([]SearchResul
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.httpClient.Do(req)
+	resp, err := c.httpClient.Load().Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -431,6 +500,10 @@ func (c *Client) doSearchRequest(ctx context.Context, u *url.URL) ([]SearchResul
 	return parseJSONResults(body)
 }
 
+// startCooldown begins (or extends) a rate-limit cooldown after a 429
+// response, using an escalating backoff schedule (rateLimitBackoff) indexed
+// by consecutive rate-limit hits, so repeated 429s back off progressively
+// further rather than retrying at the same short interval indefinitely.
 func (c *Client) startCooldown() {
 	c.rateMu.Lock()
 	defer c.rateMu.Unlock()
@@ -447,6 +520,10 @@ func (c *Client) startCooldown() {
 	}
 }
 
+// recordSuccess is called after every non-429 response. It decays the
+// rate-limit-hit counter used by startCooldown and clears an already-expired
+// cooldown, so a run of successes gradually restores the normal (unbacked-off)
+// retry schedule instead of requiring an explicit reset.
 func (c *Client) recordSuccess() {
 	c.rateMu.Lock()
 	defer c.rateMu.Unlock()
@@ -561,8 +638,11 @@ func normalizeIMDbID(value string) string {
 	return value
 }
 
+// apiURL resolves the configured base URL to the Newznab API endpoint,
+// tolerating a base URL that already includes the "/api" suffix so the
+// setting works whether the user enters NZBHydra2's root URL or its API URL.
 func (c *Client) apiURL() (*url.URL, error) {
-	base := strings.TrimRight(c.baseURL, "/")
+	base := strings.TrimRight(c.getBaseURL(), "/")
 	if strings.HasSuffix(strings.ToLower(base), "/api") {
 		return url.Parse(base)
 	}

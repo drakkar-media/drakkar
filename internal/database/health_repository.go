@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+// HealthEntry represents a symlink publication row along with its most recent
+// health-check result.
+//
+// HealthOK and LastCheckedAt are nil until the entry has been checked at least
+// once by the health-check worker.
 type HealthEntry struct {
 	ID            int64      `json:"id"`
 	LibraryItemID int64      `json:"libraryItemId"`
@@ -18,6 +23,9 @@ type HealthEntry struct {
 	HealthOK      *bool      `json:"healthOk"`
 }
 
+// DeepHealthCandidate identifies a published item eligible for a deep
+// (content-level) health check, joining its symlink publication, selected
+// release, and backing NZB document.
 type DeepHealthCandidate struct {
 	PublicationID     int64
 	LibraryItemID     int64
@@ -32,6 +40,8 @@ type DeepHealthCandidate struct {
 	SelectedReleaseID int64
 }
 
+// HealthSummary aggregates counts describing the overall health of published
+// symlinks and their backing NZB files, used to populate the health dashboard.
 type HealthSummary struct {
 	Total                int `json:"total"`
 	Checked              int `json:"checked"`
@@ -41,6 +51,9 @@ type HealthSummary struct {
 	UncalibratedNZBFiles int `json:"uncalibratedNZBFiles"`
 }
 
+// ConsistencyIssue describes a library item marked available with no
+// corresponding symlink publication, indicating the library and queue state
+// have drifted out of sync.
 type ConsistencyIssue struct {
 	LibraryItemID int64  `json:"libraryItemId"`
 	Title         string `json:"title"`
@@ -48,6 +61,9 @@ type ConsistencyIssue struct {
 	QueueState    string `json:"queueState"`
 }
 
+// MaintenanceCursorEntry represents the saved progress cursor for a named
+// background maintenance task, allowing the task to resume from where it left
+// off across restarts.
 type MaintenanceCursorEntry struct {
 	TaskName  string    `json:"taskName"`
 	Cursor    string    `json:"cursor"`
@@ -77,6 +93,8 @@ func (db *DB) ListBrokenSymlinkEntries(ctx context.Context) ([]HealthEntry, erro
 	return out, rows.Err()
 }
 
+// ListHealthEntries returns all symlink publications regardless of health
+// status, ordered so unchecked entries are surfaced first.
 func (db *DB) ListHealthEntries(ctx context.Context) ([]HealthEntry, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select id, library_item_id, library_path, target_path, created_at, last_checked_at, health_ok
@@ -98,13 +116,21 @@ func (db *DB) ListHealthEntries(ctx context.Context) ([]HealthEntry, error) {
 	return out, rows.Err()
 }
 
+// HealthEntriesPage is a single page of HealthEntry results together with the
+// total row count matching the filter, used to drive pagination controls.
 type HealthEntriesPage struct {
 	Items []HealthEntry `json:"items"`
 	Total int           `json:"total"`
 }
 
 // ListHealthEntriesPage returns a paginated, filterable page of health entries.
-// filter: "all" | "broken" | "unchecked"
+//
+// Broken and unchecked entries are ordered ahead of healthy ones so operators
+// triaging health issues see the entries needing attention first.
+//
+// Parameters:
+//   - filter: one of "all", "broken", or "unchecked"; any other value behaves as "all".
+//   - limit, offset: pagination window applied after filtering.
 func (db *DB) ListHealthEntriesPage(ctx context.Context, filter string, limit, offset int) (HealthEntriesPage, error) {
 	var where string
 	switch filter {
@@ -149,6 +175,13 @@ func (db *DB) ListHealthEntriesPage(ctx context.Context, filter string, limit, o
 	return HealthEntriesPage{Items: items, Total: total}, rows.Err()
 }
 
+// HealthSummary computes aggregate health-check and consistency counts across
+// all symlink publications.
+//
+// The consistency-issues and uncalibrated-NZB-files counts are best-effort:
+// failures querying them are logged and swallowed so a problem in either
+// secondary count does not prevent the primary health totals from being
+// returned.
 func (db *DB) HealthSummary(ctx context.Context) (HealthSummary, error) {
 	var s HealthSummary
 	err := db.SQL.QueryRowContext(ctx, `
@@ -181,6 +214,9 @@ func (db *DB) HealthSummary(ctx context.Context) (HealthSummary, error) {
 	return s, nil
 }
 
+// ListConsistencyIssues returns library items marked available that have no
+// corresponding symlink publication, capped at 500 rows, for surfacing on the
+// health dashboard.
 func (db *DB) ListConsistencyIssues(ctx context.Context) ([]ConsistencyIssue, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select li.id, li.title, li.media_type,
@@ -211,6 +247,8 @@ func (db *DB) ListConsistencyIssues(ctx context.Context) ([]ConsistencyIssue, er
 	return out, rows.Err()
 }
 
+// RecordHealthCheck stores the result of a health check for the given
+// publication and stamps last_checked_at with the current time.
 func (db *DB) RecordHealthCheck(ctx context.Context, publicationID int64, ok bool) error {
 	_, err := db.SQL.ExecContext(ctx, `
 		update symlink_publications
@@ -219,6 +257,9 @@ func (db *DB) RecordHealthCheck(ctx context.Context, publicationID int64, ok boo
 	return err
 }
 
+// RecordHealthStatus updates the health status of the given publication
+// without touching last_checked_at, for callers that need to flag a status
+// change independent of the periodic health-check pass.
 func (db *DB) RecordHealthStatus(ctx context.Context, publicationID int64, ok bool) error {
 	_, err := db.SQL.ExecContext(ctx, `
 		update symlink_publications
@@ -227,6 +268,18 @@ func (db *DB) RecordHealthStatus(ctx context.Context, publicationID int64, ok bo
 	return err
 }
 
+// ListDeepHealthCandidates returns publications eligible for deep (content-
+// level) health checking: one row per library item, taken from its most
+// recent queue item, restricted to items that are available and whose queue
+// state is "available" or "degraded".
+//
+// Results are ordered so never-checked and least-recently-checked entries are
+// returned first, matching the priority order the deep health checker
+// processes candidates in.
+//
+// Parameters:
+//   - limit: maximum number of candidates to return; a non-positive value
+//     returns all eligible candidates.
 func (db *DB) ListDeepHealthCandidates(ctx context.Context, limit int) ([]DeepHealthCandidate, error) {
 	query := `
 		SELECT DISTINCT ON (sp.library_item_id)
@@ -278,12 +331,17 @@ func (db *DB) ListDeepHealthCandidates(ctx context.Context, limit int) ([]DeepHe
 	return scanDeepHealthCandidates(rows)
 }
 
+// deepHealthScanner abstracts *sql.Rows so scanDeepHealthCandidates can be
+// shared between ListDeepHealthCandidates' limited and unlimited query paths.
 type deepHealthScanner interface {
 	Next() bool
 	Scan(dest ...any) error
 	Err() error
 }
 
+// scanDeepHealthCandidates scans the column set produced by the
+// ListDeepHealthCandidates query into DeepHealthCandidate rows. The caller
+// remains responsible for closing rows.
 func scanDeepHealthCandidates(rows deepHealthScanner) ([]DeepHealthCandidate, error) {
 	var out []DeepHealthCandidate
 	for rows.Next() {
@@ -308,6 +366,9 @@ func scanDeepHealthCandidates(rows deepHealthScanner) ([]DeepHealthCandidate, er
 	return out, rows.Err()
 }
 
+// MarkLibraryItemDegraded transitions the library item's most recent queue
+// item to the degraded state, recording reason as the failure reason. Used
+// when a health check discovers a published item is no longer valid.
 func (db *DB) MarkLibraryItemDegraded(ctx context.Context, libraryItemID int64, reason string) error {
 	_, err := db.SQL.ExecContext(ctx, `
 		UPDATE queue_items

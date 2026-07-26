@@ -1,4 +1,10 @@
 <script lang="ts">
+  /**
+   * Persistent app chrome: desktop sidebar nav, topbar with global
+   * type-ahead search and the user menu, and a mobile drawer + bottom nav.
+   * Mounted once by the root layout; page content renders into the default
+   * slot.
+   */
   import { onDestroy, onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';

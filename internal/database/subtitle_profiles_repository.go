@@ -2,6 +2,7 @@ package database
 
 import "context"
 
+// ListSubtitleProfiles returns all subtitle profiles ordered by name.
 func (db *DB) ListSubtitleProfiles(ctx context.Context) ([]SubtitleProfile, error) {
 	rows, err := db.SQL.QueryContext(ctx,
 		`SELECT id, name, languages, prefer_hearing_impaired, require_exact_language, is_default, created_at, updated_at
@@ -21,6 +22,11 @@ func (db *DB) ListSubtitleProfiles(ctx context.Context) ([]SubtitleProfile, erro
 	return out, rows.Err()
 }
 
+// CreateSubtitleProfile inserts a new subtitle profile.
+//
+// At most one profile may be marked default: if p.IsDefault is set, any
+// existing default profile is cleared first so the invariant holds without
+// requiring a database-level constraint.
 func (db *DB) CreateSubtitleProfile(ctx context.Context, p SubtitleProfile) (SubtitleProfile, error) {
 	if p.Languages == nil {
 		p.Languages = []string{}
@@ -40,6 +46,10 @@ func (db *DB) CreateSubtitleProfile(ctx context.Context, p SubtitleProfile) (Sub
 	return out, err
 }
 
+// UpdateSubtitleProfile overwrites an existing subtitle profile by ID.
+//
+// As in CreateSubtitleProfile, promoting this profile to default clears any
+// other profile currently holding that flag so only one default ever exists.
 func (db *DB) UpdateSubtitleProfile(ctx context.Context, p SubtitleProfile) (SubtitleProfile, error) {
 	if p.Languages == nil {
 		p.Languages = []string{}
@@ -60,6 +70,7 @@ func (db *DB) UpdateSubtitleProfile(ctx context.Context, p SubtitleProfile) (Sub
 	return out, err
 }
 
+// DeleteSubtitleProfile removes the subtitle profile with the given ID.
 func (db *DB) DeleteSubtitleProfile(ctx context.Context, id int64) error {
 	_, err := db.SQL.ExecContext(ctx, `DELETE FROM subtitle_profiles WHERE id=$1`, id)
 	return err

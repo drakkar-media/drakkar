@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+// ListSymlinkPublicationRecords returns all symlink_publications rows,
+// ordered by id ascending.
 func (db *DB) ListSymlinkPublicationRecords(ctx context.Context) ([]SymlinkPublicationRecord, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select id, library_path, target_path
@@ -28,11 +30,16 @@ func (db *DB) ListSymlinkPublicationRecords(ctx context.Context) ([]SymlinkPubli
 	return out, rows.Err()
 }
 
+// DeleteSymlinkPublication removes the symlink_publications row identified by
+// publicationID. It is a no-op if the row no longer exists.
 func (db *DB) DeleteSymlinkPublication(ctx context.Context, publicationID int64) error {
 	_, err := db.SQL.ExecContext(ctx, `delete from symlink_publications where id = $1`, publicationID)
 	return err
 }
 
+// TouchMaintenanceCursor persists the progress cursor for a named background
+// maintenance task, upserting on taskName so a task can resume from where it
+// left off across restarts.
 func (db *DB) TouchMaintenanceCursor(ctx context.Context, taskName string, cursor string) error {
 	_, err := db.SQL.ExecContext(ctx, `
 		insert into maintenance_cursors (task_name, cursor)
@@ -43,6 +50,12 @@ func (db *DB) TouchMaintenanceCursor(ctx context.Context, taskName string, curso
 	return err
 }
 
+// GetMaintenanceCursor returns the persisted progress cursor for taskName.
+//
+// Returns:
+//   - string: the empty string if no cursor has been recorded yet for
+//     taskName, allowing callers to treat "no cursor" as "start from the
+//     beginning" without a separate existence check.
 func (db *DB) GetMaintenanceCursor(ctx context.Context, taskName string) (string, error) {
 	var cursor string
 	err := db.SQL.QueryRowContext(ctx, `
@@ -139,6 +152,8 @@ func (db *DB) PruneOrphanedSelectedReleases(ctx context.Context, olderThan time.
 	}
 }
 
+// ListMaintenanceCursors returns all recorded maintenance task cursors,
+// ordered by task name ascending.
 func (db *DB) ListMaintenanceCursors(ctx context.Context) ([]MaintenanceCursorEntry, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select task_name, cursor, updated_at

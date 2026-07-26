@@ -7,9 +7,9 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/drakkar-media/drakkar/internal/database"
 	"github.com/drakkar-media/drakkar/internal/ranking"
+	"github.com/go-chi/chi/v5"
 )
 
 // registerProfileRoutes mounts custom-format, release-block-rule, indexer-policy,
@@ -388,4 +388,3 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 		respondJSON(w, http.StatusOK, map[string]any{"deleted": id})
 	})
 }
-

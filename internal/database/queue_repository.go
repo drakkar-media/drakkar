@@ -12,6 +12,9 @@ import (
 	"github.com/drakkar-media/drakkar/internal/policy"
 )
 
+// importedFileSegments records the nzb_files row created for one imported
+// file, keyed by filename so archive entries can later look up which NZB
+// file backs a given RAR/7z volume.
 type importedFileSegments struct {
 	fileName  string
 	nzbFileID int64
@@ -67,6 +70,9 @@ func insertImportedFiles(ctx context.Context, tx *sql.Tx, selectedReleaseID, nzb
 	return fileSegments, nil
 }
 
+// ListQueue returns a snapshot of the download queue: every item not in the
+// "requested" state, plus the most recent 200 "available" or "failed"
+// items, each joined with its library title and latest NZB document info.
 func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 	// Return active items (all states except requested) + last 200 available/failed.
 	// Skipping 'requested' items keeps the response fast — there can be thousands
@@ -162,6 +168,11 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 	return out, rows.Err()
 }
 
+// CreateImportedNZB records a manually-uploaded NZB as a brand-new library
+// item, creating its library_items/release_candidates/selected_releases rows
+// and enqueuing a queue_items row in the indexing state. Idempotent on
+// imported.IdempotencyKey: a repeat call returns the existing queue snapshot
+// instead of creating a duplicate.
 func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (QueueSnapshot, error) {
 	imported = db.applyImportPolicies(ctx, imported)
 	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher)
@@ -402,6 +413,11 @@ func (db *DB) AttachImportedNZBToLibraryItem(ctx context.Context, libraryItemID 
 	return snapshot, nil
 }
 
+// ImportSelectedReleaseNZB replaces the NZB document, files, and archives
+// backing an already-selected release (e.g. once the search/ranking
+// pipeline's chosen candidate NZB has been fetched), deleting any prior
+// virtual_files/archives/nzb_documents rows first, then moves the queue item
+// back to the indexing state.
 func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID int64, imported ImportedNZB) (QueueSnapshot, error) {
 	imported = db.applyImportPolicies(ctx, imported)
 	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher)
@@ -650,6 +666,9 @@ func insertArchiveRanges(ctx context.Context, tx *sql.Tx, entries []ImportedArch
 	return err
 }
 
+// insertArchiveVirtualFile inserts a virtual_files row for a playable
+// archive entry, pointing at the NZB file and byte offset backing its
+// first range.
 func insertArchiveVirtualFile(ctx context.Context, tx *sql.Tx, selectedReleaseID int64, entry ImportedArchiveEntry, volumePaths map[int]string, fileSegments map[string]importedFileSegments) (int64, error) {
 	// For stored_rar entries that span multiple volumes, only the first range's
 	// NZB file and archive offset are stored — multi-volume RAR is not supported
@@ -698,6 +717,8 @@ func segmentSizes(segments []ImportedNZBSegment) (int64, int64) {
 	return first, last
 }
 
+// MarkSelectedReleaseFetching transitions the queue item for the given
+// selected release into the fetching_nzb state and clears any failure reason.
 func (db *DB) MarkSelectedReleaseFetching(ctx context.Context, selectedReleaseID int64) error {
 	_, err := db.SQL.ExecContext(ctx, `
 		update queue_items
@@ -722,6 +743,8 @@ func (db *DB) StoreRawNZBDocument(ctx context.Context, selectedReleaseID int64, 
 	return err
 }
 
+// SetImportedNZBIndexed transitions a queue item to the preflight state once
+// its imported NZB has been fully indexed.
 func (db *DB) SetImportedNZBIndexed(ctx context.Context, queueItemID int64) error {
 	_, err := db.SQL.ExecContext(ctx, `
 		update queue_items
@@ -730,6 +753,7 @@ func (db *DB) SetImportedNZBIndexed(ctx context.Context, queueItemID int64) erro
 	return err
 }
 
+// MarkQueueItemPublishing transitions a queue item to the publishing state.
 func (db *DB) MarkQueueItemPublishing(ctx context.Context, queueItemID int64) error {
 	_, err := db.SQL.ExecContext(ctx, `
 		update queue_items
@@ -738,6 +762,9 @@ func (db *DB) MarkQueueItemPublishing(ctx context.Context, queueItemID int64) er
 	return err
 }
 
+// CancelNZBDocument marks the queue item associated with the given NZB
+// document as failed with reason "cancelled". Returns an error if no queue
+// item references that document.
 func (db *DB) CancelNZBDocument(ctx context.Context, nzbDocumentID int64) error {
 	result, err := db.SQL.ExecContext(ctx, `
 		update queue_items
@@ -758,6 +785,9 @@ func (db *DB) CancelNZBDocument(ctx context.Context, nzbDocumentID int64) error 
 	return nil
 }
 
+// ListNZBMountEntries returns the NZB document (with XML decompressed) for
+// every queue item not yet in a terminal (failed/available) state, for
+// exposing in-progress NZBs as mountable files.
 func (db *DB) ListNZBMountEntries(ctx context.Context) ([]NZBMountEntry, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select
@@ -795,6 +825,9 @@ func (db *DB) ListNZBMountEntries(ctx context.Context) ([]NZBMountEntry, error) 
 // would show as "Video: none / Audio: none" in Plex.
 const minPlayableFileSizeBytes = 50 * 1024 * 1024 // 50 MB
 
+// isPlayableMedia reports whether name/sizeBytes looks like real playable
+// video (a .mkv/.mp4/.avi file, not a sample, at least
+// minPlayableFileSizeBytes) as opposed to a sample, extra, or corrupt stub.
 func isPlayableMedia(name string, sizeBytes int64) bool {
 	switch strings.ToLower(filepath.Ext(name)) {
 	case ".mkv", ".mp4", ".avi":
@@ -823,6 +856,9 @@ func isSampleFilename(name string) bool {
 		strings.HasSuffix(base, ".sample")
 }
 
+// applyImportPolicies loads the persisted policy settings (falling back to
+// defaults if unset or unreadable) and filters imported's files against the
+// configured ignored-filename patterns.
 func (db *DB) applyImportPolicies(ctx context.Context, imported ImportedNZB) ImportedNZB {
 	settings := policy.DefaultSettings()
 	if db != nil {
@@ -834,6 +870,9 @@ func (db *DB) applyImportPolicies(ctx context.Context, imported ImportedNZB) Imp
 	return filterImportedByPatterns(imported, settings.IgnoredPatterns)
 }
 
+// filterImportedByPatterns drops files matching any ignored-filename pattern
+// from imported and rebuilds its archive groups, file count, and segment
+// count from the surviving files.
 func filterImportedByPatterns(imported ImportedNZB, patterns []string) ImportedNZB {
 	if len(patterns) == 0 || len(imported.Files) == 0 {
 		return imported
@@ -858,6 +897,9 @@ func filterImportedByPatterns(imported ImportedNZB, patterns []string) ImportedN
 	return filtered
 }
 
+// matchesIgnoredPattern reports whether name's base filename matches any of
+// the given glob patterns, case-insensitively. Malformed patterns are
+// skipped rather than erroring.
 func matchesIgnoredPattern(name string, patterns []string) bool {
 	base := strings.ToLower(filepath.Base(strings.TrimSpace(name)))
 	if base == "" {
@@ -973,6 +1015,9 @@ func (db *DB) ResetStaleQueueItems(ctx context.Context, staleAfter, downloadStal
 	return int(n), nil
 }
 
+// ListSabQueueItems returns in-progress library items (excluding terminal
+// and dismissed ones) in the SABnzbd queue format, for Radarr/Sonarr's
+// SAB-compatible API polling. category filters to "movies", "tv", or all.
 func (db *DB) ListSabQueueItems(ctx context.Context, category string, start, limit int) ([]SabQueueItem, int, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT li.id, li.title, li.media_type, q.state
@@ -1019,6 +1064,9 @@ func (db *DB) ListSabQueueItems(ctx context.Context, category string, start, lim
 	return items, total, nil
 }
 
+// ListSabHistoryItems returns completed or failed library items (excluding
+// dismissed ones) in the SABnzbd history format, for Radarr/Sonarr's
+// SAB-compatible API polling. category filters to "movies", "tv", or all.
 func (db *DB) ListSabHistoryItems(ctx context.Context, category string, start, limit int) ([]SabHistoryItem, int, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT li.id, li.title, li.media_type, q.state, q.failure_reason,

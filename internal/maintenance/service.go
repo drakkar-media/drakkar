@@ -1,3 +1,8 @@
+// Package maintenance implements the background cleanup tasks that keep the
+// published library and the database consistent with each other over time:
+// removing symlinks left behind by deleted or moved content, reconciling
+// orphaned filesystem entries with their database records, and pruning
+// stale/orphaned rows so history tables don't grow unbounded.
 package maintenance
 
 import (
@@ -10,6 +15,9 @@ import (
 	"github.com/drakkar-media/drakkar/internal/database"
 )
 
+// Repository defines the database operations required by the maintenance
+// tasks: enumerating and deleting symlink publication records, recording
+// task run cursors, and pruning stale/orphaned candidate and release rows.
 type Repository interface {
 	ListSymlinkPublicationRecords(ctx context.Context) ([]database.SymlinkPublicationRecord, error)
 	DeleteSymlinkPublication(ctx context.Context, publicationID int64) error
@@ -30,11 +38,18 @@ const releaseCandidateRetention = 14 * 24 * time.Hour
 // elsewhere in the codebase (the 90-minute download-stale timeout).
 const orphanedSelectedReleaseRetention = time.Hour
 
+// Service runs the periodic library/database maintenance tasks: pruning
+// broken or orphaned symlinks and their records, pruning stale search
+// history, and pruning abandoned selected releases.
 type Service struct {
 	repo    Repository
 	runtime config.Runtime
 }
 
+// Result summarizes a single maintenance task run for reporting/logging.
+// Fields are populated selectively depending on which task produced the
+// result; a task that doesn't scan/reset/repair anything simply leaves the
+// corresponding field at zero.
 type Result struct {
 	TaskName      string `json:"taskName"`
 	DeletedFiles  int    `json:"deletedFiles"`
@@ -46,10 +61,16 @@ type Result struct {
 	DegradedItems int    `json:"degradedItems"`
 }
 
+// NewService creates a Service backed by repo, using runtime's library paths
+// as the roots scanned by RemoveOrphanedContent.
 func NewService(repo Repository, runtime config.Runtime) *Service {
 	return &Service{repo: repo, runtime: runtime}
 }
 
+// RemoveBrokenMediaSymlinks scans every known symlink publication and
+// deletes both the on-disk symlink and its database record when the symlink
+// is missing/replaced by a non-symlink, or when it still exists but its
+// target no longer resolves (e.g. the backing virtual content was removed).
 func (s *Service) RemoveBrokenMediaSymlinks(ctx context.Context) (Result, error) {
 	records, err := s.repo.ListSymlinkPublicationRecords(ctx)
 	if err != nil {
@@ -82,6 +103,10 @@ func (s *Service) RemoveBrokenMediaSymlinks(ctx context.Context) (Result, error)
 	return result, s.repo.TouchMaintenanceCursor(ctx, result.TaskName, time.Now().UTC().Format(time.RFC3339))
 }
 
+// RemoveOrphanedCompletedSymlinks deletes symlink_publication records whose
+// on-disk symlink no longer exists at all (e.g. removed manually or by an
+// external process), so the database doesn't keep tracking a publication
+// that no longer has any corresponding library entry.
 func (s *Service) RemoveOrphanedCompletedSymlinks(ctx context.Context) (Result, error) {
 	records, err := s.repo.ListSymlinkPublicationRecords(ctx)
 	if err != nil {
@@ -126,6 +151,10 @@ func (s *Service) PruneOrphanedSelectedReleases(ctx context.Context) (Result, er
 	return result, s.repo.TouchMaintenanceCursor(ctx, result.TaskName, time.Now().UTC().Format(time.RFC3339))
 }
 
+// RemoveOrphanedContent walks the movie and TV library roots and removes any
+// symlink not backed by a known symlink_publication record, cleaning up
+// library entries left behind by a publication whose database record was
+// already removed (or never created) through some other path.
 func (s *Service) RemoveOrphanedContent(ctx context.Context) (Result, error) {
 	records, err := s.repo.ListSymlinkPublicationRecords(ctx)
 	if err != nil {

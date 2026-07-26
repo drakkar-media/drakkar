@@ -1,4 +1,11 @@
 <script lang="ts">
+  /**
+   * Displays a monthly calendar of library movies and episodes by release/air date.
+   *
+   * Fetched months are cached in memory (`cache`): switching months shows cached
+   * data immediately with no loading flicker, while the previous/next months are
+   * preloaded in the background so navigation feels instant.
+   */
   import { onMount } from 'svelte';
   import ChevronLeft from '@lucide/svelte/icons/chevron-left';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';

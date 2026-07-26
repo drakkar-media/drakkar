@@ -1,3 +1,7 @@
+// Package seerr provides a client for the Jellyseerr/Overseerr ("Seerr")
+// HTTP API: listing pending media requests to import into Drakkar's queue,
+// creating new requests, and notifying Seerr when a request becomes
+// available in Plex.
 package seerr
 
 import (
@@ -10,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/drakkar-media/drakkar/internal/config"
@@ -17,14 +22,37 @@ import (
 	"github.com/drakkar-media/drakkar/internal/mediadate"
 )
 
+type clientConfig struct {
+	baseURL string
+	apiKey  string
+}
+
+// Client calls the Jellyseerr/Overseerr ("Seerr") HTTP API to list pending
+// requests, create new requests, and notify Seerr when a request becomes
+// available in Plex.
+//
+// The base URL and API key are held behind an atomic.Pointer so SetConfig can
+// hot-swap them (e.g. after a settings save) without disrupting requests
+// already in flight on other goroutines. Client is safe for concurrent use.
 type Client struct {
-	baseURL    string
-	apiKey     string
+	cfg        atomic.Pointer[clientConfig]
 	httpClient *http.Client
 }
 
+// SetConfig updates the target URL/API key live, e.g. after a settings save.
+func (c *Client) SetConfig(cfg config.ServiceConfig) {
+	c.cfg.Store(&clientConfig{baseURL: strings.TrimRight(cfg.URL, "/"), apiKey: cfg.APIKey})
+}
+
+// errRequestNotVisible marks a benign timeout in waitForVisibleRequest: the
+// create call did not return a hard error, but the resulting request never
+// showed up in the pending list within the retry window. Callers treat this
+// the same as success rather than surfacing an error, since Seerr may simply
+// be slow to index the new request.
 var errRequestNotVisible = errors.New("seerr request not yet visible")
 
+// Request is a normalized view of a Seerr media request, covering both
+// individual-episode and season-level TV requests as well as movie requests.
 type Request struct {
 	ID            int64
 	Type          string
@@ -39,27 +67,30 @@ type Request struct {
 	Seasons       []int // set for season-level requests (no individual episodes)
 }
 
+// NewClient creates a Client targeting the given Seerr service configuration.
 func NewClient(cfg config.ServiceConfig) *Client {
-	return &Client{
-		baseURL: strings.TrimRight(cfg.URL, "/"),
-		apiKey:  cfg.APIKey,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+	c := &Client{
+		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
+	c.SetConfig(cfg)
+	return c
 }
 
+// Name identifies this client for use in service-health and probe reporting.
 func (c *Client) Name() string {
 	return "seerr"
 }
 
+// Probe checks connectivity to Seerr by calling its status endpoint. It is
+// used for service-health checks and does not classify errors beyond a
+// non-2xx status.
 func (c *Client) Probe(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/v1/status", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.Load().baseURL+"/api/v1/status", nil)
 	if err != nil {
 		return err
 	}
-	if c.apiKey != "" {
-		req.Header.Set("X-Api-Key", c.apiKey)
+	if c.cfg.Load().apiKey != "" {
+		req.Header.Set("X-Api-Key", c.cfg.Load().apiKey)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -72,6 +103,13 @@ func (c *Client) Probe(ctx context.Context) error {
 	return nil
 }
 
+// PendingRequests returns all Seerr requests worth importing, paginating
+// through the full result set.
+//
+// Only explicitly declined requests (status 3) are excluded; pending,
+// approved, available, and failed requests are all returned so Drakkar can
+// serve an item regardless of what another downloader or Seerr itself did
+// with it.
 func (c *Client) PendingRequests(ctx context.Context) ([]Request, error) {
 	const pageSize = 5000
 	var out []Request
@@ -155,7 +193,7 @@ type requestListPayload struct {
 }
 
 func (c *Client) fetchRequestPage(ctx context.Context, skip, take int) (requestListPayload, error) {
-	u, err := url.Parse(c.baseURL + "/api/v1/request")
+	u, err := url.Parse(c.cfg.Load().baseURL + "/api/v1/request")
 	if err != nil {
 		return requestListPayload{}, err
 	}
@@ -168,8 +206,8 @@ func (c *Client) fetchRequestPage(ctx context.Context, skip, take int) (requestL
 	if err != nil {
 		return requestListPayload{}, err
 	}
-	if c.apiKey != "" {
-		req.Header.Set("X-Api-Key", c.apiKey)
+	if c.cfg.Load().apiKey != "" {
+		req.Header.Set("X-Api-Key", c.cfg.Load().apiKey)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -194,6 +232,11 @@ func (c *Client) fetchRequestPage(ctx context.Context, skip, take int) (requestL
 	return payload, nil
 }
 
+// CreateRequest creates a Seerr request for a movie or an entire TV show
+// (all seasons). It waits for the created request to become visible in
+// Seerr's pending-request list (via createRequestWithRecovery) before
+// returning, retrying the POST once if a transient failure left the outcome
+// ambiguous.
 func (c *Client) CreateRequest(ctx context.Context, mediaType string, tmdbID int64) error {
 	body := map[string]any{
 		"mediaType": mediaType,
@@ -208,6 +251,11 @@ func (c *Client) CreateRequest(ctx context.Context, mediaType string, tmdbID int
 	return c.createRequestWithRecovery(ctx, body, match)
 }
 
+// CreateTVSeasonRequest creates a Seerr request for specific TV seasons and
+// waits for it to become visible in the pending-request list, retrying once
+// on a transient failure (see createRequestWithRecovery). Use
+// CreateTVSeasonRequestNoWait instead when visibility confirmation isn't
+// needed, e.g. for bulk imports.
 func (c *Client) CreateTVSeasonRequest(ctx context.Context, tmdbID int64, seasons []int) error {
 	body := map[string]any{
 		"mediaType": "tv",
@@ -312,7 +360,7 @@ type partialMediaPayload struct {
 }
 
 func (c *Client) fetchPartialMediaPage(ctx context.Context, skip, pageSize int) (partialMediaPayload, error) {
-	u, err := url.Parse(c.baseURL + "/api/v1/media")
+	u, err := url.Parse(c.cfg.Load().baseURL + "/api/v1/media")
 	if err != nil {
 		return partialMediaPayload{}, err
 	}
@@ -326,8 +374,8 @@ func (c *Client) fetchPartialMediaPage(ctx context.Context, skip, pageSize int) 
 	if err != nil {
 		return partialMediaPayload{}, err
 	}
-	if c.apiKey != "" {
-		req.Header.Set("X-Api-Key", c.apiKey)
+	if c.cfg.Load().apiKey != "" {
+		req.Header.Set("X-Api-Key", c.cfg.Load().apiKey)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -351,6 +399,16 @@ func (c *Client) fetchPartialMediaPage(ctx context.Context, skip, pageSize int) 
 	return payload, nil
 }
 
+// createRequestWithRecovery posts a create-request body and confirms the
+// request became visible in Seerr's pending list (per match), retrying the
+// POST up to once more if the initial attempt failed with a retryable error
+// (IsRetryableError) and the request never showed up. This handles the case
+// where a timed-out/5xx response left it unclear whether Seerr actually
+// created the request: if it shows up despite the error, treat it as
+// success rather than double-creating the same request. A final failed
+// visibility check that is itself retryable, or errRequestNotVisible (Seerr
+// merely slow to index), is not surfaced as an error since a successful post
+// with delayed visibility is the common case.
 func (c *Client) createRequestWithRecovery(ctx context.Context, body map[string]any, match func(Request) bool) error {
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -383,13 +441,13 @@ func (c *Client) createRequestWithRecovery(ctx context.Context, body map[string]
 }
 
 func (c *Client) postCreateRequest(ctx context.Context, data []byte) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/request", strings.NewReader(string(data)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.Load().baseURL+"/api/v1/request", strings.NewReader(string(data)))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("X-Api-Key", c.apiKey)
+	if c.cfg.Load().apiKey != "" {
+		req.Header.Set("X-Api-Key", c.cfg.Load().apiKey)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -412,6 +470,11 @@ func (c *Client) postCreateRequest(ctx context.Context, data []byte) error {
 	return nil
 }
 
+// waitForVisibleRequest polls PendingRequests with increasing backoff
+// (0s, 1s, 2s, 3s) until a request satisfying match appears, returning
+// errRequestNotVisible if it never does within that window. A retryable
+// PendingRequests error (IsRetryableError) is swallowed and treated as
+// "not yet visible" rather than aborting the wait early.
 func (c *Client) waitForVisibleRequest(ctx context.Context, match func(Request) bool) error {
 	backoff := []time.Duration{0, 1 * time.Second, 2 * time.Second, 3 * time.Second}
 	for _, delay := range backoff {
@@ -442,7 +505,7 @@ func (c *Client) waitForVisibleRequest(ctx context.Context, match func(Request) 
 // It first looks up the Seerr-internal media ID by TMDB ID, then POSTs to
 // the available endpoint. A 404 means the item isn't tracked in Seerr — not an error.
 func (c *Client) NotifyAvailable(ctx context.Context, tmdbID int64, mediaType string) error {
-	if c.baseURL == "" || c.apiKey == "" {
+	if c.cfg.Load().baseURL == "" || c.cfg.Load().apiKey == "" {
 		return nil
 	}
 	apiMediaType := "movie"
@@ -450,12 +513,12 @@ func (c *Client) NotifyAvailable(ctx context.Context, tmdbID int64, mediaType st
 		apiMediaType = "tv"
 	}
 	// Resolve TMDB ID to Seerr internal media ID.
-	infoURL := fmt.Sprintf("%s/api/v1/%s/%d", c.baseURL, apiMediaType, tmdbID)
+	infoURL := fmt.Sprintf("%s/api/v1/%s/%d", c.cfg.Load().baseURL, apiMediaType, tmdbID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, infoURL, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Api-Key", c.apiKey)
+	req.Header.Set("X-Api-Key", c.cfg.Load().apiKey)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -479,13 +542,13 @@ func (c *Client) NotifyAvailable(ctx context.Context, tmdbID int64, mediaType st
 		return nil // no mediaInfo yet — Seerr doesn't track it
 	}
 	// Mark as available.
-	availURL := fmt.Sprintf("%s/api/v1/media/%d/available", c.baseURL, info.MediaInfo.ID)
+	availURL := fmt.Sprintf("%s/api/v1/media/%d/available", c.cfg.Load().baseURL, info.MediaInfo.ID)
 	postReq, err := http.NewRequestWithContext(ctx, http.MethodPost, availURL, strings.NewReader("{}"))
 	if err != nil {
 		return err
 	}
 	postReq.Header.Set("Content-Type", "application/json")
-	postReq.Header.Set("X-Api-Key", c.apiKey)
+	postReq.Header.Set("X-Api-Key", c.cfg.Load().apiKey)
 	postResp, err := c.httpClient.Do(postReq)
 	if err != nil {
 		return err

@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"database/sql"
@@ -36,6 +37,9 @@ import (
 	"github.com/drakkar-media/drakkar/internal/tvdb"
 )
 
+// Repository is the persistence contract the workflow Service depends on for
+// every library, queue, search-candidate, and release-selection operation.
+// Implemented by internal/database against Postgres.
 type Repository interface {
 	ListMediaRequests(ctx context.Context) ([]database.MediaRequestSummary, error)
 	UpsertMovieRequest(ctx context.Context, externalID string, tmdbID int64, title string, year int) (int64, bool, error)
@@ -106,6 +110,8 @@ type Repository interface {
 	TouchQueueItemSearched(ctx context.Context, libraryItemID int64) error
 }
 
+// SeerrClient is the subset of Seerr/Overseerr operations the workflow
+// Service needs to sync and create media requests.
 type SeerrClient interface {
 	PendingRequests(ctx context.Context) ([]seerr.Request, error)
 	CreateRequest(ctx context.Context, mediaType string, tmdbID int64) error
@@ -114,11 +120,15 @@ type SeerrClient interface {
 	PartialTVItems(ctx context.Context) ([]seerr.PartialTVItem, error)
 }
 
+// HydraClient is the subset of NZBHydra2 search operations the workflow
+// Service needs to find candidate releases.
 type HydraClient interface {
 	Search(ctx context.Context, request hydra.SearchRequest) ([]hydra.SearchResult, error)
 	SearchRecent(ctx context.Context, mediaType string) ([]hydra.SearchResult, error)
 }
 
+// IndexerLimits bundles the indexer-wide search and candidate-filtering
+// constraints sourced from config.IndexerConfig.
 type IndexerLimits struct {
 	MinimumAgeMinutes int
 	RetentionDays     int
@@ -129,6 +139,12 @@ type IndexerLimits struct {
 	ReleaseGraceHours int
 }
 
+// Service implements Drakkar's core workflow: syncing requests from Seerr,
+// searching NZBHydra2 for matching releases, ranking and selecting
+// candidates, fetching and importing the winning NZB, and dispatching the
+// download/publish pipeline. A single Service instance is shared across HTTP
+// handlers, BullMQ workers, and background schedulers, so its methods must be
+// safe for concurrent use.
 type Service struct {
 	repo             Repository
 	seerr            SeerrClient
@@ -205,15 +221,21 @@ type Service struct {
 	tmdbEnrichSem chan struct{}
 }
 
+// WorkQueueStatus reports whether the BullMQ work queue is paused and how
+// many jobs are waiting (see (*Service).WorkQueueStatus).
 type WorkQueueStatus struct {
 	Paused bool  `json:"paused"`
 	Depth  int64 `json:"depth"`
 }
 
+// QueuePolicyProvider supplies the user-configured queue failure-handling
+// policy (policy.Settings) used by RetryFailedQueue and ManageQueueItem.
 type QueuePolicyProvider interface {
 	Settings(ctx context.Context) (policy.Settings, error)
 }
 
+// TMDBClient is the subset of TMDB lookups the workflow Service uses to
+// enrich movies/shows and expand season requests into individual episodes.
 type TMDBClient interface {
 	Enabled() bool
 	MovieDetails(ctx context.Context, tmdbID int64) (tmdb.MovieDetails, error)
@@ -222,21 +244,30 @@ type TMDBClient interface {
 	TVSeason(ctx context.Context, tmdbID int64, seasonNumber int) (tmdb.TVSeason, error)
 }
 
+// TVDBClient is the fallback metadata source used to enrich TV episodes when
+// TMDB is unavailable or disabled.
 type TVDBClient interface {
 	Enabled() bool
 	SeriesDetails(ctx context.Context, tvdbID int64) (tvdb.SeriesDetails, error)
 }
 
+// NZBFetcher downloads a single NZB document's raw bytes from its indexer URL.
 type NZBFetcher interface {
-	Fetch(ctx context.Context, rawURL string) (string, []byte, error)
+	Fetch(ctx context.Context, rawURL, indexerName string) (string, []byte, error)
 }
 
+// SyncResult reports how many Seerr requests were seen and how many new
+// library items were created by a sync operation (SyncRequests,
+// CreateSeerrRequest, CreateSeerrSeasonRequest).
 type SyncResult struct {
 	Seen                  int     `json:"seen"`
 	Created               int     `json:"created"`
 	CreatedLibraryItemIDs []int64 `json:"createdLibraryItemIds,omitempty"`
 }
 
+// SearchResult reports the outcome of a single library item's search: the
+// query used, how many candidates were found, and which release (if any)
+// ended up selected.
 type SearchResult struct {
 	LibraryItemID     int64  `json:"libraryItemId"`
 	Query             string `json:"query"`
@@ -244,6 +275,8 @@ type SearchResult struct {
 	SelectedReleaseID *int64 `json:"selectedReleaseId,omitempty"`
 }
 
+// BulkSearchResult aggregates per-item outcomes across a batch search pass
+// (SearchPendingLibrary, DispatchAutomaticPending, SearchRecentPending).
 type BulkSearchResult struct {
 	Processed      int     `json:"processed"`
 	Searched       int     `json:"searched"`
@@ -253,6 +286,8 @@ type BulkSearchResult struct {
 	FailedItems    []int64 `json:"failedItems,omitempty"`
 }
 
+// BulkQueueRetryResult aggregates per-item outcomes across RetryFailedQueue's
+// batch retry pass.
 type BulkQueueRetryResult struct {
 	Processed       int     `json:"processed"`
 	Retried         int     `json:"retried"`
@@ -261,12 +296,16 @@ type BulkQueueRetryResult struct {
 	FailedQueues    []int64 `json:"failedQueues,omitempty"`
 }
 
+// ReleaseActionResult reports the outcome of a single manual release-candidate
+// action (select/reject/restore/skip).
 type ReleaseActionResult struct {
 	ReleaseCandidateID int64  `json:"releaseCandidateId"`
 	Action             string `json:"action"`
 	SelectedReleaseID  *int64 `json:"selectedReleaseId,omitempty"`
 }
 
+// QueueRetryResult reports the outcome of retrying a single failed queue item
+// (RetryQueueItem).
 type QueueRetryResult struct {
 	QueueItemID        int64  `json:"queueItemId"`
 	Action             string `json:"action"`
@@ -274,6 +313,8 @@ type QueueRetryResult struct {
 	SearchCandidateCnt int    `json:"searchCandidateCount,omitempty"`
 }
 
+// QueueManageResult reports the outcome of a manual queue-item management
+// action (ManageQueueItem).
 type QueueManageResult struct {
 	QueueItemID        int64  `json:"queueItemId"`
 	Action             string `json:"action"`
@@ -296,6 +337,12 @@ type QueueManageResult struct {
 const pendingQueueBatchSize = 250
 
 const (
+	// defaultInlineFallbackDepth, busyInlineFallbackDepth, and
+	// fastLaneInlineFallbackDepth bound how many levels of the recursive
+	// candidate-promotion fallback chain run inline/synchronously before
+	// deferring the rest to the next queue pass; busyQueueDepthThreshold is
+	// the backlog size past which the shallower "busy" depth applies instead
+	// of the default. See maxInlineFallbackDepth.
 	defaultInlineFallbackDepth  = 3
 	busyInlineFallbackDepth     = 1
 	fastLaneInlineFallbackDepth = 3
@@ -333,6 +380,10 @@ type searchAttemptRecord struct {
 	queryText string
 }
 
+// completionFastLaneKey marks a context so a submitted download job is given
+// fast-lane priority (see withCompletionFastLane). Used by callers that just
+// completed a related step of the same user-facing operation and should not
+// be re-queued behind unrelated background traffic.
 type completionFastLaneKey struct{}
 
 // asyncDownloadKey marks a context as HTTP-initiated: fetchAndImportSelectedRelease
@@ -495,12 +546,16 @@ func (d *downloadDispatcher) hasWorkers() bool {
 	return d.workerCount > 0
 }
 
+// NewService creates a Service wired to the given repository, Seerr client,
+// and Hydra client. Optional dependencies (TMDB/TVDB clients, NZB fetcher,
+// hooks, logger) are configured afterward via the Set* methods; the zero
+// values are safe defaults suitable for tests.
 func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service {
 	return &Service{
 		repo:           repo,
 		seerr:          seerr,
 		hydra:          hydra,
-		fetcher:        HTTPNZBFetcher{},
+		fetcher:        NewHTTPNZBFetcher(nil, nil),
 		importSem:      make(chan struct{}, 2), // kept for ImportNZBFromPush only
 		downloader:     newDownloadDispatcher(),
 		dispatchC:      make(chan struct{}, 1),
@@ -526,26 +581,49 @@ func (s *Service) DispatchWakeCh() <-chan struct{} {
 	return s.dispatchC
 }
 
+// SetIndexerLimits configures the indexer-wide search and candidate-filtering
+// constraints (age, retention, size, release grace period) used by search and
+// candidate ranking.
 func (s *Service) SetIndexerLimits(limits IndexerLimits) {
 	s.indexerLimits = limits
 }
 
+// SetNZBFetcher overrides the default (unrouted) fetcher -- used to inject
+// a privacy-routing-aware *HTTPNZBFetcher at startup.
+func (s *Service) SetNZBFetcher(f NZBFetcher) {
+	s.fetcher = f
+}
+
+// SetTMDBClient injects the TMDB client used for movie/show metadata
+// enrichment and season expansion.
 func (s *Service) SetTMDBClient(client TMDBClient) {
 	s.tmdb = client
 }
 
+// SetTVDBClient injects the TVDB client used as a fallback metadata source
+// when TMDB is unavailable or disabled.
 func (s *Service) SetTVDBClient(client TVDBClient) {
 	s.tvdb = client
 }
 
+// SetPostImportHook registers a callback invoked after a selected release's
+// NZB has been imported and the queue item created, letting callers trigger
+// downstream processing (e.g. download dispatch) without this package
+// depending on those subsystems directly.
 func (s *Service) SetPostImportHook(fn func(context.Context, database.QueueSnapshot) error) {
 	s.postImportHook = fn
 }
 
+// SetPreflightChecker registers a callback run against a queue snapshot
+// before dispatch is allowed to proceed; a returned error blocks dispatch.
 func (s *Service) SetPreflightChecker(fn func(context.Context, database.QueueSnapshot) error) {
 	s.preflightChecker = fn
 }
 
+// SetImportConcurrency resizes the semaphore bounding concurrent
+// ImportNZBFromPush operations (the SABnzbd push path only; the main
+// download path uses the priority downloader instead). Values below 1 are
+// clamped to 1.
 func (s *Service) SetImportConcurrency(workers int) {
 	if s == nil {
 		return
@@ -556,10 +634,16 @@ func (s *Service) SetImportConcurrency(workers int) {
 	s.importSem = make(chan struct{}, workers)
 }
 
+// SetEarlyChecker registers a callback run against a single message ID
+// immediately after NZB parsing, before archive inspection and DB import. A
+// non-nil error rejects the candidate before the expensive segment download
+// and import work, allowing fast rejection of already-expired releases.
 func (s *Service) SetEarlyChecker(fn func(context.Context, string) error) {
 	s.earlyChecker = fn
 }
 
+// SetArticleChecker registers the callback ValidatePublishedArticles uses to
+// probe whether a given NNTP message ID is still retrievable.
 func (s *Service) SetArticleChecker(fn func(ctx context.Context, messageID string) error) {
 	s.articleChecker = fn
 }
@@ -610,14 +694,27 @@ func (s *Service) ValidatePublishedArticles(ctx context.Context) (int, error) {
 	return reset, nil
 }
 
+// SetQueuePolicyProvider injects the source of user-configured queue
+// failure-handling policy used by RetryFailedQueue and ManageQueueItem.
 func (s *Service) SetQueuePolicyProvider(provider QueuePolicyProvider) {
 	s.queuePolicy = provider
 }
 
+// SetLogger overrides the Service's logger.
 func (s *Service) SetLogger(l zerolog.Logger) {
 	s.logger = l
 }
 
+// calibrateImportedDocumentBestEffort kicks off yEnc offset calibration for a
+// freshly imported NZB document in a background goroutine and returns
+// immediately; it is fire-and-forget and never surfaces an error to the
+// caller. Concurrent calls for the same document are deduplicated via
+// calibrateInflight so a burst of triggers only calibrates once, and
+// calibrateSem (when configured) bounds how many calibrations run at a time.
+// The background work is capped by asyncCalibrateBudget and treats the
+// document having already been deleted (sql.ErrNoRows) as benign -- the
+// owning release_candidate may have been abandoned or blocklisted while
+// calibration was in flight.
 func (s *Service) calibrateImportedDocumentBestEffort(nzbDocumentID int64) {
 	if s == nil || nzbDocumentID <= 0 {
 		return
@@ -647,10 +744,19 @@ func (s *Service) calibrateImportedDocumentBestEffort(nzbDocumentID int64) {
 	}()
 }
 
+// ListRequests returns a summary of all known media requests.
 func (s *Service) ListRequests(ctx context.Context) ([]database.MediaRequestSummary, error) {
 	return s.repo.ListMediaRequests(ctx)
 }
 
+// SyncRequests pulls pending requests from Seerr and upserts a library item
+// for each. Season-level TV requests are expanded into per-episode library
+// items via TMDB (syncSeasonRequest); movie and single-episode requests map
+// to one item each. Metadata enrichment for newly created items runs in
+// background goroutines (bounded by tmdbEnrichSem) so it does not block the
+// sync loop -- items are queued for search immediately and metadata arrives
+// shortly after. Waking the pending-dispatch loop is deferred until after all
+// requests are processed, so a single sync pass triggers at most one wake.
 func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 	if s == nil || s.seerr == nil {
 		return SyncResult{}, fmt.Errorf("seerr client unavailable")
@@ -819,6 +925,13 @@ var ErrSeerrSyncPending = errors.New("seerr request created; library sync still 
 // deadline (if any) the HTTP handler's request context happens to carry.
 const seerrRequestSyncBudget = 20 * time.Second
 
+// CreateSeerrRequest creates a new Seerr request for the given media and
+// reconciles it into a library item immediately, bounded by
+// seerrRequestSyncBudget.
+//
+// Errors:
+//   - ErrSeerrSyncPending: the Seerr request was created but reconciliation
+//     did not finish within budget; the periodic sync will complete it.
 func (s *Service) CreateSeerrRequest(ctx context.Context, mediaType string, tmdbID int64) (SyncResult, error) {
 	if s == nil || s.seerr == nil {
 		return SyncResult{}, fmt.Errorf("seerr client unavailable")
@@ -829,6 +942,10 @@ func (s *Service) CreateSeerrRequest(ctx context.Context, mediaType string, tmdb
 	return s.syncAfterSeerrRequest()
 }
 
+// CreateSeerrSeasonRequest creates a new Seerr season-pack request and
+// reconciles it into per-episode library items immediately, bounded by
+// seerrRequestSyncBudget. See CreateSeerrRequest for the ErrSeerrSyncPending
+// contract.
 func (s *Service) CreateSeerrSeasonRequest(ctx context.Context, tmdbID int64, seasons []int) (SyncResult, error) {
 	if s == nil || s.seerr == nil {
 		return SyncResult{}, fmt.Errorf("seerr client unavailable")
@@ -842,6 +959,11 @@ func (s *Service) CreateSeerrSeasonRequest(ctx context.Context, tmdbID int64, se
 	return s.syncAfterSeerrRequest()
 }
 
+// syncAfterSeerrRequest reconciles a just-created Seerr request into a
+// library item, bounded by seerrRequestSyncBudget and detached from the
+// caller's own context so an HTTP request deadline can't cut reconciliation
+// short. A timeout here is not a failure: it is translated into
+// ErrSeerrSyncPending so the caller treats the Seerr request as accepted.
 func (s *Service) syncAfterSeerrRequest() (SyncResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), seerrRequestSyncBudget)
 	defer cancel()
@@ -855,6 +977,8 @@ func (s *Service) syncAfterSeerrRequest() (SyncResult, error) {
 	return result, nil
 }
 
+// PushMissingToSeerrResult reports how many library items were pushed to
+// Seerr as new requests versus skipped because Seerr already had them.
 type PushMissingToSeerrResult struct {
 	MoviesPushed  int `json:"moviesPushed"`
 	ShowsPushed   int `json:"showsPushed"`
@@ -982,6 +1106,11 @@ func (s *Service) SyncPlexDetectedShows(ctx context.Context) (SyncPlexDetectedRe
 	return result, nil
 }
 
+// enrichMovieRequest fetches TMDB metadata for a movie and persists it against
+// the library item. It is best-effort: a disabled/unconfigured TMDB client or
+// a failed lookup is treated as a no-op (nil error) rather than surfaced,
+// since metadata enrichment must never block the request sync it runs
+// alongside.
 func (s *Service) enrichMovieRequest(ctx context.Context, libraryItemID, tmdbID int64) error {
 	if s == nil || s.tmdb == nil || !s.tmdb.Enabled() || tmdbID <= 0 {
 		return nil
@@ -1017,6 +1146,9 @@ func (s *Service) enrichMovieRequest(ctx context.Context, libraryItemID, tmdbID 
 	})
 }
 
+// enrichEpisodeRequest enriches an episode's library item metadata, preferring
+// TMDB when enabled and available; it falls back to TVDB only when TMDB is
+// disabled/unconfigured or its lookup fails.
 func (s *Service) enrichEpisodeRequest(ctx context.Context, libraryItemID, tmdbID, tvdbID int64, episodeTitle string) error {
 	if s != nil && s.tmdb != nil && s.tmdb.Enabled() && tmdbID > 0 {
 		item, err := s.tmdb.TVDetails(ctx, tmdbID)
@@ -1086,6 +1218,8 @@ func (s *Service) PushPendingToQueue(priority int) {
 	}
 }
 
+// PushLibraryItemsToQueue pushes each distinct, positive library item ID to
+// the work queue at the given priority, deduplicating the input slice.
 func (s *Service) PushLibraryItemsToQueue(ids []int64, priority int) {
 	if s == nil || s.WorkQueue == nil {
 		return
@@ -1104,6 +1238,13 @@ func (s *Service) PushLibraryItemsToQueue(ids []int64, priority int) {
 	}
 }
 
+// SearchPendingLibrary drives one batch pass over pending library items
+// (from the scheduled backlog tick or a manual trigger). Items that already
+// have a selected release are dispatched directly to the download queue
+// (bypassing BullMQ's lock latency for a near-instant async submit, subject
+// to shouldDispatchSelectedTarget's URL cooldown); items still needing a
+// Hydra search are pushed to BullMQ when it is available, or searched
+// synchronously as a fallback when it is not.
 func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, error) {
 	targets, err := s.repo.ListPendingLibrarySearchTargets(ctx, s.indexerLimits.ReleaseGraceHours)
 	if err != nil {
@@ -1167,6 +1308,13 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 	return result, nil
 }
 
+// DispatchAutomaticPending is the passive-resume sweep: it re-submits the
+// download job for every already-selected pending item, subject to
+// shouldDispatchSelectedTarget's URL cooldown. It exists to advance items
+// left in a selected-but-not-yet-fetched state by an interrupted prior
+// dispatch (e.g. after a redeploy) without requiring a fresh Hydra search.
+// It must never mark the URL as dispatched itself -- see the inline comment
+// above the submit call for the 2026-07-17 incident this constraint fixes.
 func (s *Service) DispatchAutomaticPending(ctx context.Context) (BulkSearchResult, error) {
 	targets, err := s.repo.ListPendingLibrarySearchTargets(ctx, s.indexerLimits.ReleaseGraceHours)
 	if err != nil {
@@ -1224,6 +1372,11 @@ func (s *Service) DispatchAutomaticPending(ctx context.Context) (BulkSearchResul
 	return result, nil
 }
 
+// filterPendingSearchTargets splits targets into already-selected items (always
+// kept, dispatched rather than searched) and items still needing a search,
+// capping the latter at pendingQueueBatchSize per call. now is accepted for
+// interface symmetry with related helpers but is currently unused for
+// filtering.
 func (s *Service) filterPendingSearchTargets(targets []database.PendingLibrarySearchTarget, now time.Time) []database.PendingLibrarySearchTarget {
 	if len(targets) == 0 {
 		return nil
@@ -1254,6 +1407,8 @@ func (s *Service) filterPendingSearchTargets(targets []database.PendingLibrarySe
 	return append(selectedTargets, searchTargets...)
 }
 
+// shouldDispatchSelectedTarget reports whether an already-selected pending
+// target is eligible for (re-)dispatch to the download queue right now.
 func (s *Service) shouldDispatchSelectedTarget(target database.PendingLibrarySearchTarget, now time.Time) bool {
 	if target.SelectedReleaseID <= 0 {
 		return false
@@ -1374,6 +1529,9 @@ func (s *Service) ClaimURLForFetch(ctx context.Context, rawURL string) bool {
 	return !claimed
 }
 
+// searchRequestFingerprint builds a stable dedup key for a single library
+// item + Hydra search request, used to key the in-memory searchAttempts
+// cooldown cache in shouldSkipSearchRequest/rememberSearchRequest.
 func searchRequestFingerprint(libraryItemID int64, request hydra.SearchRequest) string {
 	query := normalizeSearchText(request.Query)
 	return fmt.Sprintf("%d|%s|%s|%d|%s|%d|%d", libraryItemID,
@@ -1386,6 +1544,13 @@ func searchRequestFingerprint(libraryItemID int64, request hydra.SearchRequest) 
 	)
 }
 
+// shouldSkipSearchRequest reports whether an identical search (same library
+// item, media type, query, and season/episode) was already attempted within
+// searchRequestCooldown and produced a conclusive outcome ("selected",
+// "usable", "rejected_only", or "empty"). This throttles the automated
+// backlog scheduler from re-issuing the same Hydra query every cycle; it is
+// bypassed entirely for contexts marked via WithForceSearch (manual/
+// interactive search endpoints).
 func (s *Service) shouldSkipSearchRequest(ctx context.Context, libraryItemID int64, request hydra.SearchRequest, now time.Time) bool {
 	if s == nil {
 		return false
@@ -1413,6 +1578,9 @@ func (s *Service) shouldSkipSearchRequest(ctx context.Context, libraryItemID int
 	}
 }
 
+// rememberSearchRequest records the outcome of a completed search under its
+// fingerprint so a later shouldSkipSearchRequest call within
+// searchRequestCooldown can short-circuit an identical request.
 func (s *Service) rememberSearchRequest(libraryItemID int64, request hydra.SearchRequest, outcome string, now time.Time) {
 	if s == nil {
 		return
@@ -1427,6 +1595,10 @@ func (s *Service) rememberSearchRequest(libraryItemID int64, request hydra.Searc
 	s.searchAttemptMu.Unlock()
 }
 
+// searchCandidateOutcome classifies a search pass's result for the
+// searchAttempts cooldown cache: "selected" when a release was chosen,
+// "empty" when Hydra returned nothing, "usable" when at least one candidate
+// survived ranking, or "rejected_only" when every candidate was filtered out.
 func searchCandidateOutcome(candidates []database.SearchCandidateRecord, selectedReleaseID *int64) string {
 	if selectedReleaseID != nil {
 		return "selected"
@@ -1440,6 +1612,8 @@ func searchCandidateOutcome(candidates []database.SearchCandidateRecord, selecte
 	return "rejected_only"
 }
 
+// withCompletionFastLane returns ctx marked so a subsequent download-job
+// submission is treated as priority 0 (see fetchAndImportSelectedRelease).
 func withCompletionFastLane(ctx context.Context) context.Context {
 	return context.WithValue(ctx, completionFastLaneKey{}, true)
 }
@@ -1499,6 +1673,9 @@ func (s *Service) ProcessLibraryItem(ctx context.Context, libraryItemID int64) e
 	return err
 }
 
+// WorkQueueStatus reports whether the BullMQ work queue is paused and its
+// current waiting-job depth. Returns the zero value with no error if the
+// work queue is not configured.
 func (s *Service) WorkQueueStatus(ctx context.Context) (WorkQueueStatus, error) {
 	if s == nil || s.WorkQueue == nil {
 		return WorkQueueStatus{}, nil
@@ -1513,6 +1690,8 @@ func (s *Service) WorkQueueStatus(ctx context.Context) (WorkQueueStatus, error) 
 	}, nil
 }
 
+// PauseWorkQueue pauses the BullMQ work queue so it stops handing out new
+// search jobs, then returns the resulting status.
 func (s *Service) PauseWorkQueue(ctx context.Context) (WorkQueueStatus, error) {
 	if s == nil || s.WorkQueue == nil {
 		return WorkQueueStatus{}, errors.New("work queue unavailable")
@@ -1523,6 +1702,8 @@ func (s *Service) PauseWorkQueue(ctx context.Context) (WorkQueueStatus, error) {
 	return s.WorkQueueStatus(ctx)
 }
 
+// ResumeWorkQueue reverses a prior PauseWorkQueue and returns the resulting
+// status.
 func (s *Service) ResumeWorkQueue(ctx context.Context) (WorkQueueStatus, error) {
 	if s == nil || s.WorkQueue == nil {
 		return WorkQueueStatus{}, errors.New("work queue unavailable")
@@ -1533,6 +1714,15 @@ func (s *Service) ResumeWorkQueue(ctx context.Context) (WorkQueueStatus, error) 
 	return s.WorkQueueStatus(ctx)
 }
 
+// SearchRecentPending matches pending library items against NZBHydra2's
+// recent/RSS feed for the given media type, instead of issuing a per-item
+// Hydra search. Items are skipped when a search conflict is detected, when
+// their media type doesn't match, or when the recent feed yields no
+// candidate matching the item's title (a rejected_only result silently
+// overwrites nothing, preserving any existing valid candidates). Guarded per
+// item by searchInflight (O-05) so this recent-feed pass cannot race a
+// concurrent manual search or retry pass into selecting/fetching different
+// candidates for the same item.
 func (s *Service) SearchRecentPending(ctx context.Context, mediaType string) (BulkSearchResult, error) {
 	if s == nil || s.hydra == nil {
 		return BulkSearchResult{}, fmt.Errorf("nzbhydra2 client unavailable")
@@ -1647,6 +1837,17 @@ const (
 	retryMatrixRetryQueueItem
 )
 
+// decideRetryQueueAction picks the recovery path for one failed queue item.
+// A user-configured policy for the target's failure reason wins, except when
+// the item's selected release hasn't actually failed yet (CandidateFailureCount
+// == 0) -- that combination means the item is only in a failed state for some
+// other reason (e.g. a restart interruption) and should be requeued rather
+// than have the user's failure-reason policy (which assumes a bad candidate)
+// applied to a candidate that never failed. Reasons with no configured policy
+// fall back to the hardcoded recovery matrix (policy.DecideFromReason), which
+// additionally escalates a retry-later verdict to blocklist+search once the
+// same candidate has failed 3 times, to avoid an unbounded throttle-retry
+// loop.
 func decideRetryQueueAction(settings policy.Settings, target database.FailedQueueRetryTarget) retryQueueDecision {
 	userAction := policy.ActionForReason(settings, target.FailureReason)
 	if userAction != policy.QueueActionDoNothing &&
@@ -1687,6 +1888,13 @@ func decideRetryQueueAction(settings policy.Settings, target database.FailedQueu
 	return retryMatrixRetryQueueItem
 }
 
+// RetryFailedQueue drives the scheduled bulk-retry pass over failed queue
+// items. For each target it decides a recovery action via
+// decideRetryQueueAction (user policy first, falling back to the hardcoded
+// recovery matrix) and executes it. Hydra-dependent actions are capped at
+// maxHydraCalls per run (restart-interrupted items requeue without calling
+// Hydra and are processed first/faster, so a large restart backlog can still
+// clear quickly even while the Hydra-call budget throttles fresh searches).
 func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, error) {
 	// Fetch up to 500 items: restart-interrupted items (stale_worker, interrupted_by_restart)
 	// don't call Hydra and are much faster to process. Hydra calls are capped at 100
@@ -1807,6 +2015,16 @@ func isDeadlock(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.SQLState() == "40P01"
 }
 
+// SearchLibrary searches for and selects a release for a single library
+// item. Concurrent calls for the same libraryItemID are deduplicated
+// (searchInflight, O-05): a call that arrives while another is already in
+// progress for the same item returns immediately as a no-op rather than
+// racing it. The search is automatically treated as an upgrade search
+// (upgradeSearch=true) whenever the item already has a selected release, so
+// an existing working/published release is protected until a replacement is
+// actually confirmed rather than being torn down the moment a new search
+// runs. Transient Postgres deadlocks (SQLSTATE 40P01) are retried up to 3
+// times with a short backoff before giving up.
 func (s *Service) SearchLibrary(ctx context.Context, libraryItemID int64) (SearchResult, error) {
 	// O-05: skip if another goroutine is already searching this item.
 	if _, loaded := s.searchInflight.LoadOrStore(libraryItemID, struct{}{}); loaded {
@@ -1843,6 +2061,17 @@ func (s *Service) SearchLibrary(ctx context.Context, libraryItemID int64) (Searc
 	return SearchResult{}, fmt.Errorf("searchLibrary: too many deadlock retries for item %d", libraryItemID)
 }
 
+// searchLibraryOnceWithMode performs a single (non-deadlock-retried) search
+// attempt for a library item: it validates the item is searchable (no
+// conflict, has a title, not deleted mid-flight), tries a season pack first
+// for TV episodes when the season-pack cooldown allows it, then runs tier 1
+// (ID-based, trusted) and tier 2 (title-based, verified) Hydra queries,
+// stopping early once a tier yields a usable selection. If a fresh search
+// finds nothing at all, it falls back to promoting any existing unselected
+// candidate before giving up, so an item is never stuck merely because an
+// identical Hydra result failed to reappear. upgradeSearch gates candidates
+// against currentSelected via applyUpgradeMinimums so an existing working
+// release is only replaced by a genuine improvement.
 func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID int64, upgradeSearch bool) (SearchResult, error) {
 	if s == nil || s.hydra == nil {
 		return SearchResult{}, fmt.Errorf("nzbhydra2 client unavailable")
@@ -2176,6 +2405,10 @@ func buildSeasonPackRequests(input database.LibrarySearchInput) []hydra.SearchRe
 	return requests
 }
 
+// searchHydraWithRetry issues a single Hydra search, retrying exactly once
+// when the first attempt fails with a transient error (see
+// isRetryableSearchFailure). Non-retryable failures and the retry's own
+// result (success or error) are returned as-is.
 func (s *Service) searchHydraWithRetry(ctx context.Context, request hydra.SearchRequest) ([]hydra.SearchResult, error) {
 	results, err := s.hydra.Search(ctx, request)
 	if err == nil {
@@ -2187,6 +2420,9 @@ func (s *Service) searchHydraWithRetry(ctx context.Context, request hydra.Search
 	return s.hydra.Search(ctx, request)
 }
 
+// syncRequestsWithRetry runs SyncRequests with up to two retries (0s, 1s, 2s
+// backoff) for transient Seerr failures (see isRetryableSeerrSyncFailure).
+// A non-retryable error or ctx cancellation returns immediately.
 func (s *Service) syncRequestsWithRetry(ctx context.Context) (SyncResult, error) {
 	backoff := []time.Duration{0, 1 * time.Second, 2 * time.Second}
 	var lastResult SyncResult
@@ -2232,6 +2468,8 @@ var transientGatewayTimeoutSubstrings = []string{
 	"status 524", "cloudflare timeout", "gateway timeout",
 }
 
+// containsAnySubstring reports whether message contains any of substrings.
+// message is expected to already be lowercased/trimmed by the caller.
 func containsAnySubstring(message string, substrings []string) bool {
 	for _, substr := range substrings {
 		if strings.Contains(message, substr) {
@@ -2241,6 +2479,10 @@ func containsAnySubstring(message string, substrings []string) bool {
 	return false
 }
 
+// classifySearchFailureReason maps a Hydra search error to one of a small
+// set of stable reason codes (search_timeout, search_auth_error,
+// search_rate_limited, search_unavailable, search_cancelled, search_error)
+// used both for logging/metrics and to drive isRetryableSearchFailure.
 func classifySearchFailureReason(err error) string {
 	if err == nil {
 		return "search_error"
@@ -2273,6 +2515,9 @@ func classifySearchFailureReason(err error) string {
 	}
 }
 
+// isRetryableSearchFailure reports whether err is transient enough to justify
+// a single automatic retry (see searchHydraWithRetry) -- currently timeouts
+// and 5xx/gateway-style unavailability, but not auth or rate-limit errors.
 func isRetryableSearchFailure(err error) bool {
 	switch classifySearchFailureReason(err) {
 	case "search_timeout", "search_unavailable":
@@ -2318,6 +2563,16 @@ func isRetryableSeerrSyncFailure(err error) bool {
 	}
 }
 
+// fetchAndImportSelectedRelease is the entry point for turning a selected
+// release into a downloaded, imported, published queue item. When the
+// download dispatcher has active workers, the job is submitted to it and
+// this method either blocks for the result (synchronous callers) or returns
+// immediately (context marked via WithAsyncDownload/isCompletionFastLane, in
+// which case the result is drained in the background so the worker is never
+// blocked). When no workers are running (e.g. unit tests), the fetch/import/
+// publish steps run inline. Returns (nil, nil) when the job was already
+// queued or in-flight for this selectedReleaseID -- the caller does not need
+// to wait for a duplicate.
 func (s *Service) fetchAndImportSelectedRelease(ctx context.Context, selectedReleaseID int64) (*int64, error) {
 	// If no worker is running (e.g. in unit tests), execute inline — same as the
 	// old importSem path but without semaphore contention.
@@ -2518,7 +2773,7 @@ func (s *Service) fetchAndBuildImportedNZB(ctx context.Context, current database
 	if err := s.repo.MarkSelectedReleaseFetching(ctx, current.SelectedReleaseID); err != nil {
 		return nil, nil, err
 	}
-	fileName, raw, err := s.fetcher.Fetch(ctx, current.ExternalURL)
+	fileName, raw, err := s.fetcher.Fetch(ctx, current.ExternalURL, current.IndexerName)
 	if err != nil {
 		result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
 		return result, nil, err
@@ -2612,6 +2867,16 @@ func (s *Service) publishImportedRelease(ctx context.Context, p pendingPublish) 
 	return &value, nil
 }
 
+// fetchAndImportSelectedReleaseDepth drives one release through fetch,
+// import, and (via importSelectedRelease) publish or promote-on-failure. depth
+// tracks how many inline fallback hops (see promoteNextAfterFailureDepth) led
+// here, bounding recursive candidate promotion. A release already at or past
+// maxCandidateFailuresBeforeGiveUp is blocklisted and skipped without a fetch;
+// a release with a previously downloaded NZB document is retried from that
+// stored document (retrySelectedReleaseFromStoredNZB) instead of re-fetching,
+// so a reset-after-preflight-failure never re-downloads from the indexer.
+// Returns (nil, nil) when the underlying selected_releases row was concurrently
+// processed or deleted by another worker.
 func (s *Service) fetchAndImportSelectedReleaseDepth(ctx context.Context, selectedReleaseID int64, depth int) (*int64, error) {
 	current, err := s.repo.GetSelectedReleaseSummary(ctx, selectedReleaseID)
 	if err != nil {
@@ -2841,6 +3106,15 @@ func sizesClose(a, b int64) bool {
 	return diff*20 <= max
 }
 
+// buildSearchCandidates turns raw Hydra results into ranked, deduplicated
+// SearchCandidateRecords. Results are filtered in this order before ranking:
+// passworded releases, indexer age/retention/size limits (IndexerLimits),
+// episode-mismatch titles (wrong_episode), and URLs with a durable prior
+// failure (see candidateFailurePenaltyProfile) -- each rejection is recorded
+// as a zero-score rejected candidate rather than dropped silently, so the UI
+// can still show why a release was excluded. Surviving results are scored via
+// ranking.ScoreWithPreferences and the final slice is sorted non-rejected
+// first, then by descending score.
 func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requirements, history map[string]database.CandidateHistory, prefs ranking.Preferences, limits IndexerLimits, indexerPolicies map[string]int) []database.SearchCandidateRecord {
 	results = dedupeSearchResults(results)
 	now := time.Now()
@@ -2946,6 +3220,18 @@ func buildSearchCandidates(results []hydra.SearchResult, required ranking.Requir
 	return candidates
 }
 
+// candidateFailurePenaltyProfile decides how a release URL's failure history
+// affects its treatment in buildSearchCandidates. durableRejectThreshold is
+// currently always 1 -- a single non-transient failure durably rejects the
+// candidate outright, matching Sonarr's own first-failure-blocks behavior.
+// This was deliberately hardened from an earlier, more lenient
+// threshold-of-3-with-reduced-penalty policy for certain "maybe transient"
+// failure reasons; that leniency let candidates be re-fetched from the
+// indexer well past a reasonable retry budget and directly caused an indexer
+// account-termination warning. The restart-interruption/temporary-quota
+// exceptions (checked by the caller) remain untouched by this threshold,
+// since those failures reflect Drakkar's own process restart or a transient
+// indexer quota, not the release's quality.
 func candidateFailurePenaltyProfile(history database.CandidateHistory) (effectiveFailureCount int, degraded bool, durableRejectThreshold int) {
 	effectiveFailureCount = history.FailureCount
 	degraded = history.FailureCount > 0
@@ -3012,6 +3298,11 @@ func applyUpgradeMinimums(candidates []database.SearchCandidateRecord, current *
 	return candidates
 }
 
+// searchRequirements maps a library search input into the ranking package's
+// requirements shape. For a whole-show/season-level request, the media type
+// is forced to "tv" and the title/year are taken from the show rather than
+// any individual episode, since a season pack must be matched and scored
+// against the show as a whole.
 func searchRequirements(input database.LibrarySearchInput) ranking.Requirements {
 	mediaType := input.MediaType
 	if isWholeShowRequest(input) {
@@ -3133,6 +3424,11 @@ func mergeSearchCandidates(existing, incoming []database.SearchCandidateRecord) 
 	return out
 }
 
+// betterSearchCandidate reports whether left should win over right when both
+// resolve to the same underlying release (same URL, or same indexer +
+// normalized title + close size) during mergeSearchCandidates. Preference
+// order: non-rejected beats rejected, then higher score, then fewer prior
+// failures, then more recently posted.
 func betterSearchCandidate(left, right database.SearchCandidateRecord) bool {
 	if left.Rejected != right.Rejected {
 		return !left.Rejected
@@ -3149,6 +3445,13 @@ func betterSearchCandidate(left, right database.SearchCandidateRecord) bool {
 	return false
 }
 
+// shouldContinueSearch reports whether searchLibraryOnceWithMode should keep
+// issuing further search tiers after this batch of candidates. It returns
+// false as soon as an untried, non-season-pack candidate is found (a good
+// specific-episode match already exists, so further searching is wasted
+// query volume); it returns true when every non-rejected candidate is either
+// a season pack (an episode-specific release might still be out there) or has
+// already failed before.
 func shouldContinueSearch(candidates []database.SearchCandidateRecord, input database.LibrarySearchInput) bool {
 	for _, candidate := range candidates {
 		if candidate.Rejected {
@@ -3164,6 +3467,11 @@ func shouldContinueSearch(candidates []database.SearchCandidateRecord, input dat
 	return true // all non-rejected candidates are season packs or have failures
 }
 
+// shouldKeepSearchingPastCandidate reports whether candidate is a season-pack
+// match for an episode-level request rather than a specific-episode release,
+// meaning shouldContinueSearch should keep looking for a better, episode-exact
+// candidate instead of settling for the pack. Always false for whole-show
+// requests and non-TV media types, since a pack is exactly what those want.
 func shouldKeepSearchingPastCandidate(candidate database.SearchCandidateRecord, input database.LibrarySearchInput) bool {
 	if isWholeShowRequest(input) {
 		return false
@@ -3297,11 +3605,19 @@ func hasSeasonPackToken(title string, seasonNumber int) bool {
 	return false
 }
 
+// normalizeSearchText lowercases value and collapses common release-name
+// punctuation (dots, underscores, hyphens, brackets) into single spaces so
+// title/token matching is insensitive to scene-naming formatting differences.
 func normalizeSearchText(value string) string {
 	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ")
 	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(value))), " ")
 }
 
+// importSelectedRelease persists a fetched-and-parsed NZB against the
+// selected release and continues the pipeline: on import failure the
+// candidate is promoted past (see promoteNextAfterFailureDepth); on success,
+// yEnc offset calibration is kicked off best-effort in the background before
+// the queue item is marked indexed.
 func (s *Service) importSelectedRelease(ctx context.Context, current database.ReleaseSummary, imported database.ImportedNZB, depth int) (*int64, error) {
 	item, err := s.repo.ImportSelectedReleaseNZB(ctx, current.SelectedReleaseID, imported)
 	if err != nil {
@@ -3353,6 +3669,8 @@ func (s *Service) importSelectedRelease(ctx context.Context, current database.Re
 	return &value, nil
 }
 
+// promoteNextAfterFailure is the depth=0 entry point into
+// promoteNextAfterFailureDepth's recursive candidate-promotion chain.
 func (s *Service) promoteNextAfterFailure(ctx context.Context, current database.ReleaseSummary, reason string) (*int64, error) {
 	return s.promoteNextAfterFailureDepth(ctx, current, reason, 0)
 }
@@ -3369,6 +3687,12 @@ func cleanupCtx(ctx context.Context) context.Context {
 	return context.Background()
 }
 
+// maxInlineFallbackDepth returns how many levels of candidate-promotion
+// fallback promoteNextAfterFailureDepth may run inline/synchronously before
+// deferring the rest to a later queue pass. The fast-lane context gets the
+// most generous budget (a user is actively waiting); otherwise the budget
+// shrinks under a large active search backlog or work-queue depth so a
+// single bad episode cannot monopolize workers while many other items wait.
 func (s *Service) maxInlineFallbackDepth(ctx context.Context) int {
 	if s == nil {
 		return defaultInlineFallbackDepth
@@ -3464,6 +3788,11 @@ func (s *Service) promoteNextAfterFailureDepth(ctx context.Context, current data
 	return result, err
 }
 
+// retrySelectedReleaseFromStoredNZB re-imports a release using its
+// already-downloaded NZB document rather than fetching it again from the
+// indexer -- used when a prior attempt was interrupted after fetch (e.g.
+// stuck in preflight, then reset). This is what keeps a reset-and-retry from
+// appearing to NZBHydra2/the indexer as a repeated duplicate download.
 func (s *Service) retrySelectedReleaseFromStoredNZB(ctx context.Context, current database.ReleaseSummary, depth int) (*int64, error) {
 	if err := s.repo.MarkSelectedReleaseFetching(ctx, current.SelectedReleaseID); err != nil {
 		return nil, err
@@ -3479,6 +3808,11 @@ func (s *Service) retrySelectedReleaseFromStoredNZB(ctx context.Context, current
 	return s.importSelectedRelease(ctx, current, imported, depth)
 }
 
+// SelectRelease is the manual "select this release" action: it marks
+// releaseCandidateID as the selected release for its library item and drives
+// it through fetch/import/publish via fetchAndImportSelectedRelease. A nil
+// current summary (candidate already selected/consumed by a concurrent
+// caller) is treated as a graceful no-op rather than an error.
 func (s *Service) SelectRelease(ctx context.Context, releaseCandidateID int64) (ReleaseActionResult, error) {
 	current, err := s.repo.SelectReleaseCandidate(ctx, releaseCandidateID)
 	if err != nil {
@@ -3498,6 +3832,11 @@ func (s *Service) SelectRelease(ctx context.Context, releaseCandidateID int64) (
 	}, nil
 }
 
+// RejectRelease is the manual "reject this release" action: it marks
+// releaseCandidateID as rejected (defaulting reason to "manual_reject" when
+// blank) and, if another candidate is promoted as a result, drives it through
+// fetch/import/publish. A nil next candidate (nothing left to promote) is a
+// graceful no-op.
 func (s *Service) RejectRelease(ctx context.Context, releaseCandidateID int64, reason string) (ReleaseActionResult, error) {
 	if strings.TrimSpace(reason) == "" {
 		reason = "manual_reject"
@@ -3523,6 +3862,9 @@ func (s *Service) RejectRelease(ctx context.Context, releaseCandidateID int64, r
 	}, nil
 }
 
+// RestoreRelease reverses a manual reject/skip on a single release candidate,
+// making it eligible for selection again. It does not itself trigger a new
+// fetch/import.
 func (s *Service) RestoreRelease(ctx context.Context, releaseCandidateID int64) (ReleaseActionResult, error) {
 	if err := s.repo.RestoreReleaseCandidate(ctx, releaseCandidateID); err != nil {
 		return ReleaseActionResult{}, err
@@ -3533,10 +3875,17 @@ func (s *Service) RestoreRelease(ctx context.Context, releaseCandidateID int64) 
 	}, nil
 }
 
+// RestoreRejectedReleases reverses rejection for every rejected release
+// candidate belonging to libraryItemID, making them eligible for selection
+// again.
 func (s *Service) RestoreRejectedReleases(ctx context.Context, libraryItemID int64) (database.RejectedReleaseRestoreResult, error) {
 	return s.repo.RestoreRejectedReleaseCandidates(ctx, libraryItemID)
 }
 
+// SkipRelease is the manual "skip this release" action: unlike RejectRelease
+// it marks the candidate as skipped (not rejected) while still promoting the
+// next candidate and driving it through fetch/import/publish when one
+// exists. A nil next candidate is a graceful no-op.
 func (s *Service) SkipRelease(ctx context.Context, releaseCandidateID int64) (ReleaseActionResult, error) {
 	next, err := s.repo.SkipReleaseCandidate(ctx, releaseCandidateID)
 	if err != nil {
@@ -3747,6 +4096,14 @@ func searchRequestLabel(request hydra.SearchRequest) string {
 	return ""
 }
 
+// RetryQueueItem retries a single queue item, choosing the cheapest viable
+// recovery path in order: already-available items are a no-op; a failed
+// selected release first tries promoting a different, untried candidate for
+// the same library item (PromoteAlternativeRetryCandidate) before re-fetching
+// the same one; a release with no stored external URL replays from its
+// stored NZB document (retrySelectedReleaseFromStoredNZB) instead of
+// re-fetching; only when no existing candidate is usable does it fall back to
+// promoting any existing candidate, and finally to a fresh SearchLibrary call.
 func (s *Service) RetryQueueItem(ctx context.Context, queueItemID int64) (QueueRetryResult, error) {
 	target, err := s.repo.GetQueueRetryTarget(ctx, queueItemID)
 	if err != nil {
@@ -3830,6 +4187,10 @@ func (s *Service) RetryQueueItem(ctx context.Context, queueItemID int64) (QueueR
 	}, nil
 }
 
+// ManageQueueItem applies a user-requested queue action (remove,
+// remove-and-blocklist, or remove-blocklist-and-search) to a single queue
+// item, loading the current queue policy settings to determine the
+// blocklist TTL.
 func (s *Service) ManageQueueItem(ctx context.Context, queueItemID int64, action string) (QueueManageResult, error) {
 	settings := policy.DefaultSettings()
 	if s.queuePolicy != nil {
@@ -3884,6 +4245,9 @@ func (s *Service) manageQueueItemWithSettings(ctx context.Context, queueItemID i
 	}
 }
 
+// ManageFailedQueue applies action to every currently failed queue item
+// (bounded by the indexer's release grace period), delegating the per-item
+// work to ManageQueueItems.
 func (s *Service) ManageFailedQueue(ctx context.Context, action string) (BulkQueueRetryResult, error) {
 	targets, err := s.repo.ListFailedQueueRetryTargets(ctx, 0, s.indexerLimits.ReleaseGraceHours)
 	if err != nil {
@@ -3896,6 +4260,10 @@ func (s *Service) ManageFailedQueue(ctx context.Context, action string) (BulkQue
 	return s.ManageQueueItems(ctx, ids, action)
 }
 
+// ManageQueueItems applies action to each of queueItemIDs, loading the queue
+// policy settings once for the whole batch rather than once per item. Each
+// item's outcome is tracked independently -- one item's failure does not
+// abort the batch.
 func (s *Service) ManageQueueItems(ctx context.Context, queueItemIDs []int64, action string) (BulkQueueRetryResult, error) {
 	settings := policy.DefaultSettings()
 	if s.queuePolicy != nil {
@@ -3923,6 +4291,7 @@ func (s *Service) ManageQueueItems(ctx context.Context, queueItemIDs []int64, ac
 	return result, nil
 }
 
+// UpgradeSearchResult reports the outcome of a SearchUpgrades pass.
 type UpgradeSearchResult struct {
 	Checked  int `json:"checked"`
 	Upgraded int `json:"upgraded"`
@@ -3966,6 +4335,9 @@ func (s *Service) SearchUpgrades(ctx context.Context) (UpgradeSearchResult, erro
 	return result, nil
 }
 
+// parseCandidate converts a raw Hydra search result into a ranking.Candidate,
+// detecting resolution/source/codec/language/release-group from the title
+// text and looking up the indexer's configured policy score.
 func parseCandidate(item hydra.SearchResult, history database.CandidateHistory, effectiveFailureCount int, degraded bool, indexerPolicies map[string]int) ranking.Candidate {
 	titleLower := strings.ToLower(item.Title)
 	policyScore := 0
@@ -4402,8 +4774,47 @@ func detectReleaseGroup(title string) string {
 	return ""
 }
 
+// HTTPNZBFetcher downloads NZB files, normally through whatever client is
+// privacy-routed (Client), except for indexers listed in ExcludedIndexers
+// (matched case-insensitively against a release candidate's IndexerName),
+// which always use DirectClient regardless of the active privacy mode --
+// e.g. a private, already-trusted indexer the user doesn't want routed.
 type HTTPNZBFetcher struct {
-	Client *http.Client
+	Client       *http.Client
+	DirectClient *http.Client
+
+	excludedIndexers atomic.Pointer[map[string]struct{}]
+}
+
+// NewHTTPNZBFetcher builds a fetcher. Either client may be nil; Fetch falls
+// back to prepareNZBHTTPClient's own default in that case.
+func NewHTTPNZBFetcher(client, directClient *http.Client) *HTTPNZBFetcher {
+	return &HTTPNZBFetcher{Client: client, DirectClient: directClient}
+}
+
+// SetExcludedIndexers updates, live, which indexer names always bypass
+// privacy routing for NZB downloads. Safe to call concurrently with Fetch.
+func (f *HTTPNZBFetcher) SetExcludedIndexers(names []string) {
+	set := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		n = strings.ToLower(strings.TrimSpace(n))
+		if n != "" {
+			set[n] = struct{}{}
+		}
+	}
+	f.excludedIndexers.Store(&set)
+}
+
+// clientFor selects the HTTP client for indexerName, honoring the live
+// SetExcludedIndexers configuration: excluded indexers always use
+// DirectClient, bypassing privacy routing.
+func (f *HTTPNZBFetcher) clientFor(indexerName string) *http.Client {
+	if set := f.excludedIndexers.Load(); set != nil && f.DirectClient != nil {
+		if _, excluded := (*set)[strings.ToLower(strings.TrimSpace(indexerName))]; excluded {
+			return f.DirectClient
+		}
+	}
+	return f.Client
 }
 
 // nzbFetchInterval enforces a minimum gap between NZB downloads to prevent
@@ -4417,7 +4828,14 @@ var (
 // reManualSearchEpisode matches SxxExx / sxxexx in a manual search query.
 var reManualSearchEpisode = regexp.MustCompile(`(?i)s(\d{1,2})e(\d{1,2})`)
 
-func (f HTTPNZBFetcher) Fetch(ctx context.Context, rawURL string) (string, []byte, error) {
+// Fetch downloads the NZB document at rawURL and returns a filename derived
+// from the URL path along with the raw bytes. It enforces a global 1-second
+// minimum gap between any two NZB fetches (across all indexers) to avoid
+// bursting an indexer's grab-rate limit, sets browser-like headers to reduce
+// the chance of an indexer rejecting an obvious script client, and treats a
+// 403 following a cross-host redirect as a distinct, more specific error
+// (direct indexer download forbidden) rather than a generic status error.
+func (f *HTTPNZBFetcher) Fetch(ctx context.Context, rawURL, indexerName string) (string, []byte, error) {
 	// Rate-limit NZB fetches globally: wait if less than 2 seconds since last fetch.
 	nzbFetchMu.Lock()
 	wait := time.Second - time.Since(nzbFetchLastTime) // was 2s; 1s is safe with 5-failure hard cap
@@ -4433,8 +4851,7 @@ func (f HTTPNZBFetcher) Fetch(ctx context.Context, rawURL string) (string, []byt
 	nzbFetchLastTime = time.Now()
 	nzbFetchMu.Unlock()
 
-	client := f.Client
-	client = prepareNZBHTTPClient(client)
+	client := prepareNZBHTTPClient(f.clientFor(indexerName))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", nil, err
@@ -4471,6 +4888,13 @@ func (f HTTPNZBFetcher) Fetch(ctx context.Context, rawURL string) (string, []byt
 	return name, raw, nil
 }
 
+// prepareNZBHTTPClient clones base (or builds a 60s-timeout default when nil)
+// and configures it for NZB downloads: a cookie jar is attached so
+// session/auth cookies survive redirects, and CheckRedirect propagates the
+// original request's identifying headers (and a synthesized Referer) to
+// every redirect hop, since some indexers reject a redirected request that
+// arrives without them. An existing CheckRedirect is preserved and still
+// invoked after header propagation; otherwise redirects are capped at 10.
 func prepareNZBHTTPClient(base *http.Client) *http.Client {
 	if base == nil {
 		base = &http.Client{Timeout: 60 * time.Second}
@@ -4580,6 +5004,8 @@ type FillMissingEpisodesResult struct {
 	Queued         int `json:"queued"`
 }
 
+// PrioritizeTVShowResult reports the outcome of a PrioritizeTVShowMissing
+// pass for a single TV show.
 type PrioritizeTVShowResult struct {
 	TVShowID      int64 `json:"tvShowId"`
 	EpisodesFound int   `json:"episodesFound"`
@@ -4587,6 +5013,11 @@ type PrioritizeTVShowResult struct {
 	Queued        int   `json:"queued"`
 }
 
+// missingEpisodeBatchEnsurer is an optional Repository capability that lets
+// FillMissingEpisodes create all of a season's missing episode library items
+// in a single batched call instead of one repo round-trip per episode.
+// Repositories that don't implement it fall back to the per-episode
+// EnsureEpisodeLibraryItem path.
 type missingEpisodeBatchEnsurer interface {
 	EnsureEpisodeLibraryItemsBatch(ctx context.Context, tvShowID int64, showTitle string, episodes []database.MissingEpisodeBatchInput) ([]int64, error)
 }
@@ -4691,6 +5122,12 @@ func (s *Service) FillMissingEpisodes(ctx context.Context) (FillMissingEpisodesR
 	return result, nil
 }
 
+// shouldAutoSearchNewlyAddedEpisode reports whether a newly discovered
+// episode aired recently enough (within the last 14 days, or airing within
+// the next day) to warrant an immediate search, mirroring Sonarr's
+// episode-refresh behavior of only auto-searching current episodes rather
+// than flooding searches for an entire back catalog whenever a show is
+// refreshed.
 func shouldAutoSearchNewlyAddedEpisode(airDate string, now time.Time) bool {
 	airDate = strings.TrimSpace(airDate)
 	if airDate == "" {
@@ -4724,6 +5161,13 @@ func dedupeInt64s(values []int64) []int64 {
 	return out
 }
 
+// PrioritizeTVShowMissing is the single-show, user-triggered equivalent of
+// FillMissingEpisodes: it fetches missing episodes for tvShowID from TMDB,
+// creates any missing library items, and immediately queues both the newly
+// created episodes and any other still-pending episodes for this show at
+// high priority -- unlike FillMissingEpisodes' recency filter, every missing
+// episode is searched regardless of air date, since this is an explicit user
+// request for this specific show.
 func (s *Service) PrioritizeTVShowMissing(ctx context.Context, tvShowID int64) (PrioritizeTVShowResult, error) {
 	if s == nil || s.repo == nil || s.tmdb == nil || !s.tmdb.Enabled() || tvShowID <= 0 {
 		return PrioritizeTVShowResult{}, nil

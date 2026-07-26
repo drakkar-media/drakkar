@@ -30,19 +30,33 @@ const (
 	defaultArticleBufferSize        = 40
 )
 
+// FetchPriority orders competing segment fetches so interactive playback
+// reads are never starved by prefetch or background work.
 type FetchPriority int
 
+// Higher values win contention for fetch capacity. Read-ahead always fetches
+// below interactive playback reads (see the const block's leading comment
+// for why the read-ahead parallelism ceiling doesn't need to reserve
+// capacity for interactive reads itself).
 const (
 	PriorityBackground  FetchPriority = 10
 	PriorityReadAhead   FetchPriority = 80
 	PriorityInteractive FetchPriority = 100
 )
 
+// PrioritySegmentFetcher extends SegmentFetcher with a priority-aware fetch,
+// used by read-ahead so its prefetch requests never outrank the player's
+// interactive reads for the same underlying NNTP connection budget.
 type PrioritySegmentFetcher interface {
 	SegmentFetcher
 	FetchRangePriority(ctx context.Context, segment SegmentRange, priority FetchPriority) ([]byte, error)
 }
 
+// SessionVirtualMediaFile extends VirtualMediaFile with the session
+// lifecycle hooks needed to drive read-ahead prefetch for one open stream.
+// Implementations must tolerate being called on a nil receiver (StartSession
+// et al. are no-ops in that case) since not every VirtualMediaFile
+// implementation supports sessions.
 type SessionVirtualMediaFile interface {
 	VirtualMediaFile
 	StartSession(sessionID string)
@@ -52,6 +66,14 @@ type SessionVirtualMediaFile interface {
 	RegisterMeta(sessionID string, meta SessionMeta)
 }
 
+// ReadAheadManager tracks active stream sessions and schedules background
+// prefetch windows ahead of each session's current read position.
+//
+// Prefetch parallelism is shared across all active sessions (see schedule)
+// and is bounded by SetConnectionBudget so read-ahead cannot exceed the
+// operator's configured NNTP connection budget. Safe for concurrent use,
+// including on a nil *ReadAheadManager (all methods are no-ops in that
+// case), so callers with an optional manager don't need nil checks.
 type ReadAheadManager struct {
 	windowBytes int64
 
@@ -87,6 +109,10 @@ type readAheadSession struct {
 	currentOffset int64
 }
 
+// NewReadAheadManager creates a ReadAheadManager that prefetches up to
+// windowBytes ahead of each session's current read position. A negative
+// windowBytes is clamped to 0, which disables prefetch (schedule becomes a
+// no-op) while still tracking sessions for ActiveSessions/ActiveCount.
 func NewReadAheadManager(windowBytes int64) *ReadAheadManager {
 	if windowBytes < 0 {
 		windowBytes = 0
@@ -134,6 +160,12 @@ func (m *ReadAheadManager) SetConnectionBudget(totalConnections int, streamingPr
 	m.mu.Unlock()
 }
 
+// SetArticleBufferSize caps the number of segment ranges fetched within a
+// single scheduled read-ahead window, regardless of how many the window's
+// byte span would otherwise resolve to. A limit <= 0 resets to
+// defaultArticleBufferSize rather than disabling the cap, since an unbounded
+// window could otherwise fan out one goroutine per segment for a very large
+// window/small-segment combination.
 func (m *ReadAheadManager) SetArticleBufferSize(limit int) {
 	if m == nil {
 		return
@@ -146,6 +178,15 @@ func (m *ReadAheadManager) SetArticleBufferSize(limit int) {
 	m.mu.Unlock()
 }
 
+// Register starts tracking a new read-ahead session for sessionID, replacing
+// (and cancelling the in-flight prefetch of) any existing session already
+// registered under the same ID.
+//
+// spans is copied rather than retained, so the caller's slice may be reused
+// or mutated after this call returns even though StoredRarReader/
+// DirectNzbReader spans are themselves mutated in place elsewhere. meta is
+// variadic only so callers without display metadata yet can omit it; at most
+// the first element is used, and OpenedAt defaults to now if left zero.
 func (m *ReadAheadManager) Register(sessionID string, spans []SegmentSpan, fetcher PrioritySegmentFetcher, meta ...SessionMeta) {
 	if m == nil || sessionID == "" || fetcher == nil {
 		return
@@ -204,6 +245,10 @@ func (m *ReadAheadManager) ActiveSessions() []SessionSnapshot {
 	return out
 }
 
+// NotifyRead records sessionID's current read position and schedules the
+// next read-ahead window from it. Callers report every interactive read
+// through here so prefetch always chases the player's actual position rather
+// than the position last assumed.
 func (m *ReadAheadManager) NotifyRead(sessionID string, offset int64) {
 	if m != nil && sessionID != "" && offset >= 0 {
 		m.mu.Lock()
@@ -215,14 +260,18 @@ func (m *ReadAheadManager) NotifyRead(sessionID string, offset int64) {
 	m.schedule(sessionID, offset)
 }
 
+// Seek cancels sessionID's in-flight read-ahead window without scheduling a
+// replacement.
+//
+// A new window is deliberately not started here: the interactive ReadAt that
+// follows a seek fetches at PriorityInteractive (100), and starting a new
+// read-ahead window immediately (at PriorityReadAhead, 80) would only spawn
+// goroutines that compete with that fetch for the same connection budget at
+// the worst possible moment. NotifyRead, called by the FUSE handle right
+// after the interactive read returns, schedules the next window from the
+// correct post-seek offset instead.
 func (m *ReadAheadManager) Seek(sessionID string, offset int64) {
 	metrics.M.ReadAheadCancellations.Add(1)
-	// Cancel the current read-ahead window without immediately scheduling a
-	// new one. The interactive ReadAt that follows a seek goes to priority 100
-	// (vs read-ahead 80). If we started a new window here those goroutines
-	// would compete with the player's first fetch at the new position. Instead,
-	// NotifyRead — called by the FUSE handle right after the interactive read
-	// returns — will schedule the next window from the correct offset.
 	if m == nil || sessionID == "" {
 		return
 	}
@@ -245,6 +294,8 @@ func (m *ReadAheadManager) ActiveCount() int {
 	return len(m.sessions)
 }
 
+// Stop ends sessionID's read-ahead session, removing it from tracking and
+// cancelling any in-flight prefetch for it.
 func (m *ReadAheadManager) Stop(sessionID string) {
 	if m == nil || sessionID == "" {
 		return
@@ -258,6 +309,19 @@ func (m *ReadAheadManager) Stop(sessionID string) {
 	}
 }
 
+// schedule cancels sessionID's previous read-ahead window (if any) and
+// launches a new one covering up to windowBytes ahead of offset, clamped to
+// the remaining file length. It is called from NotifyRead on every
+// interactive read, so windows are constantly superseded as the read
+// position advances; the old window's context is cancelled before the new
+// one starts so a stale fetch in flight doesn't hold a connection-budget slot
+// past its usefulness.
+//
+// Prefetch runs in a background goroutine and divides the manager's
+// maxParallelism across currently active sessions (floor of
+// minReadAheadParallelism) so no single stream can starve the others'
+// read-ahead of connection budget. articleLimit further caps how many
+// segment ranges a single window will fetch, independent of parallelism.
 func (m *ReadAheadManager) schedule(sessionID string, offset int64) {
 	if m == nil || sessionID == "" || m.windowBytes == 0 || offset < 0 {
 		return

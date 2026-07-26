@@ -123,6 +123,9 @@ var (
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
+// Candidate is a single release/NZB result to be scored against Requirements
+// and Preferences. Fields are populated from indexer search results and,
+// where noted, from prior selection history for the same library item.
 type Candidate struct {
 	ID           int64
 	Title        string
@@ -143,6 +146,10 @@ type Candidate struct {
 	IndexerPolicyScore int
 }
 
+// Requirements describes the media item a candidate must match: what title,
+// year, and (for TV) season/episode the requested content actually is. These
+// values drive the hard title/year/episode rejections in
+// ScoreWithPreferences, independent of quality scoring.
 type Requirements struct {
 	Title         string
 	MediaType     string
@@ -161,6 +168,10 @@ type Requirements struct {
 	RuntimeMinutes int
 }
 
+// CustomFormat is a user-defined, regex-based scoring rule loaded from the
+// custom_formats table, mirroring Radarr/Sonarr's custom format concept:
+// when Pattern matches a candidate's title, Score is added to the candidate's
+// total (may be negative).
 type CustomFormat struct {
 	Name    string
 	Pattern string
@@ -230,6 +241,10 @@ func buildUnifiedRules(customFormats []CustomFormat, blockRules []BlockRule) []u
 	return out
 }
 
+// Preferences is the quality-profile configuration that drives scoring and
+// filtering in ScoreWithPreferences: ordered allow-lists (best first) for
+// resolution/source/codec/language/audio/HDR, size limits, and the custom
+// formats and block rules layered on top of the base score.
 type Preferences struct {
 	Resolutions     []string
 	Sources         []string
@@ -262,6 +277,10 @@ type Preferences struct {
 	BlockRules []BlockRule
 }
 
+// Result is the outcome of scoring a single Candidate: either a numeric
+// Score (higher is better) with an explanation trail, or a Rejected verdict
+// with a stable RejectReason used elsewhere for blocklisting/failure
+// classification (see internal/policy.Classify).
 type Result struct {
 	Score                 int
 	CustomFormatScore     int
@@ -273,10 +292,31 @@ type Result struct {
 
 // ── Scoring entry points ─────────────────────────────────────────────────────
 
+// Score scores candidate against required using zero-value Preferences
+// (built-in scoring tiers only, no profile-specific allow-lists, custom
+// formats, or block rules). Most callers should use ScoreWithPreferences.
 func Score(candidate Candidate, required Requirements) Result {
 	return ScoreWithPreferences(candidate, required, Preferences{})
 }
 
+// ScoreWithPreferences evaluates a single release candidate against the
+// requested media (Requirements) and the active quality profile (Preferences),
+// returning either a hard rejection or an additive score.
+//
+// Checks run in a fixed order, each short-circuiting on the first match:
+// title (unless TrustSource and the title is unstructured/obfuscated) →
+// minimum age → exclude patterns → hard content rejections (CAM/TS/BR-DISK/
+// hardsub) → resolution allow-list → size limits → language → year/episode
+// match. Only candidates that pass every rejection reach additive scoring for
+// resolution, source, codec, language, audio, HDR, proper/repack, indexer
+// signals, community grabs, and finally custom formats / block rules.
+//
+// Many of these checks encode lessons from specific production
+// mismatches (wrong show, wrong spinoff, wrong resolution actually
+// selected) rather than being obvious from the domain alone — see the
+// inline comments on containsNormalized, titlesWordMatch, and the
+// resolution allow-list block below for the incidents that shaped them
+// before changing this ordering or any individual rule.
 func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Preferences) Result {
 	explanations := []string{}
 	addExplanation := func(format string, args ...any) {
@@ -768,6 +808,10 @@ func scoreSourceField(source, titleLower string, prefs Preferences) int {
 
 // ── Size / resolution / codec / language ────────────────────────────────────
 
+// rejectBySize checks candidate's size against profile-level MB/min bounds
+// and, when set, the per-resolution TierMBPerMinuteLimits override. Both
+// bound types are skipped when runtimeMinutes is unknown (<=0), since a
+// MB/min check is meaningless without a duration to compare against.
 func rejectBySize(candidate Candidate, prefs Preferences, runtimeMinutes int) string {
 	if candidate.SizeBytes <= 0 {
 		return ""
@@ -819,6 +863,8 @@ func ResolutionRank(resolution string) int {
 	}
 }
 
+// scoreResolution scores resolution via the profile's Resolutions allow-list
+// (scoreByPreference) when set, otherwise falls back to a built-in tier.
 func scoreResolution(resolution string, prefs Preferences) int {
 	if score, ok := scoreByPreference(resolution, prefs.Resolutions, 500, 75); ok {
 		return score
@@ -835,6 +881,8 @@ func scoreResolution(resolution string, prefs Preferences) int {
 	}
 }
 
+// scoreCodec scores codec via the profile's Codecs allow-list
+// (scoreByPreference) when set, otherwise falls back to a built-in tier.
 func scoreCodec(codec string, prefs Preferences) int {
 	if score, ok := scoreByPreference(codec, prefs.Codecs, 180, 30); ok {
 		return score
@@ -849,6 +897,10 @@ func scoreCodec(codec string, prefs Preferences) int {
 	}
 }
 
+// scoreLanguage scores language via the profile's Languages allow-list
+// (scoreByPreference) when set, otherwise falls back to a built-in tier that
+// favors Dutch and English and penalizes anything else (an unrecognized
+// language is more likely wrong-language content than one worth keeping).
 func scoreLanguage(language string, prefs Preferences) int {
 	if score, ok := scoreByPreference(language, prefs.Languages, 120, 20); ok {
 		return score
@@ -867,6 +919,11 @@ func scoreLanguage(language string, prefs Preferences) int {
 	}
 }
 
+// rejectLanguageMismatch reports whether a candidate's detected language
+// should hard-reject it under prefs.Languages. An empty profile Languages
+// list means no language restriction. "", "unknown", and "multi" are never
+// rejected since the language couldn't be reliably detected or the release
+// plausibly contains the preferred language as one of several tracks.
 func rejectLanguageMismatch(language string, prefs Preferences) bool {
 	if len(prefs.Languages) == 0 {
 		return false
@@ -884,6 +941,15 @@ func rejectLanguageMismatch(language string, prefs Preferences) bool {
 	return true
 }
 
+// scoreByPreference scores value by its position in ordered, a user-configured
+// best-to-worst allow-list (e.g. Preferences.Resolutions): the first entry
+// scores base, each subsequent entry scores step less, floored at step so a
+// listed-but-low-priority value is never scored as low as an unlisted one.
+// When ordered is empty, (0, false) tells the caller to fall back to the
+// built-in default tier for that field. When ordered is non-empty but value
+// isn't in it, (-120, true) is returned: a value the profile doesn't
+// recognize is penalized rather than scored by the built-in tier, since an
+// explicit allow-list implies everything else is undesired.
 func scoreByPreference(value string, ordered []string, base int, step int) (int, bool) {
 	if len(ordered) == 0 {
 		return 0, false
@@ -1242,6 +1308,9 @@ func ParseHDRFormat(title string) string {
 	}
 }
 
+// scoreAudio scores audio via the profile's AudioFormats allow-list
+// (scoreByPreference) when set, otherwise falls back to the built-in
+// trash-guides audio priority tier.
 func scoreAudio(audio string, prefs Preferences) int {
 	if audio == "" {
 		return 0
@@ -1272,6 +1341,10 @@ func scoreAudio(audio string, prefs Preferences) int {
 	}
 }
 
+// scoreHDR scores hdr via the profile's HdrFormats allow-list
+// (scoreByPreference) when set — including an explicit "SDR" entry, letting a
+// profile score the absence of HDR — otherwise falls back to the built-in
+// trash-guides HDR tier (DV > HDR10+ > HDR10 > HLG).
 func scoreHDR(hdr string, prefs Preferences) int {
 	if hdr == "" || hdr == "SDR" {
 		if len(prefs.HdrFormats) > 0 {

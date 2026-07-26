@@ -2,6 +2,10 @@ package database
 
 import "context"
 
+// ListCustomFormats returns all custom formats ordered alphabetically by name.
+//
+// Errors:
+//   - error: any failure executing or scanning the underlying query.
 func (db *DB) ListCustomFormats(ctx context.Context) ([]CustomFormat, error) {
 	rows, err := db.SQL.QueryContext(ctx,
 		`SELECT id, name, pattern, score, enabled, coalesce(source,'custom') FROM custom_formats ORDER BY name ASC`)
@@ -20,6 +24,13 @@ func (db *DB) ListCustomFormats(ctx context.Context) ([]CustomFormat, error) {
 	return out, rows.Err()
 }
 
+// UpsertCustomFormat inserts a new custom format or updates the existing row
+// matched by ID.
+//
+// It defaults f.Source to "custom" when unset before writing.
+//
+// Returns:
+//   - CustomFormat: the row as stored, including any defaulted fields.
 func (db *DB) UpsertCustomFormat(ctx context.Context, f CustomFormat) (CustomFormat, error) {
 	if f.Source == "" {
 		f.Source = "custom"
@@ -40,6 +51,13 @@ func (db *DB) UpsertCustomFormat(ctx context.Context, f CustomFormat) (CustomFor
 	return out, err
 }
 
+// UpdateCustomFormat overwrites the custom format identified by f.ID with the
+// provided field values.
+//
+// It defaults f.Source to "custom" when unset before writing.
+//
+// Errors:
+//   - sql.ErrNoRows: no custom format exists with the given ID.
 func (db *DB) UpdateCustomFormat(ctx context.Context, f CustomFormat) (CustomFormat, error) {
 	if f.Source == "" {
 		f.Source = "custom"
@@ -55,6 +73,9 @@ func (db *DB) UpdateCustomFormat(ctx context.Context, f CustomFormat) (CustomFor
 	return out, err
 }
 
+// DeleteCustomFormat removes the custom format identified by id.
+//
+// It is a no-op if no row matches id.
 func (db *DB) DeleteCustomFormat(ctx context.Context, id int64) error {
 	_, err := db.SQL.ExecContext(ctx, `DELETE FROM custom_formats WHERE id=$1`, id)
 	return err

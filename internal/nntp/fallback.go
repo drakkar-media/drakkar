@@ -29,21 +29,40 @@ func waitBackoff(ctx context.Context) error {
 	}
 }
 
+// NamedArticleSource pairs an ArticleSource with the provider name used for
+// logging and circuit-breaker state.
 type NamedArticleSource struct {
 	Name   string
 	Source ArticleSource
 }
 
+// StatSource is implemented by article sources that can check existence
+// without downloading the body. Sources that don't implement it fall back to
+// a full Body fetch (see fetchArticleStat).
 type StatSource interface {
 	Stat(ctx context.Context, messageID string) error
 }
 
+// FallbackSource fetches articles across multiple provider sources in order,
+// retrying failed rounds up to retries times and skipping any source whose
+// circuit breaker is currently tripped. It is the top-level ArticleSource
+// used by the streaming/calibration paths when more than one provider is
+// configured.
+//
+// Safe for concurrent use: state mutated per call (conclusivelyMissing) is
+// local to each Body/Stat invocation, and the shared breaker is itself
+// concurrency-safe.
 type FallbackSource struct {
 	sources []NamedArticleSource
 	retries int
 	breaker *providerCircuitBreaker
 }
 
+// NewFallbackSource builds a FallbackSource over sources, dropping any entry
+// with a nil Source. retries is coerced to 0 if negative, and is also forced
+// to 0 when fewer than two sources remain after filtering -- with a single
+// provider there is nothing to fall back to, so retrying just doubles
+// round-trips (and duplicate misses) for no benefit.
 func NewFallbackSource(sources []NamedArticleSource, retries int) *FallbackSource {
 	filtered := make([]NamedArticleSource, 0, len(sources))
 	for _, source := range sources {
@@ -68,10 +87,22 @@ func NewFallbackSource(sources []NamedArticleSource, retries int) *FallbackSourc
 	}
 }
 
+// Body fetches an article body at the default interactive priority.
+// Equivalent to BodyPriority with stream.PriorityInteractive.
 func (s *FallbackSource) Body(ctx context.Context, messageID string) ([]byte, error) {
 	return s.BodyPriority(ctx, messageID, stream.PriorityInteractive)
 }
 
+// BodyPriority tries each configured source in order for up to 1+retries
+// rounds, returning the first successful body. Sources with a tripped
+// circuit breaker are skipped for the round; sources that give a
+// conclusive "article missing" answer are skipped on subsequent rounds
+// rather than re-queried (see the conclusivelyMissing field comment below).
+// A short backoff (waitBackoff) separates retry rounds.
+//
+// Returns:
+//   - error: a joined error (errors.Join) of every source's failure across
+//     every attempted round, if no source succeeded.
 func (s *FallbackSource) BodyPriority(ctx context.Context, messageID string, priority stream.FetchPriority) ([]byte, error) {
 	if s == nil || len(s.sources) == 0 {
 		return nil, errors.New("fallback source unavailable")
@@ -122,6 +153,8 @@ func (s *FallbackSource) BodyPriority(ctx context.Context, messageID string, pri
 	return nil, errors.Join(failures...)
 }
 
+// Stat mirrors BodyPriority's fallback/retry/circuit-breaker/conclusive-miss
+// logic but for an existence check rather than a body fetch.
 func (s *FallbackSource) Stat(ctx context.Context, messageID string) error {
 	if s == nil || len(s.sources) == 0 {
 		return errors.New("fallback source unavailable")
@@ -162,6 +195,9 @@ func (s *FallbackSource) Stat(ctx context.Context, messageID string) error {
 	return errors.Join(failures...)
 }
 
+// fetchArticleBody uses source's priority-aware BodyPriority when available,
+// falling back to the plain Body method for sources that don't implement
+// PriorityArticleSource (priority is then implicit/ignored by that source).
 func fetchArticleBody(ctx context.Context, source ArticleSource, messageID string, priority stream.FetchPriority) ([]byte, error) {
 	if prioritySource, ok := source.(PriorityArticleSource); ok {
 		return prioritySource.BodyPriority(ctx, messageID, priority)
@@ -169,6 +205,9 @@ func fetchArticleBody(ctx context.Context, source ArticleSource, messageID strin
 	return source.Body(ctx, messageID)
 }
 
+// fetchArticleStat uses source's Stat method when it implements StatSource,
+// falling back to a full Body fetch (discarding the body) for sources that
+// only support downloading the article.
 func fetchArticleStat(ctx context.Context, source ArticleSource, messageID string) error {
 	if statSource, ok := source.(StatSource); ok {
 		return statSource.Stat(ctx, messageID)

@@ -10,6 +10,10 @@ import (
 // zstdMagic is the first 4 bytes of every zstandard frame (0xFD2FB528 little-endian).
 var zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}
 
+// nzbZstdEncoder and nzbZstdDecoder are package-level singletons reused across
+// every compress/decompress call rather than constructed per-call. Their
+// EncodeAll/DecodeAll methods are safe for concurrent use, so no locking is
+// required despite the shared state.
 var (
 	nzbZstdEncoder, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
 	nzbZstdDecoder, _ = zstd.NewReader(nil)

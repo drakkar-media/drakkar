@@ -7,16 +7,33 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/drakkar-media/drakkar/internal/mediaserver"
 )
 
+type jellyfinEndpoint struct {
+	serverURL string
+	apiKey    string
+}
+
 // Client calls the Jellyfin HTTP API.
 type Client struct {
-	serverURL  string
-	apiKey     string
+	endpoint   atomic.Pointer[jellyfinEndpoint]
 	httpClient *http.Client
+}
+
+// SetConfig updates the server URL/API key live, e.g. after a settings save.
+func (c *Client) SetConfig(serverURL, apiKey string) {
+	c.endpoint.Store(&jellyfinEndpoint{serverURL: strings.TrimRight(serverURL, "/"), apiKey: apiKey})
+}
+
+func (c *Client) getEndpoint() jellyfinEndpoint {
+	if e := c.endpoint.Load(); e != nil {
+		return *e
+	}
+	return jellyfinEndpoint{}
 }
 
 // TestResult is returned from a connection test.
@@ -27,16 +44,22 @@ type TestResult struct {
 	Error      string `json:"error,omitempty"`
 }
 
+// NewClient creates a Client for the Jellyfin server at serverURL,
+// authenticated with apiKey. Either value may be empty; use SetConfig later
+// once real settings are available, and check Enabled before relying on the
+// client being usable.
 func NewClient(serverURL, apiKey string) *Client {
-	return &Client{
-		serverURL:  strings.TrimRight(serverURL, "/"),
-		apiKey:     apiKey,
-		httpClient: &http.Client{Timeout: 15 * time.Second},
-	}
+	c := &Client{httpClient: &http.Client{Timeout: 15 * time.Second}}
+	c.SetConfig(serverURL, apiKey)
+	return c
 }
 
+// Enabled reports whether the client has both a server URL and API key
+// configured. Callers should skip Jellyfin integration entirely when false
+// rather than issuing a request that is certain to fail.
 func (c *Client) Enabled() bool {
-	return c != nil && strings.TrimSpace(c.serverURL) != "" && strings.TrimSpace(c.apiKey) != ""
+	e := c.getEndpoint()
+	return c != nil && strings.TrimSpace(e.serverURL) != "" && strings.TrimSpace(e.apiKey) != ""
 }
 
 // Test verifies connectivity and returns server info.
@@ -68,15 +91,17 @@ func (c *Client) RefreshLibraries(ctx context.Context) error {
 }
 
 func (c *Client) get(ctx context.Context, path string, out interface{}) error {
-	return mediaserver.Get(ctx, c.httpClient, c.serverURL, path, "X-MediaBrowser-Token", c.apiKey, "jellyfin", out)
+	e := c.getEndpoint()
+	return mediaserver.Get(ctx, c.httpClient, e.serverURL, path, "X-MediaBrowser-Token", e.apiKey, "jellyfin", out)
 }
 
 func (c *Client) post(ctx context.Context, path string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.serverURL+path, nil)
+	e := c.getEndpoint()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.serverURL+path, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-MediaBrowser-Token", c.apiKey)
+	req.Header.Set("X-MediaBrowser-Token", e.apiKey)
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err

@@ -1,3 +1,6 @@
+// Package observability provides the process's structured logging setup
+// (zerolog-based, with runtime-adjustable verbosity and dual stdout/file
+// output) plus panic-recovery helpers for long-lived background goroutines.
 package observability
 
 import (
@@ -12,6 +15,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// Level names a logging verbosity accepted by NewWithFile and SetGlobalLevel.
 type Level string
 
 const (
@@ -20,6 +24,15 @@ const (
 	LevelError Level = "error"
 )
 
+// NewWithFile builds the application's root zerolog.Logger, writing to w and,
+// when logsDir is non-empty, additionally appending raw JSON lines to
+// <logsDir>/drakkar.log for the UI log viewer (the log file always gets JSON
+// regardless of DRAKKAR_LOG_FORMAT). If the log directory or file cannot be
+// created, logging silently falls back to w alone.
+//
+// The returned logger's level is left unset so it always tracks the process's
+// global zerolog level — see the comment above the zerolog.New call — meaning
+// SetGlobalLevel takes effect on it without recreating the logger.
 func NewWithFile(w io.Writer, level Level, logsDir string) zerolog.Logger {
 	zerolog.TimeFieldFormat = time.RFC3339
 

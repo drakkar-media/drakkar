@@ -171,7 +171,7 @@ func TestSetConnectionBudgetScalesWithStreamingBudget(t *testing.T) {
 		streamingPct     int
 		wantParallelism  int
 	}{
-		{"generous budget caps at absolute max", 90, 80, 60}, // streamingBudget=72, capped to 60
+		{"generous budget caps at absolute max", 90, 80, 60},            // streamingBudget=72, capped to 60
 		{"modest budget scales with full streaming budget", 20, 80, 16}, // streamingBudget=16
 		{"zero total falls back to default", 0, 80, defaultMaxReadAheadParallelism},
 	}

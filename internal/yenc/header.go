@@ -1,3 +1,30 @@
+// Package yenc decodes yEnc-encoded NNTP article bodies, the binary transfer
+// encoding Usenet uses for posting/retrieving article payloads.
+//
+// Two decoding implementations exist, selected at compile time by build tag:
+//
+//   - decoder_purego.go (build tag "!rapidyenc || !cgo", the default): a
+//     pure-Go decoder with no external dependencies, used whenever CGO is
+//     disabled or the rapidyenc tag is not passed.
+//   - decoder_rapidyenc.go (build tag "rapidyenc && cgo"): a CGO binding to
+//     the SIMD-accelerated rapidyenc C library, used only in builds that
+//     explicitly opt in via `-tags rapidyenc` with CGO enabled. It is
+//     substantially faster for the segment-cache hot path but requires a
+//     working C toolchain and libc at build time.
+//
+// Both implementations expose the same DecodeArticle, DecodeArticleWithInfo,
+// and DecoderInfo functions and share this file's header parsing and
+// helpers.go's CRC verification, so callers do not need to know which
+// decoder is active. DecoderInfo is logged once at startup specifically so a
+// build or Dockerfile regression that silently drops the rapidyenc tag or
+// CGO_ENABLED is visible as a log line rather than only showing up later as
+// unexplained CPU load.
+//
+// Decoding correctness constraint: NNTP dot-stuffing (a leading "." on a
+// line being doubled to "..") must already be reversed by the transport
+// layer (see nntp.readMultilineBody) before a body reaches either decoder.
+// Un-stuffing it again here would incorrectly strip a legitimate leading
+// byte from any decoded data line that happens to start with "..".
 package yenc
 
 import (
@@ -91,6 +118,8 @@ func parseKeyValue(line []byte, key string) (string, bool) {
 	return string(line[start:end]), true
 }
 
+// parseHexUint32 extracts an 8-hex-digit key=value (e.g. crc32=deadbeef)
+// from a yEnc footer line as a big-endian uint32.
 func parseHexUint32(line []byte, key string) (uint32, bool) {
 	value, ok := parseKeyValue(line, key)
 	if !ok || len(value) != 8 {

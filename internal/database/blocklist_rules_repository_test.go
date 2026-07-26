@@ -162,12 +162,12 @@ func TestUpdateReleaseBlockRuleOnDefaultSourceOnlyTogglesEnabledAndNote(t *testi
 	updated, err := db.UpdateReleaseBlockRule(ctx, ReleaseBlockRule{
 		ID:           defaultID,
 		Type:         "missing_release_group", // attempted change, must be ignored
-		Pattern:      "SHOULD_NOT_BE_APPLIED",  // attempted change, must be ignored
-		MediaType:    "movie",                  // attempted change, must be ignored
-		Action:       "penalty",                // attempted change, must be ignored
-		ScorePenalty: 999,                       // attempted change, must be ignored
-		Enabled:      !originalEnabled,          // allowed to change
-		Note:         "test toggled note",       // allowed to change
+		Pattern:      "SHOULD_NOT_BE_APPLIED", // attempted change, must be ignored
+		MediaType:    "movie",                 // attempted change, must be ignored
+		Action:       "penalty",               // attempted change, must be ignored
+		ScorePenalty: 999,                     // attempted change, must be ignored
+		Enabled:      !originalEnabled,        // allowed to change
+		Note:         "test toggled note",     // allowed to change
 	})
 	if err != nil {
 		t.Fatal(err)

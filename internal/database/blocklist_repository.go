@@ -9,8 +9,10 @@ import (
 	"time"
 )
 
+// BlocklistFilter holds the search, filter, sort, and pagination parameters
+// for ListBlocklistItemsPaged.
 type BlocklistFilter struct {
-	Q        string
+	Q        string // case-insensitive substring match against key or reason
 	Reason   string
 	Page     int
 	PageSize int
@@ -18,6 +20,9 @@ type BlocklistFilter struct {
 	Dir      string // asc | desc
 }
 
+// ListBlocklistItemsPaged returns a filtered, sorted, paginated page of
+// active blocklist_items, enriching each item with the release/library-item
+// metadata it was originally blocked from, when that can still be resolved.
 func (db *DB) ListBlocklistItemsPaged(ctx context.Context, f BlocklistFilter) (BlocklistPage, error) {
 	page := f.Page
 	if page < 1 {
@@ -136,6 +141,10 @@ func blocklistKeyType(key string) string {
 	}
 }
 
+// enrichBlocklistItem populates item's release/library-item metadata in
+// place by resolving its key back to the release_candidates row it
+// originally blocked, dispatching on key type. No-op if the key is empty,
+// unrecognized, or no matching row is found.
 func (db *DB) enrichBlocklistItem(ctx context.Context, item *BlocklistItemSummary) error {
 	if item == nil || strings.TrimSpace(item.Key) == "" {
 		return nil
@@ -154,6 +163,9 @@ func (db *DB) enrichBlocklistItem(ctx context.Context, item *BlocklistItemSummar
 	}
 }
 
+// enrichBlocklistExternalURL resolves release metadata for a blocklist entry
+// keyed by an exact external_url match, preferring a row that still has an
+// associated selected_release over a bare release_candidate.
 func (db *DB) enrichBlocklistExternalURL(ctx context.Context, item *BlocklistItemSummary, externalURL string) error {
 	if externalURL == "" {
 		return nil
@@ -190,6 +202,10 @@ func (db *DB) enrichBlocklistExternalURL(ctx context.Context, item *BlocklistIte
 	return nil
 }
 
+// enrichBlocklistSignature resolves release metadata for a blocklist entry
+// keyed by a release_signature (normalized title + indexer + bucketed
+// size/date), which can't be matched by an exact SQL predicate -- it scans
+// indexer/size/date matches and re-normalizes each title in Go to find one.
 func (db *DB) enrichBlocklistSignature(ctx context.Context, item *BlocklistItemSummary, titleKey, indexerKey string, sizeBucket int64, dateBucket *time.Time) error {
 	rows, err := db.SQL.QueryContext(ctx, `
 		select
@@ -249,6 +265,9 @@ func assignBlocklistMetadata(item *BlocklistItemSummary, selectedReleaseID, libr
 	}
 }
 
+// parseReleaseSignatureKey splits a "release_signature:title|indexer|size|date"
+// key into its components. An empty/"0" size or empty/"none" date means that
+// part carries no bucket constraint.
 func parseReleaseSignatureKey(key string) (titleKey, indexerKey string, sizeBucket int64, dateBucket *time.Time) {
 	raw := strings.TrimSpace(strings.TrimPrefix(key, "release_signature:"))
 	parts := strings.Split(raw, "|")
@@ -271,7 +290,10 @@ func parseReleaseSignatureKey(key string) (titleKey, indexerKey string, sizeBuck
 	return titleKey, indexerKey, sizeBucket, dateBucket
 }
 
-
+// BlocklistStats returns aggregate counts (total/expired/active) plus a
+// per-reason breakdown of active entries, normalizing away the unique
+// per-segment ID embedded in preflight/strict-health reasons so repeated
+// failures of the same kind group together.
 func (db *DB) BlocklistStats(ctx context.Context) (BlocklistStats, error) {
 	var s BlocklistStats
 	if err := db.SQL.QueryRowContext(ctx, `
@@ -333,6 +355,8 @@ func (db *DB) ListBlocklistItems(ctx context.Context) ([]BlocklistItemSummary, e
 	return page.Items, nil
 }
 
+// DeleteBlocklistItem deletes the blocklist item with the given ID,
+// returning sql.ErrNoRows if no row matched.
 func (db *DB) DeleteBlocklistItem(ctx context.Context, id int64) error {
 	result, err := db.SQL.ExecContext(ctx, `delete from blocklist_items where id = $1`, id)
 	if err != nil {
@@ -344,6 +368,9 @@ func (db *DB) DeleteBlocklistItem(ctx context.Context, id int64) error {
 	return nil
 }
 
+// CreateBlocklistItem inserts a new blocklist entry, defaulting an empty
+// reason to "manual", and returns it enriched with resolved release
+// metadata.
 func (db *DB) CreateBlocklistItem(ctx context.Context, item BlocklistMutation) (BlocklistItemSummary, error) {
 	reason := strings.TrimSpace(item.Reason)
 	if reason == "" {
@@ -371,6 +398,9 @@ func (db *DB) CreateBlocklistItem(ctx context.Context, item BlocklistMutation) (
 	return created, nil
 }
 
+// UpdateBlocklistItem updates the key, reason, and expiry of an existing
+// blocklist entry, defaulting an empty reason to "manual", and returns it
+// enriched with resolved release metadata.
 func (db *DB) UpdateBlocklistItem(ctx context.Context, id int64, item BlocklistMutation) (BlocklistItemSummary, error) {
 	reason := strings.TrimSpace(item.Reason)
 	if reason == "" {
@@ -401,6 +431,8 @@ func (db *DB) UpdateBlocklistItem(ctx context.Context, id int64, item BlocklistM
 	return updated, nil
 }
 
+// DeleteAllBlocklistItems deletes every currently-active (non-expired)
+// blocklist item and returns the number removed.
 func (db *DB) DeleteAllBlocklistItems(ctx context.Context) (int, error) {
 	result, err := db.SQL.ExecContext(ctx, `
 		delete from blocklist_items
@@ -415,6 +447,8 @@ func (db *DB) DeleteAllBlocklistItems(ctx context.Context) (int, error) {
 	return int(rows), nil
 }
 
+// DeleteBlocklistItemsByReason deletes every currently-active blocklist item
+// with an exact reason match and returns the number removed.
 func (db *DB) DeleteBlocklistItemsByReason(ctx context.Context, reason string) (int, error) {
 	result, err := db.SQL.ExecContext(ctx, `
 		delete from blocklist_items

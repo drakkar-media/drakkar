@@ -1,4 +1,15 @@
 <script lang="ts">
+  /**
+   * Root layout wrapping every route: bootstraps first-run setup detection and
+   * session authentication before any protected page renders.
+   *
+   * On mount (for non-public routes) it checks `/api/setup/status` and
+   * redirects to `/setup` if first-time setup is still required, then verifies
+   * the session cookie via `/api/auth/me` and redirects to `/login` on
+   * failure. `/login` and `/setup` themselves render immediately without these
+   * checks. Once checks pass, child routes are rendered inside `AppShell`
+   * (nav/chrome) alongside the global `ToastViewport`.
+   */
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/state';

@@ -8,24 +8,43 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
 // Client calls the rclone Remote Control (RC) API.
 // It is used to refresh rclone's VFS directory cache after new content is
 // published so Plex sees new files immediately.
+//
+// The RC address is held behind an atomic.Pointer so SetConfig can hot-swap
+// it (e.g. after a settings save) without disrupting requests already in
+// flight on other goroutines. Client is safe for concurrent use, and a nil
+// *Client is safe to call RefreshPath on (see RefreshPath).
 type Client struct {
-	rcAddr     string
+	rcAddr     atomic.Pointer[string]
 	httpClient *http.Client
 }
 
+// NewClient creates a Client targeting the given rclone RC address. rcAddr
+// may be empty; use SetConfig later once it becomes available, since
+// RefreshPath treats an empty address as a no-op rather than an error.
 func NewClient(rcAddr string) *Client {
-	return &Client{
-		rcAddr: strings.TrimRight(rcAddr, "/"),
-		httpClient: &http.Client{
-			Timeout: 5 * time.Second,
-		},
+	c := &Client{httpClient: &http.Client{Timeout: 5 * time.Second}}
+	c.SetConfig(rcAddr)
+	return c
+}
+
+// SetConfig updates the rclone RC address live, e.g. after a settings save.
+func (c *Client) SetConfig(rcAddr string) {
+	addr := strings.TrimRight(rcAddr, "/")
+	c.rcAddr.Store(&addr)
+}
+
+func (c *Client) getRCAddr() string {
+	if v := c.rcAddr.Load(); v != nil {
+		return *v
 	}
+	return ""
 }
 
 // ErrNotUnderMountRoot is returned by RefreshMountPath when absPath isn't
@@ -103,10 +122,14 @@ func relativeMountPath(mountRoot, absPath string) (string, bool) {
 // Errors are non-fatal (rclone dir-cache-time handles staleness when RC is
 // unavailable).
 func (c *Client) RefreshPath(ctx context.Context, path string) error {
-	if c == nil || c.rcAddr == "" {
+	if c == nil {
 		return nil
 	}
-	endpoint := c.rcAddr + "/vfs/refresh"
+	rcAddr := c.getRCAddr()
+	if rcAddr == "" {
+		return nil
+	}
+	endpoint := rcAddr + "/vfs/refresh"
 	form := url.Values{}
 	form.Set("dir", path)
 	form.Set("recursive", "false")

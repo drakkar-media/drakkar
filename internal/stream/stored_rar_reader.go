@@ -7,8 +7,23 @@ import (
 	"sync"
 )
 
+// ErrStoredRarLayoutInvalid is returned when a StoredRarReader's spans don't
+// form a valid, contiguous [0, size) layout — see validateStoredRarSpans.
 var ErrStoredRarLayoutInvalid = errors.New("stored_rar layout invalid")
 
+// StoredRarReader is a VirtualMediaFile for a file embedded inside a
+// multi-volume stored (uncompressed) RAR archive. Unlike DirectNzbReader,
+// each span additionally carries the offset of the embedded file's content
+// within its NNTP segment's decoded bytes (DecodedStart/SegmentByteStart),
+// since a stored-RAR segment mixes RAR volume/file headers with raw file
+// data.
+//
+// size and spans self-correct the same way DirectNzbReader's do: an initial
+// decoded-size estimate for a segment can be wrong (most often the last
+// segment of the last volume, which is hardest to estimate), and realignSpan
+// corrects the affected span once a fetch reveals its true boundaries. All
+// access to size and spans must go through mu; StoredRarReader is safe for
+// concurrent ReadAt calls.
 type StoredRarReader struct {
 	name    string
 	size    int64
@@ -18,6 +33,9 @@ type StoredRarReader struct {
 	mu      sync.Mutex
 }
 
+// NewStoredRarReader creates a StoredRarReader for a file embedded across the
+// given segment spans. spans is copied, so the caller's slice may be reused
+// or mutated after this call.
 func NewStoredRarReader(name string, size int64, spans []SegmentSpan, fetcher SegmentFetcher, manager *ReadAheadManager) *StoredRarReader {
 	reader := &StoredRarReader{
 		name:    name,
@@ -29,10 +47,13 @@ func NewStoredRarReader(name string, size int64, spans []SegmentSpan, fetcher Se
 	return reader
 }
 
+// Name returns the file's display name.
 func (r *StoredRarReader) Name() string {
 	return r.name
 }
 
+// Size returns the file's current size, which may have been corrected since
+// construction as realignSpan learned segments' true decoded boundaries.
 func (r *StoredRarReader) Size() int64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -59,6 +80,25 @@ func (r *StoredRarReader) snapshot() ([]SegmentSpan, int64) {
 	return out, r.size
 }
 
+// ReadAt fills dst with up to len(dst) bytes starting at offset (in this
+// virtual file's byte space), translating each resolved span into the
+// corresponding byte range of its underlying NNTP segment before fetching.
+//
+// Errors:
+//   - ErrStoredRarLayoutInvalid: the reader's spans don't form a valid,
+//     contiguous [0, size) layout (see validateStoredRarSpans).
+//   - io.EOF: offset+len(dst) reached or exceeded the file's current size;
+//     any bytes written before EOF are still returned.
+//
+// A short fetch for a span is first checked against the fetcher's actual
+// measurement of that segment's boundaries: if the segment's true decoded
+// size differs from the estimate used to build the span (self-correction via
+// realignSpan), the read retries against the corrected layout rather than
+// treating the short fetch as an error or premature EOF. A short fetch that
+// isn't explained by a boundary correction is a genuine error.
+//
+// Safe for concurrent use; concurrent ReadAt calls on the same reader may
+// each trigger and observe realignment independently.
 func (r *StoredRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) (int, error) {
 	spans, size := r.snapshot()
 	if err := validateStoredRarSpans(spans, size); err != nil {
@@ -226,6 +266,9 @@ func min64(a, b int64) int64 {
 	return b
 }
 
+// StartSession registers this reader with its ReadAheadManager under
+// sessionID, enabling read-ahead prefetch for the stream. A no-op if the
+// reader has no manager or its fetcher doesn't support prioritized fetches.
 func (r *StoredRarReader) StartSession(sessionID string) {
 	if r == nil || r.manager == nil {
 		return
@@ -238,6 +281,8 @@ func (r *StoredRarReader) StartSession(sessionID string) {
 	r.manager.Register(sessionID, spans, fetcher)
 }
 
+// NotifyRead reports the current read position for sessionID to the
+// ReadAheadManager, which uses it to schedule the next prefetch window.
 func (r *StoredRarReader) NotifyRead(sessionID string, offset int64) {
 	if r == nil || r.manager == nil {
 		return
@@ -245,6 +290,9 @@ func (r *StoredRarReader) NotifyRead(sessionID string, offset int64) {
 	r.manager.NotifyRead(sessionID, offset)
 }
 
+// Seek cancels any in-flight read-ahead window for sessionID without
+// scheduling a new one at offset; the next NotifyRead (from the interactive
+// read that follows a seek) schedules read-ahead from the correct position.
 func (r *StoredRarReader) Seek(sessionID string, offset int64) {
 	if r == nil || r.manager == nil {
 		return
@@ -252,6 +300,8 @@ func (r *StoredRarReader) Seek(sessionID string, offset int64) {
 	r.manager.Seek(sessionID, offset)
 }
 
+// StopSession ends the read-ahead session for sessionID and cancels any
+// in-flight prefetch for it.
 func (r *StoredRarReader) StopSession(sessionID string) {
 	if r == nil || r.manager == nil {
 		return
@@ -259,6 +309,7 @@ func (r *StoredRarReader) StopSession(sessionID string) {
 	r.manager.Stop(sessionID)
 }
 
+// RegisterMeta attaches display metadata to the session's read-ahead entry.
 func (r *StoredRarReader) RegisterMeta(sessionID string, meta SessionMeta) {
 	if r == nil || r.manager == nil {
 		return
@@ -266,6 +317,13 @@ func (r *StoredRarReader) RegisterMeta(sessionID string, meta SessionMeta) {
 	r.manager.RegisterMeta(sessionID, meta)
 }
 
+// validateStoredRarSpans reports whether spans form a valid layout for a
+// file of the given size: sorted, contiguous from 0, with no zero-or-negative
+// length span, and collectively covering exactly [0, size). ReadAt checks
+// this on every call (against a fresh snapshot) rather than only at
+// construction, since realignSpan mutates spans concurrently with reads and
+// a bug in that self-correction logic should surface as an explicit error
+// instead of corrupting the served stream.
 func validateStoredRarSpans(spans []SegmentSpan, size int64) error {
 	if size < 0 {
 		return ErrStoredRarLayoutInvalid

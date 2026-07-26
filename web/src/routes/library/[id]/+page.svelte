@@ -1,4 +1,11 @@
 <script lang="ts">
+  /**
+   * Redirects a legacy per-library-item URL to the merged media detail page.
+   *
+   * Resolves the library item ID from the route, fetches its detail record,
+   * and derives the canonical merged-detail href (keyed by media type, title,
+   * year, and external IDs) before replacing the current history entry.
+   */
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { onMount } from 'svelte';

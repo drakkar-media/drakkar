@@ -1,4 +1,15 @@
 <script lang="ts">
+  /**
+   * Displays the combined TMDB "discover" info and local library/queue state
+   * for a single movie or TV show: season/episode browser, the manual-scrape
+   * release picker modal (auto search, manual title search, or direct NZB
+   * upload), per-episode subtitle management, quality-profile/monitoring
+   * overrides, and grab history.
+   *
+   * Refetches when the route params or `?title=`/`?year=` query change (see
+   * the `activeKey` reactive block below) and otherwise stays live via SSE
+   * events rather than polling.
+   */
   import { page } from '$app/state';
   import Search from '@lucide/svelte/icons/search';
   import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
@@ -76,6 +87,7 @@
   let loadToken = 0;
 
 
+  /** Extracts display tags (resolution, source, codec, HDR/DV) from a release title via pattern matching, in a fixed priority order with duplicates dropped. */
   function qualityTags(title: string): string[] {
     const rules: [RegExp, string][] = [
       [/\b2160p\b/i, '2160p'], [/\b4k\b/i, '4K'], [/\b1080p\b/i, '1080p'],
@@ -104,11 +116,13 @@
   // src/routes/(protected)/+layout.svelte: ModeWatcher defaultTheme="darkmatter")
   // reproduced verbatim so the manual-scrape modal matches pixel-for-pixel.
 
+  /** Lowercases, strips apostrophes/punctuation, and collapses whitespace so titles can be compared regardless of formatting. */
   function normalizeTitle(value: string) {
     return value.toLowerCase().replace(/[''']/g, '').replace(/[^a-z0-9]+/g, ' ').trim();
   }
 
   type ParsedExplanation = { text: string; delta: number | null; isReject: boolean };
+  /** Splits a scoring-explanation line (e.g. "Preferred word (+10)") into its text, trailing signed score delta, and whether it represents an outright rejection. */
   function parseExplanation(line: string): ParsedExplanation {
     const isReject = line.startsWith('Rejected:') || line.startsWith('Rejected by');
     const m = line.match(/\(([+-]\d+)\)$/);
@@ -116,6 +130,7 @@
     return { text: line, delta, isReject };
   }
 
+  /** Matches a library item to this page's TMDB subject: prefers exact tmdbId/imdbId match, falling back to normalized-title (+ year, if known) comparison. */
   function sameIdentity(item: LibraryItem, mediaType: string, title: string, year?: number, tmdbId?: number, imdbId?: string) {
     const mapped = item.mediaType === 'episode' ? 'tv' : item.mediaType;
     if (mapped !== mediaType) return false;
@@ -124,6 +139,12 @@
     return normalizeTitle(item.title) === normalizeTitle(title) && (!!year ? item.year === year : true);
   }
 
+  /**
+   * Loads the TMDB discover details for the current route, finds the matching
+   * local library item (if any), and — only when a match exists — loads the
+   * library-specific data (local season/episode state, subtitles, release/grab
+   * history, quality profiles). Guarded by `loadToken` (see above).
+   */
   async function loadDetail() {
     const token = ++loadToken;
     loading = true;
@@ -180,6 +201,10 @@
     }
   }
 
+  // SvelteKit reuses this component across navigations to sibling routes, so
+  // route params/query alone won't rerun on:mount logic — this reactive block
+  // re-triggers loadDetail() whenever the subject (mediaType/idSlug/query)
+  // actually changes.
   $: {
     const nextKey = `${page.params.mediaType}:${page.params.idSlug}:${page.url.search}`;
     if (nextKey !== activeKey) {
@@ -189,6 +214,7 @@
   }
 
   onMount(() => {
+    // Keeps the page's data live via targeted SSE events instead of polling.
     return subscribeEvents((event) => {
       if (!event) return;
       if (event.kind === 'library.replacements' && event.libraryItemId === pickerLibraryItemID) {
@@ -255,6 +281,7 @@
     }
   }
 
+  /** Explicitly triggers a fresh indexer search for the Auto Scrape tab (unlike selectPickerTab, which only reads existing candidates). */
   async function searchAgain() {
     if (!pickerLibraryItemID) return;
     await runAction(() => api.replacementCandidates(pickerLibraryItemID!), {
@@ -415,6 +442,7 @@
     });
   }
 
+  /** Fetches subtitle files/candidates for one episode into the `episodeSubtitles` map, keyed by that episode's library item id. */
   async function loadEpisodeSubtitles(epLibraryItemId: number) {
     episodeSubtitles = { ...episodeSubtitles, [epLibraryItemId]: { loading: true, files: [], candidates: [] } };
     try {
@@ -432,6 +460,7 @@
     }
   }
 
+  /** Expands/collapses an episode's subtitle panel, lazy-loading its data only the first time it's expanded. */
   function toggleEpisodeSubtitles(epLibraryItemId: number) {
     if (expandedEpisodeId === epLibraryItemId) {
       expandedEpisodeId = null;
@@ -458,6 +487,7 @@
     });
   }
 
+  /** Applies a quality-profile override optimistically; on failure, reloads from the server to discard the change and restore the true state. */
   async function updateQualityProfile(nextValue: string) {
     if (!libraryMatch) return;
     const parsedProfileId = nextValue ? Number(nextValue) : null;
