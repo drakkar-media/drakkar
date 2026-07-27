@@ -359,7 +359,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// swap-pointer, mirroring dynamicWorkQueue's pattern, so a Usenet
 	// provider settings change can rebuild it and swap it in live.
 	dynamicArticleSrc := newDynamicArticleSource(rt, logger)
-	dynamicArticleSrc.Rebuild(ctx, cfg.Usenet, privacyMgr)
+	dynamicArticleSrc.Rebuild(ctx, usenetConfigForPrivacyMode(cfg.Usenet, privacyMgr.Mode()), privacyMgr)
 	db.SegmentFetcher = dynamicArticleSrc
 	if maxConns, pct := dynamicArticleSrc.ConnectionBudget(); maxConns > 0 {
 		db.ReadAhead.SetConnectionBudget(maxConns, pct)
@@ -1194,10 +1194,6 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	}
 }
 
-// maintenanceRecentTaskName maps a Seerr/Hydra media type string to the
-// matching recurring-task name; any value other than "tv"/"episode" is
-// treated as a movie, since Seerr's request payloads use varying media type
-// strings that don't need individual enumeration here.
 // hostOf extracts the host[:port] portion of a URL, tolerating a bare
 // host[:port] with no scheme (url.Parse would otherwise misparse it as a
 // path). Returns "" for an empty or unparseable input.
@@ -1214,6 +1210,32 @@ func hostOf(rawURL string) string {
 		return ""
 	}
 	return u.Host
+}
+
+// wireGuardMaxDownloadConnections caps concurrent NNTP connections when
+// WireGuard is the active privacy mode. Confirmed live (2026-07-27): the
+// userspace WireGuard tunnel (gVisor netstack, golang.zx2c4.com/wireguard +
+// gvisor.dev/gvisor) corrupts NNTP article data under real concurrent
+// connection load through the same tunnel -- yEnc CRC mismatches and
+// "article missing" errors on freshly-fetched segments occurred constantly
+// at 25 and even 2 concurrent connections (dozens of distinct releases
+// failing within minutes, zero successful publishes), and vanished
+// entirely once serialized to exactly 1 (zero corruption, 72 successful
+// publishes in the same window). This is very likely a demultiplexing bug
+// in the third-party gVisor netstack itself, not something fixable in this
+// codebase -- capping concurrency to 1 is the only proven-safe mitigation
+// short of patching or replacing that dependency.
+const wireGuardMaxDownloadConnections = 1
+
+// usenetConfigForPrivacyMode returns cfg with MaxDownloadConnections forced
+// to wireGuardMaxDownloadConnections whenever mode is WireGuard, regardless
+// of the user's configured value -- see wireGuardMaxDownloadConnections for
+// why. Any other mode returns cfg unchanged.
+func usenetConfigForPrivacyMode(cfg config.UsenetConfig, mode privacy.Mode) config.UsenetConfig {
+	if mode == privacy.ModeWireGuard {
+		cfg.MaxDownloadConnections = wireGuardMaxDownloadConnections
+	}
+	return cfg
 }
 
 func maintenanceRecentTaskName(mediaType string) string {

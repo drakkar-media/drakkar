@@ -115,3 +115,19 @@ func TestDynamicArticleSourceNoProvidersReturnsClearError(t *testing.T) {
 		t.Fatalf("expected errNoUsenetProviders, got %v", err)
 	}
 }
+
+func TestUsenetConfigForPrivacyModeCapsWireGuardConcurrency(t *testing.T) {
+	cfg := config.UsenetConfig{MaxDownloadConnections: 25}
+
+	got := usenetConfigForPrivacyMode(cfg, privacy.ModeWireGuard)
+	if got.MaxDownloadConnections != wireGuardMaxDownloadConnections {
+		t.Fatalf("expected wireguard mode to cap MaxDownloadConnections to %d, got %d", wireGuardMaxDownloadConnections, got.MaxDownloadConnections)
+	}
+
+	for _, mode := range []privacy.Mode{privacy.ModeDirect, privacy.ModeSOCKS5} {
+		got := usenetConfigForPrivacyMode(cfg, mode)
+		if got.MaxDownloadConnections != 25 {
+			t.Fatalf("expected mode %q to leave MaxDownloadConnections unchanged, got %d", mode, got.MaxDownloadConnections)
+		}
+	}
+}
