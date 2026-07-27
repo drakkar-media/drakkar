@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -93,13 +94,29 @@ func (q *WorkQueue) Depth(ctx context.Context) int64 {
 
 // Pause stops the queue from handing out new jobs to workers. Jobs already
 // in flight are not affected.
+//
+// gobullmq's underlying Lua script (internal/lua/pause_lua.go, generated,
+// not ours to edit) performs the pause correctly -- renaming the wait key,
+// setting the "paused" flag, publishing the event -- but has no explicit
+// Lua `return`, so Redis replies with a nil bulk reply that go-redis's
+// Eval().Result() surfaces as the redis.Nil sentinel error. Confirmed live:
+// every Pause/Resume call failed with "redis: nil" even though the pause
+// itself visibly took effect. redis.Nil here is not a real failure, so it
+// is swallowed; any other error still propagates.
 func (q *WorkQueue) Pause(ctx context.Context) error {
-	return q.queue.Pause(ctx)
+	if err := q.queue.Pause(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return err
+	}
+	return nil
 }
 
 // Resume reverses a prior Pause, allowing the queue to hand out jobs again.
+// See Pause's doc comment for why a redis.Nil error is swallowed here too.
 func (q *WorkQueue) Resume(ctx context.Context) error {
-	return q.queue.Resume(ctx)
+	if err := q.queue.Resume(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return err
+	}
+	return nil
 }
 
 // IsPaused reports whether the queue is currently paused.

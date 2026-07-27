@@ -44,6 +44,7 @@
   let pickerLabel = '';
   let pickerLibraryItemID: number | null = null;
   let pickerSearching = false;
+  let pickerSearchTimeout: ReturnType<typeof setTimeout> | null = null;
   let manualQuery = '';
   let manualResults: ManualSearchItem[] = [];
   let manualSearching = false;
@@ -218,7 +219,11 @@
     return subscribeEvents((event) => {
       if (!event) return;
       if (event.kind === 'library.replacements' && event.libraryItemId === pickerLibraryItemID) {
-        // Background search completed — refresh candidates and clear searching indicator
+        // Background search completed — refresh candidates and clear searching indicator.
+        if (pickerSearchTimeout) {
+          clearTimeout(pickerSearchTimeout);
+          pickerSearchTimeout = null;
+        }
         api.releases(pickerLibraryItemID as number).then((r) => {
           releaseCandidates = (r.items ?? []).sort((a, b) => b.score - a.score);
           pickerSearching = false;
@@ -281,16 +286,50 @@
     }
   }
 
-  /** Explicitly triggers a fresh indexer search for the Auto Scrape tab (unlike selectPickerTab, which only reads existing candidates). */
+  /**
+   * Explicitly triggers a fresh indexer search for the Auto Scrape tab
+   * (unlike selectPickerTab, which only reads existing candidates).
+   *
+   * The POST here returns immediately with whatever candidates existed
+   * *before* this search (see the backend handler's own comment — it
+   * starts the real search in a background goroutine and returns the old
+   * snapshot right away so the modal doesn't block on a full NZB search
+   * round-trip). The real, fresh candidates only arrive later via the
+   * 'library.replacements' SSE event (handled in onMount above).
+   *
+   * pickerSearching is deliberately kept true — and Search Again / Download
+   * disabled — until that event actually arrives, not just until this POST
+   * resolves. Clearing it early (the previous behavior, via runAction's
+   * automatic setWorking) let a user click Search Again again, or click
+   * Download on a candidate, while the first search was still replacing
+   * (deleting + reinserting) every release_candidates row underneath them —
+   * confirmed live as the direct cause of "release candidate no longer
+   * available" toasts on Download shortly after Search Again.
+   *
+   * A safety timeout clears the stuck state if the SSE event never arrives
+   * (e.g. a dropped connection), rather than leaving the modal disabled
+   * forever.
+   */
   async function searchAgain() {
     if (!pickerLibraryItemID) return;
-    await runAction(() => api.replacementCandidates(pickerLibraryItemID!), {
-      setWorking: (v) => (pickerSearching = v),
-      successMessage: () => 'Search queued — results will update shortly',
-      afterSuccess: (result) => {
-        releaseCandidates = (result.items ?? []).sort((a, b) => b.score - a.score);
+    pickerSearching = true;
+    if (pickerSearchTimeout) clearTimeout(pickerSearchTimeout);
+    pickerSearchTimeout = setTimeout(() => {
+      pickerSearching = false;
+      pickerSearchTimeout = null;
+      toastError('Search is taking longer than expected — try again in a moment.');
+    }, 25000);
+    try {
+      await api.replacementCandidates(pickerLibraryItemID);
+      toastSuccess('Search queued — results will update shortly');
+    } catch (error) {
+      if (pickerSearchTimeout) {
+        clearTimeout(pickerSearchTimeout);
+        pickerSearchTimeout = null;
       }
-    });
+      pickerSearching = false;
+      toastError(error instanceof Error ? error.message : String(error));
+    }
   }
 
   async function runLocalSearch() {
@@ -993,9 +1032,15 @@
           </div>
         {:else}
           <Button kind="secondary" on:click={searchAgain} disabled={pickerSearching}>
-            <Search size={14} />
+            {#if pickerSearching}<RefreshCw size={14} class="spin" />{:else}<Search size={14} />{/if}
             {pickerSearching ? 'Searching…' : 'Search Again'}
           </Button>
+          {#if pickerSearching}
+            <div class="rel-searching-banner">
+              <RefreshCw size={14} class="spin" />
+              Searching indexers — results will refresh automatically…
+            </div>
+          {/if}
           {#if releaseCandidates.length === 0 && !pickerSearching}
             <div class="rel-empty">No candidates yet — click "Search Again" to run an indexer search.</div>
           {:else if releaseCandidates.length > 0}
@@ -1047,7 +1092,7 @@
                       </div>
                     </details>
                   {/if}
-                  <Button kind={c.selected ? 'primary' : 'secondary'} on:click={() => pickRelease(c)} disabled={isBusy('pick-release')}>
+                  <Button kind={c.selected ? 'primary' : 'secondary'} on:click={() => pickRelease(c)} disabled={isBusy('pick-release') || pickerSearching}>
                     <Download size={14} />
                     {c.selected ? 'Re-grab' : 'Download'}
                   </Button>
@@ -1292,6 +1337,9 @@
   }
   .rel-filter-input::placeholder { color: hsl(var(--muted-foreground)); }
   .rel-empty { padding: 36px; text-align: center; color: hsl(var(--muted-foreground)); font-size: 14px; }
+  .rel-searching-banner { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 10px; background: hsl(var(--primary) / 0.08); color: hsl(var(--muted-foreground)); font-size: 13px; }
+  :global(.spin) { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .rel-card {
     display: flex; flex-direction: column; gap: 8px; padding: 12px 16px;
     border-radius: var(--radius-xl);
