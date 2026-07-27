@@ -40,6 +40,16 @@
   let releaseCandidates: ReleaseItem[] = [];
   let profiles: QualityProfile[] = [];
   let activeProfileId: number | null = null;
+  // Native <select> elements only respect Svelte's two-way bind:value for
+  // keeping the selected <option> in sync -- a plain value={...} attribute
+  // (no bind:) sets the DOM attribute, not the select's actual selection
+  // state, so the box renders with nothing visibly selected even when
+  // activeProfileId correctly holds a real profile id. Confirmed live: the
+  // select's selectedIndex was -1 despite a matching <option> existing.
+  // These derived string vars are the bind:value targets; on:change still
+  // drives the real update (updateQualityProfile / setTVShowMonitoring).
+  $: profileSelectValue = activeProfileId == null ? '' : String(activeProfileId);
+  $: monitoringSelectValue = localDetail?.monitoringMode ?? 'all';
   let showReleasePicker = false;
   let pickerLabel = '';
   let pickerLibraryItemID: number | null = null;
@@ -810,13 +820,13 @@
               <label for="profile-select">Quality Profile</label>
               <select
                 id="profile-select"
-                value={activeProfileId == null ? '' : String(activeProfileId)}
+                bind:value={profileSelectValue}
                 disabled={isBusy('quality-profile') || profiles.length === 0}
                 on:change={(e) => updateQualityProfile((e.currentTarget as HTMLSelectElement).value)}
               >
                 <option value="">Default profile</option>
                 {#each profiles as profile}
-                  <option value={profile.id}>{profile.name}{profile.isDefault ? ' · default' : ''}</option>
+                  <option value={String(profile.id)}>{profile.name}{profile.isDefault ? ' · default' : ''}</option>
                 {/each}
               </select>
             </div>
@@ -828,7 +838,7 @@
                 <label for="monitoring-select">Monitoring</label>
                 <select
                   id="monitoring-select"
-                  value={localDetail.monitoringMode ?? 'all'}
+                  bind:value={monitoringSelectValue}
                   on:change={async (e) => {
                     if (!localDetail?.tvShowId) return;
                     const mode = (e.currentTarget as HTMLSelectElement).value;
