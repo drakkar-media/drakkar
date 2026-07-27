@@ -13,8 +13,10 @@ services:
       - /mnt/drakkar:/mnt/drakkar:rshared
     devices:
       - /dev/fuse:/dev/fuse
+      - /dev/net/tun:/dev/net/tun
     cap_add:
       - SYS_ADMIN
+      - NET_ADMIN
     security_opt:
       - apparmor:unconfined
     ports:

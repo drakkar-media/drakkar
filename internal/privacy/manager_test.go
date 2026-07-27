@@ -66,6 +66,46 @@ func TestManagerReloadSOCKS5AndDialsThroughIt(t *testing.T) {
 	}
 }
 
+func TestManagerReloadNoOpsWhenConfigUnchanged(t *testing.T) {
+	proxy := startTestSOCKS5Server(t, "", "")
+	host, portStr, _ := net.SplitHostPort(proxy.addr())
+	var port int
+	fmtSscan(portStr, &port)
+
+	cfg := Config{
+		Mode:   ModeSOCKS5,
+		SOCKS5: SOCKS5Config{Host: host, Port: port, TimeoutSeconds: 5},
+	}
+
+	m := NewManager()
+	if err := m.Reload(context.Background(), cfg); err != nil {
+		t.Fatalf("first reload: %v", err)
+	}
+	firstDialer := m.state.Load().dialer
+
+	// A second Reload with the byte-identical Config (simulating
+	// ApplySettings' unconditional call on every settings save, even one
+	// that only touched an unrelated section) must not rebuild anything --
+	// the dialer instance must be the exact same one, not merely an
+	// equivalent new one.
+	if err := m.Reload(context.Background(), cfg); err != nil {
+		t.Fatalf("second reload: %v", err)
+	}
+	secondDialer := m.state.Load().dialer
+
+	if firstDialer != secondDialer {
+		t.Fatal("expected Reload with an unchanged Config to keep the same dialer instance, got a rebuilt one")
+	}
+
+	// A genuinely different Config (mode change) must still rebuild.
+	if err := m.Reload(context.Background(), Config{Mode: ModeDirect}); err != nil {
+		t.Fatalf("reload to direct: %v", err)
+	}
+	if m.Mode() != ModeDirect {
+		t.Fatal("expected a real config change to still take effect")
+	}
+}
+
 func TestManagerReloadRejectsBadCandidateKeepsOldActive(t *testing.T) {
 	proxy := startTestSOCKS5Server(t, "", "")
 	host, portStr, _ := net.SplitHostPort(proxy.addr())

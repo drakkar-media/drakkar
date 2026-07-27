@@ -479,7 +479,7 @@ func (c *liveSettingsController) ApplySettings(ctx context.Context, cfg config.S
 		c.rcloneClient.SetConfig(cfg.Rclone.RCAddr)
 	}
 	if c.articleSrc != nil {
-		c.articleSrc.Rebuild(ctx, usenetConfigForPrivacyMode(cfg.Usenet, c.privacyMgr.Mode()), c.privacyMgr)
+		c.articleSrc.Rebuild(ctx, cfg.Usenet, c.privacyMgr)
 		if c.readAhead != nil {
 			c.readAhead.SetArticleBufferSize(cfg.Usenet.ArticleBufferSize)
 			if maxConns, pct := c.articleSrc.ConnectionBudget(); maxConns > 0 {

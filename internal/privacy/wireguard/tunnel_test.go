@@ -18,6 +18,7 @@ import (
 	"golang.org/x/crypto/curve25519"
 	wgconn "golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
+	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
@@ -42,6 +43,23 @@ func genKeypair(t *testing.T) (privB64, pubB64 string) {
 }
 
 var listenPortRe = regexp.MustCompile(`(?m)^listen_port=(\d+)$`)
+
+// canCreateRealTUN reports whether this process can create a real kernel
+// TUN device (NET_ADMIN + /dev/net/tun) -- true on a normal Linux host or
+// a privileged CI runner, false in a restricted/rootless environment.
+// Tests that need Start() to actually bring up a real interface skip
+// gracefully when this is false, rather than failing CI somewhere that
+// can't support it.
+func canCreateRealTUN(t *testing.T) bool {
+	t.Helper()
+	d, err := tun.CreateTUN("drakkarwgprobe", 1420)
+	if err != nil {
+		return false
+	}
+	d.Close()
+	_ = removeLink("drakkarwgprobe")
+	return true
+}
 
 // startFakePeer brings up a second, independent userspace WireGuard device
 // (not going through this package's Config/Start) acting as the "VPN
@@ -114,6 +132,9 @@ func TestWireGuardTunnelTrafficTraversesRealHandshake(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real WireGuard handshake test in -short mode")
 	}
+	if !canCreateRealTUN(t) {
+		t.Skip("skipping: this environment cannot create a real TUN device (needs NET_ADMIN + /dev/net/tun)")
+	}
 	clientAddr := netip.MustParseAddr("10.19.0.2")
 	serverAddr := netip.MustParseAddr("10.19.0.1")
 
@@ -175,6 +196,9 @@ func TestWireGuardTunnelTrafficTraversesRealHandshake(t *testing.T) {
 // don't leak goroutines -- required since privacy.Manager.Reload rebuilds a
 // tunnel on every WireGuard config change.
 func TestTunnelLifecycleRepeatedStartStop(t *testing.T) {
+	if !canCreateRealTUN(t) {
+		t.Skip("skipping: this environment cannot create a real TUN device (needs NET_ADMIN + /dev/net/tun)")
+	}
 	priv, pub := genKeypair(t)
 	_ = pub
 	baseline := runtime.NumGoroutine()

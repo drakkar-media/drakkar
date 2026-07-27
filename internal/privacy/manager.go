@@ -29,6 +29,12 @@ type managerState struct {
 	wgTunnel *wireguard.Tunnel
 	wgConfig *wireguard.Config
 	initErr  error
+	// cfg is the exact Config this state was built from, compared against
+	// the incoming Config on every Reload so an unrelated settings change
+	// (e.g. Usenet's own maxDownloadConnections) doesn't tear down and
+	// rebuild a perfectly healthy WireGuard tunnel/dialer. Config is a
+	// plain comparable struct, so this compare is just ==.
+	cfg Config
 }
 
 // Manager is the single point every privacy-routed dial and HTTP client
@@ -72,25 +78,25 @@ func (m *Manager) OnDrain(fn func()) {
 func buildState(cfg Config) *managerState {
 	switch cfg.Mode {
 	case ModeDirect, "":
-		return &managerState{mode: ModeDirect, dialer: NewDirectDialer(15 * time.Second)}
+		return &managerState{mode: ModeDirect, dialer: NewDirectDialer(15 * time.Second), cfg: cfg}
 	case ModeSOCKS5:
 		d, err := NewSOCKS5Dialer(cfg.SOCKS5)
 		if err != nil {
-			return &managerState{mode: ModeSOCKS5, initErr: err}
+			return &managerState{mode: ModeSOCKS5, initErr: err, cfg: cfg}
 		}
-		return &managerState{mode: ModeSOCKS5, dialer: d}
+		return &managerState{mode: ModeSOCKS5, dialer: d, cfg: cfg}
 	case ModeWireGuard:
 		parsed, err := wireguard.ParseConfig(cfg.WireGuardConfigText)
 		if err != nil {
-			return &managerState{mode: ModeWireGuard, initErr: err}
+			return &managerState{mode: ModeWireGuard, initErr: err, cfg: cfg}
 		}
 		tunnel, err := wireguard.Start(parsed)
 		if err != nil {
-			return &managerState{mode: ModeWireGuard, initErr: err, wgConfig: parsed}
+			return &managerState{mode: ModeWireGuard, initErr: err, wgConfig: parsed, cfg: cfg}
 		}
-		return &managerState{mode: ModeWireGuard, dialer: tunnel, wgTunnel: tunnel, wgConfig: parsed}
+		return &managerState{mode: ModeWireGuard, dialer: tunnel, wgTunnel: tunnel, wgConfig: parsed, cfg: cfg}
 	default:
-		return &managerState{mode: cfg.Mode, initErr: fmt.Errorf("privacy: unknown mode %q", cfg.Mode)}
+		return &managerState{mode: cfg.Mode, initErr: fmt.Errorf("privacy: unknown mode %q", cfg.Mode), cfg: cfg}
 	}
 }
 
@@ -98,7 +104,19 @@ func buildState(cfg Config) *managerState {
 // pointer if the candidate initialized successfully -- the previously
 // working route stays active on failure (candidate/swap safety), and the
 // old WireGuard tunnel (if any) is torn down only after the swap succeeds.
+//
+// ApplySettings calls Reload unconditionally on every settings save (not
+// just ones that touch Privacy), so this first checks whether cfg is
+// byte-identical to the currently active state's own cfg and, if so,
+// returns immediately without rebuilding anything. Without this, saving an
+// unrelated setting (e.g. Usenet's own maxDownloadConnections) would tear
+// down and rebuild a perfectly healthy WireGuard tunnel -- a fresh
+// handshake with the real peer, and every pooled NNTP connection drained --
+// for no reason at all.
 func (m *Manager) Reload(ctx context.Context, cfg Config) error {
+	if current := m.state.Load(); current != nil && current.initErr == nil && current.cfg == cfg {
+		return nil
+	}
 	candidate := buildState(cfg)
 	if candidate.initErr != nil {
 		return candidate.initErr

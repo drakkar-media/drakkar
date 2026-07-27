@@ -10,9 +10,11 @@ require (
 	github.com/mnightingale/rapidyenc v0.0.0-20260606125752-cdd7bcd89529
 	github.com/redis/go-redis/v9 v9.16.0
 	github.com/rs/zerolog v1.34.0
+	github.com/vishvananda/netlink v1.3.1
 	go.codycody31.dev/gobullmq v1.0.3
 	golang.org/x/crypto v0.51.0
 	golang.org/x/net v0.55.0
+	golang.org/x/sys v0.45.0
 	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 )
 
@@ -35,11 +37,11 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.21 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/ulikunitz/xz v0.5.12 // indirect
+	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go4.org v0.0.0-20200411211856-f5505b9728dd // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
