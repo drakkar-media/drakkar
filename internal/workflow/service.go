@@ -2690,7 +2690,12 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 	current, err := s.repo.GetSelectedReleaseSummary(ctx, selectedReleaseID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			// Concurrent worker already processed or deleted this release — skip quietly.
+			// Concurrent worker already processed or deleted this release --
+			// skip quietly, but leave a trace: this used to be fully silent,
+			// which made a real production stall (a dispatched job vanishing
+			// with no success, failure, or log of any kind) impossible to
+			// diagnose after the fact.
+			s.logger.Info().Int64("selectedReleaseId", selectedReleaseID).Msg("download job: release vanished before fetch — skipping")
 			return nil, nil, nil
 		}
 		return nil, nil, err
@@ -2710,6 +2715,12 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 	item, err := s.repo.ImportSelectedReleaseNZB(ctx, current.SelectedReleaseID, *imported)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			// The row this UPDATE targeted no longer matched its WHERE
+			// clause -- most likely another actor (e.g. a health-check
+			// re-publish) changed the queue item's state concurrently. Log
+			// so a stuck-with-no-nzb_documents-row case like this is
+			// traceable instead of vanishing silently.
+			s.logger.Info().Int64("selectedReleaseId", current.SelectedReleaseID).Int64("libraryItemId", current.LibraryItemID).Msg("download job: queue item state changed concurrently during NZB import — skipping")
 			return nil, nil, nil
 		}
 		result, err := s.promoteNextAfterFailure(ctx, current, err.Error())
@@ -2768,6 +2779,9 @@ func (s *Service) fetchAndBuildImportedNZB(ctx context.Context, current database
 		// other path (or a moment ago via this one) — skip quietly rather than
 		// re-fetching or promoting to the next candidate; the current
 		// selection is likely fine, we just don't need to hammer it again.
+		// Debug level: this is the expected, common case for every retry
+		// inside the 30-minute cooldown, not a fault.
+		s.logger.Debug().Int64("selectedReleaseId", current.SelectedReleaseID).Str("url", current.ExternalURL).Msg("download job: URL already claimed within cooldown — skipping")
 		return nil, nil, nil
 	}
 	if err := s.repo.MarkSelectedReleaseFetching(ctx, current.SelectedReleaseID); err != nil {
@@ -2784,6 +2798,10 @@ func (s *Service) fetchAndBuildImportedNZB(ctx context.Context, current database
 	// stored bytes on the next attempt instead of calling NZBFinder again.
 	if storeErr := s.repo.StoreRawNZBDocument(ctx, current.SelectedReleaseID, fileName, raw, current.ExternalURL); storeErr != nil {
 		if database.IsFKViolation(storeErr) {
+			// The selected_releases row this NZB belongs to was deleted
+			// concurrently (e.g. superseded by a new selection) — skip
+			// quietly, but log it: this used to be fully silent.
+			s.logger.Info().Int64("selectedReleaseId", current.SelectedReleaseID).Msg("download job: selected release deleted concurrently before NZB store — skipping")
 			return nil, nil, nil
 		}
 		s.logger.Warn().Err(storeErr).Int64("srId", current.SelectedReleaseID).Msg("early NZB store failed — will re-download on next attempt if restart occurs")

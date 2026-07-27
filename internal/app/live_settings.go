@@ -426,12 +426,16 @@ func (c *liveSettingsController) ApplySettings(ctx context.Context, cfg config.S
 	if c.hydraClient != nil {
 		c.hydraClient.SetSearchDelay(time.Duration(cfg.Indexer.SearchDelayMs) * time.Millisecond)
 		c.hydraClient.SetConfig(cfg.NZBHydra2)
-		if cfg.Privacy.SyncNZBHydra2Proxy {
-			// Best-effort and asynchronous: NZBHydra2 being briefly
-			// unreachable shouldn't block a settings save or fail the rest
-			// of this reload sequence.
+		{
+			// Run unconditionally, matching ApplySettings' overall
+			// "reapply everything on every save" convention -- when the
+			// checkbox is off (or mode isn't SOCKS5), enabled is false and
+			// NZBHydra2's own proxy is actively cleared back to "no proxy",
+			// not just left alone. Best-effort and asynchronous: NZBHydra2
+			// being briefly unreachable shouldn't block a settings save or
+			// fail the rest of this reload sequence.
 			hydraClient := c.hydraClient
-			enabled := cfg.Privacy.Mode == config.PrivacyModeSOCKS5
+			enabled := cfg.Privacy.SyncNZBHydra2Proxy && cfg.Privacy.Mode == config.PrivacyModeSOCKS5
 			proxy := hydra.ProxyConfig{
 				Host:     cfg.Privacy.SOCKS5.Host,
 				Port:     cfg.Privacy.SOCKS5.Port,

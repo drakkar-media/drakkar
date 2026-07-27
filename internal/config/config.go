@@ -72,14 +72,17 @@ type PrivacyConfig struct {
 	SOCKS5           PrivacySOCKS5Config    `json:"socks5"`
 	WireGuard        PrivacyWireGuardConfig `json:"wireguard"`
 	ExcludedIndexers []string               `json:"excludedIndexers"`
-	// SyncNZBHydra2Proxy: when true, push Mode/SOCKS5 into NZBHydra2's own
-	// proxy settings (via its /internalapi/config API) on every settings
-	// save, so NZBHydra2's own outbound indexer traffic -- which Drakkar has
-	// no way to route itself, since NZBHydra2 is a separate process with its
-	// own networking -- goes through the same SOCKS5 proxy. Only SOCKS5 is
-	// pushed: NZBHydra2 has no WireGuard proxy type, so WireGuard/Direct mode
-	// pushes "no proxy" instead. Left false by default since it mutates a
-	// different application's config.
+	// SyncNZBHydra2Proxy: when true (and Mode is "socks5"), push SOCKS5 into
+	// NZBHydra2's own proxy settings (via its /internalapi/config API) on
+	// every settings save and at startup, so NZBHydra2's own outbound
+	// indexer traffic -- which Drakkar has no way to route itself, since
+	// NZBHydra2 is a separate process with its own networking -- goes
+	// through the same SOCKS5 proxy. Applied unconditionally on every
+	// reload: false (or any mode other than "socks5") actively clears
+	// NZBHydra2's proxy back to "no proxy" rather than leaving whatever was
+	// last pushed in place, since NZBHydra2 has no WireGuard proxy type.
+	// Left false by default since it mutates a different application's
+	// config.
 	SyncNZBHydra2Proxy bool `json:"syncNzbHydra2Proxy"`
 }
 

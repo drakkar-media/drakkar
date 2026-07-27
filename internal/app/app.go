@@ -419,10 +419,13 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	nzbFetcher.SetExcludedIndexers(cfg.Privacy.ExcludedIndexers)
 	nzbFetcher.SetLocalHost(hostOf(cfg.NZBHydra2.URL))
 	workflowSvc.SetNZBFetcher(nzbFetcher)
-	if cfg.Privacy.SyncNZBHydra2Proxy {
-		// Best-effort and asynchronous, same as the settings-reload path in
-		// live_settings.go -- NZBHydra2 being briefly unreachable at startup
-		// shouldn't delay the rest of Run().
+	{
+		// Run unconditionally at startup too, matching the settings-reload
+		// path in live_settings.go -- when the checkbox is off (or mode
+		// isn't SOCKS5), this actively clears NZBHydra2's own proxy back to
+		// "no proxy" rather than leaving whatever was last pushed in place.
+		// Best-effort and asynchronous: NZBHydra2 being briefly unreachable
+		// at startup shouldn't delay the rest of Run().
 		go func() {
 			syncCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
@@ -432,7 +435,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 				Username: cfg.Privacy.SOCKS5.Username,
 				Password: cfg.Privacy.SOCKS5.Password,
 			}
-			if err := hydraClient.SyncProxy(syncCtx, cfg.Privacy.Mode == config.PrivacyModeSOCKS5, proxy); err != nil {
+			enabled := cfg.Privacy.SyncNZBHydra2Proxy && cfg.Privacy.Mode == config.PrivacyModeSOCKS5
+			if err := hydraClient.SyncProxy(syncCtx, enabled, proxy); err != nil {
 				slog.Warn("nzbhydra2 proxy sync failed", "error", err)
 			}
 		}()

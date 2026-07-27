@@ -2663,7 +2663,8 @@
                 <span>
                   Push this SOCKS5 config into NZBHydra2's own proxy settings on save, so its own
                   outbound indexer traffic is routed too — Drakkar can't route NZBHydra2's traffic
-                  itself, since it's a separate process with its own networking.
+                  itself, since it's a separate process with its own networking. Unchecking this
+                  clears NZBHydra2's proxy back to none.
                 </span>
               </div>
             </label>
