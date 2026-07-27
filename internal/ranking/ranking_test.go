@@ -169,6 +169,25 @@ func TestScoreRejectsEpisodeFromWrongProductionWithSameTitleAndNumbering(t *test
 	}
 }
 
+// TestScoreAcceptsEpisodeTaggedWithItsOwnLaterAirYear guards against a
+// regression the wrong_year hard-reject above almost introduced: a
+// long-running show's later seasons legitimately air -- and get
+// release-tagged -- years after the show's own first-air-date year (e.g.
+// "Bones" debuted 2005, but its season 2 aired in 2006 and is commonly
+// release-tagged "Bones.S02E01.2006..."). That must still be accepted, not
+// hard-rejected as a wrong show, when EpisodeYear (this specific episode's
+// own air year) is supplied and matches.
+func TestScoreAcceptsEpisodeTaggedWithItsOwnLaterAirYear(t *testing.T) {
+	result := Score(Candidate{
+		Title:      "Bones.S02E01.2006.1080p.Netflix.WEB-DL.AVC.DDP.5.1-DBTV",
+		Resolution: "1080p",
+		Source:     "web-dl",
+	}, Requirements{Title: "Bones", MediaType: "episode", Year: 2005, EpisodeYear: 2006, SeasonNumber: 2, EpisodeNumber: 1})
+	if result.Rejected {
+		t.Fatalf("expected acceptance (episode's own air year matches), got rejected: %+v", result)
+	}
+}
+
 func TestScoreWithPreferencesUsesOrderedResolution(t *testing.T) {
 	prefs := Preferences{Resolutions: []string{"720p", "1080p"}}
 	low := ScoreWithPreferences(Candidate{

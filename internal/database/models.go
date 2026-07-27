@@ -525,20 +525,26 @@ type SubtitleCandidateRecord struct {
 // LibrarySearchInput carries the metadata needed to query indexers for a
 // release matching a specific library item.
 type LibrarySearchInput struct {
-	LibraryItemID   int64
-	MediaType       string
-	Title           string
-	IMDbID          string
-	MovieYear       int
-	MovieTMDBID     int64 // used in tmdbid= query parameter (Radarr approach)
-	ShowTitle       string
-	EpisodeTitle    string
-	ShowIMDbID      string
-	ShowTVDBID      int64
-	ShowTMDBID      int64 // used in tmdbid= query parameter for TV (Sonarr approach)
-	ShowYear        int
-	SeasonNumber    int
-	EpisodeNumber   int
+	LibraryItemID int64
+	MediaType     string
+	Title         string
+	IMDbID        string
+	MovieYear     int
+	MovieTMDBID   int64 // used in tmdbid= query parameter (Radarr approach)
+	ShowTitle     string
+	EpisodeTitle  string
+	ShowIMDbID    string
+	ShowTVDBID    int64
+	ShowTMDBID    int64 // used in tmdbid= query parameter for TV (Sonarr approach)
+	ShowYear      int
+	SeasonNumber  int
+	EpisodeNumber int
+	// EpisodeYear: the year of this specific episode's own air_date, when
+	// known (0 otherwise). A long-running show's later seasons legitimately
+	// air -- and get release-tagged -- years after ShowYear (the show's
+	// first-air-date year), so a release matching this instead of ShowYear
+	// is not a wrong-show signal and must not be treated as one.
+	EpisodeYear     int
 	TVShowID        int64    // DB primary key of tv_shows row, used for season pack tracking
 	AlternateTitles []string // mirrors Radarr/Sonarr AlternativeTitles; checked as fallback
 	RuntimeMinutes  int      // movie runtime; 0 for episodes/unknown; used for MB/min size checks

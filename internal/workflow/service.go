@@ -3338,6 +3338,7 @@ func searchRequirements(input database.LibrarySearchInput) ranking.Requirements 
 	if input.ShowTitle != "" {
 		required.Title = input.ShowTitle
 		required.Year = input.ShowYear
+		required.EpisodeYear = input.EpisodeYear
 	}
 	return required
 }

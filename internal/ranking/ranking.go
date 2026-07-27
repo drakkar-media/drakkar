@@ -156,6 +156,14 @@ type Requirements struct {
 	Year          int
 	SeasonNumber  int
 	EpisodeNumber int
+	// EpisodeYear: the specific requested episode's own air-date year, when
+	// known (0 otherwise). Only meaningful for MediaType "episode". A
+	// release matching this instead of Year (the show's first-air-date
+	// year) is a legitimate match, not a wrong-show signal -- a long-running
+	// show's later seasons air, and get release-tagged, years after the
+	// show's debut. See the "episode" case below for how this and Year are
+	// used together.
+	EpisodeYear int
 	// TrustSource: skip title check for ID-based searches (TMDB/IMDB/TVDB).
 	// Obfuscated NZB subjects would otherwise wrongly reject valid results.
 	TrustSource bool
@@ -462,12 +470,27 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 		// and the -40 penalty wasn't nearly enough to stop it from being
 		// selected. Hard-reject like "movie"/"tv" now that there's a
 		// concrete case where nothing else catches the mismatch either.
-		switch matchYear(titleLower, required.Year) {
+		//
+		// Checked against Year (the show's first-air-date year) OR
+		// EpisodeYear (this specific episode's own air-date year) --
+		// accepting either. A long-running show's later seasons legitimately
+		// air, and get release-tagged, years after the show's own debut
+		// (e.g. "Bones.S02E01.2006" for a show that debuted in 2005): that
+		// is a real release convention, not a wrong-show signal, and must
+		// not hard-reject just because it embeds a season's air year rather
+		// than the show's.
+		yearResult := matchYear(titleLower, required.Year)
+		if yearResult == yearMismatch && required.EpisodeYear > 0 && required.EpisodeYear != required.Year {
+			if matchYear(titleLower, required.EpisodeYear) == yearExact {
+				yearResult = yearExact
+			}
+		}
+		switch yearResult {
 		case yearMismatch:
-			return Result{Rejected: true, RejectReason: "wrong_year", Explanations: []string{"Rejected: release year did not match the show's first-air-date year."}}
+			return Result{Rejected: true, RejectReason: "wrong_year", Explanations: []string{"Rejected: release year did not match the show's first-air-date year or this episode's own air year."}}
 		case yearExact:
 			score += 30
-			addExplanation("Year matched show metadata (+30)")
+			addExplanation("Year matched show/episode metadata (+30)")
 		}
 	}
 

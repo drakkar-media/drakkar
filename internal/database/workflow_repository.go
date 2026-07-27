@@ -648,7 +648,8 @@ func (db *DB) GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (L
 			coalesce(e.episode_number, 0),
 			coalesce(tv.id, 0),
 			coalesce(m.alternative_titles, '{}') || coalesce(tv.alternative_titles, '{}'),
-			coalesce(m.runtime_minutes, 0)
+			coalesce(m.runtime_minutes, 0),
+			coalesce(extract(year from e.air_date)::int, 0)
 		from library_items li
 		left join movies m on m.id = li.movie_id
 		left join episodes e on e.id = li.episode_id
@@ -672,6 +673,7 @@ func (db *DB) GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (L
 		&item.TVShowID,
 		pgTextArrayScan(&item.AlternateTitles),
 		&item.RuntimeMinutes,
+		&item.EpisodeYear,
 	)
 	if err != nil {
 		return item, err
