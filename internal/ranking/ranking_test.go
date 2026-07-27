@@ -149,6 +149,26 @@ func TestScoreRejectsWrongEpisode(t *testing.T) {
 	}
 }
 
+// TestScoreRejectsEpisodeFromWrongProductionWithSameTitleAndNumbering guards
+// a real mismatch reported live (2026-07-28): the 1999 "One Piece" anime and
+// the 2023 live-action "One Piece" share an identical title, and their own
+// independent episode numbering coincidentally collided at S03E01 -- so
+// episodeExact matched and the old -40 soft year penalty wasn't nearly
+// enough to stop the anime's S03E01 from being selected for the live-action
+// show's S03E01. A clear year mismatch must hard-reject here exactly like
+// it already does for "movie"/"tv", since matchEpisode alone cannot be
+// trusted to catch a different, same-titled production.
+func TestScoreRejectsEpisodeFromWrongProductionWithSameTitleAndNumbering(t *testing.T) {
+	result := Score(Candidate{
+		Title:      "One Piece (1999) S03E01 (1080p CR WEB-DL x265 SDR DDP 2.0 Dual - DarQ HONE)",
+		Resolution: "1080p",
+		Source:     "web-dl",
+	}, Requirements{Title: "One Piece", MediaType: "episode", Year: 2023, SeasonNumber: 3, EpisodeNumber: 1})
+	if !result.Rejected || result.RejectReason != "wrong_year" {
+		t.Fatalf("expected wrong_year rejection, got %+v", result)
+	}
+}
+
 func TestScoreWithPreferencesUsesOrderedResolution(t *testing.T) {
 	prefs := Preferences{Resolutions: []string{"720p", "1080p"}}
 	low := ScoreWithPreferences(Candidate{

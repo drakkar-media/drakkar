@@ -451,13 +451,23 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 			score += 120
 			addExplanation("Season pack match (+120)")
 		}
+		// A year mismatch here used to be only a -40 soft penalty (easily
+		// outweighed by quality scoring), on the assumption that a wrong
+		// show would also fail the season/episode check above. Confirmed
+		// live (2026-07-28) that assumption doesn't hold: a completely
+		// different, same-titled production (the 1999 "One Piece" anime,
+		// vs. the requested 2023 live-action show) can coincidentally share
+		// both the title AND the season/episode numbering (its own S03E01
+		// vs. the live-action show's own S03E01), so episodeExact matched
+		// and the -40 penalty wasn't nearly enough to stop it from being
+		// selected. Hard-reject like "movie"/"tv" now that there's a
+		// concrete case where nothing else catches the mismatch either.
 		switch matchYear(titleLower, required.Year) {
+		case yearMismatch:
+			return Result{Rejected: true, RejectReason: "wrong_year", Explanations: []string{"Rejected: release year did not match the show's first-air-date year."}}
 		case yearExact:
 			score += 30
 			addExplanation("Year matched show metadata (+30)")
-		case yearMismatch:
-			score -= 40
-			addExplanation("Year mismatched show metadata (-40)")
 		}
 	}
 
