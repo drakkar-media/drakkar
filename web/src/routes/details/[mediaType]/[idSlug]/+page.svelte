@@ -55,6 +55,23 @@
   let pickerLibraryItemID: number | null = null;
   let pickerSearching = false;
   let pickerSearchTimeout: ReturnType<typeof setTimeout> | null = null;
+  let pickerSearchStartedAt = 0;
+  /** Floor so the "Searching…" state/spinner is actually perceivable even
+   *  when NZBHydra2 answers in well under a second (confirmed live: some
+   *  searches resolved in ~200ms, too fast to notice the indicator at all). */
+  const MIN_PICKER_SEARCH_VISIBLE_MS = 700;
+
+  /** Applies `apply` (refresh candidates, clear pickerSearching) no earlier
+   *  than MIN_PICKER_SEARCH_VISIBLE_MS after the search started. */
+  function finishPickerSearch(apply: () => void) {
+    const elapsed = Date.now() - pickerSearchStartedAt;
+    const remaining = MIN_PICKER_SEARCH_VISIBLE_MS - elapsed;
+    if (remaining > 0) {
+      setTimeout(apply, remaining);
+    } else {
+      apply();
+    }
+  }
   let manualQuery = '';
   let manualResults: ManualSearchItem[] = [];
   let manualSearching = false;
@@ -235,9 +252,12 @@
           pickerSearchTimeout = null;
         }
         api.releases(pickerLibraryItemID as number).then((r) => {
-          releaseCandidates = (r.items ?? []).sort((a, b) => b.score - a.score);
-          pickerSearching = false;
-        }).catch(() => { pickerSearching = false; });
+          const sorted = (r.items ?? []).sort((a, b) => b.score - a.score);
+          finishPickerSearch(() => {
+            releaseCandidates = sorted;
+            pickerSearching = false;
+          });
+        }).catch(() => finishPickerSearch(() => { pickerSearching = false; }));
       }
       if (event.kind === 'subtitle.search' && event.libraryItemId === libraryMatch?.id) {
         void loadDetail();
@@ -323,6 +343,7 @@
   async function searchAgain() {
     if (!pickerLibraryItemID) return;
     pickerSearching = true;
+    pickerSearchStartedAt = Date.now();
     if (pickerSearchTimeout) clearTimeout(pickerSearchTimeout);
     pickerSearchTimeout = setTimeout(() => {
       pickerSearching = false;

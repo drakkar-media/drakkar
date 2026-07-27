@@ -541,6 +541,159 @@ func (s *Service) tvCards(ctx context.Context) ([]MediaCard, error) {
 	return out, rows.Err()
 }
 
+// trendingLibraryState looks up local library state -- id, availability,
+// queue state, counts -- for whichever of the given TMDB ids are already
+// tracked locally, keyed by TMDB id. Trending() itself returns pure TMDB
+// metadata with no local cross-reference, so without this every trending
+// card always reports ID 0 (and therefore always shows the "+ request"
+// button) regardless of whether the title was already requested/is
+// downloading/is fully available. Returns an empty map (never an error) if
+// tmdbIDs is empty.
+func (s *Service) trendingLibraryState(ctx context.Context, mediaType string, tmdbIDs []int64) (map[int64]MediaCard, error) {
+	out := make(map[int64]MediaCard, len(tmdbIDs))
+	if len(tmdbIDs) == 0 {
+		return out, nil
+	}
+	if mediaType == "movie" {
+		rows, err := s.db.SQL.QueryContext(ctx, `
+			select
+				li.id,
+				m.tmdb_id,
+				li.available,
+				li.requested_at,
+				coalesce(q.state, ''),
+				coalesce(q.failure_reason, ''),
+				q.selected_release_id
+			from library_items li
+			left join lateral (
+				select qi.state, qi.failure_reason, qi.selected_release_id
+				from queue_items qi
+				where qi.library_item_id = li.id
+				order by qi.id desc
+				limit 1
+			) q on true
+			join movies m on m.id = li.movie_id
+			where m.tmdb_id = any($1)`, tmdbIDs)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var (
+				item     MediaCard
+				tmdbID   int64
+				selected sql.NullInt64
+			)
+			if err := rows.Scan(&item.ID, &tmdbID, &item.Available, &item.RequestedAt, &item.QueueState, &item.FailureReason, &selected); err != nil {
+				return nil, err
+			}
+			if selected.Valid {
+				value := selected.Int64
+				item.SelectedReleaseID = &value
+			}
+			if item.Available {
+				item.AvailableCount = 1
+			} else {
+				item.MissingCount = 1
+			}
+			out[tmdbID] = item
+		}
+		return out, rows.Err()
+	}
+
+	// tv: aggregate across a show's episode-level rows, same shape as tvCards.
+	rows, err := s.db.SQL.QueryContext(ctx, `
+		select
+			min(li.id),
+			tv.tmdb_id,
+			max(li.requested_at),
+			count(distinct case when li.available and e.season_number > 0 and e.episode_number > 0 then li.id end),
+			greatest(
+			    count(distinct case when e.season_number > 0 and e.episode_number > 0 then li.id end),
+			    coalesce(max(tv.number_of_episodes), 0)
+			),
+			max(q.selected_release_id),
+			max(
+				case
+					when q.state in ('selected', 'fetching_nzb', 'indexing', 'preflight', 'publishing') then 3
+					when q.state = 'failed' then 2
+					when q.state = 'requested' then 1
+					else 0
+				end
+			),
+			max(coalesce(q.failure_reason, ''))
+		from library_items li
+		join episodes e on e.id = li.episode_id
+		join tv_shows tv on tv.id = e.tv_show_id
+		left join queue_items q on q.library_item_id = li.id
+		where tv.tmdb_id = any($1)
+		group by tv.id, tv.tmdb_id`, tmdbIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			item              MediaCard
+			tmdbID            int64
+			selected          sql.NullInt64
+			availableEpisodes int
+			totalEpisodes     int
+			queueRank         int
+		)
+		if err := rows.Scan(&item.ID, &tmdbID, &item.RequestedAt, &availableEpisodes, &totalEpisodes, &selected, &queueRank, &item.FailureReason); err != nil {
+			return nil, err
+		}
+		if selected.Valid {
+			value := selected.Int64
+			item.SelectedReleaseID = &value
+		}
+		item.AvailableCount = availableEpisodes
+		item.MissingCount = totalEpisodes - availableEpisodes
+		if totalEpisodes > 0 {
+			item.Available = availableEpisodes == totalEpisodes
+		} else {
+			item.Available = queueRank == 0 && item.SelectedReleaseID != nil
+		}
+		item.QueueState = queueStateFromRank(queueRank, item.Available)
+		out[tmdbID] = item
+	}
+	return out, rows.Err()
+}
+
+// mergeTrendingLibraryState overlays local library state onto TMDB-sourced
+// trending cards in place, for whichever cards have a local match in state
+// (keyed by TMDBID). Cards with no match are left untouched (ID stays 0,
+// meaning "not in library yet" -- the "+ request" button's actual signal).
+func mergeTrendingLibraryState(cards []MediaCard, state map[int64]MediaCard) {
+	for i := range cards {
+		local, ok := state[cards[i].TMDBID]
+		if !ok {
+			continue
+		}
+		cards[i].ID = local.ID
+		cards[i].Available = local.Available
+		cards[i].QueueState = local.QueueState
+		cards[i].FailureReason = local.FailureReason
+		cards[i].RequestedAt = local.RequestedAt
+		cards[i].SelectedReleaseID = local.SelectedReleaseID
+		cards[i].AvailableCount = local.AvailableCount
+		cards[i].MissingCount = local.MissingCount
+	}
+}
+
+// tmdbIDsOf collects the TMDB ids of cards, for use as a trendingLibraryState
+// batch-lookup filter.
+func tmdbIDsOf(cards []MediaCard) []int64 {
+	ids := make([]int64, 0, len(cards))
+	for _, c := range cards {
+		if c.TMDBID > 0 {
+			ids = append(ids, c.TMDBID)
+		}
+	}
+	return ids
+}
+
 // Dashboard builds the home page payload: recently added library items plus
 // TMDB trending rails when TMDB is enabled. The hero item is chosen from
 // recently-added content first, falling back to trending, then to any
@@ -562,6 +715,9 @@ func (s *Service) Dashboard(ctx context.Context) (DashboardHome, error) {
 	if s.tmdb != nil && s.tmdb.Enabled() {
 		if movies, err := s.tmdb.Trending(ctx, "movie"); err == nil {
 			out.TrendingMovies = summariesToCards(movies)
+			if state, err := s.trendingLibraryState(ctx, "movie", tmdbIDsOf(out.TrendingMovies)); err == nil {
+				mergeTrendingLibraryState(out.TrendingMovies, state)
+			}
 			if out.Hero == nil && len(out.TrendingMovies) > 0 {
 				hero := out.TrendingMovies[0]
 				out.Hero = &hero
@@ -569,6 +725,9 @@ func (s *Service) Dashboard(ctx context.Context) (DashboardHome, error) {
 		}
 		if tv, err := s.tmdb.Trending(ctx, "tv"); err == nil {
 			out.TrendingTV = summariesToCards(tv)
+			if state, err := s.trendingLibraryState(ctx, "tv", tmdbIDsOf(out.TrendingTV)); err == nil {
+				mergeTrendingLibraryState(out.TrendingTV, state)
+			}
 			if out.Hero == nil && len(out.TrendingTV) > 0 {
 				hero := out.TrendingTV[0]
 				out.Hero = &hero
