@@ -747,6 +747,20 @@ func (s *Service) Dashboard(ctx context.Context) (DashboardHome, error) {
 // individually-published episodes) or, for season-pack downloads that never
 // get an individual symlink, the library_items row itself. seen deduplicates
 // a library item that could otherwise surface from both branches.
+//
+// Every row here already satisfies li.available = true. The frontend's
+// itemStatus() deliberately lets an in-progress queue state override
+// availability elsewhere in the app (e.g. the main Library grid, where
+// "actively re-checking for an upgrade" is useful to show) -- but for this
+// rail specifically, that reads as a real bug: a routine background upgrade
+// check queued against an already-available item (state 'selected',
+// 'requested', 'searching', 'ranking', or a failed upgrade attempt) made a
+// just-added, fully watchable title display as "Missing"/"active" in the
+// one section whose entire point is "this is ready to watch." Only an
+// actually-in-flight fetch (fetching_nzb/indexing/preflight/publishing)
+// reflects something genuinely happening to this item right now, so only
+// those states are passed through here; anything else is blanked so the
+// frontend falls back to its availability-based status instead.
 func (s *Service) recentlyAdded(ctx context.Context) ([]MediaCard, error) {
 	rows, err := s.db.SQL.QueryContext(ctx, `
 		select
@@ -754,7 +768,7 @@ func (s *Service) recentlyAdded(ctx context.Context) ([]MediaCard, error) {
 			li.media_type,
 			coalesce(m.title, tv.title, li.title, ''),
 			li.available,
-			coalesce(q.state, ''),
+			case when q.state in ('fetching_nzb', 'indexing', 'preflight', 'publishing') then q.state else '' end,
 			coalesce(q.failure_reason, ''),
 			q.selected_release_id,
 			coalesce(m.release_year, 0),
