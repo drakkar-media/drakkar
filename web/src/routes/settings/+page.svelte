@@ -1189,8 +1189,9 @@
                 </li>
                 <li>Leave <strong>JSON Payload</strong> at its default (Seerr standard format)</li>
                 <li>
-                  <strong>(Optional)</strong> Generate a Bearer token below and add it as an
-                  <code>Authorization</code> header in Seerr's webhook settings for extra security
+                  <strong>Required:</strong> generate a Bearer token below and add it as an
+                  <code>Authorization</code> header (<code>Bearer &lt;token&gt;</code>) in Seerr's
+                  webhook settings — Drakkar now rejects any webhook call without a valid token
                 </li>
                 <li>Save and use <strong>Test</strong> to verify the connection</li>
               </ol>
@@ -1205,7 +1206,7 @@
                 </button>
               </div>
               <div class="webhook-token-section">
-                <div class="webhook-token-label">Bearer token (optional)</div>
+                <div class="webhook-token-label">Bearer token (required)</div>
                 {#if webhookToken}
                   <p class="webhook-token-hint">Copy this token now — it will not be shown again.</p>
                   <div class="webhook-url-row">

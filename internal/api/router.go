@@ -1325,17 +1325,20 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 	r.Post("/api/webhooks/seerr", func(w http.ResponseWriter, r *http.Request) {
 		// This endpoint is in the auth middleware's public-path exemption list
 		// (Seerr can't send a session cookie or the normal Bearer token flow),
-		// so if the caller supplied an Authorization header at all, it must be
-		// a real API token — matching the "Generate API Token" flow in
-		// Settings → Seerr → Webhook setup. No header at all is still allowed,
-		// keeping the token optional as documented there.
+		// so it enforces its own auth here: a valid API token is required on
+		// every call, matching the "Generate API Token" flow in Settings →
+		// Seerr → Webhook setup. Without this, anyone who can reach this URL
+		// could forge a webhook call and trigger a sync.
 		if userRepo != nil {
-			if authz := strings.TrimSpace(r.Header.Get("Authorization")); authz != "" {
-				raw := strings.TrimPrefix(authz, "Bearer ")
-				if _, _, _, _, err := userRepo.GetAPITokenByHash(r.Context(), auth.HashToken(raw)); err != nil {
-					respondError(w, http.StatusUnauthorized, errors.New("invalid webhook token"))
-					return
-				}
+			authz := strings.TrimSpace(r.Header.Get("Authorization"))
+			if authz == "" {
+				respondError(w, http.StatusUnauthorized, errors.New("missing webhook token"))
+				return
+			}
+			raw := strings.TrimPrefix(authz, "Bearer ")
+			if _, _, _, _, err := userRepo.GetAPITokenByHash(r.Context(), auth.HashToken(raw)); err != nil {
+				respondError(w, http.StatusUnauthorized, errors.New("invalid webhook token"))
+				return
 			}
 		}
 		var payload seerr.WebhookPayload
