@@ -832,20 +832,26 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceH
 			    -- Normal pending items: no release selected yet.
 			    -- last_searched_at cooldown (1 h) mirrors Sonarr/Radarr LastSearchTime:
 			    -- once searched, skip until the cooldown expires to avoid hammering Hydra2.
-			    -- For items in the failed state specifically, the cooldown escalates
-			    -- with consecutive_failure_searches (reset to 0 on any successful
-			    -- selection) instead of staying flat at 1h forever — an item that has
-			    -- exhausted every known candidate many times running is very likely
-			    -- never going to resolve on its own, so back off hard rather than
-			    -- retrying at the same cadence as a normal, still-plausible item that
-			    -- simply hasn't been searched yet.
+			    -- The cooldown escalates with consecutive_failure_searches (reset to 0 on
+			    -- any successful selection) instead of staying flat at 1h forever — an item
+			    -- that has exhausted every known candidate many times running is very likely
+			    -- never going to resolve on its own, so back off hard rather than retrying at
+			    -- the same cadence as a normal, still-plausible item that simply hasn't been
+			    -- searched yet. This must key off the counter regardless of current state
+			    -- ($1 requested or $2 failed): ClearQueueSelectedRelease bounces a failed item
+			    -- with no selection back to 'requested' so it isn't stuck looping forever in
+			    -- RetryFailedQueue/ManageFailedQueue, but the counter survives that bounce —
+			    -- gating the escalation on state = failed let RetryFailedQueue's periodic pass
+			    -- flip it back to requested just before the backoff mattered, defeating the
+			    -- escalation entirely and hammering Hydra hourly forever for items that had
+			    -- already failed dozens of times (confirmed live 2026-08-07: PAW Patrol, The
+			    -- Odyssey, Minions & Monsters, a full NCIS: LA back-catalog, Silo, The Ark).
 			    (q.selected_release_id is null and q.state in ($1, $2)
 			     and (q.state != $2 or q.updated_at < now() - interval '2 hours')
 			     and (
 			         q.last_searched_at is null
 			         or q.last_searched_at < now() - (
 			             case
-			                 when q.state != $2 then interval '1 hour'
 			                 when q.consecutive_failure_searches >= 10 then interval '7 days'
 			                 when q.consecutive_failure_searches >= 6  then interval '1 day'
 			                 when q.consecutive_failure_searches >= 3  then interval '6 hours'

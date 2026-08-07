@@ -226,3 +226,52 @@ func TestListPendingLibrarySearchTargetsAppliesReleaseGraceHours(t *testing.T) {
 		}
 	}
 }
+
+// TestListPendingLibrarySearchTargetsAppliesBackoffToRequestedState guards a
+// bug confirmed live (2026-08-07): ClearQueueSelectedRelease bounces a
+// 'failed' item with no selection back to 'requested' (so RetryFailedQueue's
+// periodic pass doesn't loop it forever), but the bounce leaves
+// consecutive_failure_searches untouched. The cooldown escalation ladder used
+// to key off `state != failed`, so once an item was bounced back to
+// 'requested' it fell back to a flat 1h cooldown no matter how many times it
+// had already failed -- defeating the escalation entirely and hammering
+// Hydra hourly forever for items that had failed dozens of times (a full
+// NCIS: LA back-catalog, PAW Patrol, The Odyssey, ...). The escalation must
+// key off the counter regardless of current state.
+func TestListPendingLibrarySearchTargetsAppliesBackoffToRequestedState(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	// Bounced-back item: state='requested', but consecutive_failure_searches
+	// is high and last_searched_at is 2 hours ago -- inside the old flat 1h
+	// window's "eligible" zone, but well short of the escalated >=10 tier's
+	// 7-day cooldown, which should exclude it.
+	movieID, libID := setupPendingMovie(t, ctx, sqlDB, "backoff-requested-bounced", -1)
+	defer sqlDB.ExecContext(ctx, `delete from movies where id = $1`, movieID)
+	if _, err := sqlDB.ExecContext(ctx, `
+		update queue_items
+		set consecutive_failure_searches = 12, last_searched_at = now() - interval '2 hours'
+		where library_item_id = $1`, libID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	targets, err := db.ListPendingLibrarySearchTargets(ctx, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tg := range targets {
+		if tg.LibraryItemID == libID {
+			t.Error("expected a 'requested' item with 12 prior consecutive failures to respect the 7-day escalated cooldown, not the flat 1h window")
+		}
+	}
+}
