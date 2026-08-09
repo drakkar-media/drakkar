@@ -244,6 +244,62 @@ func TestReadAheadManagerRampsUpParallelismOverFirstWindows(t *testing.T) {
 	}
 }
 
+// TestReadAheadManagerSeekResetsRamp guards a gap in the ramp-up fix above,
+// confirmed live (2026-08-10) independently on two unrelated titles: play
+// from the start always worked, but seeking to a specific timestamp
+// afterward consistently hung. The ramp only reset on a brand-new session
+// (Register), so a session that had already played sequentially long enough
+// to reach its full parallelism share, then seeked to a distant, entirely
+// unfetched part of the file, burst straight to that full share for the new
+// region anyway -- the exact instant spike the ramp exists to prevent, just
+// triggered by a seek instead of a fresh open. A seek must restart the ramp,
+// since it lands on unfetched territory just as surely as a new session
+// does.
+func TestReadAheadManagerSeekResetsRamp(t *testing.T) {
+	manager := NewReadAheadManager(1 << 20)
+	manager.SetConnectionBudget(25, 80) // full per-stream share = 20
+	manager.SetArticleBufferSize(30)
+
+	spans := make([]SegmentSpan, 30)
+	for i := range spans {
+		spans[i] = SegmentSpan{SegmentID: int64(i + 1), MessageID: fmt.Sprintf("<msg%d>", i+1), Start: int64(i) * 64, End: int64(i+1) * 64}
+	}
+
+	fetcher := &priorityFetcherStub{calls: make(chan priorityFetchCall, 64)}
+	manager.Register("stream-seek-ramp", spans, fetcher)
+	defer manager.Stop("stream-seek-ramp")
+
+	drainConcurrentCalls := func() int {
+		count := 0
+		for {
+			select {
+			case <-fetcher.calls:
+				count++
+			case <-time.After(150 * time.Millisecond):
+				return count
+			}
+		}
+	}
+
+	// Play sequentially through all 4 ramp windows to reach full parallelism.
+	for range 4 {
+		manager.NotifyRead("stream-seek-ramp", 0)
+		drainConcurrentCalls()
+	}
+	if got := drainConcurrentCalls(); got != 0 {
+		t.Fatalf("setup: expected the ramp-up loop to have drained everything, got %d extra", got)
+	}
+
+	// Now seek to a distant, never-fetched part of the file. Without the
+	// reset, this next window would burst straight to the full share (20)
+	// instead of restarting the ramp at the floor (8).
+	manager.Seek("stream-seek-ramp", 0)
+	manager.NotifyRead("stream-seek-ramp", 0)
+	if got := drainConcurrentCalls(); got != 8 {
+		t.Fatalf("expected the window right after a seek to ramp back down to 8, got %d", got)
+	}
+}
+
 func TestReadAheadManagerCapsArticleBuffer(t *testing.T) {
 	manager := NewReadAheadManager(1024)
 	manager.SetArticleBufferSize(2)

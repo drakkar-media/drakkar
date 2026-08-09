@@ -295,7 +295,7 @@ func (m *ReadAheadManager) NotifyRead(sessionID string, offset int64) {
 }
 
 // Seek cancels sessionID's in-flight read-ahead window without scheduling a
-// replacement.
+// replacement, and resets its ramp-up progress.
 //
 // A new window is deliberately not started here: the interactive ReadAt that
 // follows a seek fetches at PriorityInteractive (100), and starting a new
@@ -304,6 +304,15 @@ func (m *ReadAheadManager) NotifyRead(sessionID string, offset int64) {
 // the worst possible moment. NotifyRead, called by the FUSE handle right
 // after the interactive read returns, schedules the next window from the
 // correct post-seek offset instead.
+//
+// Resetting windowsStarted here closes a real gap confirmed live
+// (2026-08-10, reproduced independently on two unrelated titles): the ramp
+// only reset on a brand-new session (see Register), so a seek partway
+// through an already-playing, already-ramped-up session jumped straight to
+// its full parallelism share for a region of the file nothing has fetched
+// yet -- the exact instant burst the ramp exists to avoid, just triggered by
+// a seek instead of a fresh open. A seek lands on unfetched territory just
+// as surely as a new session does, so it deserves the same gradual start.
 func (m *ReadAheadManager) Seek(sessionID string, offset int64) {
 	metrics.M.ReadAheadCancellations.Add(1)
 	if m == nil || sessionID == "" {
@@ -311,9 +320,12 @@ func (m *ReadAheadManager) Seek(sessionID string, offset int64) {
 	}
 	m.mu.Lock()
 	session := m.sessions[sessionID]
-	if session != nil && session.cancel != nil {
-		session.cancel()
-		session.cancel = nil
+	if session != nil {
+		if session.cancel != nil {
+			session.cancel()
+			session.cancel = nil
+		}
+		session.windowsStarted = 0
 	}
 	m.mu.Unlock()
 }
