@@ -1,8 +1,11 @@
 package nntp
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -98,6 +101,66 @@ func TestDiskCachedDecodedSourceBoundsDecodeConcurrency(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+}
+
+// TestDiskCachedDecodedSourceLogsDecodeSemContention guards the observability
+// added during the 2026-08-09 A/V-sync-delay investigation: the scheduler's
+// own slow-fetch warning times fetch+decode together and can't tell a slow
+// NNTP fetch apart from queuing here for a decodeSem slot. This proves the
+// warning actually fires when decodeArticle genuinely has to wait, so the
+// next live occurrence can be attributed to one or the other.
+func TestDiskCachedDecodedSourceLogsDecodeSemContention(t *testing.T) {
+	origLogger := slog.Default()
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	src := &countingBodySource{body: []byte("=ybegin line=128 size=5 name=test\r\n" + encode([]byte("hello")) + "\r\n=yend size=5\r\n")}
+	cache := NewDiskCachedDecodedSource(src, t.TempDir(), 1024)
+	cache.decodeSemWaitThreshold = 20 * time.Millisecond
+
+	// Fill every decodeSem slot so the next acquire genuinely has to wait.
+	held := 0
+	for held < cap(cache.decodeSem) {
+		cache.decodeSem <- struct{}{}
+		held++
+	}
+	go func() {
+		time.Sleep(40 * time.Millisecond)
+		<-cache.decodeSem // release one slot so the blocked call below can proceed
+	}()
+
+	if _, _, err := cache.decodeArticle(context.Background(), src.body); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < held-1; i++ {
+		<-cache.decodeSem
+	}
+
+	if got := buf.String(); !strings.Contains(got, "decode semaphore contention") {
+		t.Fatalf("expected a decode-semaphore-contention warning, got: %s", got)
+	}
+}
+
+// TestDiskCachedDecodedSourceDoesNotLogWithoutContention guards against the
+// warning firing on every normal decode -- it should only surface genuine
+// semaphore contention.
+func TestDiskCachedDecodedSourceDoesNotLogWithoutContention(t *testing.T) {
+	origLogger := slog.Default()
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	src := &countingBodySource{body: []byte("=ybegin line=128 size=5 name=test\r\n" + encode([]byte("hello")) + "\r\n=yend size=5\r\n")}
+	cache := NewDiskCachedDecodedSource(src, t.TempDir(), 1024)
+
+	if _, _, err := cache.decodeArticle(context.Background(), src.body); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := buf.String(); strings.Contains(got, "decode semaphore contention") {
+		t.Fatalf("did not expect a decode-semaphore-contention warning for an uncontended decode, got: %s", got)
+	}
 }
 
 func TestDiskCachedDecodedSourceReturnsPartInfo(t *testing.T) {

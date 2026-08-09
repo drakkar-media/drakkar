@@ -5,12 +5,29 @@ import (
 	"errors"
 	"log/slog"
 	"runtime"
+	"time"
 
 	"github.com/drakkar-media/drakkar/internal/cache"
 	"github.com/drakkar-media/drakkar/internal/metrics"
 	"github.com/drakkar-media/drakkar/internal/stream"
 	"github.com/drakkar-media/drakkar/internal/yenc"
 )
+
+// defaultDecodeSemWaitThreshold is how long decodeArticle may wait to
+// acquire a decodeSem slot before logging it as suspiciously slow.
+//
+// Added during the 2026-08-09 A/V-sync-delay investigation: the scheduler's
+// own slow-fetch warning (see scheduler.go) times fetch+decode together, so
+// it can't distinguish an NNTP-side stall from queuing here -- and decodeSem
+// is deliberately capped at NumCPU (see the field comment on
+// DiskCachedDecodedSource), while a single active stream's read-ahead can
+// burst up to its full connection-budget share (e.g. 20 concurrent fetches
+// against an 8-core box), all funneling through this same semaphore. That's
+// a real, mechanistically plausible source of multi-second tail latency for
+// the last requests in a burst even though nothing is actually failing or
+// even network-slow -- this pinpoints whether that theory is correct the
+// next time the scheduler's warning fires.
+const defaultDecodeSemWaitThreshold = 500 * time.Millisecond
 
 // DiskCachedDecodedSource wraps an ArticleSource with a disk-backed LRU cache
 // of decoded article bodies, an in-memory companion cache of their yEnc
@@ -45,6 +62,11 @@ type DiskCachedDecodedSource struct {
 	// stay highly concurrent (I/O-bound, cheap to leave in flight) while
 	// capping how many CPU-bound CGO calls compete for OS threads at once.
 	decodeSem chan struct{}
+
+	// decodeSemWaitThreshold is a per-instance field (not a package-level
+	// var) for the same cross-test-race reason as ScheduledSource's
+	// slowFetchThreshold -- see that field's comment in scheduler.go.
+	decodeSemWaitThreshold time.Duration
 }
 
 // NewDiskCachedDecodedSource creates a DiskCachedDecodedSource backed by a
@@ -52,11 +74,12 @@ type DiskCachedDecodedSource struct {
 // sized to runtime.NumCPU regardless of maxBytes or fetch concurrency.
 func NewDiskCachedDecodedSource(source ArticleSource, root string, maxBytes int64) *DiskCachedDecodedSource {
 	return &DiskCachedDecodedSource{
-		source:       source,
-		cache:        cache.NewFileCache(root, maxBytes),
-		singleflight: cache.NewSingleFlight(),
-		partInfo:     cache.NewByteLRU(infoCacheMaxBytes),
-		decodeSem:    make(chan struct{}, runtime.NumCPU()),
+		source:                 source,
+		cache:                  cache.NewFileCache(root, maxBytes),
+		singleflight:           cache.NewSingleFlight(),
+		partInfo:               cache.NewByteLRU(infoCacheMaxBytes),
+		decodeSem:              make(chan struct{}, runtime.NumCPU()),
+		decodeSemWaitThreshold: defaultDecodeSemWaitThreshold,
 	}
 }
 
@@ -164,10 +187,14 @@ func (s *DiskCachedDecodedSource) fillPartInfoFromRaw(ctx context.Context, messa
 // on DiskCachedDecodedSource for why this needs its own, smaller concurrency
 // bound separate from fetch parallelism.
 func (s *DiskCachedDecodedSource) decodeArticle(ctx context.Context, raw []byte) ([]byte, yenc.PartInfo, error) {
+	waitStart := time.Now()
 	select {
 	case s.decodeSem <- struct{}{}:
 	case <-ctx.Done():
 		return nil, yenc.PartInfo{}, ctx.Err()
+	}
+	if waited := time.Since(waitStart); waited >= s.decodeSemWaitThreshold {
+		slog.Warn("nntp: decode semaphore contention", "waited", waited, "rawBytes", len(raw))
 	}
 	defer func() { <-s.decodeSem }()
 	return yenc.DecodeArticleWithInfo(raw)

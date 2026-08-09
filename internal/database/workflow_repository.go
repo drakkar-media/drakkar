@@ -189,9 +189,38 @@ func (db *DB) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID 
 		if !errors.Is(err, sql.ErrNoRows) {
 			return 0, false, err
 		}
-		// The media_request row exists but its movie/library_item is gone
-		// (e.g. the user deleted it from the library) — fall through and
-		// recreate it below instead of silently no-op'ing on every future
+		// The movie lookup by tmdb_id found nothing, but this request was
+		// already tracked -- check whether it's still durably associated with
+		// a library item via its own queue_items row before assuming the
+		// library item is genuinely gone. This distinguishes "library item
+		// deleted, needs recreating" from "Seerr/TMDB now reports a different
+		// tmdb_id for the same, still-fully-intact request" (confirmed live
+		// 2026-08-09: a TMDB ID merge/redirect made Seerr report a different
+		// tmdb_id for an already-fulfilled movie request; the naive "recreate"
+		// fallback below tried inserting a second movie/library_item/
+		// queue_item for it, colliding on idempotency_key -- which is keyed by
+		// externalID and unaffected by tmdb_id drift -- permanently jamming
+		// every future sync on that same conflict). If this request's own
+		// queue_items row still exists, its library_item_id is definitionally
+		// correct for this request regardless of what tmdb_id Seerr reports
+		// today.
+		var existingLibraryItemID int64
+		err = tx.QueryRowContext(ctx, `
+			select library_item_id from queue_items where idempotency_key = $1`,
+			"seerr-movie-"+externalID).Scan(&existingLibraryItemID)
+		if err == nil {
+			if err = tx.Commit(); err != nil {
+				return 0, false, err
+			}
+			return existingLibraryItemID, false, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return 0, false, err
+		}
+		// The media_request row exists but its movie/library_item is
+		// genuinely gone (e.g. the user deleted it from the library, and its
+		// queue_items row was cascade-deleted along with it) — fall through
+		// and recreate it below instead of silently no-op'ing on every future
 		// sync for this externalID.
 		err = nil
 	}
@@ -396,9 +425,29 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 		if !errors.Is(err, sql.ErrNoRows) {
 			return 0, false, err
 		}
-		// The media_request row exists but its episode/library_item is gone
-		// (e.g. the user deleted it from the library) — fall through and
-		// recreate it below instead of silently no-op'ing on every future
+		// See the matching comment in UpsertMovieRequest: check this
+		// request's own queue_items row before assuming the episode/
+		// library_item is genuinely gone, so a tvdb_id/tmdb_id drift on an
+		// already-fulfilled request doesn't try to insert a duplicate
+		// library_item/queue_item that collides on idempotency_key (which is
+		// keyed by externalID, not by tvdb_id/tmdb_id).
+		var existingLibraryItemID int64
+		err = tx.QueryRowContext(ctx, `
+			select library_item_id from queue_items where idempotency_key = $1`,
+			"seerr-tv-"+externalID).Scan(&existingLibraryItemID)
+		if err == nil {
+			if err = tx.Commit(); err != nil {
+				return 0, false, err
+			}
+			return existingLibraryItemID, false, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return 0, false, err
+		}
+		// The media_request row exists but its episode/library_item is
+		// genuinely gone (e.g. the user deleted it from the library, and its
+		// queue_items row was cascade-deleted along with it) — fall through
+		// and recreate it below instead of silently no-op'ing on every future
 		// sync for this externalID.
 		err = nil
 	}
