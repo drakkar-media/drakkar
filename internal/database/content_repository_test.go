@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/drakkar-media/drakkar/internal/stream"
 )
@@ -79,6 +80,56 @@ func TestVerifyLastSpanBoundaryFallsBackWithoutFetchCapability(t *testing.T) {
 	result := db.verifyLastSpanBoundary(context.Background(), spans)
 	if result[0].End != 10 {
 		t.Fatalf("expected unchanged spans, got %+v", result)
+	}
+}
+
+// blockingRangeInfoFetcherStub never returns on its own -- it blocks until
+// the context passed to FetchRangeInfo is done, then reports that context's
+// error. Used to simulate a stalled/slow live probe fetch.
+type blockingRangeInfoFetcherStub struct{}
+
+func (blockingRangeInfoFetcherStub) FetchRange(ctx context.Context, segment stream.SegmentRange) ([]byte, error) {
+	return nil, nil
+}
+
+func (blockingRangeInfoFetcherStub) FetchRangeInfo(ctx context.Context, segment stream.SegmentRange) ([]byte, stream.SegmentSpan, error) {
+	<-ctx.Done()
+	return nil, stream.SegmentSpan{}, ctx.Err()
+}
+
+// TestVerifyLastSpanBoundaryDoesNotBlockIndefinitely guards a real,
+// caught-in-the-act production incident (2026-08-10): this probe runs
+// synchronously on every uncached OpenVirtualMediaFile call -- i.e. on the
+// critical path of a player's webdav OpenFile -- and a live goroutine dump
+// showed it stalled on a slow/cold NNTP round trip for an unbounded time,
+// hanging the entire open with it (reproduced live as "seeking gets stuck
+// and video never starts"). The probe fetch must be bounded so a stalled
+// fetch degrades to the pre-existing, already-safe fallback (uncorrected
+// spans -- StoredRarReader.realignSpan self-corrects transparently during
+// the real read that follows) instead of blocking the caller forever.
+func TestVerifyLastSpanBoundaryDoesNotBlockIndefinitely(t *testing.T) {
+	origTimeout := verifyLastSpanBoundaryTimeout
+	verifyLastSpanBoundaryTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { verifyLastSpanBoundaryTimeout = origTimeout })
+
+	db := &DB{SegmentFetcher: blockingRangeInfoFetcherStub{}}
+	spans := []stream.SegmentSpan{
+		{SegmentID: 1, MessageID: "<seg1>", Start: 0, End: 10, DecodedStart: 0, SegmentByteStart: 0},
+		{SegmentID: 2, MessageID: "<seg2>", Start: 10, End: 19, DecodedStart: 10, SegmentByteStart: 0},
+	}
+
+	done := make(chan []stream.SegmentSpan, 1)
+	go func() {
+		done <- db.verifyLastSpanBoundary(context.Background(), spans)
+	}()
+
+	select {
+	case result := <-done:
+		if result[1].End != 19 {
+			t.Fatalf("expected unchanged (uncorrected) End=19 on a bounded timeout, got %d", result[1].End)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("verifyLastSpanBoundary did not return within a reasonable multiple of its timeout -- it blocked on the stalled fetch")
 	}
 }
 

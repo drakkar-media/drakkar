@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/drakkar-media/drakkar/internal/stream"
 )
@@ -471,6 +472,27 @@ type rangeInfoFetcher interface {
 	FetchRangeInfo(ctx context.Context, segment stream.SegmentRange) ([]byte, stream.SegmentSpan, error)
 }
 
+// verifyLastSpanBoundaryTimeout bounds the live probe fetch in
+// verifyLastSpanBoundary, which runs synchronously on every uncached
+// OpenVirtualMediaFile call (i.e. on the critical path of a player's
+// webdav OpenFile for any stored_rar file not yet in db.vfCache -- every
+// process restart, and every title not recently opened). The probe is
+// normally cheap (the doc comment below assumes the underlying fetch is
+// already warm), but confirmed live (2026-08-10) via a caught-in-the-act
+// goroutine dump: an uncached open's probe fetch can itself stall for a
+// long, unbounded time on a slow/cold NNTP round trip, hanging the entire
+// player-facing open with it -- reproduced as a real "seek gets stuck and
+// never starts playback" report. A bounded timeout here degrades to the
+// pre-existing, already-safe fallback (return the uncorrected/estimated
+// spans, as already happens on any other fetch error below) rather than
+// blocking indefinitely: StoredRarReader.realignSpan already self-corrects
+// a wrong estimate transparently during the real read that follows, so a
+// skipped proactive correction here costs nothing but the rare case of a
+// briefly-optimistic Content-Length on first open.
+// A var, not a const, so tests can shrink it instead of waiting out a real
+// multi-second timeout.
+var verifyLastSpanBoundaryTimeout = 3 * time.Second
+
 // verifyLastSpanBoundary probes the final byte of the last span via a live
 // fetch and shrinks that span (and the effective total) if the segment's
 // real decoded content falls short of the estimate. The probe is cheap: it
@@ -499,7 +521,9 @@ func (db *DB) verifyLastSpanBoundary(ctx context.Context, spans []stream.Segment
 		SegmentStart: span.DecodedStart,
 		SegmentEnd:   span.DecodedStart + span.SegmentByteStart + length,
 	}
-	_, actual, err := aware.FetchRangeInfo(ctx, req)
+	probeCtx, cancel := context.WithTimeout(ctx, verifyLastSpanBoundaryTimeout)
+	_, actual, err := aware.FetchRangeInfo(probeCtx, req)
+	cancel()
 	if err != nil || actual.MessageID == "" {
 		return spans
 	}
