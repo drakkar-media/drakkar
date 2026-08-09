@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -186,6 +187,60 @@ func TestSetConnectionBudgetScalesWithStreamingBudget(t *testing.T) {
 				t.Fatalf("maxParallelism = %d, want %d", got, tt.wantParallelism)
 			}
 		})
+	}
+}
+
+// TestReadAheadManagerRampsUpParallelismOverFirstWindows guards the fix for
+// a live A/V-sync-delay report (2026-08-09, Venom: Let There Be Carnage):
+// visible block/stutter artifacts right at stream start, then a persistent
+// desync only a seek (not pause/resume) fixed. A live repro caught every
+// priority tier -- interactive, read-ahead, and the health-check's own
+// background probe -- going slow simultaneously, alongside unrelated titles'
+// health-check probes failing in the same few seconds, matching this
+// codebase's own documented signature for provider-side rate limiting
+// triggered by aggregate connection/request load. A single stream jumping
+// straight from 0 to its full parallelism share (routinely ~20 connections)
+// in one instant, right when read-ahead first fills its window, is exactly
+// the kind of spike that can trip it. This proves the first few windows ramp
+// up gradually (readAheadRampFloor, then increasing) instead of bursting
+// straight to the full share, while still reaching the full share within
+// readAheadRampWindows.
+func TestReadAheadManagerRampsUpParallelismOverFirstWindows(t *testing.T) {
+	manager := NewReadAheadManager(1 << 20)
+	manager.SetConnectionBudget(25, 80) // full per-stream share = 20
+	manager.SetArticleBufferSize(30)
+
+	spans := make([]SegmentSpan, 30)
+	for i := range spans {
+		spans[i] = SegmentSpan{SegmentID: int64(i + 1), MessageID: fmt.Sprintf("<msg%d>", i+1), Start: int64(i) * 64, End: int64(i+1) * 64}
+	}
+
+	fetcher := &priorityFetcherStub{calls: make(chan priorityFetchCall, 64)}
+	manager.Register("stream-ramp", spans, fetcher)
+	defer manager.Stop("stream-ramp")
+
+	// priorityFetcherStub sends to calls then blocks on ctx.Done() forever,
+	// so once a window's semaphore fills, no further calls arrive until the
+	// next NotifyRead cancels it -- draining until a short quiet gap gives an
+	// exact count of that window's concurrent fetches.
+	drainConcurrentCalls := func() int {
+		count := 0
+		for {
+			select {
+			case <-fetcher.calls:
+				count++
+			case <-time.After(150 * time.Millisecond):
+				return count
+			}
+		}
+	}
+
+	wantByWindow := []int{8, 12, 16, 20} // floor 4 + (20-4)*windowIndex/4, then full from window 4
+	for i, want := range wantByWindow {
+		manager.NotifyRead("stream-ramp", 0)
+		if got := drainConcurrentCalls(); got != want {
+			t.Fatalf("window %d: expected %d concurrent fetches, got %d", i+1, want, got)
+		}
 	}
 }
 

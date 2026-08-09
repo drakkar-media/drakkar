@@ -28,6 +28,39 @@ const (
 	absoluteMaxReadAheadParallelism = 60
 	minReadAheadParallelism         = 1
 	defaultArticleBufferSize        = 40
+
+	// readAheadRampWindows is how many read-ahead windows a session ramps up
+	// over before reaching its full per-stream parallelism share. Added
+	// while chasing a live A/V-sync-delay report on Venom: Let There Be
+	// Carnage (2026-08-09): visible block/stutter artifacts right at stream
+	// start, immediately followed by a persistent desync that only a seek
+	// (not a pause/resume) fixed -- the signature of a genuine data-delivery
+	// hiccup at open, not a per-file decode bug (both the RAR header-skip
+	// detection and the yEnc segment-length calibration for this exact
+	// release were independently verified correct against the real fetched
+	// bytes). A live repro caught every priority tier (interactive,
+	// read-ahead, AND the health-check's own background probe) going slow
+	// simultaneously, together with unrelated titles' health-check probes
+	// failing in the same few seconds -- the same signature this codebase's
+	// health-check pacing comment already attributes to provider-side rate
+	// limiting triggered by aggregate connection/request load. A single
+	// stream jumping straight from 0 to its full parallelism share
+	// (routinely ~20 connections) in one instant, right at the moment
+	// read-ahead first fills its window, is exactly the kind of spike that
+	// can trip that kind of throttling. Ramping the first few windows up
+	// gradually doesn't lower the eventual ceiling (full parallelism is
+	// reached within readAheadRampWindows real reads, typically well under
+	// a second of playback), it just avoids bursting to it in one instant.
+	readAheadRampWindows = 4
+
+	// readAheadRampFloor is the concurrency a session's very first read-ahead
+	// window starts at -- and, critically, the ramp never kicks in at all
+	// when the stream's own full share is already at or below this (e.g. a
+	// low connection budget, or many concurrent streams splitting a modest
+	// total). The spike this ramp exists to avoid only happens when a
+	// single window's fetch count jumps by a lot in one instant; a share
+	// that's already small has nothing meaningful to spike from.
+	readAheadRampFloor = 4
 )
 
 // FetchPriority orders competing segment fetches so interactive playback
@@ -102,11 +135,12 @@ type SessionSnapshot struct {
 }
 
 type readAheadSession struct {
-	spans         []SegmentSpan
-	fetcher       PrioritySegmentFetcher
-	cancel        context.CancelFunc
-	meta          SessionMeta
-	currentOffset int64
+	spans          []SegmentSpan
+	fetcher        PrioritySegmentFetcher
+	cancel         context.CancelFunc
+	meta           SessionMeta
+	currentOffset  int64
+	windowsStarted int
 }
 
 // NewReadAheadManager creates a ReadAheadManager that prefetches up to
@@ -337,6 +371,10 @@ func (m *ReadAheadManager) schedule(sessionID string, offset int64) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	session.cancel = cancel
+	if session.windowsStarted < readAheadRampWindows {
+		session.windowsStarted++
+	}
+	windowIndex := session.windowsStarted
 	spans := make([]SegmentSpan, len(session.spans))
 	copy(spans, session.spans)
 	fetcher := session.fetcher
@@ -374,6 +412,20 @@ func (m *ReadAheadManager) schedule(sessionID string, offset int64) {
 		parallelism := maxParallelism / activeStreams
 		if parallelism < minReadAheadParallelism {
 			parallelism = minReadAheadParallelism
+		}
+		// Ramp up gradually over this session's first few windows instead of
+		// bursting straight to its full share the instant read-ahead starts
+		// filling its window -- see readAheadRampWindows/readAheadRampFloor's
+		// doc comments. A no-op whenever the full share is already at or
+		// below the floor.
+		if windowIndex < readAheadRampWindows && parallelism > readAheadRampFloor {
+			ramped := readAheadRampFloor + (parallelism-readAheadRampFloor)*windowIndex/readAheadRampWindows
+			if ramped < readAheadRampFloor {
+				ramped = readAheadRampFloor
+			}
+			if ramped < parallelism {
+				parallelism = ramped
+			}
 		}
 		sem := make(chan struct{}, parallelism)
 		var wg sync.WaitGroup
