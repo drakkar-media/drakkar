@@ -445,7 +445,7 @@ func (f *contentFS) OpenFile(ctx context.Context, name string, _ int, _ os.FileM
 	return nil, os.ErrNotExist
 }
 
-func (f *contentFS) openRoot(ctx context.Context) (webdav.File, error) {
+func (f *contentFS) openRoot(_ context.Context) (webdav.File, error) {
 	children := []os.FileInfo{
 		&dirInfo{name: "content"},
 		&dirInfo{name: "completed-symlinks"},

@@ -3,10 +3,28 @@ package nntp
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"time"
 
 	"github.com/drakkar-media/drakkar/internal/observability"
 	"github.com/drakkar-media/drakkar/internal/stream"
 )
+
+// defaultSlowFetchThreshold is how long a single article fetch/stat may take
+// before handleRequestProtected logs it as suspiciously slow.
+//
+// Added during the 2026-08-09 A/V-sync-delay investigation: a live repro
+// showed a ~6-11s stall before a fresh read served any bytes, with no error
+// anywhere in the chain (direct provider connectivity, Drakkar's own webdav
+// responses, and the DB were all independently confirmed fast) except one
+// rclone-side "i/o timeout, low level retry" for the same file caught by
+// chance in the logs -- i.e. something in this fetch path occasionally stalls
+// for several seconds without ever producing a log line pointing at it. Every
+// article fetch/stat, on every priority tier, passes through
+// handleRequestProtected, making it the one choke point where timing every
+// single request (rather than guessing which layer is slow) will catch the
+// next occurrence with an actual messageID/priority/duration to chase.
+const defaultSlowFetchThreshold = 2 * time.Second
 
 // ErrSchedulerQueueFull is returned when a priority tier's queue is at
 // capacity and cannot accept another request. Callers should treat this as a
@@ -37,6 +55,13 @@ type ScheduledSource struct {
 	medium chan fetchRequest
 	low    chan fetchRequest
 	cancel context.CancelFunc
+
+	// slowFetchThreshold is a per-instance field (not a package-level var) so
+	// tests can tune it on their own ScheduledSource without racing a
+	// dangling worker goroutine left running by some other, unrelated test
+	// past its own test function's return -- see defaultSlowFetchThreshold's
+	// doc comment for why this value exists at all.
+	slowFetchThreshold time.Duration
 }
 
 type fetchRequest struct {
@@ -81,11 +106,12 @@ func NewScheduledSourceLanes(ctx context.Context, source ArticleSource, workers,
 	}
 	schedCtx, cancel := context.WithCancel(ctx)
 	s := &ScheduledSource{
-		source: source,
-		high:   make(chan fetchRequest, queueSize),
-		medium: make(chan fetchRequest, queueSize),
-		low:    make(chan fetchRequest, queueSize),
-		cancel: cancel,
+		source:             source,
+		high:               make(chan fetchRequest, queueSize),
+		medium:             make(chan fetchRequest, queueSize),
+		low:                make(chan fetchRequest, queueSize),
+		cancel:             cancel,
+		slowFetchThreshold: defaultSlowFetchThreshold,
 	}
 	if backgroundWorkers > 0 {
 		for range workers {
@@ -284,11 +310,15 @@ func (s *ScheduledSource) handleRequestProtected(req fetchRequest) {
 		body []byte
 		err  error
 	)
+	start := time.Now()
 	switch req.op {
 	case fetchOperationStat:
 		err = fetchArticleStat(req.ctx, s.source, req.messageID)
 	default:
 		body, err = fetchArticleBody(req.ctx, s.source, req.messageID, req.priority)
+	}
+	if elapsed := time.Since(start); elapsed >= s.slowFetchThreshold {
+		slog.Warn("nntp: slow article fetch", "messageID", req.messageID, "priority", req.priority, "op", req.op, "elapsed", elapsed, "err", err)
 	}
 	select {
 	case req.resultCh <- fetchResult{body: body, err: err}:

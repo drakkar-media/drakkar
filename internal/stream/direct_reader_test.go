@@ -192,6 +192,53 @@ func TestDirectNzbReaderReadAt(t *testing.T) {
 	}
 }
 
+// shortFetchStub always reports the span exactly as requested (so ReadAt
+// never mistakes this for a realignment case), and returns one byte fewer
+// than a multi-byte request -- modeling an unexplained truncated fetch. A
+// single-byte request (the retry ReadAt naturally issues for the remainder)
+// is fulfilled in full, so the old, unguarded code path can silently "heal"
+// the short read across two round trips instead of ever seeing a zero-length
+// block -- the discriminator this test relies on (see below).
+type shortFetchStub struct{}
+
+func (s shortFetchStub) FetchRange(ctx context.Context, segment SegmentRange) ([]byte, error) {
+	block, _, err := s.FetchRangeInfo(ctx, segment)
+	return block, err
+}
+
+func (shortFetchStub) FetchRangeInfo(ctx context.Context, segment SegmentRange) ([]byte, SegmentSpan, error) {
+	actual := SegmentSpan{SegmentID: segment.SegmentID, Start: segment.SegmentStart, End: segment.SegmentEnd}
+	full := int(segment.RangeEnd - segment.RangeStart)
+	got := full
+	if full > 1 {
+		got = full - 1
+	}
+	return make([]byte, got), actual, nil
+}
+
+// TestDirectNzbReaderShortFetchIsHardError guards a gap found during the
+// 2026-08-09 A/V-sync-delay investigation: unlike StoredRarReader (which
+// explicitly errors on any unexplained short, non-zero fetch -- see its
+// "short fetch" error), DirectNzbReader only checked for a zero-length block
+// and otherwise silently accepted whatever length came back, advancing
+// current by len(block) and re-requesting the remainder. With shortFetchStub,
+// that old behavior doesn't even surface as an error: the initial 10-byte
+// request comes back 9 bytes short, current advances to 9, and the retry's
+// 1-byte request is fulfilled in full -- ReadAt returns (10, nil) as if
+// nothing were wrong, silently masking that the underlying fetch never
+// explained why it truncated the first request. Confirming err == nil here
+// would demonstrate the old bug; the fix must return a hard error instead.
+func TestDirectNzbReaderShortFetchIsHardError(t *testing.T) {
+	reader := NewDirectNzbReader("test.mkv", 30, []SegmentSpan{
+		{SegmentID: 1, Start: 0, End: 30},
+	}, shortFetchStub{}, nil)
+	buf := make([]byte, 10)
+	n, err := reader.ReadAt(context.Background(), buf, 0)
+	if err == nil {
+		t.Fatalf("expected a hard error for a short, non-zero, unexplained fetch; got (%d, nil) instead", n)
+	}
+}
+
 func TestDirectNzbReaderRealignsEstimatedBoundaries(t *testing.T) {
 	reader := NewDirectNzbReader("test.mkv", 22, []SegmentSpan{
 		{SegmentID: 1, Start: 0, End: 9},

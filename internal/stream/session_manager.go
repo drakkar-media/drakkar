@@ -377,14 +377,12 @@ func (m *ReadAheadManager) schedule(sessionID string, offset int64) {
 		}
 		sem := make(chan struct{}, parallelism)
 		var wg sync.WaitGroup
+	readAhead:
 		for _, segment := range ranges {
 			select {
 			case <-ctx.Done():
-				break
+				break readAhead
 			case sem <- struct{}{}:
-			}
-			if ctx.Err() != nil {
-				break
 			}
 			wg.Add(1)
 			go func(seg SegmentRange) {

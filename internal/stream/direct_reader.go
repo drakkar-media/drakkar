@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sort"
 	"sync"
@@ -146,6 +147,7 @@ func (r *DirectNzbReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 			continue
 		}
 		r.realignSpans(index, actualSpan)
+		expected := int(requestEnd - current)
 		if len(block) == 0 {
 			// realignSpans just corrected the span boundaries based on actual yEnc
 			// offsets. The requested position may now fall in a different span —
@@ -159,10 +161,22 @@ func (r *DirectNzbReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 			}
 			continue
 		}
+		if len(block) < expected {
+			// A non-zero but short block here (as opposed to the realignSpans
+			// correction above, which already reconciled the span boundaries)
+			// means the fetch itself returned less than the segment's own
+			// resolved range promised -- an unexplained truncation, not a
+			// boundary estimate being wrong. StoredRarReader treats this
+			// identically (see its "short fetch" error): silently accepting it
+			// and advancing current by len(block) would let a lenient MKV
+			// demuxer absorb the gap as a dropped/duplicated frame instead of
+			// surfacing the underlying fetch problem.
+			return written, errors.New("short fetch")
+		}
 		emptyCount = 0
-		copy(dst[written:written+len(block)], block)
-		written += len(block)
-		current += int64(len(block))
+		copy(dst[written:written+expected], block[:expected])
+		written += expected
+		current += int64(expected)
 	}
 	if int64(written) < int64(len(dst)) {
 		return written, io.EOF

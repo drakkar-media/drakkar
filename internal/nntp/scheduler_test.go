@@ -1,7 +1,10 @@
 package nntp
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -114,5 +117,49 @@ func TestScheduledSourceBackgroundLaneNotBlockedByForeground(t *testing.T) {
 	}
 	if d := startedAt.Sub(testStart); d > 100*time.Millisecond {
 		t.Fatalf("expected background fetch to START promptly via its own lane, started %v after test began (foreground worker was busy for 200ms)", d)
+	}
+}
+
+// TestHandleRequestProtectedLogsSlowFetch guards the observability added
+// during the 2026-08-09 A/V-sync-delay investigation: a live repro showed a
+// several-second stall before a fresh read served any bytes, with nothing in
+// the logs pointing at which layer was slow. Every fetch passes through
+// handleRequestProtected, so timing it here is the one place that can catch
+// the next occurrence with an actual messageID/duration instead of a mystery.
+func TestHandleRequestProtectedLogsSlowFetch(t *testing.T) {
+	origLogger := slog.Default()
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	src := &orderedSource{wait: 20 * time.Millisecond}
+	scheduler := NewScheduledSource(context.Background(), src, 1, 8)
+	scheduler.slowFetchThreshold = 5 * time.Millisecond
+	if _, err := scheduler.BodyPriority(context.Background(), "slow-1", stream.PriorityInteractive); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := buf.String(); !strings.Contains(got, "slow article fetch") || !strings.Contains(got, "slow-1") {
+		t.Fatalf("expected a slow-fetch warning naming slow-1, got: %s", got)
+	}
+}
+
+// TestHandleRequestProtectedDoesNotLogFastFetch guards against the warning
+// firing on every normal, fast fetch -- it should only ever surface the
+// genuinely slow ones.
+func TestHandleRequestProtectedDoesNotLogFastFetch(t *testing.T) {
+	origLogger := slog.Default()
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(origLogger) })
+
+	src := &orderedSource{wait: 0}
+	scheduler := NewScheduledSource(context.Background(), src, 1, 8)
+	if _, err := scheduler.BodyPriority(context.Background(), "fast-1", stream.PriorityInteractive); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := buf.String(); strings.Contains(got, "slow article fetch") {
+		t.Fatalf("did not expect a slow-fetch warning for a fast fetch, got: %s", got)
 	}
 }
