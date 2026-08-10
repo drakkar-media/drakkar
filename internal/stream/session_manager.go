@@ -116,12 +116,16 @@ type ReadAheadManager struct {
 	articleLimit   int
 }
 
-// SessionMeta carries display metadata for an open stream session.
+// SessionMeta carries display metadata for an open stream session, plus an
+// optional Cancel hook the session's owner can use to tear down its actual
+// foreground serving loop -- not just read-ahead -- when RegisterMeta finds
+// it superseded by a new session on the same VirtualFileID.
 type SessionMeta struct {
 	VirtualFileID int64
 	FileName      string
 	FileSizeBytes int64
 	OpenedAt      time.Time
+	Cancel        context.CancelFunc
 }
 
 // SessionSnapshot is a point-in-time view of one active session, safe to read outside the lock.
@@ -247,20 +251,23 @@ func (m *ReadAheadManager) Register(sessionID string, spans []SegmentSpan, fetch
 }
 
 // RegisterMeta attaches display metadata to an already-registered session,
-// and stops read-ahead for any other session already open on the same
-// VirtualFileID.
+// and stops both read-ahead AND the foreground serving loop for any other
+// session already open on the same VirtualFileID.
 //
 // A seek from a WebDAV client (e.g. Plex) doesn't reuse the existing
 // connection -- it opens a brand-new GET/Range request while the old one
 // may still be lingering (see deadlineResponseWriter in internal/dav for
-// why that lingering can itself take a while to resolve). Until now, the
-// old session's read-ahead kept running the whole time, competing with the
-// new session's interactive fetch for the same finite NNTP connection pool
-// at exactly the moment that fetch needs a connection fastest. Since
+// why that lingering can itself take a while to resolve). Read-ahead
+// cancellation alone wasn't enough: confirmed live (2026-08-10, Venom: Let
+// There Be Carnage) that the old session's actual foreground Read loop kept
+// running for as long as its client (rclone) kept draining it -- up to
+// ~163s of real, no-longer-needed data transfer, holding NNTP connection
+// budget the new seek's fetch was waiting on the whole time. meta.Cancel,
+// when the session's owner supplied one, tears that foreground loop down
+// immediately instead of leaving it to notice on its own. Since
 // VirtualFileID only becomes known here (Register, called from
 // StartSession, has none yet), this is the first point two sessions for the
-// same file can be recognized as the same logical playback -- so this is
-// where the stale one's read-ahead gets cut loose.
+// same file can be recognized as the same logical playback.
 func (m *ReadAheadManager) RegisterMeta(sessionID string, meta SessionMeta) {
 	if m == nil || sessionID == "" {
 		return
@@ -281,6 +288,9 @@ func (m *ReadAheadManager) RegisterMeta(sessionID string, meta SessionMeta) {
 		if s := m.sessions[id]; s != nil {
 			if s.cancel != nil {
 				s.cancel()
+			}
+			if s.meta.Cancel != nil {
+				s.meta.Cancel()
 			}
 			delete(m.sessions, id)
 		}

@@ -345,6 +345,19 @@ type virtualFile struct {
 	vf      stream.VirtualMediaFile
 	openErr error
 
+	// readCtx/cancel are a private cancellation scope derived from ctx, not
+	// ctx itself -- so a seek's new session can proactively tear down THIS
+	// session's foreground Read loop rather than waiting for it to notice
+	// the client stopped wanting it. Confirmed live (2026-08-10, Venom: Let
+	// There Be Carnage): stopping only the stale session's read-ahead (the
+	// original fix) left the OLD connection's actual serving loop running
+	// for as long as its client (rclone) kept draining it -- measured up to
+	// ~163s of real data transfer nobody needed anymore, continuing to hold
+	// NNTP connection budget the new seek's fetch was waiting on the whole
+	// time. RegisterMeta's stale-session cleanup now cancels this too.
+	readCtx context.Context
+	cancel  context.CancelFunc
+
 	pos         int64
 	sessionFile stream.SessionVirtualMediaFile // nil for inline/byte files, or before the first Read
 	sessionID   string
@@ -365,6 +378,7 @@ func (f *virtualFile) ensureOpen() error {
 		return err
 	}
 	f.vf = vf
+	f.readCtx, f.cancel = context.WithCancel(f.ctx)
 	if sf, ok := vf.(stream.SessionVirtualMediaFile); ok {
 		f.sessionFile = sf
 		f.sessionID = fmt.Sprintf("dav-%d-%d", f.virtualFileID, time.Now().UnixNano())
@@ -374,6 +388,7 @@ func (f *virtualFile) ensureOpen() error {
 			FileName:      f.fi.Name(),
 			FileSizeBytes: f.size,
 			OpenedAt:      time.Now().UTC(),
+			Cancel:        f.cancel,
 		})
 	}
 	return nil
@@ -382,6 +397,9 @@ func (f *virtualFile) ensureOpen() error {
 func (f *virtualFile) Close() error {
 	if f.sessionFile != nil {
 		f.sessionFile.StopSession(f.sessionID)
+	}
+	if f.cancel != nil {
+		f.cancel()
 	}
 	return nil
 }
@@ -430,7 +448,7 @@ func (f *virtualFile) Read(p []byte) (int, error) {
 	if int64(len(p)) > remaining {
 		p = p[:remaining]
 	}
-	n, err := f.vf.ReadAt(f.ctx, p, f.pos)
+	n, err := f.vf.ReadAt(f.readCtx, p, f.pos)
 	if err != nil && err != io.EOF {
 		slog.Debug("dav read error", "name", f.fi.Name(), "pos", f.pos, "n", n, "err", err)
 	}
