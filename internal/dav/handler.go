@@ -185,6 +185,23 @@ func (fi *fileInfo) ModTime() time.Time { return contentModTime }
 func (fi *fileInfo) IsDir() bool        { return false }
 func (fi *fileInfo) Sys() any           { return nil }
 
+// ContentType implements golang.org/x/net/webdav's ContentTyper, the only
+// way to stop webdav.findContentType from calling fs.OpenFile before it even
+// checks mime.TypeByExtension -- confirmed live via pprof (2026-08-10): every
+// PROPFIND (issued constantly by rclone's dir cache refresh and Plex library
+// scans) was opening every single video file through the full
+// OpenVirtualMediaFile path (segment-span loading plus a live NNTP boundary
+// probe) just to answer a directory listing, for the whole ~11,100-item
+// library repeatedly. That explained simultaneous CPU/memory/network blowup
+// and, by starving the NNTP connection pool and decode semaphore that real
+// playback also uses, the concurrent stream corruption and failed seeks.
+func (fi *fileInfo) ContentType(context.Context) (string, error) {
+	if ctype := mime.TypeByExtension(filepath.Ext(fi.name)); ctype != "" {
+		return ctype, nil
+	}
+	return "application/octet-stream", nil
+}
+
 // --- webdav.File implementations ---
 
 // dirFile is a read-only directory.
@@ -263,14 +280,56 @@ func (f *bytesFile) Read(p []byte) (int, error) {
 // StartSession on open, NotifyRead after each read, Seek on non-sequential
 // access, StopSession on close.
 type virtualFile struct {
-	ctx         context.Context
-	vf          stream.VirtualMediaFile
-	fi          os.FileInfo
+	ctx           context.Context
+	db            ContentProvider
+	virtualFileID int64
+	size          int64
+	fi            os.FileInfo
+
+	// vf is opened lazily, on the first real Read, not on OpenFile -- a
+	// PROPFIND (issued continuously by rclone's dir-cache refresh and Plex
+	// library scans) only ever calls Stat/Close on the file returned here,
+	// never Read. Confirmed live via pprof (2026-08-10) that opening eagerly
+	// meant every directory listing paid the full OpenVirtualMediaFile cost
+	// (segment-span loading, a live NNTP boundary probe) and even started a
+	// read-ahead session with an immediate NotifyRead(0), storming the whole
+	// library's NNTP/CPU/memory on every listing and starving the connection
+	// pool real playback depends on.
+	vf      stream.VirtualMediaFile
+	openErr error
+
 	pos         int64
-	sessionFile stream.SessionVirtualMediaFile // nil for inline/byte files
+	sessionFile stream.SessionVirtualMediaFile // nil for inline/byte files, or before the first Read
 	sessionID   string
 	hasRead     bool  // true after the first actual data read
 	lastEnd     int64 // position after the last read, for seek detection
+}
+
+// ensureOpen performs the real OpenVirtualMediaFile call and starts the
+// read-ahead session, memoized so it only happens once and only when a Read
+// actually needs the data.
+func (f *virtualFile) ensureOpen() error {
+	if f.vf != nil || f.openErr != nil {
+		return f.openErr
+	}
+	vf, err := f.db.OpenVirtualMediaFile(f.ctx, f.virtualFileID)
+	if err != nil {
+		f.openErr = err
+		return err
+	}
+	f.vf = vf
+	if sf, ok := vf.(stream.SessionVirtualMediaFile); ok {
+		f.sessionFile = sf
+		f.sessionID = fmt.Sprintf("dav-%d-%d", f.virtualFileID, time.Now().UnixNano())
+		sf.StartSession(f.sessionID)
+		sf.RegisterMeta(f.sessionID, stream.SessionMeta{
+			VirtualFileID: f.virtualFileID,
+			FileName:      f.fi.Name(),
+			FileSizeBytes: f.size,
+			OpenedAt:      time.Now().UTC(),
+		})
+	}
+	return nil
 }
 
 func (f *virtualFile) Close() error {
@@ -292,7 +351,7 @@ func (f *virtualFile) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekCurrent:
 		newPos = f.pos + offset
 	case io.SeekEnd:
-		newPos = f.vf.Size() + offset
+		newPos = f.size + offset
 	default:
 		return 0, os.ErrInvalid
 	}
@@ -313,7 +372,10 @@ func (f *virtualFile) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	size := f.vf.Size()
+	if err := f.ensureOpen(); err != nil {
+		return 0, err
+	}
+	size := f.size
 	if f.pos >= size {
 		return 0, io.EOF
 	}
@@ -519,28 +581,13 @@ func (f *contentFS) openContent(ctx context.Context, rest string) (webdav.File, 
 	}
 	for _, e := range entries {
 		if e.FileName == filename {
-			vf, err := f.db.OpenVirtualMediaFile(ctx, e.VirtualFileID)
-			if err != nil {
-				return nil, err
-			}
-			file := &virtualFile{
-				ctx: ctx,
-				vf:  vf,
-				fi:  &fileInfo{name: e.FileName, size: e.SizeBytes},
-			}
-			if sf, ok := vf.(stream.SessionVirtualMediaFile); ok {
-				file.sessionFile = sf
-				file.sessionID = fmt.Sprintf("dav-%d-%d", e.VirtualFileID, time.Now().UnixNano())
-				sf.StartSession(file.sessionID)
-				sf.RegisterMeta(file.sessionID, stream.SessionMeta{
-					VirtualFileID: e.VirtualFileID,
-					FileName:      e.FileName,
-					FileSizeBytes: e.SizeBytes,
-					OpenedAt:      time.Now().UTC(),
-				})
-				sf.NotifyRead(file.sessionID, 0)
-			}
-			return file, nil
+			return &virtualFile{
+				ctx:           ctx,
+				db:            f.db,
+				virtualFileID: e.VirtualFileID,
+				size:          e.SizeBytes,
+				fi:            &fileInfo{name: e.FileName, size: e.SizeBytes},
+			}, nil
 		}
 	}
 	return nil, os.ErrNotExist
