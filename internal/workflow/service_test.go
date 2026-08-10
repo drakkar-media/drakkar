@@ -1710,6 +1710,36 @@ func TestManualSearchRetriesTransientHydraFailure(t *testing.T) {
 	}
 }
 
+// TestManualSearchDropsWrongSeasonPack guards a real production mismatch
+// (2026-08-11): searching "Lioness S01E01" returned
+// "Lioness.2023.S02.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb" (a season-2 pack,
+// no episode token at all) scored as a good match. hasWrongEpisodeToken
+// deliberately lets season-pack titles through untouched (it only flags a
+// wrong EPISODE within the RIGHT season), so nothing in ManualSearch ever
+// checked the season token at all. hasWrongSeasonToken must drop it before
+// it's ever scored, the same way a same-season wrong-episode result
+// already gets dropped.
+func TestManualSearchDropsWrongSeasonPack(t *testing.T) {
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{
+		seqByQuery: map[string][]hydraReply{
+			"lioness s01e01": {
+				{results: []hydra.SearchResult{
+					{Title: "Lioness.2023.S01E01.1080p.WEB-DL.x265-GRP", Link: "http://example/right-season", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+					{Title: "Lioness.2023.S02.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb", Link: "http://example/wrong-season", Indexer: "hydra", SizeBytes: 5678, PublishedAt: time.Now()},
+				}},
+			},
+		},
+	})
+
+	items, err := service.ManualSearch(context.Background(), "lioness s01e01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ExternalURL != "http://example/right-season" {
+		t.Fatalf("expected only the season-1 result to survive, got %+v", items)
+	}
+}
+
 func TestMaxInlineFallbackDepthUsesBusyQueueLimit(t *testing.T) {
 	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
 	queue := newWorkQueueStub()

@@ -149,6 +149,25 @@ func TestScoreRejectsWrongEpisode(t *testing.T) {
 	}
 }
 
+// TestScoreRejectsWrongSeasonPack guards a real production mismatch
+// (2026-08-11): "Lioness.2023.S02.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb" (a
+// season-2 pack, no episode token at all) scored as a good match for a
+// season-1 episode-1 search. matchEpisode's season-token loop only ever
+// checked for the REQUESTED season's own token, so a bare token for a
+// DIFFERENT season fell through as episodeUnknown (no signal found at
+// all) -- which neither hard-rejects nor penalizes, unlike an explicit
+// wrong-episode token in the same season.
+func TestScoreRejectsWrongSeasonPack(t *testing.T) {
+	result := Score(Candidate{
+		Title:      "Lioness.2023.S02.1080p.AMZN.WEB-DL.DDP5.1.H.264-NTb",
+		Resolution: "1080p",
+		Source:     "web-dl",
+	}, Requirements{Title: "Lioness", MediaType: "episode", Year: 2023, SeasonNumber: 1, EpisodeNumber: 1})
+	if !result.Rejected || result.RejectReason != "wrong_season" {
+		t.Fatalf("expected wrong_season rejection, got %+v", result)
+	}
+}
+
 // TestScoreRejectsEpisodeFromWrongProductionWithSameTitleAndNumbering guards
 // a real mismatch reported live (2026-07-28): the 1999 "One Piece" anime and
 // the 2023 live-action "One Piece" share an identical title, and their own

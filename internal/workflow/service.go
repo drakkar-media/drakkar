@@ -3633,6 +3633,36 @@ func shouldKeepSearchingPastCandidate(candidate database.SearchCandidateRecord, 
 	return hasSeasonPackToken(title, input.SeasonNumber)
 }
 
+// reSeasonToken matches a bare or episode-qualified season token (s02 or
+// s02e01) anywhere in a lowercased release title.
+var reSeasonToken = regexp.MustCompile(`s(\d{2})(?:e\d{1,3})?`)
+
+// hasWrongSeasonToken reports whether titleLower contains an explicit season
+// token for a season other than seasonNumber -- including a season-PACK
+// title with no episode token at all (e.g. a bare "S02"). Unlike
+// hasWrongEpisodeToken, which deliberately lets season-pack titles through
+// untouched (see its own doc comment) since it only flags a wrong EPISODE
+// within the RIGHT season, this flags any season token that isn't the
+// requested one regardless of whether an episode number follows it.
+// Confirmed live: "Lioness.2023.S02.1080p..." (a season-2 pack) scored as a
+// good match for a season-1 episode-1 manual search, since nothing in the
+// manual-search path checked the season token at all.
+func hasWrongSeasonToken(titleLower string, seasonNumber int) bool {
+	if seasonNumber <= 0 {
+		return false
+	}
+	for _, m := range reSeasonToken.FindAllStringSubmatch(titleLower, -1) {
+		season, err := strconv.Atoi(m[1])
+		if err != nil {
+			continue
+		}
+		if season != seasonNumber {
+			return true
+		}
+	}
+	return false
+}
+
 // hasWrongEpisodeToken returns true when the title contains an episode token for
 // the right season but a different episode. Handles SxxEnn and NxMM formats.
 // Season-pack titles (no episode token) return false so they pass through.
@@ -5489,13 +5519,22 @@ func (s *Service) ManualSearch(ctx context.Context, query string) ([]ManualSearc
 
 	out := make([]ManualSearchItem, 0, len(results))
 	for _, r := range results {
-		// Drop results that clearly belong to a different episode.
-		if filterEpisode > 0 && hasWrongEpisodeToken(strings.ToLower(r.Title), filterSeason, filterEpisode) {
+		titleLower := strings.ToLower(r.Title)
+		// Drop results that clearly belong to a different season -- including
+		// season-PACK titles with no episode token at all, which
+		// hasWrongEpisodeToken deliberately lets through untouched (see its
+		// own doc comment). Confirmed live: a "Lioness.2023.S02..." season-2
+		// pack scored as a good match for a season-1 episode-1 manual search,
+		// since nothing here ever checked the season token at all.
+		if filterSeason > 0 && hasWrongSeasonToken(titleLower, filterSeason) {
+			continue
+		}
+		// Drop results that clearly belong to a different episode (same season).
+		if filterEpisode > 0 && hasWrongEpisodeToken(titleLower, filterSeason, filterEpisode) {
 			continue
 		}
 		// hydra.SearchResult has limited fields — extract resolution/source/codec
 		// from the title using the same parser the ranking engine uses.
-		titleLower := strings.ToLower(r.Title)
 		resolution := detectOne(titleLower, "2160p", "1080p", "720p", "576p", "480p")
 		source := detectOne(titleLower, "bluray", "remux", "web-dl", "webrip", "hdtv", "dvdrip")
 		codec := detectOne(titleLower, "x265", "hevc", "x264", "avc", "av1")

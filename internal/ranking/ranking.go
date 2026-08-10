@@ -452,6 +452,8 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 		switch matchEpisode(titleLower, required.SeasonNumber, required.EpisodeNumber) {
 		case episodeMismatch:
 			return Result{Rejected: true, RejectReason: "wrong_episode", Explanations: []string{"Rejected: season/episode did not match the requested episode."}}
+		case episodeWrongSeason:
+			return Result{Rejected: true, RejectReason: "wrong_season", Explanations: []string{"Rejected: release names a different season than the one requested."}}
 		case episodeExact:
 			score += 350
 			addExplanation("Exact episode match (+350)")
@@ -1052,6 +1054,7 @@ const (
 	episodeExact
 	episodeSeasonPack
 	episodeMismatch
+	episodeWrongSeason
 )
 
 // containsNormalized checks whether the required title words appear at the
@@ -1278,7 +1281,42 @@ func matchEpisode(title string, seasonNumber, episodeNumber int) episodeMatch {
 	if containsEpisodeToken(title) {
 		return episodeMismatch
 	}
+	if hasOtherBareSeasonToken(title, seasonNumber) {
+		return episodeWrongSeason
+	}
 	return episodeUnknown
+}
+
+// bareSeasonTokenPattern matches an explicit season-only token ("s02" or
+// "season 2") not immediately followed by more word characters -- so it
+// does not match the season half of "s02e01" (no word boundary between the
+// season digits and the following "e").
+var bareSeasonTokenPattern = regexp.MustCompile(`(?i)\bs(\d{1,2})\b|\bseason\s+(\d{1,2})\b`)
+
+// hasOtherBareSeasonToken reports whether title names an explicit season
+// number, via a bare "sNN"/"season N" token with no episode number
+// attached, other than seasonNumber -- e.g. a season-2 pack title when
+// season 1 was requested. Without this, such a title fell through
+// matchEpisode as episodeUnknown (no season/episode signal recognized at
+// all, since the season-token loop above only ever looks for the
+// REQUESTED season's own token), which neither hard-rejects nor penalizes
+// it. Confirmed live (2026-08-11): "Lioness.2023.S02.1080p..." (a season-2
+// pack) scored as a good match for a season-1 episode-1 search.
+func hasOtherBareSeasonToken(title string, seasonNumber int) bool {
+	for _, m := range bareSeasonTokenPattern.FindAllStringSubmatch(title, -1) {
+		digits := m[1]
+		if digits == "" {
+			digits = m[2]
+		}
+		other, err := strconv.Atoi(digits)
+		if err != nil {
+			continue
+		}
+		if other != seasonNumber {
+			return true
+		}
+	}
+	return false
 }
 
 // episodeTokenPattern matches an SxxExx or NxNN episode marker anywhere in a
