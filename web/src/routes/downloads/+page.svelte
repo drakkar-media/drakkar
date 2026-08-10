@@ -58,9 +58,41 @@
   const doneStates = ['available', 'failed'];
   const queuePageSize = 8;
   const historyPageSize = 12;
+  // Matches ListQueue's recent_history CTE limit (internal/database/queue_repository.go)
+  // -- the backend deliberately caps history to the most recent 200 rows for
+  // response-time reasons, so a count that lands exactly on this cap almost
+  // certainly means older rows exist but were cut off, not that history is
+  // coincidentally exactly 200 items long.
+  const historyBackendCap = 200;
+
+  // Some queue rows carry an SxxExx suffix baked into libraryTitle already
+  // (however that item's title happened to be generated), others don't --
+  // confirmed live: inconsistent across creation paths, not something to
+  // paper over per-row. Deriving the badge from the actual episodes join
+  // (seasonNumber/episodeNumber, now returned by ListQueue) instead of
+  // parsing libraryTitle text means it's always correct for every episode
+  // row regardless of how that title was built, and the "already has it"
+  // check just avoids a redundant duplicate badge next to a title that
+  // happens to already end in the same SxxExx.
+  function episodeBadge(item: QueueItem): string | null {
+    if (item.seasonNumber == null || item.episodeNumber == null) return null;
+    const tag = `S${String(item.seasonNumber).padStart(2, '0')}E${String(item.episodeNumber).padStart(2, '0')}`;
+    return item.libraryTitle.includes(tag) ? null : tag;
+  }
 
   $: queueItems = items.filter((item) => ACTIVE_STATES.includes(item.state));
-  $: historyItems = items.filter((item) => doneStates.includes(item.state));
+  // The backend's /api/queue ordering groups rows by state first (so every
+  // 'available' row sorts before every 'failed' row) and only sorts by
+  // updatedAt WITHIN each state bucket -- correct for the Queue tab's
+  // pipeline-stage grouping, but it means a recent 'failed' row could sort
+  // far below an older 'available' row here. History needs one unified
+  // "latest activity first" ordering across both terminal states, so it's
+  // re-sorted by updatedAt (falling back to createdAt) here rather than
+  // trusting the backend's state-bucketed order.
+  $: historyItems = items
+    .filter((item) => doneStates.includes(item.state))
+    .slice()
+    .sort((a, b) => Date.parse(b.updatedAt || b.createdAt || '') - Date.parse(a.updatedAt || a.createdAt || ''));
   $: failedItems = items.filter((item) => item.state === 'failed');
   $: failedHistoryIds = new Set(failedItems.map((item) => item.queueItemId));
   $: selectedFailedIds = Array.from(selectedHistoryIds).filter((id) => failedHistoryIds.has(id));
@@ -370,7 +402,11 @@
 
 <Panel
   title={tab === 'queue' ? 'Queue' : 'History'}
-  subtitle={tab === 'queue' ? 'Active lifecycle rows from request to publication.' : 'Completed and failed rows.'}
+  subtitle={tab === 'queue'
+    ? 'Active lifecycle rows from request to publication.'
+    : historyItems.length >= historyBackendCap
+      ? `Completed and failed rows — showing the most recent ${historyBackendCap}, older rows are trimmed.`
+      : 'Completed and failed rows.'}
 >
   <div slot="actions">
     <StatusPill tone="neutral">{tab === 'queue' ? `${queueItems.length} active` : `${historyItems.length} rows`}</StatusPill>
@@ -482,7 +518,9 @@
                   </label>
                 {/if}
                 <div class="row-text">
-                  <div class="row-title">{item.libraryTitle}</div>
+                  <div class="row-title">
+                    {item.libraryTitle}{#if episodeBadge(item)}<span class="ep-badge">{episodeBadge(item)}</span>{/if}
+                  </div>
                   <div class="row-sub">
                     {item.nzbFileName ? `${item.nzbFileName} · ` : ''}{item.nzbSegmentCount} segments
                   </div>
@@ -648,6 +686,18 @@
 
   .row-title {
     font-weight: 600;
+  }
+
+  .ep-badge {
+    margin-left: 0.5rem;
+    padding: 0.05rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    background: hsl(var(--muted-foreground) / 0.14);
+    color: hsl(var(--muted-foreground));
+    vertical-align: middle;
   }
 
   .row-head > :global(.button),

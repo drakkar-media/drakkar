@@ -114,10 +114,29 @@ func parseNZBSubjectFilename(subject string) string {
 	return strings.Trim(fields[0], "\"")
 }
 
+// interiorSampleBudget bounds how many additional interior (neither first nor
+// last) segments PreflightCheckFirstSegments samples for a single-file
+// release, on top of the existing first/last check. Confirmed live
+// (2026-08-11, Landman S01E01/E02/E04+): a release can have a perfectly
+// reachable first and last segment while still having several articles
+// missing somewhere in the middle -- Newshosting returned "430 No Such
+// Article" for scattered segments of a specific poster's upload, so
+// first/last-only reachability gave a false pass and the file only failed
+// hours later, mid-playback, once a real read reached the missing offset.
+// Deliberately NOT extended to multi-file (RAR volume) releases -- see
+// loadNZBInteriorSampleSegments -- since checking every volume of a 90-file
+// RAR set at this sample density is exactly the burst that originally
+// tripped the provider circuit breaker (see loadNZBFirstLastSegmentPairs).
+// This only runs once per already-selected candidate (not per search
+// result), so the added check volume stays small even at this budget.
+const interiorSampleBudget = 40
+
 // PreflightCheckFirstSegments verifies that the first AND last segment of every
-// NZB file in the given document is reachable on NNTP. Unlike CalibrateNZBOffsets
-// (which silently skips missing segments), this returns an error immediately so
-// the workqueue can reject the release and fall back to the next candidate.
+// NZB file in the given document is reachable on NNTP, plus a bounded sample
+// of interior segments for a single-file release (see interiorSampleBudget).
+// Unlike CalibrateNZBOffsets (which silently skips missing segments), this
+// returns an error immediately so the workqueue can reject the release and
+// fall back to the next candidate.
 func (db *DB) PreflightCheckFirstSegments(ctx context.Context, nzbDocumentID int64) error {
 	checker, ok := db.SegmentFetcher.(SegmentChecker)
 	if !ok || checker == nil {
@@ -127,7 +146,11 @@ func (db *DB) PreflightCheckFirstSegments(ctx context.Context, nzbDocumentID int
 	if err != nil {
 		return err
 	}
-	if len(pairs) == 0 {
+	samples, err := db.loadNZBInteriorSampleSegments(ctx, nzbDocumentID, interiorSampleBudget)
+	if err != nil {
+		return err
+	}
+	if len(pairs) == 0 && len(samples) == 0 {
 		return nil
 	}
 	checkCtx, cancel := context.WithCancel(ctx)
@@ -139,38 +162,94 @@ func (db *DB) PreflightCheckFirstSegments(ctx context.Context, nzbDocumentID int
 		errOnce  sync.Once
 		firstErr error
 	)
+	checkOne := func(messageID, pos string) {
+		defer wg.Done()
+		defer observability.Recover("nntp-preflight-check")
+		select {
+		case sem <- struct{}{}:
+		case <-checkCtx.Done():
+			return
+		}
+		defer func() { <-sem }()
+		if err := checker.Exists(checkCtx, messageID); err != nil {
+			errOnce.Do(func() {
+				firstErr = sanitizedSegmentErr("preflight", pos, err)
+				cancel()
+			})
+			return
+		}
+		slog.Debug("preflight: segment reachable", "messageID", messageID, "pos", pos)
+	}
 	for _, pair := range pairs {
-		pair := pair
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer observability.Recover("nntp-preflight-check")
-			select {
-			case sem <- struct{}{}:
-			case <-checkCtx.Done():
-				return
-			}
-			defer func() { <-sem }()
-			if err := checker.Exists(checkCtx, pair.first); err != nil {
-				errOnce.Do(func() {
-					firstErr = sanitizedSegmentErr("preflight", "first", err)
-					cancel()
-				})
-				return
-			}
-			slog.Debug("preflight: segment reachable", "messageID", pair.first)
-			if pair.last != pair.first {
-				if err := checker.Exists(checkCtx, pair.last); err != nil {
-					errOnce.Do(func() {
-						firstErr = sanitizedSegmentErr("preflight", "last", err)
-						cancel()
-					})
-				}
-			}
-		}()
+		go checkOne(pair.first, "first")
+		if pair.last != pair.first {
+			wg.Add(1)
+			go checkOne(pair.last, "last")
+		}
+	}
+	for _, messageID := range samples {
+		wg.Add(1)
+		go checkOne(messageID, "interior sample")
 	}
 	wg.Wait()
 	return firstErr
+}
+
+// loadNZBInteriorSampleSegments returns up to maxSamples evenly-spaced
+// interior message IDs (excluding the first and last, already covered by
+// loadNZBFirstLastSegmentPairs) from the document's qualifying files -- but
+// only when exactly one qualifying file exists. A multi-file release (e.g. a
+// RAR volume set) returns nil: sampling every volume at this density would
+// reintroduce the exact per-candidate check-volume burst that made
+// first/last-only the original design (see loadNZBFirstLastSegmentPairs).
+func (db *DB) loadNZBInteriorSampleSegments(ctx context.Context, nzbDocumentID int64, maxSamples int) ([]string, error) {
+	if maxSamples <= 0 {
+		return nil, nil
+	}
+	rows, err := db.SQL.QueryContext(ctx, `
+		SELECT nf.subject, nf.message_ids::text
+		FROM nzb_files nf
+		WHERE nf.nzb_document_id = $1
+		  AND array_length(nf.message_ids, 1) > 0
+		ORDER BY nf.id ASC`, nzbDocumentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var messageIDs []string
+	qualifyingFiles := 0
+	for rows.Next() {
+		var subject, idsRaw string
+		if err := rows.Scan(&subject, &idsRaw); err != nil {
+			return nil, err
+		}
+		if !shouldValidateNZBSubject(subject) {
+			continue
+		}
+		qualifyingFiles++
+		if qualifyingFiles > 1 {
+			continue // keep scanning to detect multi-file, but stop collecting
+		}
+		messageIDs = parsePostgresArray(idsRaw)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if qualifyingFiles != 1 || len(messageIDs) < 3 {
+		return nil, nil
+	}
+	// Interior range excludes index 0 (first) and len-1 (last).
+	interior := messageIDs[1 : len(messageIDs)-1]
+	if len(interior) <= maxSamples {
+		return interior, nil
+	}
+	step := float64(len(interior)) / float64(maxSamples)
+	samples := make([]string, 0, maxSamples)
+	for i := 0; i < maxSamples; i++ {
+		samples = append(samples, interior[int(float64(i)*step)])
+	}
+	return samples, nil
 }
 
 // StrictCheckFirstSegments uses the older heavier validation strategy:

@@ -157,6 +157,8 @@ export type QueueItem = {
   nzbFileName?: string;
   nzbFileCount: number;
   nzbSegmentCount: number;
+  seasonNumber?: number;
+  episodeNumber?: number;
   onHold: boolean;
   createdAt?: string;
   updatedAt?: string;

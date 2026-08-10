@@ -102,12 +102,15 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 			coalesce(n.file_name, ''),
 			coalesce((select count(*) from nzb_files nf where nf.nzb_document_id = n.id), 0),
 			coalesce((select sum(array_length(nf.message_ids, 1)) from nzb_files nf where nf.nzb_document_id = n.id), 0),
+			ep.season_number,
+			ep.episode_number,
 			q.on_hold,
 			q.created_at,
 			q.updated_at
 		from queue_items q
 		join ids on ids.id = q.id
 		join library_items l on l.id = q.library_item_id
+		left join episodes ep on ep.id = l.episode_id
 		left join selected_releases sr on sr.id = q.selected_release_id
 		left join lateral (
 			select id, file_name
@@ -141,6 +144,7 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 		var item QueueSnapshot
 		var selectedRelease sql.NullInt64
 		var nzbDocument sql.NullInt64
+		var seasonNumber, episodeNumber sql.NullInt64
 		if err := rows.Scan(
 			&item.QueueItemID,
 			&item.LibraryItemID,
@@ -153,6 +157,8 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 			&item.NZBFileName,
 			&item.NZBFileCount,
 			&item.NZBSegmentCount,
+			&seasonNumber,
+			&episodeNumber,
 			&item.OnHold,
 			&item.CreatedAt,
 			&item.UpdatedAt,
@@ -166,6 +172,14 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 		if nzbDocument.Valid {
 			value := nzbDocument.Int64
 			item.NZBDocumentID = &value
+		}
+		if seasonNumber.Valid {
+			value := int(seasonNumber.Int64)
+			item.SeasonNumber = &value
+		}
+		if episodeNumber.Valid {
+			value := int(episodeNumber.Int64)
+			item.EpisodeNumber = &value
 		}
 		out = append(out, item)
 	}
