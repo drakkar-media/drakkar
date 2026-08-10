@@ -2287,6 +2287,62 @@ func TestShouldDispatchSelectedTargetBlocksRecentlyDispatchedSameURL(t *testing.
 	}
 }
 
+// TestShouldDispatchSelectedTargetAppliesPerItemBackoffOnRepeatedFailure
+// guards the 2026-08-10 production fix: promoteNextAfterFailure gives a
+// failing item a brand new selected_release_id (and therefore a brand new,
+// never-before-seen external_url) on every failure, so the per-URL cooldown
+// alone never throttled an item with a large or continually-replenished
+// candidate pool -- the 30-second passive-resume sweep kept re-dispatching a
+// real NZB download for a different release every single tick, confirmed
+// live as a sustained flood (dispatched=~222 pending=~238 every 30s,
+// visible in NZBHydra's own download history and likely starving a
+// concurrent real playback session for NNTP connections).
+func TestShouldDispatchSelectedTargetAppliesPerItemBackoffOnRepeatedFailure(t *testing.T) {
+	now := time.Now()
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
+	target := database.PendingLibrarySearchTarget{
+		LibraryItemID:              42,
+		SelectedReleaseID:          303,
+		ExternalURL:                "http://example/brand-new-never-seen.nzb",
+		State:                      database.QueueSelected,
+		ConsecutiveFailureSearches: 1,
+		UpdatedAt:                  now,
+	}
+	if service.shouldDispatchSelectedTarget(target, now) {
+		t.Fatal("expected an item with 1+ consecutive failures to back off immediately after its last update, even with a never-before-seen url")
+	}
+	if service.shouldDispatchSelectedTarget(target, now.Add(90*time.Second)) {
+		t.Fatal("expected the 2-minute backoff to still be in effect after only 90s")
+	}
+	if !service.shouldDispatchSelectedTarget(target, now.Add(3*time.Minute)) {
+		t.Fatal("expected dispatch to resume once the 2-minute backoff elapsed")
+	}
+
+	target.ConsecutiveFailureSearches = 6
+	if service.shouldDispatchSelectedTarget(target, now.Add(3*time.Minute)) {
+		t.Fatal("expected the escalated 1-hour backoff to still block a 6-failure item after only 3 minutes")
+	}
+	if !service.shouldDispatchSelectedTarget(target, now.Add(61*time.Minute)) {
+		t.Fatal("expected dispatch to resume once the escalated 1-hour backoff elapsed")
+	}
+}
+
+func TestShouldDispatchSelectedTargetDispatchesImmediatelyOnFirstAttempt(t *testing.T) {
+	now := time.Now()
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
+	target := database.PendingLibrarySearchTarget{
+		LibraryItemID:              42,
+		SelectedReleaseID:          303,
+		ExternalURL:                "http://example/first-attempt.nzb",
+		State:                      database.QueueSelected,
+		ConsecutiveFailureSearches: 0,
+		UpdatedAt:                  now,
+	}
+	if !service.shouldDispatchSelectedTarget(target, now) {
+		t.Fatal("expected a first attempt (no prior failures) to dispatch immediately, not wait on the per-item backoff")
+	}
+}
+
 func TestSearchRecentPendingMovieSelectsWithoutActiveHydraSearch(t *testing.T) {
 	repo := &repoStub{
 		pending: []database.PendingLibrarySearchTarget{{LibraryItemID: 42}},

@@ -195,6 +195,61 @@ func TestListPendingLibrarySearchTargetsIncludesAvailableOrphanWithNoSelection(t
 	t.Fatalf("expected available=true orphan (no selected_release_id) to be eligible for search, got targets: %+v", targets)
 }
 
+// TestListPendingLibrarySearchTargetsReturnsConsecutiveFailureSearches
+// guards the 2026-08-10 fix backing the passive-resume dispatch sweep's
+// per-item backoff (shouldDispatchSelectedTarget in internal/workflow) --
+// that backoff is useless if the counter it reads is always zero because
+// the SQL scan silently dropped it.
+func TestListPendingLibrarySearchTargetsReturnsConsecutiveFailureSearches(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	movieID, libID := setupPendingMovie(t, ctx, sqlDB, "consecutive-failures-scan-check", -1)
+	defer sqlDB.ExecContext(ctx, `delete from movies where id = $1`, movieID)
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, external_url, selected)
+		values ($1, 'consecutive-failures-scan-check release', 'http://example/scan-check.nzb', true)
+		returning id`, libID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+	var srID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2) returning id`, libID, rcID).Scan(&srID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `
+		update queue_items set selected_release_id = $2, consecutive_failure_searches = 4
+		where library_item_id = $1`, libID, srID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	targets, err := db.ListPendingLibrarySearchTargets(ctx, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tg := range targets {
+		if tg.LibraryItemID == libID {
+			if tg.ConsecutiveFailureSearches != 4 {
+				t.Fatalf("expected ConsecutiveFailureSearches=4, got %d", tg.ConsecutiveFailureSearches)
+			}
+			return
+		}
+	}
+	t.Fatal("expected the library item to appear in pending search targets (resume branch)")
+}
+
 // TestListPendingLibrarySearchTargetsAppliesReleaseGraceHours guards the
 // 2026-07-26 feature: search eligibility isn't just "release date has
 // passed" (a bare calendar-date comparison), it's "release date + a

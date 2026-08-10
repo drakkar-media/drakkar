@@ -582,6 +582,12 @@ type PendingLibrarySearchTarget struct {
 	ExternalURL       string     `json:"externalUrl,omitempty"`
 	State             QueueState `json:"state"`
 	UpdatedAt         time.Time  `json:"updatedAt"`
+	// ConsecutiveFailureSearches backs the passive-resume dispatch sweep's
+	// per-item backoff (see shouldDispatchSelectedTarget) -- the same
+	// counter ListPendingLibrarySearchTargets's own search cooldown escalates
+	// on, reused here since it already increments on every candidate failure
+	// and resets to 0 on a successful selection.
+	ConsecutiveFailureSearches int `json:"consecutiveFailureSearches"`
 }
 
 // FailedQueueRetryTarget is a queue item in the failed state considered for

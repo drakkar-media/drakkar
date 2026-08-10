@@ -1452,7 +1452,37 @@ func (s *Service) shouldDispatchSelectedTarget(target database.PendingLibrarySea
 	// roughly every 60 seconds until the fallback chain exhausted. The
 	// cooldown is keyed purely on target.ExternalURL, which is meaningful
 	// regardless of state, so it must apply uniformly.
-	return !s.peekRecentlyDispatchedURL(target.ExternalURL, now)
+	if s.peekRecentlyDispatchedURL(target.ExternalURL, now) {
+		return false
+	}
+	// Per-item backoff, separate from the per-URL cooldown above: that
+	// cooldown only blocks re-fetching the SAME url, but promoteNextAfterFailure
+	// gives a failing item a brand new selected_release_id (and therefore a
+	// brand new, never-seen url) on every failure. For an item backed by a
+	// large or continually-replenished (via the 15-minute backlog_search
+	// pass) candidate pool, that let this 30-second sweep re-dispatch a real
+	// NZB download for a *different* release every single tick, indefinitely
+	// -- confirmed live 2026-08-10: "monitoring: pending dispatch complete"
+	// logged dispatched=~222 pending=~238 on every 30s tick without the
+	// pending count actually shrinking, visible as a sustained flood in
+	// NZBHydra's own download history, and very likely also the cause of a
+	// concurrent real-playback stall (NNTP connection/provider contention
+	// from hundreds of simultaneous background fetch attempts). Escalates
+	// with the same consecutive_failure_searches counter the search cooldown
+	// in ListPendingLibrarySearchTargets already escalates on (reset to 0 on
+	// any successful selection), keyed off target.UpdatedAt (bumped on every
+	// promotion) rather than last_searched_at, since a dispatch attempt is
+	// not a search.
+	switch {
+	case target.ConsecutiveFailureSearches >= 6:
+		return now.Sub(target.UpdatedAt) >= time.Hour
+	case target.ConsecutiveFailureSearches >= 3:
+		return now.Sub(target.UpdatedAt) >= 15*time.Minute
+	case target.ConsecutiveFailureSearches >= 1:
+		return now.Sub(target.UpdatedAt) >= 2*time.Minute
+	default:
+		return true
+	}
 }
 
 // peekRecentlyDispatchedURL reports whether rawURL has an in-memory dispatch
