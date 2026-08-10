@@ -121,6 +121,7 @@ export type Integrations = {
 
 export type Status = {
   service: string;
+  version: string;
   healthy: boolean;
   startedAt: string;
   settings: Record<string, unknown>;

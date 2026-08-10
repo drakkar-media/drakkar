@@ -28,6 +28,7 @@
   let searchToken = 0;
   let debounceTimer: number | undefined;
   let currentUser: User | null = null;
+  let appVersion = '';
 
   function isActive(href: string) {
     if (href === '/dashboard' && page.url.pathname === '/') return true;
@@ -97,6 +98,7 @@
 
   onMount(() => {
     void loadMe();
+    void api.status().then((s) => (appVersion = s.version)).catch(() => {});
   });
   onDestroy(() => window.clearTimeout(debounceTimer));
 </script>
@@ -116,6 +118,9 @@
     </nav>
     <div class="sidebar-tail">
       <a href="/settings?tab=logs" title="Logs" aria-label="Logs"><Bell size={18} /></a>
+      {#if appVersion}
+        <span class="app-version" title="Drakkar version">v{appVersion}</span>
+      {/if}
     </div>
   </aside>
 
@@ -245,7 +250,11 @@
   }
 
   .side-nav { display: flex; flex-direction: column; gap: 2px; flex: 1; padding-top: 4px; }
-  .sidebar-tail { display: flex; flex-direction: column; gap: 6px; }
+  .sidebar-tail { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .app-version {
+    font-size: 10px; color: hsl(var(--muted-foreground) / 0.7);
+    font-family: 'JetBrains Mono', monospace;
+  }
 
   .side-nav a, .sidebar-tail a {
     display: grid; place-items: center; width: 40px; height: 40px;
