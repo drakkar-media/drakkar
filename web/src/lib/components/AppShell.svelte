@@ -10,6 +10,7 @@
   import { page } from '$app/state';
   import Bell from '@lucide/svelte/icons/bell';
   import BookOpen from '@lucide/svelte/icons/book-open';
+  import FileText from '@lucide/svelte/icons/file-text';
   import LogOut from '@lucide/svelte/icons/log-out';
   import Menu from '@lucide/svelte/icons/menu';
   import Search from '@lucide/svelte/icons/search';
@@ -18,6 +19,7 @@
   import { detailsHref } from '$lib/detailsHref';
   import { navItems, mobilePrimaryItems } from '$lib/nav';
   import DrakkarLogo from '$lib/components/DrakkarLogo.svelte';
+  import { clearToastHistory, toastHistory } from '$lib/toast';
   import type { DiscoverMediaItem, DiscoverSearchResult, User } from '$lib/types';
 
   let mobileOpen = false;
@@ -29,6 +31,19 @@
   let debounceTimer: number | undefined;
   let currentUser: User | null = null;
   let appVersion = '';
+  let notifOpen = false;
+
+  /** Formats a toast's timestamp as a short relative time (e.g. "3m ago"). */
+  function relativeTime(at: number): string {
+    const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
+    if (seconds < 5) return 'just now';
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.round(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.round(hours / 24)}d ago`;
+  }
 
   function isActive(href: string) {
     if (href === '/dashboard' && page.url.pathname === '/') return true;
@@ -117,7 +132,40 @@
       {/each}
     </nav>
     <div class="sidebar-tail">
-      <a href="/settings?tab=logs" title="Logs" aria-label="Logs"><Bell size={18} /></a>
+      <a href="/docs" target="_blank" rel="noreferrer" title="API docs" aria-label="API docs"><FileText size={18} /></a>
+      <div class="notif-wrap">
+        <button
+          class="notif-btn"
+          class:active={notifOpen}
+          type="button"
+          title="Notifications"
+          aria-label="Notifications"
+          on:click={() => (notifOpen = !notifOpen)}
+        ><Bell size={18} /></button>
+        {#if notifOpen}
+          <button class="notif-backdrop" type="button" aria-label="Close notifications" on:click={() => (notifOpen = false)}></button>
+          <div class="notif-popover" role="dialog" aria-label="Notifications">
+            <div class="notif-head">
+              <span>Notifications</span>
+              {#if $toastHistory.length}
+                <button class="notif-clear" type="button" on:click={clearToastHistory}>Clear</button>
+              {/if}
+            </div>
+            <div class="notif-list">
+              {#if $toastHistory.length === 0}
+                <div class="notif-empty">No notifications yet.</div>
+              {:else}
+                {#each $toastHistory as item (item.id)}
+                  <div class={`notif-item ${item.tone}`}>
+                    <div class="notif-message">{item.message}</div>
+                    <div class="notif-time">{relativeTime(item.at)}</div>
+                  </div>
+                {/each}
+              {/if}
+            </div>
+          </div>
+        {/if}
+      </div>
       {#if appVersion}
         <span class="app-version" title="Drakkar version">v{appVersion}</span>
       {/if}
@@ -255,6 +303,49 @@
     font-size: 10px; color: hsl(var(--muted-foreground) / 0.7);
     font-family: 'JetBrains Mono', monospace;
   }
+
+  .notif-wrap { position: relative; }
+  .notif-btn {
+    display: grid; place-items: center; width: 40px; height: 40px;
+    border-radius: 14px; border: 1px solid transparent; cursor: pointer;
+    color: hsl(var(--muted-foreground)); background: transparent;
+  }
+  .notif-btn:hover, .notif-btn.active {
+    color: hsl(var(--foreground)); background: hsl(0 0% 100% / 0.08);
+  }
+  .notif-backdrop {
+    position: fixed; inset: 0; z-index: 89; border: 0; background: transparent; cursor: default;
+  }
+  .notif-popover {
+    position: absolute; left: calc(100% + 10px); bottom: 0; z-index: 90;
+    width: 320px; max-height: 420px; display: flex; flex-direction: column;
+    border-radius: 16px; border: 1px solid hsl(0 0% 100% / 0.08);
+    background: hsl(212 27% 10% / 0.98); box-shadow: 0 18px 40px hsl(0 0% 0% / 0.35);
+    overflow: hidden;
+  }
+  .notif-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 14px; border-bottom: 1px solid hsl(0 0% 100% / 0.06);
+    font-size: 13px; font-weight: 600; color: hsl(var(--foreground));
+  }
+  .notif-clear {
+    border: 0; background: transparent; color: hsl(var(--muted-foreground));
+    font-size: 12px; cursor: pointer;
+  }
+  .notif-clear:hover { color: hsl(var(--foreground)); }
+  .notif-list { overflow-y: auto; }
+  .notif-empty {
+    padding: 24px 14px; text-align: center; color: hsl(var(--muted-foreground)); font-size: 13px;
+  }
+  .notif-item {
+    padding: 10px 14px; border-bottom: 1px solid hsl(0 0% 100% / 0.05);
+    border-left: 3px solid transparent;
+  }
+  .notif-item.success { border-left-color: hsl(140 65% 45% / 0.6); }
+  .notif-item.error { border-left-color: hsl(0 72% 51% / 0.6); }
+  .notif-item.info { border-left-color: hsl(171 82% 55% / 0.6); }
+  .notif-message { font-size: 13px; color: hsl(var(--foreground)); line-height: 1.4; }
+  .notif-time { margin-top: 2px; font-size: 11px; color: hsl(var(--muted-foreground)); }
 
   .side-nav a, .sidebar-tail a {
     display: grid; place-items: center; width: 40px; height: 40px;

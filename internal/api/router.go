@@ -2131,7 +2131,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		levelFilter := strings.ToLower(r.URL.Query().Get("level"))
 		logFile := config.DefaultLogsPath + "/drakkar.log"
-		data, err := os.ReadFile(logFile)
+		data, err := readRecentLogTail(logFile, logTailScanBytes)
 		if err != nil {
 			respondJSON(w, http.StatusOK, map[string]any{"lines": []any{}, "page": page, "pageSize": pageSize, "total": 0})
 			return
@@ -2732,6 +2732,50 @@ func libStatusPriority(item catalog.MediaCard) int {
 		return 1
 	}
 	return 3
+}
+
+// logTailScanBytes bounds how much of the log file /api/logs ever reads.
+// The log file has no rotation and grows unbounded (confirmed live
+// 2026-08-10 at 978MB after ~2 months) -- reading and splitting the whole
+// thing into lines on every single request, regardless of the page
+// requested, made the Settings > Logs tab take many seconds to load. 32MB
+// covers a very large number of recent lines for any reasonable paging
+// depth; older history is still available via the full-log download link.
+const logTailScanBytes = 32 * 1024 * 1024
+
+// readRecentLogTail reads at most maxBytes from the end of path, dropping
+// any partial first line left over from seeking into the middle of a line.
+func readRecentLogTail(path string, maxBytes int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	size := info.Size()
+	start := int64(0)
+	if size > maxBytes {
+		start = size - maxBytes
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	if start > 0 {
+		// Drop the partial line left over from seeking mid-line.
+		if idx := bytes.IndexByte(data, '\n'); idx >= 0 {
+			data = data[idx+1:]
+		}
+	}
+	return data, nil
 }
 
 // respondJSON writes payload as a JSON response body with the given status

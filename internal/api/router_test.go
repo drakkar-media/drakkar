@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -1246,5 +1247,60 @@ func TestPrivacyStatusAndTestEndpoints(t *testing.T) {
 	}
 	if ok, _ := result["ok"].(bool); ok {
 		t.Fatal("expected ok=false for an unreachable proxy")
+	}
+}
+
+// TestReadRecentLogTailBoundsReadAndDropsPartialLine guards the fix for the
+// Settings > Logs tab taking many seconds to load: /api/logs used to
+// os.ReadFile the entire (unrotated, unbounded) log file on every request.
+// readRecentLogTail must only ever read the last maxBytes of the file, and
+// must drop whatever partial line is left over from seeking into the middle
+// of a line rather than returning a truncated/corrupt first line.
+func TestReadRecentLogTailBoundsReadAndDropsPartialLine(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/drakkar.log"
+	lines := []string{
+		`{"level":"info","msg":"line1"}`,
+		`{"level":"info","msg":"line2"}`,
+		`{"level":"info","msg":"line3"}`,
+		`{"level":"info","msg":"line4"}`,
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// maxBytes lands partway into line3 (byte 75 of 124: line3 spans
+	// 62-92), so line1/line2 and the partial prefix of line3 must all be
+	// dropped -- only the complete trailing line4 should survive.
+	maxBytes := int64(len(content)) - 75
+	data, err := readRecentLogTail(path, maxBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.TrimSpace(string(data))
+	if strings.Contains(got, "line1") || strings.Contains(got, "line2") || strings.Contains(got, "line3") {
+		t.Fatalf("expected old/partial lines beyond the tail window to be excluded, got: %q", got)
+	}
+	if got != lines[3] {
+		t.Fatalf("expected only the last complete line to survive, got: %q", got)
+	}
+	for _, l := range strings.Split(got, "\n") {
+		if l == "" {
+			continue
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(l), &parsed); err != nil {
+			t.Fatalf("expected every surviving line to be valid, complete JSON, got invalid line %q: %v", l, err)
+		}
+	}
+
+	// maxBytes >= file size must return the whole file unchanged.
+	full, err := readRecentLogTail(path, int64(len(content))+100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(full) != content {
+		t.Fatalf("expected the full file when maxBytes exceeds its size, got: %q", string(full))
 	}
 }

@@ -6,9 +6,14 @@ export type ToastItem = {
   id: number;
   message: string;
   tone: ToastTone;
+  at: number;
 };
 
 const items = writable<ToastItem[]>([]);
+
+/** Most recent toasts, newest first, kept even after they auto-dismiss from the viewport -- backs the notification bell popup. */
+const historyItems = writable<ToastItem[]>([]);
+const HISTORY_LIMIT = 50;
 
 let nextID = 1;
 
@@ -23,7 +28,9 @@ let nextID = 1;
  */
 function push(message: string, tone: ToastTone = 'info', ttlMs = 4000) {
   const id = nextID++;
-  items.update((current) => [...current, { id, message, tone }]);
+  const item: ToastItem = { id, message, tone, at: Date.now() };
+  items.update((current) => [...current, item]);
+  historyItems.update((current) => [item, ...current].slice(0, HISTORY_LIMIT));
   const timer = window.setTimeout(() => dismiss(id), ttlMs);
   return () => {
     window.clearTimeout(timer);
@@ -60,3 +67,16 @@ export function toastError(message: string) {
 export const toasts = {
   subscribe: items.subscribe
 };
+
+/**
+ * Recent toast history (newest first), independent of the auto-dismiss
+ * timer on the visible toast viewport -- backs the notification bell popup.
+ */
+export const toastHistory = {
+  subscribe: historyItems.subscribe
+};
+
+/** Clears the notification bell's toast history (does not affect currently visible toasts). */
+export function clearToastHistory() {
+  historyItems.set([]);
+}
