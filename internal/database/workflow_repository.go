@@ -878,16 +878,19 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceH
 			where li.media_type in ('movie', 'episode', 'tv')
 			  and not q.on_hold
 			  and (
-			    -- Normal pending items: no release selected yet. Gated on
-			    -- li.available = false here (not globally) -- the resume and
-			    -- stranded-selected branches below cover a *new* selection
-			    -- being dispatched on an item that may already be available
-			    -- from a prior release (e.g. an upgrade re-check); requiring
-			    -- available = false for those too would permanently exclude
-			    -- them from ever being picked up once dispatched, since a
-			    -- re-selection on an already-available item doesn't flip
-			    -- available back to false. Confirmed live 2026-08-10: ~340
-			    -- queue_items stuck in requested/selected forever this way.
+			    -- Normal pending items: no release selected yet. Scoped by
+			    -- selected_release_id is null, not li.available -- a healthy
+			    -- available item always has a selected_release_id (set by
+			    -- MarkReleaseAvailable / FulfillEpisodeLibraryItem / season-pack
+			    -- fulfillment), so available=true with no selected_release_id
+			    -- is itself always an anomaly (e.g. a queue item bounced back
+			    -- to requested by ClearQueueSelectedRelease after the item was
+			    -- already marked available some other way) that a fresh search
+			    -- can only fix, never break. Requiring available=false here
+			    -- used to permanently exclude these ~37 orphaned rows from ever
+			    -- being searched again, on top of the ~340 resume/stranded rows
+			    -- fixed by scoping available=false out of the other two
+			    -- branches below. Confirmed live 2026-08-10.
 			    -- last_searched_at cooldown (1 h) mirrors Sonarr/Radarr LastSearchTime:
 			    -- once searched, skip until the cooldown expires to avoid hammering Hydra2.
 			    -- The cooldown escalates with consecutive_failure_searches (reset to 0 on
@@ -904,8 +907,7 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceH
 			    -- escalation entirely and hammering Hydra hourly forever for items that had
 			    -- already failed dozens of times (confirmed live 2026-08-07: PAW Patrol, The
 			    -- Odyssey, Minions & Monsters, a full NCIS: LA back-catalog, Silo, The Ark).
-			    (li.available = false
-			     and q.selected_release_id is null and q.state in ($1, $2)
+			    (q.selected_release_id is null and q.state in ($1, $2)
 			     and (q.state != $2 or q.updated_at < now() - interval '2 hours')
 			     and (
 			         q.last_searched_at is null

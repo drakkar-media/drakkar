@@ -400,21 +400,23 @@
                   {item.nzbFileName ? `${item.nzbFileName} · ` : ''}{item.nzbSegmentCount} segments
                 </div>
               </div>
-              {#if item.onHold}
-                <Button kind="secondary" on:click={() => resumeItem(item.queueItemId)} disabled={isBusy(`pause-${item.queueItemId}`)}>
-                  <Play size={14} />
-                  Resume
+              <div class="row-actions">
+                {#if item.onHold}
+                  <Button kind="secondary" on:click={() => resumeItem(item.queueItemId)} disabled={isBusy(`pause-${item.queueItemId}`)}>
+                    <Play size={14} />
+                    Resume
+                  </Button>
+                {:else}
+                  <Button kind="secondary" on:click={() => pauseItem(item.queueItemId)} disabled={isBusy(`pause-${item.queueItemId}`)}>
+                    <Pause size={14} />
+                    Pause
+                  </Button>
+                {/if}
+                <Button kind="secondary" on:click={() => retryItem(item.queueItemId)} disabled={isBusy(`retry-${item.queueItemId}`)}>
+                  <RotateCcw size={14} />
+                  Retry
                 </Button>
-              {:else}
-                <Button kind="secondary" on:click={() => pauseItem(item.queueItemId)} disabled={isBusy(`pause-${item.queueItemId}`)}>
-                  <Pause size={14} />
-                  Pause
-                </Button>
-              {/if}
-              <Button kind="secondary" on:click={() => retryItem(item.queueItemId)} disabled={isBusy(`retry-${item.queueItemId}`)}>
-                <RotateCcw size={14} />
-                Retry
-              </Button>
+              </div>
             </div>
             <div class="progress-track"><div class="progress-fill" style={`width:${item.onHold ? 0 : pct}%`}></div></div>
             <div class="row-foot">
@@ -649,8 +651,15 @@
   }
 
   .row-head > :global(.button),
+  .row-actions,
   .history-actions {
     flex-shrink: 0;
+  }
+
+  .row-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
 
   .history-main,

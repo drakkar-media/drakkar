@@ -139,6 +139,62 @@ func TestListFailedQueueRetryTargetsSkipsUnreleasedMovies(t *testing.T) {
 	}
 }
 
+// TestListPendingLibrarySearchTargetsIncludesAvailableOrphanWithNoSelection
+// guards the second half of the 2026-08-10 stuck-queue fix: a queue_items
+// row can end up in state='requested' with selected_release_id=null while
+// its library_item is still available=true (e.g. ClearQueueSelectedRelease
+// bouncing a no-selection item back to requested after the item was already
+// marked available some other way). The normal-pending branch used to
+// require li.available=false, permanently excluding these orphans from ever
+// being searched again -- confirmed live, ~37 stuck rows this way, on top of
+// the ~340 fixed by the resume/stranded branches' available=false removal.
+func TestListPendingLibrarySearchTargetsIncludesAvailableOrphanWithNoSelection(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	var movieID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into movies (title, release_date) values ('orphan-available-movie', current_date - interval '30 days')
+		returning id`).Scan(&movieID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from movies where id = $1`, movieID)
+
+	var libID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, movie_id, available)
+		values ('movie', 'orphan-available-movie', $1, true)
+		returning id`, movieID).Scan(&libID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into queue_items (library_item_id, state, selected_release_id, idempotency_key)
+		values ($1, 'requested', null, 'orphan-available-movie')`, libID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	targets, err := db.ListPendingLibrarySearchTargets(ctx, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tg := range targets {
+		if tg.LibraryItemID == libID {
+			return
+		}
+	}
+	t.Fatalf("expected available=true orphan (no selected_release_id) to be eligible for search, got targets: %+v", targets)
+}
+
 // TestListPendingLibrarySearchTargetsAppliesReleaseGraceHours guards the
 // 2026-07-26 feature: search eligibility isn't just "release date has
 // passed" (a bare calendar-date comparison), it's "release date + a
