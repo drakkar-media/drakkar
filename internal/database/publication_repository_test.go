@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"testing"
 
@@ -553,6 +554,91 @@ func TestListVirtualFilesForRelease(t *testing.T) {
 // mid-fetch was reset back to 'requested' with no selected_release_id by
 // this exact maintenance pass while ClaimURLForFetch's own claim for that
 // URL was still within its cooldown window.
+// TestListUnrecoverableLibraryItemsRequiresMatchingEpisodeNotJustSeason
+// guards the 2026-08-11 production fix: the season-pack "is this actually
+// recoverable" check only verified the SEASON number appeared somewhere in
+// the attached virtual files' names, never the specific EPISODE number.
+// Confirmed live: "The Boys" S01E07 (library item 53192) had a
+// selected_release whose real files were an entirely unrelated show, "A
+// Knight of the Seven Kingdoms" S01E01-06 -- season 1 matched by
+// coincidence, so this query wrongly classified the item as recoverable.
+// Since both Republish Pending and Reset Orphaned Available rely on this
+// same classification, neither button could ever resolve an item stuck this
+// way: Republish correctly found no real match and did nothing, and Reset
+// Orphaned Available never even considered the item broken enough to reset.
+func TestListUnrecoverableLibraryItemsRequiresMatchingEpisodeNotJustSeason(t *testing.T) {
+	db, sqlDB, ctx := openPublicationTestDB(t)
+
+	var tvShowID int64
+	if err := sqlDB.QueryRowContext(ctx, `insert into tv_shows (title) values ('wrong-episode-check-show') returning id`).Scan(&tvShowID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from tv_shows where id = $1`, tvShowID)
+
+	var episodeID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into episodes (tv_show_id, season_number, episode_number, title)
+		values ($1, 1, 7, 'wrong-episode-check-episode') returning id`, tvShowID).Scan(&episodeID); err != nil {
+		t.Fatal(err)
+	}
+
+	var libID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, episode_id, title, available)
+		values ('episode', $1, 'wrong-episode-check-item', true) returning id`, episodeID).Scan(&libID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into queue_items (library_item_id, state, idempotency_key)
+		values ($1, 'available', 'wrong-episode-check-item')`, libID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	// The attached release is genuinely for a different show's season 1,
+	// episodes 1-3 -- same season number as this item's own S01E07, but not
+	// a real match for episode 7 at all.
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, external_url, indexer_name)
+		values ($1, 'wrong-show-pack', 'http://example/wrong-show-pack', 'test-indexer')
+		returning id`, libID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+	var srID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2) returning id`, libID, rcID).Scan(&srID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `
+		update queue_items set selected_release_id = $2 where library_item_id = $1`, libID, srID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, ep := range []int{1, 2, 3} {
+		if _, err := sqlDB.ExecContext(ctx, `
+			insert into virtual_files (selected_release_id, path, file_name, reader_kind)
+			values ($1, $2, $3, 'archive')`, srID,
+			fmt.Sprintf("/wrong-show/S01E%02d.mkv", ep), fmt.Sprintf("A.Knight.of.the.Seven.Kingdoms.S01E%02d.mkv", ep),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ids, err := db.ListUnrecoverableLibraryItems(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if id == libID {
+			return
+		}
+	}
+	t.Fatalf("expected library item %d (season matches by coincidence, but no file for its actual episode 7) to be reported unrecoverable", libID)
+}
+
 func TestListUnrecoverableLibraryItemsSkipsItemsMidFetch(t *testing.T) {
 	db, sqlDB, ctx := openPublicationTestDB(t)
 

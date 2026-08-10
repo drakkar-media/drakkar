@@ -329,14 +329,28 @@ func (db *DB) ListUnrecoverableLibraryItems(ctx context.Context) ([]int64, error
 		      join virtual_files vf on vf.selected_release_id = sr.id
 		      where sr.library_item_id = li.id
 		      and (
-		          ep.season_number is null
+		          ep.season_number is null or ep.episode_number is null
 		          or (' ' || vf.file_name || ' ') ~* (
-		              '[^a-z]s' || lpad(ep.season_number::text, 2, '0') || 'e[0-9]{1,3}[^0-9]'
+		              '[^a-z]s' || lpad(ep.season_number::text, 2, '0')
+		              || '(e' || lpad(ep.episode_number::text, 2, '0') || '[^0-9]'
+		              || '|e[0-9]{1,3}e' || lpad(ep.episode_number::text, 2, '0') || '[^0-9])'
 		          )
 		      )
 		      and (' ' || vf.file_name || ' ') ~* '[^a-z]s[0-9]{1,2}e[0-9]{1,3}[^0-9]'
 		  )
-		  -- No parseable VF for the correct season via season-pack selected_release.
+		  -- No parseable VF for the correct season+episode via season-pack
+		  -- selected_release. Requires the SPECIFIC episode number, not just a
+		  -- matching season -- confirmed live 2026-08-11: a season-pack
+		  -- selected_release can be for a completely different show that
+		  -- happens to share a season number (e.g. "The Boys" S01E07 attached
+		  -- to a genuinely unrelated "A Knight of the Seven Kingdoms" S01
+		  -- pack), which the season-only check wrongly treated as
+		  -- "recoverable" -- neither Republish Pending nor Reset Orphaned
+		  -- Available could ever resolve those items as a result, since both
+		  -- rely on this same "is it actually recoverable" classification.
+		  -- The second alternative in the episode match handles a combined
+		  -- double-episode file (e.g. "S03E17E18") matching either episode it
+		  -- covers, mirroring EpisodeNumberMatchesFilename's Go-side logic.
 		  and not exists (
 		      select 1 from selected_releases ep_sr
 		      join selected_releases pack_sr
@@ -345,9 +359,11 @@ func (db *DB) ListUnrecoverableLibraryItems(ctx context.Context) ([]int64, error
 		      join virtual_files vf on vf.selected_release_id = pack_sr.id
 		      where ep_sr.library_item_id = li.id
 		      and (
-		          ep.season_number is null
+		          ep.season_number is null or ep.episode_number is null
 		          or (' ' || vf.file_name || ' ') ~* (
-		              '[^a-z]s' || lpad(ep.season_number::text, 2, '0') || 'e[0-9]{1,3}[^0-9]'
+		              '[^a-z]s' || lpad(ep.season_number::text, 2, '0')
+		              || '(e' || lpad(ep.episode_number::text, 2, '0') || '[^0-9]'
+		              || '|e[0-9]{1,3}e' || lpad(ep.episode_number::text, 2, '0') || '[^0-9])'
 		          )
 		      )
 		      and (' ' || vf.file_name || ' ') ~* '[^a-z]s[0-9]{1,2}e[0-9]{1,3}[^0-9]'

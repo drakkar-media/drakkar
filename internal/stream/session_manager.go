@@ -60,7 +60,17 @@ const (
 	// total). The spike this ramp exists to avoid only happens when a
 	// single window's fetch count jumps by a lot in one instant; a share
 	// that's already small has nothing meaningful to spike from.
-	readAheadRampFloor = 4
+	//
+	// Raised from 4 to 8 (2026-08-11): a floor of 4 was too conservative for
+	// higher-bitrate content -- confirmed live on "Landman" S01E01 (1080p
+	// WebRip), which stalled consistently ~15-16s into playback, right
+	// around when 4 windows at floor parallelism finish ramping to full
+	// share. 4 concurrent connections just isn't enough to keep the
+	// read-ahead buffer ahead of playback consumption for this bitrate
+	// during that window. 8 still ramps gradually (still avoids an instant
+	// full-speed burst, the original problem this const was added for) but
+	// starts high enough to actually keep up with more demanding content.
+	readAheadRampFloor = 8
 )
 
 // FetchPriority orders competing segment fetches so interactive playback

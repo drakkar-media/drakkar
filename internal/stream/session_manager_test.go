@@ -235,7 +235,7 @@ func TestReadAheadManagerRampsUpParallelismOverFirstWindows(t *testing.T) {
 		}
 	}
 
-	wantByWindow := []int{8, 12, 16, 20} // floor 4 + (20-4)*windowIndex/4, then full from window 4
+	wantByWindow := []int{11, 14, 17, 20} // floor 8 + (20-8)*windowIndex/4, then full from window 4
 	for i, want := range wantByWindow {
 		manager.NotifyRead("stream-ramp", 0)
 		if got := drainConcurrentCalls(); got != want {
@@ -292,11 +292,12 @@ func TestReadAheadManagerSeekResetsRamp(t *testing.T) {
 
 	// Now seek to a distant, never-fetched part of the file. Without the
 	// reset, this next window would burst straight to the full share (20)
-	// instead of restarting the ramp at the floor (8).
+	// instead of restarting the ramp near the floor (8 + (20-8)*1/4 = 11 for
+	// this window, the first of the restarted ramp).
 	manager.Seek("stream-seek-ramp", 0)
 	manager.NotifyRead("stream-seek-ramp", 0)
-	if got := drainConcurrentCalls(); got != 8 {
-		t.Fatalf("expected the window right after a seek to ramp back down to 8, got %d", got)
+	if got := drainConcurrentCalls(); got != 11 {
+		t.Fatalf("expected the window right after a seek to ramp back down to 11, got %d", got)
 	}
 }
 
