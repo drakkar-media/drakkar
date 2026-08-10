@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -24,6 +25,30 @@ type repoStub struct {
 	searchInput       database.SubtitleSearchInput
 	downloadCandidate database.SubtitleCandidateSummary
 	storedCandidates  []database.SubtitleCandidateRecord
+	appSettings       map[string]string
+}
+
+// GetAppSetting/PutAppSetting back the per-provider daily call budget with a
+// plain in-memory map, JSON-encoded to mirror the real Postgres-backed
+// implementation's marshal/unmarshal round trip.
+func (r *repoStub) GetAppSetting(ctx context.Context, key string, dst any) (bool, error) {
+	raw, ok := r.appSettings[key]
+	if !ok {
+		return false, nil
+	}
+	return true, json.Unmarshal([]byte(raw), dst)
+}
+
+func (r *repoStub) PutAppSetting(ctx context.Context, key string, value any) error {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	if r.appSettings == nil {
+		r.appSettings = make(map[string]string)
+	}
+	r.appSettings[key] = string(raw)
+	return nil
 }
 
 func (r *repoStub) ListSubtitleFiles(ctx context.Context, libraryItemID int64) ([]database.SubtitleFileSummary, error) {
@@ -34,7 +59,16 @@ func (r *repoStub) ListSubtitleCandidates(ctx context.Context, libraryItemID int
 	return r.candidates, nil
 }
 
+// GetSubtitleCandidate looks candidateID up in r.candidates when present, so
+// tests with more than one candidate (e.g. one per language) get the right
+// one back; r.downloadCandidate remains as a fallback for tests that only
+// care about a single fixed candidate and never populate r.candidates.
 func (r *repoStub) GetSubtitleCandidate(ctx context.Context, candidateID int64) (database.SubtitleCandidateSummary, error) {
+	for _, c := range r.candidates {
+		if c.ID == candidateID {
+			return c, nil
+		}
+	}
 	return r.downloadCandidate, nil
 }
 
@@ -81,6 +115,38 @@ func (p providerStub) Download(ctx context.Context, rawURL string) (string, []by
 		return "", nil, p.err
 	}
 	return p.fileName, p.body, nil
+}
+
+// searchCall records one Search invocation for assertions in tests that
+// care about which providers were actually called, and with which
+// languages -- the whole point of the per-language-skip and
+// provider-rotation behavior being tested.
+type searchCall struct {
+	provider  string
+	languages []string
+}
+
+// countingProviderStub returns candidates keyed by language and records
+// every Search call (provider name + requested languages) into *calls, so
+// tests can assert on-the-wire provider call behavior without needing a
+// real provider.
+type countingProviderStub struct {
+	name       string
+	candidates map[string][]ProviderCandidate
+	calls      *[]searchCall
+}
+
+func (p countingProviderStub) Name() string { return p.name }
+func (p countingProviderStub) Search(ctx context.Context, input database.SubtitleSearchInput, languages []string) ([]ProviderCandidate, error) {
+	*p.calls = append(*p.calls, searchCall{provider: p.name, languages: append([]string(nil), languages...)})
+	var out []ProviderCandidate
+	for _, lang := range languages {
+		out = append(out, p.candidates[lang]...)
+	}
+	return out, nil
+}
+func (p countingProviderStub) Download(ctx context.Context, rawURL string) (string, []byte, error) {
+	return "sub.srt", []byte("1\n00:00:01,000 --> 00:00:02,000\nHi\n"), nil
 }
 
 type providerStubNamed struct {
@@ -318,6 +384,201 @@ func TestSearchCandidatesPrefersProviderBiasWhenMatchesTie(t *testing.T) {
 	}
 }
 
+// TestSearchCandidatesSkipsLanguagesAlreadyDownloaded guards the core fix
+// requested for the subtitle system: a language that already has a
+// subtitle_files row must not be re-searched. Only "nl" (missing) should
+// ever reach the provider; "en" (already satisfied) must never appear in
+// any Search call's requested languages.
+func TestSearchCandidatesSkipsLanguagesAlreadyDownloaded(t *testing.T) {
+	var calls []searchCall
+	repo := &repoStub{
+		items: []database.SubtitleFileSummary{
+			{ID: 1, LibraryItemID: 42, Provider: "manual", Language: "en", Path: "/x/en.srt"},
+		},
+		searchInput: database.SubtitleSearchInput{LibraryItemID: 42, MediaType: "movie", Title: "Dune", MovieYear: 2021},
+	}
+	service := NewService(repo, nil, countingProviderStub{
+		name: "subdl",
+		candidates: map[string][]ProviderCandidate{
+			"en": {{Language: "en", Title: "en", ExternalID: "en-1", DownloadURL: "en-1"}},
+			"nl": {{Language: "nl", Title: "nl", ExternalID: "nl-1", DownloadURL: "nl-1"}},
+		},
+		calls: &calls,
+	})
+
+	result, err := service.SearchCandidates(context.Background(), 42, []string{"en", "nl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || len(calls[0].languages) != 1 || calls[0].languages[0] != "nl" {
+		t.Fatalf("expected exactly one call requesting only 'nl', got %+v", calls)
+	}
+	if result.CandidateCount != 1 {
+		t.Fatalf("expected only the nl candidate to be stored, got %+v", result)
+	}
+}
+
+// TestSearchCandidatesSkipsProviderEntirelyWhenFullySatisfied guards the
+// zero-call case: if every requested language already has a file, no
+// provider should be contacted at all.
+func TestSearchCandidatesSkipsProviderEntirelyWhenFullySatisfied(t *testing.T) {
+	var calls []searchCall
+	repo := &repoStub{
+		items: []database.SubtitleFileSummary{
+			{ID: 1, LibraryItemID: 42, Provider: "manual", Language: "en", Path: "/x/en.srt"},
+			{ID: 2, LibraryItemID: 42, Provider: "manual", Language: "nl", Path: "/x/nl.srt"},
+		},
+	}
+	service := NewService(repo, nil, countingProviderStub{name: "subdl", calls: &calls})
+
+	result, err := service.SearchCandidates(context.Background(), 42, []string{"en", "nl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("expected zero provider calls, got %+v", calls)
+	}
+	if result.CandidateCount != 0 {
+		t.Fatalf("expected no candidates, got %+v", result)
+	}
+}
+
+// TestSearchCandidatesFallsBackToSecondProviderForMissingLanguage guards
+// that provider distribution doesn't come at the cost of correctness: if
+// the first-tried provider can't find a still-missing language, the next
+// provider must still be tried for it, rather than giving up.
+func TestSearchCandidatesFallsBackToSecondProviderForMissingLanguage(t *testing.T) {
+	var calls []searchCall
+	repo := &repoStub{
+		searchInput: database.SubtitleSearchInput{LibraryItemID: 1, MediaType: "movie", Title: "Dune", MovieYear: 2021},
+	}
+	// libraryItemID 1 with 2 providers: assignedProviderOrder(["a","b"], 1)
+	// rotates to start at "b" (1 % 2 == 1) -- "b" only has "en", so "nl"
+	// must fall through to "a".
+	providerA := countingProviderStub{
+		name:       "a",
+		candidates: map[string][]ProviderCandidate{"nl": {{Language: "nl", Title: "nl", ExternalID: "a-nl", DownloadURL: "a-nl"}}},
+		calls:      &calls,
+	}
+	providerB := countingProviderStub{
+		name:       "b",
+		candidates: map[string][]ProviderCandidate{"en": {{Language: "en", Title: "en", ExternalID: "b-en", DownloadURL: "b-en"}}},
+		calls:      &calls,
+	}
+	service := NewService(repo, nil, providerA, providerB)
+
+	result, err := service.SearchCandidates(context.Background(), 1, []string{"en", "nl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("expected both providers to be tried, got %+v", calls)
+	}
+	if result.CandidateCount != 2 {
+		t.Fatalf("expected one candidate from each provider, got %+v", result)
+	}
+}
+
+// TestAllowProviderCallEnforcesDailyBudget guards the rate-limit half of the
+// fix: once a provider's configured daily budget is exhausted, it must not
+// be called again that day, even though the language it would have searched
+// is still missing.
+func TestAllowProviderCallEnforcesDailyBudget(t *testing.T) {
+	var calls []searchCall
+	repo := &repoStub{
+		searchInput: database.SubtitleSearchInput{LibraryItemID: 42, MediaType: "movie", Title: "Dune", MovieYear: 2021},
+	}
+	service := NewService(repo, nil, countingProviderStub{
+		name:       "subdl",
+		candidates: map[string][]ProviderCandidate{"en": {{Language: "en", Title: "en", ExternalID: "en-1", DownloadURL: "en-1"}}},
+		calls:      &calls,
+	})
+	service.SetProviderBudgets(map[string]int{"subdl": 1})
+
+	if _, err := service.SearchCandidates(context.Background(), 42, []string{"en"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 call after first search, got %+v", calls)
+	}
+
+	// "en" is still missing (SearchCandidates never creates files itself),
+	// so a second search would normally call the provider again -- but the
+	// budget of 1 is already spent.
+	if _, err := service.SearchCandidates(context.Background(), 42, []string{"en"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("expected the exhausted provider to be skipped, still got %+v", calls)
+	}
+}
+
+// TestAssignedProviderOrderSpreadsAcrossItems is a plain unit test of the
+// rotation helper: different library items should not all start at the same
+// provider, which is the mechanism that spreads real API calls across
+// providers instead of every item hitting every provider.
+func TestAssignedProviderOrderSpreadsAcrossItems(t *testing.T) {
+	names := []string{"opensubtitles", "subdl"}
+	firstOf := func(id int64) string { return assignedProviderOrder(names, id)[0] }
+	if firstOf(0) == firstOf(1) {
+		t.Fatalf("expected item 0 and item 1 to start with different providers, both got %q", firstOf(0))
+	}
+	// The rotation must still return every provider (as a fallback chain),
+	// just reordered.
+	order := assignedProviderOrder(names, 1)
+	if len(order) != 2 {
+		t.Fatalf("expected rotation to preserve all providers, got %+v", order)
+	}
+}
+
+// TestSearchAndDownloadBestDownloadsOnePerMissingLanguage guards the other
+// half of "one subtitle per language is enough": when multiple languages
+// are missing and candidates exist for each, every missing language should
+// get its own downloaded file in one call, not just a single overall best.
+func TestSearchAndDownloadBestDownloadsOnePerMissingLanguage(t *testing.T) {
+	root := t.TempDir()
+	publicationPath := filepath.Join(root, "movies", "Dune (2021).mkv")
+	if err := os.MkdirAll(filepath.Dir(publicationPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(publicationPath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repo := &repoStub{
+		publicationPaths: []string{publicationPath},
+		searchInput:      database.SubtitleSearchInput{LibraryItemID: 42, MediaType: "movie", Title: "Dune", MovieYear: 2021},
+		// Pre-populated directly (rather than produced by the provider stub's
+		// Search+ReplaceSubtitleCandidates, which repoStub deliberately keeps
+		// decoupled from ListSubtitleCandidates -- see GetSubtitleCandidate's
+		// comment) so this test only exercises the per-language download
+		// selection in SearchAndDownloadBest, matching how the other
+		// SearchAndDownloadBest tests in this file already set up fixtures.
+		candidates: []database.SubtitleCandidateSummary{
+			{ID: 1, LibraryItemID: 42, Provider: "subdl", Language: "en", Format: "srt", DownloadURL: "en-1"},
+			{ID: 2, LibraryItemID: 42, Provider: "subdl", Language: "nl", Format: "srt", DownloadURL: "nl-1"},
+		},
+	}
+	service := NewService(repo, nil, providerStub{
+		fileName: "sub.srt",
+		body:     []byte("1\n00:00:01,000 --> 00:00:02,000\nHi\n"),
+	})
+
+	results, err := service.SearchAndDownloadBest(context.Background(), 42, []string{"en", "nl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected one download per language, got %+v", results)
+	}
+	gotLangs := map[string]bool{}
+	for _, r := range results {
+		gotLangs[r.Language] = true
+	}
+	if !gotLangs["en"] || !gotLangs["nl"] {
+		t.Fatalf("expected both en and nl downloaded, got %+v", results)
+	}
+}
+
 func TestTriggerAutomaticSearch(t *testing.T) {
 	root := t.TempDir()
 	publicationPath := filepath.Join(root, "movies", "Dune (2021).mkv")
@@ -420,7 +681,7 @@ func TestSearchAndDownloadBestSkipsExistingSubtitles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.CreatedPaths) != 0 {
+	if len(result) != 0 {
 		t.Fatalf("expected no auto download, got %+v", result)
 	}
 	if _, err := os.Stat(filepath.Join(root, "movies", "Dune (2021).en.srt")); !errors.Is(err, os.ErrNotExist) {
@@ -465,7 +726,7 @@ func TestSearchAndDownloadBestFallsThroughFailedCandidates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.CreatedPaths) != 1 {
+	if len(result) != 1 || len(result[0].CreatedPaths) != 1 {
 		t.Fatalf("unexpected result %+v", result)
 	}
 	body, err := os.ReadFile(filepath.Join(root, "movies", "Dune (2021).en.srt"))

@@ -23,19 +23,18 @@
   import Button from '$lib/components/Button.svelte';
   import PosterCard from '$lib/components/PosterCard.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
+  import SubtitlePanel from '$lib/components/SubtitlePanel.svelte';
   import { api, subscribeEvents } from '$lib/api';
   import { idFromSlug } from '$lib/detailsHref';
   import { toastError, toastSuccess } from '$lib/toast';
   import { bytes as fmtBytes } from '$lib/format';
   import { runAction, confirmed } from '$lib/actions';
   import { onMount } from 'svelte';
-  import type { DiscoverDetails, GrabHistoryEntry, LibraryDetail, LibraryItem, ManualSearchItem, QualityProfile, ReleaseItem, SubtitleCandidate, SubtitleFile } from '$lib/types';
+  import type { DiscoverDetails, GrabHistoryEntry, LibraryDetail, LibraryItem, ManualSearchItem, QualityProfile, ReleaseItem } from '$lib/types';
 
   let detail: DiscoverDetails | null = null;
   let libraryMatch: LibraryItem | null = null;
   let localDetail: LibraryDetail | null = null;
-  let subtitles: SubtitleFile[] = [];
-  let subtitleCandidates: SubtitleCandidate[] = [];
   let grabHistory: GrabHistoryEntry[] = [];
   let releaseCandidates: ReleaseItem[] = [];
   let profiles: QualityProfile[] = [];
@@ -102,13 +101,7 @@
   }
   let activeKey = '';
 
-  type EpisodeSubtitleState = {
-    loading: boolean;
-    files: SubtitleFile[];
-    candidates: SubtitleCandidate[];
-  };
   let expandedEpisodeId: number | null = null;
-  let episodeSubtitles: Record<number, EpisodeSubtitleState> = {};
   // Guards against a slower earlier navigation's response landing after a
   // faster later one's and overwriting the newer page's data (e.g. quickly
   // clicking through several poster cards in a row).
@@ -191,25 +184,19 @@
       detail = discover;
       libraryMatch = library.items.find((item) => sameIdentity(item, mediaType, discover.title, discover.year, discover.tmdbId, discover.imdbId)) ?? null;
       if (libraryMatch) {
-        const [detailResult, subtitleResult, candidateResult, historyResult, profilesResult, activeProfileResult] = await Promise.all([
+        const [detailResult, historyResult, profilesResult, activeProfileResult] = await Promise.all([
           api.libraryDetail(libraryMatch.id),
-          api.subtitles(libraryMatch.id),
-          api.subtitleCandidates(libraryMatch.id),
           api.grabHistory(libraryMatch.id).catch(() => ({ items: [] })),
           api.listProfiles().catch(() => ({ profiles: [] })),
           api.getLibraryProfile(libraryMatch.id).catch(() => ({ profile: null }))
         ]);
         if (token !== loadToken) return;
         localDetail = detailResult;
-        subtitles = subtitleResult.items ?? [];
-        subtitleCandidates = candidateResult.items ?? [];
         grabHistory = historyResult.items ?? [];
         profiles = profilesResult.profiles ?? [];
         activeProfileId = activeProfileResult.profile?.id ?? null;
       } else {
         localDetail = null;
-        subtitles = [];
-        subtitleCandidates = [];
         grabHistory = [];
         profiles = [];
         activeProfileId = null;
@@ -220,8 +207,6 @@
       detail = null;
       libraryMatch = null;
       localDetail = null;
-      subtitles = [];
-      subtitleCandidates = [];
       profiles = [];
       activeProfileId = null;
     } finally {
@@ -259,17 +244,8 @@
           });
         }).catch(() => finishPickerSearch(() => { pickerSearching = false; }));
       }
-      if (event.kind === 'subtitle.search' && event.libraryItemId === libraryMatch?.id) {
-        void loadDetail();
-      }
-      // Per-episode subtitle searches publish with the episode's own
-      // libraryItemId (never libraryMatch.id, which is the show/movie-level
-      // item), and loadDetail() only refreshes the show-level subtitle
-      // state, not the episodeSubtitles map -- without this branch, a
-      // completed per-episode search never reached the UI at all.
-      if (event.kind === 'subtitle.search' && typeof event.libraryItemId === 'number' && event.libraryItemId in episodeSubtitles) {
-        void loadEpisodeSubtitles(event.libraryItemId);
-      }
+      // Subtitle refresh (both show-level and per-episode) is handled by
+      // each SubtitlePanel instance's own SSE subscription now.
       if (event.kind === 'tv.prioritize_missing' && event.tvShowId === localDetail?.tvShowId) {
         toastSuccess(`Prioritized show — queued ${event.queued ?? 0}, created ${event.itemsCreated ?? 0}`);
         void loadDetail();
@@ -466,11 +442,11 @@
     });
   }
 
-  async function runSubtitleSearch(forLibraryItemId?: number) {
-    const itemId = forLibraryItemId ?? libraryMatch?.id;
-    if (!itemId) return;
-    await runAction(() => api.searchSubtitles(itemId, ['nl', 'en']), {
-      setWorking: (v) => setBusy(`subtitle-search-${itemId}`, v),
+  /** Quick shortcut in the header action row -- equivalent to clicking "Search Subtitles" inside the Subtitles panel below. */
+  async function runSubtitleSearch() {
+    if (!libraryMatch) return;
+    await runAction(() => api.searchSubtitles(libraryMatch!.id, []), {
+      setWorking: (v) => setBusy(`subtitle-search-${libraryMatch!.id}`, v),
       successMessage: () => 'Searching subtitles in background...'
     });
   }
@@ -494,67 +470,9 @@
     });
   }
 
-  async function downloadSubtitle(candidateID: number) {
-    if (!libraryMatch) return;
-    await runAction(() => api.downloadSubtitleCandidate(candidateID), {
-      setWorking: (v) => setBusy(`subtitle-download-${candidateID}`, v),
-      successMessage: () => 'subtitle downloaded',
-      afterSuccess: loadDetail
-    });
-  }
-
-  async function deleteSubtitleFile(subtitleID: number) {
-    if (!confirmed('Delete this subtitle file?')) return;
-    await runAction(() => api.deleteSubtitle(subtitleID), {
-      setWorking: (v) => setBusy(`subtitle-delete-${subtitleID}`, v),
-      successMessage: () => 'subtitle deleted',
-      afterSuccess: loadDetail
-    });
-  }
-
-  /** Fetches subtitle files/candidates for one episode into the `episodeSubtitles` map, keyed by that episode's library item id. */
-  async function loadEpisodeSubtitles(epLibraryItemId: number) {
-    episodeSubtitles = { ...episodeSubtitles, [epLibraryItemId]: { loading: true, files: [], candidates: [] } };
-    try {
-      const [filesResult, candidatesResult] = await Promise.all([
-        api.subtitles(epLibraryItemId),
-        api.subtitleCandidates(epLibraryItemId)
-      ]);
-      episodeSubtitles = {
-        ...episodeSubtitles,
-        [epLibraryItemId]: { loading: false, files: filesResult.items ?? [], candidates: candidatesResult.items ?? [] }
-      };
-    } catch (error) {
-      toastError(error instanceof Error ? error.message : String(error));
-      episodeSubtitles = { ...episodeSubtitles, [epLibraryItemId]: { loading: false, files: [], candidates: [] } };
-    }
-  }
-
-  /** Expands/collapses an episode's subtitle panel, lazy-loading its data only the first time it's expanded. */
+  /** Expands/collapses an episode's subtitle panel; SubtitlePanel loads its own data on mount. */
   function toggleEpisodeSubtitles(epLibraryItemId: number) {
-    if (expandedEpisodeId === epLibraryItemId) {
-      expandedEpisodeId = null;
-      return;
-    }
-    expandedEpisodeId = epLibraryItemId;
-    if (!episodeSubtitles[epLibraryItemId]) void loadEpisodeSubtitles(epLibraryItemId);
-  }
-
-  async function downloadEpisodeSubtitle(epLibraryItemId: number, candidateID: number) {
-    await runAction(() => api.downloadSubtitleCandidate(candidateID), {
-      setWorking: (v) => setBusy(`ep-subtitle-download-${epLibraryItemId}-${candidateID}`, v),
-      successMessage: () => 'subtitle downloaded',
-      afterSuccess: () => loadEpisodeSubtitles(epLibraryItemId)
-    });
-  }
-
-  async function deleteEpisodeSubtitle(epLibraryItemId: number, subtitleID: number) {
-    if (!confirmed('Delete this subtitle file?')) return;
-    await runAction(() => api.deleteSubtitle(subtitleID), {
-      setWorking: (v) => setBusy(`ep-subtitle-delete-${epLibraryItemId}-${subtitleID}`, v),
-      successMessage: () => 'subtitle deleted',
-      afterSuccess: () => loadEpisodeSubtitles(epLibraryItemId)
-    });
+    expandedEpisodeId = expandedEpisodeId === epLibraryItemId ? null : epLibraryItemId;
   }
 
   /** Applies a quality-profile override optimistically; on failure, reloads from the server to discard the change and restore the true state. */
@@ -621,7 +539,7 @@
                   Prioritize Missing
                 </Button>
               {/if}
-              <Button kind="secondary" on:click={() => runSubtitleSearch()} disabled={isBusy(`subtitle-search-${libraryMatch.id}`)}>
+              <Button kind="secondary" on:click={runSubtitleSearch} disabled={isBusy(`subtitle-search-${libraryMatch.id}`)}>
                 <Languages size={15} />
                 Subs
               </Button>
@@ -705,6 +623,11 @@
                         </div>
                         <div class="ep-right">
                           <StatusPill tone={episode.status === 'available' ? 'ok' : 'neutral'}>{episode.status}</StatusPill>
+                          {#if episode.status === 'available'}
+                            <span class="ep-subs" class:missing={!episode.subtitleLanguages?.length} title="Subtitle languages available for this episode">
+                              {episode.subtitleLanguages?.length ? episode.subtitleLanguages.map((l) => l.toUpperCase()).join(', ') : 'No subs'}
+                            </span>
+                          {/if}
                           {#if episode.libraryItemId}
                             {@const epId = episode.libraryItemId}
                             <button
@@ -729,50 +652,8 @@
                         </div>
                       </div>
                       {#if episode.libraryItemId && expandedEpisodeId === episode.libraryItemId}
-                        {@const epId = episode.libraryItemId}
-                        {@const state = episodeSubtitles[epId]}
                         <div class="episode-subs">
-                          {#if !state || state.loading}
-                            <div class="empty-side">Loading subtitles…</div>
-                          {:else}
-                            {#if state.files.length > 0}
-                              <div class="stack-list">
-                                {#each state.files as file}
-                                  <div class="stack-item">
-                                    <div>
-                                      <strong>{file.language.toUpperCase()}</strong>
-                                      <span>{file.provider}</span>
-                                    </div>
-                                    <Button kind="ghost" on:click={() => deleteEpisodeSubtitle(epId, file.id)} disabled={isBusy(`ep-subtitle-delete-${epId}-${file.id}`)}>
-                                      <Trash2 size={13} />
-                                    </Button>
-                                  </div>
-                                {/each}
-                              </div>
-                            {:else}
-                              <div class="empty-side">No published subtitles for this episode.</div>
-                            {/if}
-                            {#if state.candidates.length > 0}
-                              <div class="stack-list">
-                                {#each state.candidates.slice(0, 5) as candidate}
-                                  <div class="stack-item candidate">
-                                    <div>
-                                      <strong>{candidate.language.toUpperCase()} · {candidate.provider}</strong>
-                                      <span>{candidate.releaseName || candidate.title}</span>
-                                    </div>
-                                    <Button kind="secondary" on:click={() => downloadEpisodeSubtitle(epId, candidate.id)} disabled={isBusy(`ep-subtitle-download-${epId}-${candidate.id}`)}>
-                                      <Languages size={13} />
-                                      Get
-                                    </Button>
-                                  </div>
-                                {/each}
-                              </div>
-                            {/if}
-                            <Button kind="secondary" on:click={() => runSubtitleSearch(epId)} disabled={isBusy(`subtitle-search-${epId}`)}>
-                              <Search size={13} />
-                              Search Subtitles
-                            </Button>
-                          {/if}
+                          <SubtitlePanel libraryItemId={episode.libraryItemId} compact />
                         </div>
                       {/if}
                     {/each}
@@ -897,41 +778,8 @@
           <section class="panel">
             <div class="panel-head">
               <h2>Subtitles</h2>
-              <a class="link-btn ghost" href="/subtitles">Manager</a>
             </div>
-            {#if subtitles.length > 0}
-              <div class="stack-list">
-                {#each subtitles as subtitle}
-                  <div class="stack-item">
-                    <div>
-                      <strong>{subtitle.language.toUpperCase()}</strong>
-                      <span>{subtitle.provider}</span>
-                    </div>
-                    <Button kind="ghost" on:click={() => deleteSubtitleFile(subtitle.id)} disabled={isBusy(`subtitle-delete-${subtitle.id}`)}>
-                      <Trash2 size={14} />
-                    </Button>
-                  </div>
-                {/each}
-              </div>
-            {:else}
-              <div class="empty-side">No published subtitles yet.</div>
-            {/if}
-            {#if subtitleCandidates.length > 0}
-              <div class="stack-list">
-                {#each subtitleCandidates.slice(0, 8) as candidate}
-                  <div class="stack-item candidate">
-                    <div>
-                      <strong>{candidate.language.toUpperCase()} · {candidate.provider}</strong>
-                      <span>{candidate.releaseName || candidate.title}</span>
-                    </div>
-                    <Button kind="secondary" on:click={() => downloadSubtitle(candidate.id)} disabled={isBusy(`subtitle-download-${candidate.id}`)}>
-                      <Languages size={14} />
-                      Get
-                    </Button>
-                  </div>
-                {/each}
-              </div>
-            {/if}
+            <SubtitlePanel libraryItemId={libraryMatch.id} showManagerLink />
           </section>
 
           {#if grabHistory.length > 0}
@@ -1215,18 +1063,6 @@
   .stack-item span {
     margin-top: 4px; color: hsl(var(--muted-foreground)); font-size: 12px;
   }
-  /* Release-name/candidate text (e.g. "Show.Name.S01E04.1080p.WEB-DL-GROUP")
-     is one long unbroken token with no spaces, so as a flex child its default
-     min-content width is the full string width — with no min-width: 0 here,
-     the row (and its Button, pushed by justify-content: space-between) was
-     rendered past the panel's edge instead of truncating. */
-  .stack-item.candidate > div { min-width: 0; overflow: hidden; }
-  .stack-item.candidate strong,
-  .stack-item.candidate span {
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .stack-item.candidate > :global(.button) { flex-shrink: 0; }
-  .candidate { align-items: flex-start; }
   .stat-grid span, .kv span, .summary-meta, .person-card span { color: hsl(var(--muted-foreground)); font-size: 12px; }
   .season-stack, .episode-list { display: grid; gap: 12px; }
   .season-panel { border-radius: 18px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.02); overflow: hidden; }
@@ -1245,6 +1081,15 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .ep-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .ep-subs {
+    padding: 3px 9px; border-radius: 8px; font-size: 11px; font-weight: 600;
+    border: 1px solid hsl(142 60% 45% / 0.25); color: hsl(142 60% 55%);
+    background: hsl(142 60% 45% / 0.1); white-space: nowrap;
+  }
+  .ep-subs.missing {
+    border-color: hsl(0 0% 100% / 0.08); color: hsl(var(--muted-foreground));
+    background: hsl(0 0% 100% / 0.04);
+  }
   .ep-sub-btn {
     display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px;
     border-radius: 8px; border: 1px solid hsl(0 0% 100% / 0.08);

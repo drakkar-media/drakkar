@@ -176,19 +176,21 @@ type SeasonDetail struct {
 // EpisodeDetail describes a single episode's availability status within a
 // SeasonDetail.
 type EpisodeDetail struct {
-	SeasonNumber  int    `json:"seasonNumber"`
-	EpisodeNumber int    `json:"episodeNumber"`
-	Title         string `json:"title"`
-	Status        string `json:"status"`
-	LibraryItemID *int64 `json:"libraryItemId,omitempty"`
+	SeasonNumber      int      `json:"seasonNumber"`
+	EpisodeNumber     int      `json:"episodeNumber"`
+	Title             string   `json:"title"`
+	Status            string   `json:"status"`
+	LibraryItemID     *int64   `json:"libraryItemId,omitempty"`
+	SubtitleLanguages []string `json:"subtitleLanguages,omitempty"`
 }
 
 type showEpisodeRow struct {
-	SeasonNumber  int
-	EpisodeNumber int
-	Title         string
-	Available     bool
-	LibraryItemID int64
+	SeasonNumber      int
+	EpisodeNumber     int
+	Title             string
+	Available         bool
+	LibraryItemID     int64
+	SubtitleLanguages []string
 }
 
 // ListLibraryCards returns every movie and TV show in the local library as
@@ -1103,6 +1105,7 @@ func (s *Service) buildTVSeasons(ctx context.Context, detail LibraryDetail) ([]S
 			status := "missing"
 			title := episode.Name
 			var libID *int64
+			var subtitleLanguages []string
 			if row, ok := available[episodeKey(seasonNumber, episode.EpisodeNumber)]; ok {
 				if row.Available {
 					status = "available"
@@ -1117,15 +1120,17 @@ func (s *Service) buildTVSeasons(ctx context.Context, detail LibraryDetail) ([]S
 					id := row.LibraryItemID
 					libID = &id
 				}
+				subtitleLanguages = row.SubtitleLanguages
 			} else {
 				item.MissingCount++
 			}
 			item.Episodes = append(item.Episodes, EpisodeDetail{
-				SeasonNumber:  seasonNumber,
-				EpisodeNumber: episode.EpisodeNumber,
-				Title:         title,
-				Status:        status,
-				LibraryItemID: libID,
+				SeasonNumber:      seasonNumber,
+				EpisodeNumber:     episode.EpisodeNumber,
+				Title:             title,
+				Status:            status,
+				LibraryItemID:     libID,
+				SubtitleLanguages: subtitleLanguages,
 			})
 		}
 		item.EpisodeCount = len(item.Episodes)
@@ -1219,14 +1224,30 @@ func (s *Service) showEpisodes(ctx context.Context, tvShowID int64) ([]showEpiso
 	defer rows.Close()
 
 	var out []showEpisodeRow
+	var libraryItemIDs []int64
 	for rows.Next() {
 		var item showEpisodeRow
 		if err := rows.Scan(&item.SeasonNumber, &item.EpisodeNumber, &item.Title, &item.Available, &item.LibraryItemID); err != nil {
 			return nil, err
 		}
 		out = append(out, item)
+		libraryItemIDs = append(libraryItemIDs, item.LibraryItemID)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// One batched lookup for the whole show's episodes rather than one query
+	// per episode -- backs the "which languages does this episode already
+	// have" column shown without expanding each episode's subtitle panel.
+	languagesByItem, err := s.db.ListSubtitleLanguagesByLibraryItemIDs(ctx, libraryItemIDs)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].SubtitleLanguages = languagesByItem[out[i].LibraryItemID]
+	}
+	return out, nil
 }
 
 // fallbackTVSeasonsFromRows builds a season/episode breakdown directly from
@@ -1266,11 +1287,12 @@ func fallbackTVSeasonsFromRows(rows []showEpisodeRow) []SeasonDetail {
 			libID = &id
 		}
 		season.Episodes = append(season.Episodes, EpisodeDetail{
-			SeasonNumber:  row.SeasonNumber,
-			EpisodeNumber: row.EpisodeNumber,
-			Title:         title,
-			Status:        status,
-			LibraryItemID: libID,
+			SeasonNumber:      row.SeasonNumber,
+			EpisodeNumber:     row.EpisodeNumber,
+			Title:             title,
+			Status:            status,
+			LibraryItemID:     libID,
+			SubtitleLanguages: row.SubtitleLanguages,
 		})
 		season.EpisodeCount++
 	}

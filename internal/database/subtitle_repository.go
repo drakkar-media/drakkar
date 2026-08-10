@@ -7,6 +7,40 @@ import (
 	"strings"
 )
 
+// ListSubtitleLanguagesByLibraryItemIDs returns each library item's distinct,
+// sorted set of languages with at least one subtitle_files row, using one
+// query instead of one per item -- for callers that need an at-a-glance
+// "which languages does this episode already have" view (e.g. the show
+// episode list) without paying for the full file/candidate detail every
+// SubtitlePanel already fetches on demand. Items with no subtitle files are
+// simply absent from the result map.
+func (db *DB) ListSubtitleLanguagesByLibraryItemIDs(ctx context.Context, libraryItemIDs []int64) (map[int64][]string, error) {
+	if len(libraryItemIDs) == 0 {
+		return nil, nil
+	}
+	ph, args := buildIntInClause(libraryItemIDs)
+	rows, err := db.SQL.QueryContext(ctx, fmt.Sprintf(`
+		select library_item_id, array_agg(distinct language order by language)
+		from subtitle_files
+		where library_item_id in (%s)
+		group by library_item_id`, ph), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[int64][]string)
+	for rows.Next() {
+		var id int64
+		var languages []string
+		if err := rows.Scan(&id, pgTextArrayScan(&languages)); err != nil {
+			return nil, err
+		}
+		out[id] = languages
+	}
+	return out, rows.Err()
+}
+
 // ListSubtitleFiles returns all subtitle_files rows for a library item,
 // ordered by language, provider, and path.
 func (db *DB) ListSubtitleFiles(ctx context.Context, libraryItemID int64) ([]SubtitleFileSummary, error) {

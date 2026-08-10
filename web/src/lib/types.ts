@@ -369,6 +369,8 @@ export type EpisodeDetail = {
   title: string;
   status: string;
   libraryItemId?: number;
+  /** Languages this episode already has a downloaded subtitle for, at a glance without expanding its subtitle panel. */
+  subtitleLanguages?: string[];
 };
 
 export type ReleaseItem = {

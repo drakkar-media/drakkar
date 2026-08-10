@@ -17,6 +17,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/drakkar-media/drakkar/internal/database"
 	"github.com/drakkar-media/drakkar/internal/metrics"
@@ -51,6 +53,12 @@ type Repository interface {
 	ReplaceSubtitleCandidates(ctx context.Context, libraryItemID int64, provider string, candidates []database.SubtitleCandidateRecord) error
 	DeleteSubtitleFile(ctx context.Context, subtitleID int64) (database.SubtitleDeleteGroup, error)
 	ListSubtitleLibrary(ctx context.Context, filter database.SubtitleLibraryFilter) (database.SubtitleLibraryPage, error)
+	// GetAppSetting/PutAppSetting back the per-provider daily call budget
+	// (see providerUsage) -- reusing the existing generic settings store
+	// rather than adding a dedicated table for what's just a small persisted
+	// counter.
+	GetAppSetting(ctx context.Context, key string, dst any) (bool, error)
+	PutAppSetting(ctx context.Context, key string, value any) error
 }
 
 // Provider defines the operations a subtitle source (e.g. subdl,
@@ -98,17 +106,39 @@ type SearchResult struct {
 	CandidateCount int   `json:"candidateCount"`
 }
 
+// defaultProviderDailyBudget bounds how many search calls a single provider
+// may serve per day when no explicit budget is configured for it, chosen to
+// sit comfortably under the ~1000/24h ceiling most free subtitle-provider
+// API keys carry.
+const defaultProviderDailyBudget = 900
+
+// providerUsageSettingKey is the app_settings row backing per-provider daily
+// call counts (see providerUsage).
+const providerUsageSettingKey = "subtitle_provider_usage"
+
+// providerDayUsage is one provider's persisted call count for a given day.
+type providerDayUsage struct {
+	Day   string `json:"day"`
+	Count int    `json:"count"`
+}
+
 // Service orchestrates subtitle search, scoring, download, and publication
 // across all registered providers.
 //
 // Service is safe for concurrent use: providers is built once at
-// construction and never mutated, and runAsync is only reassigned during
-// setup (see SetAsyncRunner).
+// construction and never mutated, and runAsync/providerBudgets are only
+// reassigned during setup (see SetAsyncRunner/SetProviderBudgets). usageMu
+// guards the read-check-increment sequence against the daily call budget,
+// since two searches can race in practice (a manual search landing while a
+// TriggerAutomaticSearch goroutine is still running).
 type Service struct {
 	repo             Repository
 	providers        map[string]Provider
 	defaultLanguages []string
 	runAsync         func(func())
+
+	usageMu         sync.Mutex
+	providerBudgets map[string]int
 }
 
 // NewService creates a Service backed by repo, using defaultLanguages when a
@@ -132,6 +162,20 @@ func NewService(repo Repository, defaultLanguages []string, providers ...Provide
 	}
 }
 
+// SetProviderBudgets overrides the daily call budget for one or more
+// providers (keyed by the same lowercased name as Provider.Name()); any
+// provider not present in budgets keeps defaultProviderDailyBudget. A
+// budget <= 0 disables that provider's daily limit entirely (unbounded).
+func (s *Service) SetProviderBudgets(budgets map[string]int) {
+	normalized := make(map[string]int, len(budgets))
+	for name, limit := range budgets {
+		normalized[strings.ToLower(strings.TrimSpace(name))] = limit
+	}
+	s.usageMu.Lock()
+	s.providerBudgets = normalized
+	s.usageMu.Unlock()
+}
+
 // SetAsyncRunner overrides how TriggerAutomaticSearch schedules its
 // background work (default: a bare `go fn()`). A nil fn is ignored. Intended
 // for tests that need deterministic execution instead of a real goroutine.
@@ -153,15 +197,30 @@ func (s *Service) ListCandidates(ctx context.Context, libraryItemID int64) ([]da
 	return s.repo.ListSubtitleCandidates(ctx, libraryItemID)
 }
 
-// SearchCandidates queries every registered provider for libraryItemID and
-// replaces that provider's stored candidates with the results, scored and
-// sorted best-first.
+// SearchCandidates searches only for languages libraryItemID doesn't already
+// have a downloaded subtitle_files row for, querying providers one at a
+// time -- starting from a per-item deterministic rotation, not every
+// registered provider -- until every still-missing language has at least
+// one candidate or providers run out. Each provider actually called has its
+// stored candidates replaced with fresh results, scored and sorted
+// best-first; providers never called for this item keep whatever candidates
+// they last found (they may still be useful for a manual override in the
+// UI, and there's no reason to discard them just because a different
+// provider was picked this time).
 //
 // languages, if empty, falls back to the service's configured default
-// languages. Providers are queried in a fixed (name-sorted) order for
-// deterministic output; a failure from any provider aborts the whole call
-// without touching candidates from providers already processed in this
-// invocation, since their ReplaceSubtitleCandidates call already committed.
+// languages. Confirmed live: querying every provider for every item, every
+// time, burns through a free-tier provider's daily call budget fast when
+// the library is large -- rotation plus the per-language skip below (and
+// the per-provider daily budget enforced in allowProviderCall) are all
+// aimed at the same problem from different angles.
+//
+// A no-op, zero-candidate return (nil error) when every requested language
+// is already satisfied -- no provider is called at all in that case. A
+// single provider's search error is logged into the result count as zero
+// for that provider and does not abort the rest of the loop, so one
+// down/rate-limited provider can't block a different provider from still
+// finding the remaining languages.
 //
 // Errors:
 //   - ErrNoSubtitleProviders: no providers are registered.
@@ -169,18 +228,33 @@ func (s *Service) SearchCandidates(ctx context.Context, libraryItemID int64, lan
 	if len(s.providers) == 0 {
 		return SearchResult{}, ErrNoSubtitleProviders
 	}
+	existing, err := s.repo.ListSubtitleFiles(ctx, libraryItemID)
+	if err != nil {
+		return SearchResult{}, err
+	}
+	missing := subtractLanguages(s.requestedLanguages(languages), languagesWithFiles(existing))
+	if len(missing) == 0 {
+		return SearchResult{LibraryItemID: libraryItemID}, nil
+	}
 	input, err := s.repo.GetSubtitleSearchInput(ctx, libraryItemID)
 	if err != nil {
 		return SearchResult{}, err
 	}
-	languages = s.requestedLanguages(languages)
 
 	total := 0
-	for _, name := range sortedProviderNames(s.providers) {
+	remaining := missing
+	for _, name := range assignedProviderOrder(sortedProviderNames(s.providers), libraryItemID) {
+		if len(remaining) == 0 {
+			break
+		}
+		if !s.allowProviderCall(ctx, name) {
+			continue
+		}
 		provider := s.providers[name]
-		raw, err := provider.Search(ctx, input, languages)
+		raw, err := provider.Search(ctx, input, remaining)
+		s.recordProviderCall(ctx, name)
 		if err != nil {
-			return SearchResult{}, err
+			continue
 		}
 		candidates := make([]database.SubtitleCandidateRecord, 0, len(raw))
 		for _, item := range raw {
@@ -191,7 +265,7 @@ func (s *Service) SearchCandidates(ctx context.Context, libraryItemID int64, lan
 				ReleaseName:     strings.TrimSpace(item.ReleaseName),
 				Format:          strings.ToLower(strings.TrimSpace(item.Format)),
 				HearingImpaired: item.HearingImpaired,
-				Score:           scoreCandidate(provider.Name(), input, languages, item),
+				Score:           scoreCandidate(provider.Name(), input, remaining, item),
 				ExternalID:      strings.TrimSpace(item.ExternalID),
 				DownloadURL:     strings.TrimSpace(item.DownloadURL),
 			})
@@ -203,6 +277,7 @@ func (s *Service) SearchCandidates(ctx context.Context, libraryItemID int64, lan
 			return SearchResult{}, err
 		}
 		total += len(candidates)
+		remaining = subtractLanguages(remaining, candidateLanguages(candidates))
 	}
 	return SearchResult{LibraryItemID: libraryItemID, CandidateCount: total}, nil
 }
@@ -221,43 +296,119 @@ func (s *Service) TriggerAutomaticSearch(libraryItemID int64) {
 	})
 }
 
-// SearchAndDownloadBest searches all providers for libraryItemID and, if no
-// subtitle file already exists, downloads the highest-scored candidate.
+// SearchAndDownloadBest searches for libraryItemID's still-missing languages
+// and downloads the best candidate for each one -- one subtitle file per
+// language is enough, so a language that already has a file is left alone
+// entirely (not re-searched, not re-downloaded), and a language with
+// multiple candidates only ever gets its single best one.
 //
-// It is a no-op (returning a zero UploadResult, nil error) when subtitles
-// already exist or no candidates are found. When the best candidate's
-// download fails, it falls through to the next-best candidate in score
-// order; only if every candidate fails is the last error returned.
-func (s *Service) SearchAndDownloadBest(ctx context.Context, libraryItemID int64, languages []string) (UploadResult, error) {
+// Returns one UploadResult per language successfully downloaded (possibly
+// empty, with a nil error, when every requested language was already
+// satisfied or no candidates were found for what remained missing). When a
+// language's best candidate fails to download, it falls through to that
+// language's next-best candidate in score order; a language where every
+// candidate fails is simply skipped rather than aborting the other
+// languages, and the last such error is only returned if nothing at all was
+// downloaded.
+func (s *Service) SearchAndDownloadBest(ctx context.Context, libraryItemID int64, languages []string) ([]UploadResult, error) {
 	if _, err := s.SearchCandidates(ctx, libraryItemID, languages); err != nil {
-		return UploadResult{}, err
+		return nil, err
 	}
 	existing, err := s.repo.ListSubtitleFiles(ctx, libraryItemID)
 	if err != nil {
-		return UploadResult{}, err
+		return nil, err
 	}
-	if len(existing) > 0 {
-		return UploadResult{}, nil
+	missing := subtractLanguages(s.requestedLanguages(languages), languagesWithFiles(existing))
+	if len(missing) == 0 {
+		return nil, nil
 	}
 	candidates, err := s.repo.ListSubtitleCandidates(ctx, libraryItemID)
 	if err != nil {
-		return UploadResult{}, err
+		return nil, err
 	}
 	if len(candidates) == 0 {
-		return UploadResult{}, nil
+		return nil, nil
 	}
+
+	var results []UploadResult
 	var lastErr error
-	for _, candidate := range candidates {
-		result, err := s.DownloadCandidate(ctx, candidate.ID)
-		if err == nil {
-			return result, nil
+	for _, lang := range missing {
+		for _, candidate := range candidates {
+			if candidate.Language != lang {
+				continue
+			}
+			result, err := s.DownloadCandidate(ctx, candidate.ID)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			results = append(results, result)
+			break
 		}
-		lastErr = err
 	}
-	if lastErr != nil {
-		return UploadResult{}, lastErr
+	if len(results) == 0 && lastErr != nil {
+		return nil, lastErr
 	}
-	return UploadResult{}, nil
+	return results, nil
+}
+
+// allowProviderCall reports whether provider (already lowercased/trimmed,
+// matching the key providers is stored under) has remaining daily call
+// budget, incrementing nothing itself -- callers must pair a true result
+// with a later recordProviderCall once the call actually happens, since a
+// budget check that always increments would count a call that's later
+// skipped for some other reason (e.g. no providers left to try).
+func (s *Service) allowProviderCall(ctx context.Context, provider string) bool {
+	limit := s.providerBudget(provider)
+	if limit <= 0 {
+		return true
+	}
+	usage := s.loadProviderUsage(ctx)
+	today := currentUTCDay()
+	day := usage[provider]
+	if day.Day != today {
+		return true
+	}
+	return day.Count < limit
+}
+
+// recordProviderCall increments provider's persisted call count for today,
+// resetting it first if the stored count is from a previous day.
+func (s *Service) recordProviderCall(ctx context.Context, provider string) {
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	usage := s.loadProviderUsageLocked(ctx)
+	today := currentUTCDay()
+	day := usage[provider]
+	if day.Day != today {
+		day = providerDayUsage{Day: today, Count: 0}
+	}
+	day.Count++
+	usage[provider] = day
+	_ = s.repo.PutAppSetting(ctx, providerUsageSettingKey, usage)
+}
+
+func (s *Service) providerBudget(provider string) int {
+	s.usageMu.Lock()
+	limit, ok := s.providerBudgets[provider]
+	s.usageMu.Unlock()
+	if ok {
+		return limit
+	}
+	return defaultProviderDailyBudget
+}
+
+func (s *Service) loadProviderUsage(ctx context.Context) map[string]providerDayUsage {
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	return s.loadProviderUsageLocked(ctx)
+}
+
+// loadProviderUsageLocked must be called with usageMu held.
+func (s *Service) loadProviderUsageLocked(ctx context.Context) map[string]providerDayUsage {
+	usage := make(map[string]providerDayUsage)
+	_, _ = s.repo.GetAppSetting(ctx, providerUsageSettingKey, &usage)
+	return usage
 }
 
 // DownloadCandidate downloads a previously-searched candidate by ID,
@@ -545,6 +696,82 @@ func sortedProviderNames(providers map[string]Provider) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// assignedProviderOrder rotates names to a deterministic starting point
+// derived from libraryItemID, so different items spread their searches
+// across different providers first instead of every item hitting every
+// provider in the same fixed order. The full list is still returned (just
+// reordered), so a caller that needs to fall through to a second provider
+// for a language the first one couldn't find still can -- this only changes
+// which provider gets tried FIRST for a given item, not how many are
+// available as fallback.
+func assignedProviderOrder(names []string, libraryItemID int64) []string {
+	if len(names) < 2 {
+		return names
+	}
+	n := int64(len(names))
+	start := int(((libraryItemID % n) + n) % n)
+	out := make([]string, len(names))
+	for i := range names {
+		out[i] = names[(start+i)%len(names)]
+	}
+	return out
+}
+
+// languagesWithFiles returns the distinct, normalized set of languages that
+// already have at least one subtitle_files row.
+func languagesWithFiles(files []database.SubtitleFileSummary) []string {
+	seen := make(map[string]struct{}, len(files))
+	for _, f := range files {
+		seen[normalizeLanguage(f.Language)] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for lang := range seen {
+		out = append(out, lang)
+	}
+	return out
+}
+
+// candidateLanguages returns the distinct set of languages present in
+// candidates, in the same shape languagesWithFiles/subtractLanguages expect.
+func candidateLanguages(candidates []database.SubtitleCandidateRecord) []string {
+	seen := make(map[string]struct{}, len(candidates))
+	for _, c := range candidates {
+		seen[c.Language] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for lang := range seen {
+		out = append(out, lang)
+	}
+	return out
+}
+
+// subtractLanguages returns the values in from that are not present in
+// remove, preserving from's original order.
+func subtractLanguages(from, remove []string) []string {
+	if len(remove) == 0 {
+		return from
+	}
+	skip := make(map[string]struct{}, len(remove))
+	for _, lang := range remove {
+		skip[lang] = struct{}{}
+	}
+	out := make([]string, 0, len(from))
+	for _, lang := range from {
+		if _, ok := skip[lang]; ok {
+			continue
+		}
+		out = append(out, lang)
+	}
+	return out
+}
+
+// currentUTCDay returns today's date as a stable string key for the
+// per-provider daily call budget, so day rollover doesn't depend on the
+// server's local timezone.
+func currentUTCDay() string {
+	return time.Now().UTC().Format("2006-01-02")
 }
 
 // requestedLanguages normalizes values and falls back to the service's

@@ -996,6 +996,16 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		} else if deleted > 0 {
 			logger.Info().Int64("deletedRows", deleted).Msg("monitoring: pruned recent URL fetch records")
 		}
+		// Expired login sessions and API tokens previously had no prune path
+		// at all -- PruneExpiredSessions existed but was never wired into any
+		// scheduled task, and api_tokens had no prune query at all. Found
+		// while auditing the schema for duplicate-purpose tables (both are
+		// now rows in auth_tokens); fixed here rather than left as-is.
+		if deleted, err := db.PruneExpiredAuthTokens(ctx); err != nil {
+			logger.Error().Err(err).Msg("monitoring: expired auth token prune error")
+		} else if deleted > 0 {
+			logger.Info().Int64("deletedRows", deleted).Msg("monitoring: pruned expired auth tokens")
+		}
 		if skip, reason := shouldSkipNonCriticalMaintenance(); skip {
 			logger.Info().Str("task", taskStorageMaintenance).Str("reason", reason).Msg("scheduler: skipping non-critical (filesystem-heavy) storage maintenance")
 			return

@@ -86,12 +86,17 @@ func (db *DB) DeleteUser(ctx context.Context, id int64) error {
 	return err
 }
 
+// Sessions (browser logins) and API tokens (programmatic/webhook access)
+// are both rows in auth_tokens, distinguished by kind -- they're the same
+// shape (a hashed bearer token tied to a user, with an optional expiry) and
+// used to be two separate tables with nearly-duplicated query code.
+
 // CreateSession persists a login session identified by a pre-hashed session
 // token. Only the hash is stored; the raw token is never written to the
 // database.
 func (db *DB) CreateSession(ctx context.Context, userID int64, tokenHash string, expiresAt time.Time) error {
 	_, err := db.SQL.ExecContext(ctx,
-		`INSERT INTO sessions (user_id, token_hash, expires_at) VALUES ($1, $2, $3)`,
+		`INSERT INTO auth_tokens (user_id, kind, token_hash, expires_at) VALUES ($1, 'session', $2, $3)`,
 		userID, tokenHash, expiresAt)
 	return err
 }
@@ -103,16 +108,16 @@ func (db *DB) CreateSession(ctx context.Context, userID int64, tokenHash string,
 func (db *DB) GetSessionByTokenHash(ctx context.Context, tokenHash string) (userID int64, username, role string, expiresAt time.Time, err error) {
 	err = db.SQL.QueryRowContext(ctx, `
 		SELECT s.user_id, u.username, u.role, s.expires_at
-		FROM sessions s
+		FROM auth_tokens s
 		JOIN users u ON u.id = s.user_id
-		WHERE s.token_hash = $1`, tokenHash,
+		WHERE s.token_hash = $1 AND s.kind = 'session'`, tokenHash,
 	).Scan(&userID, &username, &role, &expiresAt)
 	return
 }
 
 // DeleteSession removes a single session by token hash (used on logout).
 func (db *DB) DeleteSession(ctx context.Context, tokenHash string) error {
-	_, err := db.SQL.ExecContext(ctx, `DELETE FROM sessions WHERE token_hash = $1`, tokenHash)
+	_, err := db.SQL.ExecContext(ctx, `DELETE FROM auth_tokens WHERE token_hash = $1 AND kind = 'session'`, tokenHash)
 	return err
 }
 
@@ -121,8 +126,8 @@ func (db *DB) DeleteSession(ctx context.Context, tokenHash string) error {
 func (db *DB) ListAPITokens(ctx context.Context, userID int64) ([]APIToken, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT id, user_id, name, created_at, last_used_at, expires_at
-		FROM api_tokens
-		WHERE user_id = $1
+		FROM auth_tokens
+		WHERE user_id = $1 AND kind = 'api'
 		ORDER BY created_at DESC, id DESC`, userID)
 	if err != nil {
 		return nil, err
@@ -144,8 +149,8 @@ func (db *DB) ListAPITokens(ctx context.Context, userID int64) ([]APIToken, erro
 func (db *DB) CreateAPIToken(ctx context.Context, userID int64, name, tokenHash string, expiresAt *time.Time) (APIToken, error) {
 	var tok APIToken
 	err := db.SQL.QueryRowContext(ctx, `
-		INSERT INTO api_tokens (user_id, name, token_hash, expires_at)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO auth_tokens (user_id, kind, name, token_hash, expires_at)
+		VALUES ($1, 'api', $2, $3, $4)
 		RETURNING id, user_id, name, created_at, last_used_at, expires_at`,
 		userID, name, tokenHash, expiresAt,
 	).Scan(&tok.ID, &tok.UserID, &tok.Name, &tok.CreatedAt, &tok.LastUsedAt, &tok.ExpiresAt)
@@ -158,9 +163,9 @@ func (db *DB) CreateAPIToken(ctx context.Context, userID int64, name, tokenHash 
 func (db *DB) GetAPITokenByHash(ctx context.Context, tokenHash string) (userID int64, username, role string, expiresAt *time.Time, err error) {
 	err = db.SQL.QueryRowContext(ctx, `
 		SELECT t.user_id, u.username, u.role, t.expires_at
-		FROM api_tokens t
+		FROM auth_tokens t
 		JOIN users u ON u.id = t.user_id
-		WHERE t.token_hash = $1`, tokenHash,
+		WHERE t.token_hash = $1 AND t.kind = 'api'`, tokenHash,
 	).Scan(&userID, &username, &role, &expiresAt)
 	return
 }
@@ -168,19 +173,24 @@ func (db *DB) GetAPITokenByHash(ctx context.Context, tokenHash string) (userID i
 // TouchAPITokenUsed updates last_used_at for an API token to the current
 // time, typically called on each authenticated request for auditing.
 func (db *DB) TouchAPITokenUsed(ctx context.Context, tokenHash string) error {
-	_, err := db.SQL.ExecContext(ctx, `UPDATE api_tokens SET last_used_at = now() WHERE token_hash = $1`, tokenHash)
+	_, err := db.SQL.ExecContext(ctx, `UPDATE auth_tokens SET last_used_at = now() WHERE token_hash = $1 AND kind = 'api'`, tokenHash)
 	return err
 }
 
 // DeleteAPIToken removes an API token, scoped to userID so a user cannot
 // delete another user's token by guessing its ID.
 func (db *DB) DeleteAPIToken(ctx context.Context, userID, tokenID int64) error {
-	_, err := db.SQL.ExecContext(ctx, `DELETE FROM api_tokens WHERE id = $1 AND user_id = $2`, tokenID, userID)
+	_, err := db.SQL.ExecContext(ctx, `DELETE FROM auth_tokens WHERE id = $1 AND user_id = $2 AND kind = 'api'`, tokenID, userID)
 	return err
 }
 
-// PruneExpiredSessions removes sessions that have passed their expiry time.
-func (db *DB) PruneExpiredSessions(ctx context.Context) error {
-	_, err := db.SQL.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at < now()`)
-	return err
+// PruneExpiredAuthTokens removes both sessions and API tokens that have
+// passed their expiry time, in one query -- expires_at is nullable (a
+// non-expiring API token), so those are simply never matched here.
+func (db *DB) PruneExpiredAuthTokens(ctx context.Context) (int64, error) {
+	result, err := db.SQL.ExecContext(ctx, `DELETE FROM auth_tokens WHERE expires_at IS NOT NULL AND expires_at < now()`)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
