@@ -38,6 +38,7 @@ type DeepHealthCandidate struct {
 	Title             string
 	HasPAR2           bool
 	SelectedReleaseID int64
+	VirtualFileID     int64
 }
 
 // HealthSummary aggregates counts describing the overall health of published
@@ -298,7 +299,8 @@ func (db *DB) ListDeepHealthCandidates(ctx context.Context, limit int) ([]DeepHe
 		        WHERE nf.nzb_document_id = nd.id
 		          AND lower(nf.subject) LIKE '%.par2%'
 		    ) AS has_par2,
-		    vf.selected_release_id AS selected_release_id
+		    vf.selected_release_id AS selected_release_id,
+		    sp.virtual_file_id
 		FROM symlink_publications sp
 		JOIN virtual_files vf ON vf.id = sp.virtual_file_id
 		JOIN library_items li ON li.id = sp.library_item_id
@@ -358,6 +360,7 @@ func scanDeepHealthCandidates(rows deepHealthScanner) ([]DeepHealthCandidate, er
 			&item.Title,
 			&item.HasPAR2,
 			&item.SelectedReleaseID,
+			&item.VirtualFileID,
 		); err != nil {
 			return nil, err
 		}

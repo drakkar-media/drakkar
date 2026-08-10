@@ -3799,8 +3799,32 @@ func (db *DB) ResetLibraryItemState(ctx context.Context, libraryItemID int64) er
 		LIMIT 1`, libraryItemID,
 	).Scan(&queueItemID, &selectedReleaseID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
+			// No queue_items row at all -- a season-pack-fulfilled episode
+			// never gets one of its own (see FulfillEpisodeLibraryItem).
+			// Confirmed live 2026-08-11: silently no-op'ing here (the
+			// original behavior) left library_items.available stuck at
+			// true forever with nothing to reset it, since there was no
+			// queue_items row for the UPDATE below to ever touch -- the
+			// Health page's "Reset Orphaned Available" action correctly
+			// selected the item as unrecoverable on every pass but could
+			// never actually fix it. Insert a fresh 'requested' row so the
+			// item genuinely re-enters the normal search cycle, exactly
+			// like the row every other library item already has.
 			err = nil
-			return nil
+			if _, err = tx.ExecContext(ctx, `
+				INSERT INTO queue_items (library_item_id, state, idempotency_key)
+				VALUES ($1, $2, $3)
+				ON CONFLICT (library_item_id) DO NOTHING`,
+				libraryItemID, QueueRequested, fmt.Sprintf("manual-reset-%d", libraryItemID),
+			); err != nil {
+				return err
+			}
+			if _, err = tx.ExecContext(ctx, `
+				UPDATE library_items SET available = false WHERE id = $1`, libraryItemID,
+			); err != nil {
+				return err
+			}
+			return tx.Commit()
 		}
 		return err
 	}

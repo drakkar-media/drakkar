@@ -112,6 +112,9 @@ func TestListDeepHealthCandidatesUsesPublishedReleaseSource(t *testing.T) {
 		if c.NZBDocumentID != ndOldID {
 			t.Fatalf("expected published nzb_document_id %d, got %d", ndOldID, c.NZBDocumentID)
 		}
+		if c.VirtualFileID != vfOldID {
+			t.Fatalf("expected published virtual_file_id %d, got %d", vfOldID, c.VirtualFileID)
+		}
 		sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
 		return
 	}

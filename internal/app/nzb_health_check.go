@@ -225,7 +225,7 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 			// still never becomes readable after that, the file is not fit for
 			// playback and should be replaced by the next candidate.
 			magicCtx, magicCancel := context.WithTimeout(ctx, 45*time.Second)
-			magicErr := waitForReadableVideoContainer(magicCtx, c.TargetPath, 6, 5*time.Second)
+			magicErr := waitForReadableVideoContainerDirect(magicCtx, db, c.VirtualFileID, 6, 5*time.Second)
 			magicCancel()
 			if magicErr != nil {
 				if isTransientHealthCheckErr(magicErr) {
@@ -239,7 +239,7 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 							logger.Warn().Err(republishErr).Int64("libraryItemId", c.LibraryItemID).Msg("health check: transient container-read republish failed")
 						} else {
 							retryCtx, retryCancel := context.WithTimeout(ctx, 45*time.Second)
-							retryErr := waitForReadableVideoContainer(retryCtx, c.TargetPath, 6, 5*time.Second)
+							retryErr := waitForReadableVideoContainerDirect(retryCtx, db, c.VirtualFileID, 6, 5*time.Second)
 							retryCancel()
 							if retryErr == nil {
 								logger.Info().Int64("libraryItemId", c.LibraryItemID).Str("title", c.Title).
@@ -381,6 +381,73 @@ func readContainerHeader(path string) error {
 		return fmt.Errorf("%w: read header: %v", errContainerHeaderUnreadable, err)
 	}
 	return validateVideoContainerHeader(buf[:n])
+}
+
+// readContainerHeaderDirect validates the same leading-bytes magic-number
+// check as readContainerHeader, but reads straight from the backend
+// (db.OpenVirtualMediaFile) instead of through the host symlink path.
+//
+// The periodic deep health-check batch (up to ~50 candidates per pass) used
+// to go through os.Open on the real symlink path -- the exact same
+// kernel-FUSE-mount -> rclone -> WebDAV round trip a real player uses, which
+// creates a real tracked read-ahead session on the Drakkar side (see
+// internal/dav's virtualFile.ensureOpen). ActiveCount() divides read-ahead
+// parallelism across every such session, so this diagnostic check competed
+// directly with real playback for the same connection budget -- and a
+// broken file's retry loop (waitForReadableVideoContainer, up to 6 attempts
+// x 5s, then a republish attempt, then another 6x5s) could hold that
+// contention open for up to ~90 seconds. Confirmed live 2026-08-11: two
+// entirely unrelated files (a health-check candidate and a real concurrent
+// playback stream) hit hard EOF from rclone at the exact same second.
+// Reading directly from the backend needs only the virtual file's own byte
+// range, never touches FUSE/rclone/WebDAV, and registers no session at all,
+// so it cannot contend with real playback for read-ahead parallelism.
+//
+// Trade-off: this no longer exercises the full symlink/FUSE/rclone plumbing
+// the way the path-based check did -- it only proves the underlying data is
+// readable, not that the mount serving it to Plex/Jellyfin is healthy. That
+// full round-trip is still exercised naturally by every real playback
+// request, so it isn't going unverified, just not via this specific
+// high-frequency batch check.
+func readContainerHeaderDirect(ctx context.Context, db *database.DB, virtualFileID int64) error {
+	vf, err := db.OpenVirtualMediaFile(ctx, virtualFileID)
+	if err != nil {
+		return fmt.Errorf("%w: open: %v", errContainerHeaderUnreadable, err)
+	}
+	buf := make([]byte, 12)
+	n, err := vf.ReadAt(ctx, buf, 0)
+	if err != nil && n < 4 {
+		return fmt.Errorf("%w: read header: %v", errContainerHeaderUnreadable, err)
+	}
+	return validateVideoContainerHeader(buf[:n])
+}
+
+// waitForReadableVideoContainerDirect is waitForReadableVideoContainer's
+// direct-backend counterpart -- see readContainerHeaderDirect for why the
+// periodic deep health check uses this instead of the path-based version.
+func waitForReadableVideoContainerDirect(ctx context.Context, db *database.DB, virtualFileID int64, attempts int, delay time.Duration) error {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if err := readContainerHeaderDirect(ctx, db, virtualFileID); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if !errors.Is(lastErr, errContainerHeaderUnreadable) || attempt == attempts {
+			return lastErr
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("%w: %v", errContainerHeaderUnreadable, ctx.Err())
+		case <-timer.C:
+		}
+	}
+	return lastErr
 }
 
 // validateVideoContainerHeader checks whether the first bytes of a file match
