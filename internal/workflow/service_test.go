@@ -18,6 +18,7 @@ import (
 )
 
 type repoStub struct {
+	selectCandidateGone       bool
 	persistedDispatchedURLsMu sync.Mutex
 	persistedDispatchedURLs   map[string]bool
 	requests                  []database.MediaRequestSummary
@@ -258,6 +259,9 @@ func (r *repoStub) PromoteAlternativeRetryCandidate(ctx context.Context, library
 }
 
 func (r *repoStub) SelectReleaseCandidate(ctx context.Context, releaseCandidateID int64) (*database.ReleaseSummary, error) {
+	if r.selectCandidateGone {
+		return nil, nil
+	}
 	r.selected = database.ReleaseSummary{
 		SelectedReleaseID:  101,
 		ReleaseCandidateID: releaseCandidateID,
@@ -2697,6 +2701,16 @@ func TestSelectRelease(t *testing.T) {
 	}
 	if repo.fetching != 101 || repo.indexed != 99 {
 		t.Fatalf("unexpected state fetching=%d indexed=%d", repo.fetching, repo.indexed)
+	}
+}
+
+func TestSelectReleaseReturnsGoneErrorWhenCandidateAlreadyConsumed(t *testing.T) {
+	repo := &repoStub{selectCandidateGone: true}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+
+	_, err := service.SelectRelease(context.Background(), 77)
+	if !errors.Is(err, ErrReleaseCandidateGone) {
+		t.Fatalf("expected ErrReleaseCandidateGone, got %v", err)
 	}
 }
 

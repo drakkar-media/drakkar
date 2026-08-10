@@ -142,6 +142,7 @@ type CatalogService interface {
 	DiscoverList(ctx context.Context, mediaType string, page int) (catalog.DiscoverListResult, error)
 	DiscoverDetails(ctx context.Context, lookup catalog.DiscoverLookup) (catalog.DiscoverDetails, error)
 	LibraryDetail(ctx context.Context, libraryItemID int64) (catalog.LibraryDetail, error)
+	GetCurrentFile(ctx context.Context, libraryItemID int64) (*catalog.CurrentFile, error)
 	ReleaseCalendar(ctx context.Context, month string) ([]catalog.CalendarEntry, error)
 }
 
@@ -961,6 +962,25 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		respondJSON(w, http.StatusOK, item)
 	})
+	// On-demand current-file lookup for a single library item (e.g. one TV
+	// episode's own file, fetched only when its info modal is opened) --
+	// distinct from /details, which eagerly loads the whole show/movie.
+	r.Get("/api/library/{id}/current-file", func(w http.ResponseWriter, r *http.Request) {
+		if catalogSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("catalog unavailable"))
+			return
+		}
+		libraryItemID, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
+			return
+		}
+		current, err := catalogSvc.GetCurrentFile(r.Context(), libraryItemID)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]any{"currentFile": current})
+	})
 	r.Post("/api/library/search-upgrades", func(w http.ResponseWriter, r *http.Request) {
 		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
@@ -1588,12 +1608,11 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.SelectRelease(workflow.WithAsyncDownload(r.Context()), id)
 		if err != nil {
+			if errors.Is(err, workflow.ErrReleaseCandidateGone) {
+				respondError(w, http.StatusGone, errors.New("release candidate no longer available — please refresh and try again"))
+				return
+			}
 			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if result.SelectedReleaseID == nil && result.Action == "selected" {
-			// Candidate was replaced by a newer search — tell the client to refresh.
-			respondError(w, http.StatusGone, errors.New("release candidate no longer available — please refresh and try again"))
 			return
 		}
 		publishMutation("release.select", map[string]any{"releaseCandidateId": id, "selectedReleaseId": result.SelectedReleaseID})
@@ -2253,15 +2272,15 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := workflowSvc.ManualImport(r.Context(), libraryItemID, payload.Title, payload.ExternalURL, payload.IndexerName, payload.Resolution, payload.SizeBytes, payload.Score)
 		if err != nil {
+			if errors.Is(err, workflow.ErrReleaseCandidateGone) {
+				// A concurrent automatic search replaced every candidate for this
+				// item (including the one just inserted) before it could be
+				// selected. Tell the client to retry — the manual result no
+				// longer exists to import.
+				respondError(w, http.StatusGone, errors.New("release candidate no longer available — please search again"))
+				return
+			}
 			respondError(w, http.StatusBadRequest, err)
-			return
-		}
-		if result.SelectedReleaseID == nil && result.Action == "selected" {
-			// A concurrent automatic search replaced every candidate for this
-			// item (including the one just inserted) before it could be
-			// selected. Tell the client to retry — the manual result no
-			// longer exists to import.
-			respondError(w, http.StatusGone, errors.New("release candidate no longer available — please search again"))
 			return
 		}
 		publishMutation("library.manual_import", map[string]any{"libraryItemId": libraryItemID, "selectedReleaseId": result.SelectedReleaseID})

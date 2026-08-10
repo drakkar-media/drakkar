@@ -3827,18 +3827,22 @@ func (s *Service) retrySelectedReleaseFromStoredNZB(ctx context.Context, current
 	return s.importSelectedRelease(ctx, current, imported, depth)
 }
 
+// ErrReleaseCandidateGone is returned by SelectRelease when the candidate is
+// no longer available to select (already consumed/removed by a concurrent
+// caller), distinguishing that genuine failure from a legitimate async
+// dispatch success, which also has a nil SelectedReleaseID.
+var ErrReleaseCandidateGone = errors.New("release candidate no longer available")
+
 // SelectRelease is the manual "select this release" action: it marks
 // releaseCandidateID as the selected release for its library item and drives
-// it through fetch/import/publish via fetchAndImportSelectedRelease. A nil
-// current summary (candidate already selected/consumed by a concurrent
-// caller) is treated as a graceful no-op rather than an error.
+// it through fetch/import/publish via fetchAndImportSelectedRelease.
 func (s *Service) SelectRelease(ctx context.Context, releaseCandidateID int64) (ReleaseActionResult, error) {
 	current, err := s.repo.SelectReleaseCandidate(ctx, releaseCandidateID)
 	if err != nil {
 		return ReleaseActionResult{}, err
 	}
 	if current == nil {
-		return ReleaseActionResult{ReleaseCandidateID: releaseCandidateID, Action: "selected"}, nil
+		return ReleaseActionResult{}, ErrReleaseCandidateGone
 	}
 	finalSelected, err := s.fetchAndImportSelectedRelease(ctx, current.SelectedReleaseID)
 	if err != nil {

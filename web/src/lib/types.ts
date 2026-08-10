@@ -340,6 +340,7 @@ export type CurrentFile = {
   indexerName?: string;
   resolution?: string;
   score: number;
+  subtitleLanguages?: string[];
 };
 
 export type LibraryDetail = {

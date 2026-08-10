@@ -20,6 +20,7 @@
   import X from '@lucide/svelte/icons/x';
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import Upload from '@lucide/svelte/icons/upload';
+  import Info from '@lucide/svelte/icons/info';
   import Button from '$lib/components/Button.svelte';
   import PosterCard from '$lib/components/PosterCard.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
@@ -30,7 +31,7 @@
   import { bytes as fmtBytes } from '$lib/format';
   import { runAction, confirmed } from '$lib/actions';
   import { onMount } from 'svelte';
-  import type { DiscoverDetails, LibraryDetail, LibraryItem, ManualSearchItem, QualityProfile, ReleaseItem } from '$lib/types';
+  import type { CurrentFile, DiscoverDetails, LibraryDetail, LibraryItem, ManualSearchItem, QualityProfile, ReleaseItem } from '$lib/types';
 
   let detail: DiscoverDetails | null = null;
   let libraryMatch: LibraryItem | null = null;
@@ -100,7 +101,13 @@
   }
   let activeKey = '';
 
-  let expandedEpisodeId: number | null = null;
+  let episodeInfoOpen = false;
+  let episodeInfoLoading = false;
+  let episodeInfoLabel = '';
+  let episodeInfoData: CurrentFile | null = null;
+  let subtitleModalOpen = false;
+  let subtitleModalEpisodeId: number | null = null;
+  let subtitleModalLabel = '';
   // Guards against a slower earlier navigation's response landing after a
   // faster later one's and overwriting the newer page's data (e.g. quickly
   // clicking through several poster cards in a row).
@@ -466,9 +473,37 @@
     });
   }
 
-  /** Expands/collapses an episode's subtitle panel; SubtitlePanel loads its own data on mount. */
-  function toggleEpisodeSubtitles(epLibraryItemId: number) {
-    expandedEpisodeId = expandedEpisodeId === epLibraryItemId ? null : epLibraryItemId;
+  /** Opens the subtitle-management modal for one episode; SubtitlePanel loads its own data on mount. */
+  function openSubtitleModal(epLibraryItemId: number, label: string) {
+    subtitleModalEpisodeId = epLibraryItemId;
+    subtitleModalLabel = label;
+    subtitleModalOpen = true;
+  }
+
+  function closeSubtitleModal() {
+    subtitleModalOpen = false;
+    subtitleModalEpisodeId = null;
+  }
+
+  /** Fetches and shows the current-file info modal for one episode (or the movie/show item). */
+  async function openEpisodeInfo(libraryItemId: number, label: string) {
+    episodeInfoOpen = true;
+    episodeInfoLoading = true;
+    episodeInfoLabel = label;
+    episodeInfoData = null;
+    try {
+      const result = await api.currentFile(libraryItemId);
+      episodeInfoData = result.currentFile;
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : String(error));
+    } finally {
+      episodeInfoLoading = false;
+    }
+  }
+
+  function closeEpisodeInfo() {
+    episodeInfoOpen = false;
+    episodeInfoData = null;
   }
 
   /** Applies a quality-profile override optimistically; on failure, reloads from the server to discard the change and restore the true state. */
@@ -626,6 +661,7 @@
                           {/if}
                           {#if episode.libraryItemId}
                             {@const epId = episode.libraryItemId}
+                            {@const epLabel = `S${String(episode.seasonNumber).padStart(2,'0')}E${String(episode.episodeNumber).padStart(2,'0')} ${episode.title}`}
                             <button
                               class="ep-sub-btn"
                               title="Search releases for this episode (includes season packs)"
@@ -634,24 +670,24 @@
                             {#if episode.status === 'available'}
                               <button
                                 class="ep-sub-btn"
+                                title="Episode file info"
+                                on:click={() => openEpisodeInfo(epId, epLabel)}
+                              ><Info size={11} /></button>
+                              <button
+                                class="ep-sub-btn"
                                 title="Manage subtitles for this episode"
-                                on:click={() => toggleEpisodeSubtitles(epId)}
+                                on:click={() => openSubtitleModal(epId, epLabel)}
                               ><Languages size={11} /> Subs</button>
                               <button
                                 class="ep-sub-btn ep-reset-btn"
                                 title="Reset this episode"
                                 disabled={isBusy(`reset-${epId}`)}
-                                on:click={() => resetItem(epId, `S${String(episode.seasonNumber).padStart(2,'0')}E${String(episode.episodeNumber).padStart(2,'0')} ${episode.title}`)}
+                                on:click={() => resetItem(epId, epLabel)}
                               ><Trash2 size={11} /></button>
                             {/if}
                           {/if}
                         </div>
                       </div>
-                      {#if episode.libraryItemId && expandedEpisodeId === episode.libraryItemId}
-                        <div class="episode-subs">
-                          <SubtitlePanel libraryItemId={episode.libraryItemId} compact />
-                        </div>
-                      {/if}
                     {/each}
                   </div>
                 </details>
@@ -770,7 +806,7 @@
           </div>
         </section>
 
-        {#if libraryMatch}
+        {#if libraryMatch && localDetail?.mediaType === 'movie'}
           <section class="panel">
             <h2>Current File</h2>
             {#if localDetail?.currentFile}
@@ -782,6 +818,9 @@
                   <div><span>Indexer</span><strong>{localDetail.currentFile.indexerName || '—'}</strong></div>
                   <div><span>Resolution</span><strong>{localDetail.currentFile.resolution || '—'}</strong></div>
                   <div><span>Score</span><strong>{localDetail.currentFile.score}</strong></div>
+                </div>
+                <div class="cf-subs" class:missing={!localDetail.currentFile.subtitleLanguages?.length}>
+                  {localDetail.currentFile.subtitleLanguages?.length ? `Subtitles: ${localDetail.currentFile.subtitleLanguages.map((l) => l.toUpperCase()).join(', ')}` : 'No subtitles'}
                 </div>
               </div>
             {:else}
@@ -973,6 +1012,66 @@
   </div>
 {/if}
 
+{#if episodeInfoOpen}
+  <div
+    class="modal-backdrop"
+    on:click={(e) => e.target === e.currentTarget && closeEpisodeInfo()}
+    on:keydown={(e) => e.key === 'Escape' && closeEpisodeInfo()}
+    role="button"
+    tabindex="0"
+    aria-label="Close file info"
+  >
+    <div class="info-modal" role="dialog" aria-modal="true" aria-label="File info" tabindex="-1">
+      <div class="rel-header-top">
+        <h2>{episodeInfoLabel || 'File Info'}</h2>
+        <button class="close-btn" on:click={closeEpisodeInfo} aria-label="Close">
+          <X size={16} />
+        </button>
+      </div>
+      {#if episodeInfoLoading}
+        <div class="empty-side">Loading…</div>
+      {:else if episodeInfoData}
+        <div class="current-file">
+          <div class="cf-name" title={episodeInfoData.fileName}>{episodeInfoData.fileName}</div>
+          <div class="cf-release" title={episodeInfoData.releaseTitle}>{episodeInfoData.releaseTitle}</div>
+          <div class="kv">
+            <div><span>Size</span><strong>{fmtBytes(episodeInfoData.fileSizeBytes)}</strong></div>
+            <div><span>Indexer</span><strong>{episodeInfoData.indexerName || '—'}</strong></div>
+            <div><span>Resolution</span><strong>{episodeInfoData.resolution || '—'}</strong></div>
+            <div><span>Score</span><strong>{episodeInfoData.score}</strong></div>
+          </div>
+          <div class="cf-subs" class:missing={!episodeInfoData.subtitleLanguages?.length}>
+            {episodeInfoData.subtitleLanguages?.length ? `Subtitles: ${episodeInfoData.subtitleLanguages.map((l) => l.toUpperCase()).join(', ')}` : 'No subtitles'}
+          </div>
+        </div>
+      {:else}
+        <div class="empty-side">No file currently selected.</div>
+      {/if}
+    </div>
+  </div>
+{/if}
+
+{#if subtitleModalOpen && subtitleModalEpisodeId}
+  <div
+    class="modal-backdrop"
+    on:click={(e) => e.target === e.currentTarget && closeSubtitleModal()}
+    on:keydown={(e) => e.key === 'Escape' && closeSubtitleModal()}
+    role="button"
+    tabindex="0"
+    aria-label="Close subtitle manager"
+  >
+    <div class="info-modal" role="dialog" aria-modal="true" aria-label="Subtitles" tabindex="-1">
+      <div class="rel-header-top">
+        <h2>Subtitles — {subtitleModalLabel}</h2>
+        <button class="close-btn" on:click={closeSubtitleModal} aria-label="Close">
+          <X size={16} />
+        </button>
+      </div>
+      <SubtitlePanel libraryItemId={subtitleModalEpisodeId} compact />
+    </div>
+  </div>
+{/if}
+
 <style>
   .page { display: grid; gap: 22px; }
   .hero {
@@ -1012,11 +1111,6 @@
     min-height: 28px; padding: 0 10px; font-size: 12px;
     color: hsl(var(--muted-foreground)); border-color: transparent;
   }
-  .episode-subs {
-    padding: 10px 12px 12px 30px; margin: -4px 0 6px;
-    border-left: 2px solid hsl(0 0% 100% / 0.08);
-    display: grid; gap: 8px;
-  }
   .grid { display: grid; grid-template-columns: minmax(0,1.7fr) minmax(300px,0.8fr); gap: 20px; align-items: start; }
   .main, .side { display: grid; gap: 18px; }
   .panel {
@@ -1033,6 +1127,16 @@
   .cf-release {
     color: hsl(var(--muted-foreground)); font-size: 12px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cf-subs {
+    display: inline-flex; align-self: start; padding: 3px 9px; border-radius: 8px;
+    font-size: 11px; font-weight: 600;
+    border: 1px solid hsl(142 60% 45% / 0.25); color: hsl(142 60% 55%);
+    background: hsl(142 60% 45% / 0.1);
+  }
+  .cf-subs.missing {
+    border-color: hsl(0 0% 100% / 0.08); color: hsl(var(--muted-foreground));
+    background: hsl(0 0% 100% / 0.04);
   }
   .stat-grid, .kv { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
   .stat-grid div, .kv div {
@@ -1140,6 +1244,12 @@
     color: hsl(var(--foreground));
   }
   .rel-header { flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
+  .info-modal {
+    background: hsl(var(--card)); border: 1px solid hsl(0 0% 100% / 0.1);
+    border-radius: 20px; padding: 20px; width: 100%; max-width: 440px;
+    max-height: 80vh; overflow-y: auto; display: grid; gap: 14px;
+  }
+  .info-modal h2 { margin: 0; font-size: 16px; font-weight: 600; }
   .rel-header-top { display: flex; align-items: center; justify-content: space-between; }
   .rel-header h2 { margin: 0; font-size: 18px; font-weight: 600; line-height: 1; }
   .rel-header-desc { font-size: 14px; color: hsl(var(--muted-foreground)); }

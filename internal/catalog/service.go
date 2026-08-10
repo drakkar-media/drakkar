@@ -167,12 +167,13 @@ type LibraryDetail struct {
 // library item's selected release -- what drakkar is really serving right
 // now, as opposed to a log of past grab attempts.
 type CurrentFile struct {
-	FileName      string `json:"fileName"`
-	FileSizeBytes int64  `json:"fileSizeBytes"`
-	ReleaseTitle  string `json:"releaseTitle"`
-	IndexerName   string `json:"indexerName,omitempty"`
-	Resolution    string `json:"resolution,omitempty"`
-	Score         int    `json:"score"`
+	FileName          string   `json:"fileName"`
+	FileSizeBytes     int64    `json:"fileSizeBytes"`
+	ReleaseTitle      string   `json:"releaseTitle"`
+	IndexerName       string   `json:"indexerName,omitempty"`
+	Resolution        string   `json:"resolution,omitempty"`
+	Score             int      `json:"score"`
+	SubtitleLanguages []string `json:"subtitleLanguages,omitempty"`
 }
 
 // SeasonDetail describes one TV season within LibraryDetail, including its
@@ -919,6 +920,35 @@ func (s *Service) recentlyAdded(ctx context.Context) ([]MediaCard, error) {
 // LibraryDetail returns the full detail view for a single library item. For
 // TV shows this also builds the per-season/episode breakdown via
 // buildTVSeasons.
+// GetCurrentFile returns the actual media file currently backing
+// libraryItemID's selected release, along with which subtitle languages it
+// already has. Works for any library item -- a movie, or a single episode
+// -- since each has its own selected_releases/virtual_files rows
+// independent of any show-level aggregate. Returns (nil, nil) when the item
+// has no selected release yet.
+func (s *Service) GetCurrentFile(ctx context.Context, libraryItemID int64) (*CurrentFile, error) {
+	current, found, err := s.db.GetCurrentFileDetail(ctx, libraryItemID)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, nil
+	}
+	languagesByItem, err := s.db.ListSubtitleLanguagesByLibraryItemIDs(ctx, []int64{libraryItemID})
+	if err != nil {
+		return nil, err
+	}
+	return &CurrentFile{
+		FileName:          current.FileName,
+		FileSizeBytes:     current.FileSizeBytes,
+		ReleaseTitle:      current.ReleaseTitle,
+		IndexerName:       current.IndexerName,
+		Resolution:        current.Resolution,
+		Score:             current.Score,
+		SubtitleLanguages: languagesByItem[libraryItemID],
+	}, nil
+}
+
 func (s *Service) LibraryDetail(ctx context.Context, libraryItemID int64) (LibraryDetail, error) {
 	var (
 		detail         LibraryDetail
@@ -1006,18 +1036,11 @@ func (s *Service) LibraryDetail(ctx context.Context, libraryItemID int64) (Libra
 		value := selected.Int64
 		detail.SelectedReleaseID = &value
 	}
-	if current, found, err := s.db.GetCurrentFileDetail(ctx, libraryItemID); err != nil {
+	currentFile, err := s.GetCurrentFile(ctx, libraryItemID)
+	if err != nil {
 		return LibraryDetail{}, err
-	} else if found {
-		detail.CurrentFile = &CurrentFile{
-			FileName:      current.FileName,
-			FileSizeBytes: current.FileSizeBytes,
-			ReleaseTitle:  current.ReleaseTitle,
-			IndexerName:   current.IndexerName,
-			Resolution:    current.Resolution,
-			Score:         current.Score,
-		}
 	}
+	detail.CurrentFile = currentFile
 	if detail.MediaType == "movie" {
 		detail.Year = movieYear
 		detail.TMDBID = movieTMDBID
