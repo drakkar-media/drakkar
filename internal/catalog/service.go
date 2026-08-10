@@ -160,6 +160,19 @@ type LibraryDetail struct {
 	Seasons           []SeasonDetail `json:"seasons,omitempty"`
 	TVShowID          int64          `json:"tvShowId,omitempty"`
 	MonitoringMode    string         `json:"monitoringMode,omitempty"`
+	CurrentFile       *CurrentFile   `json:"currentFile,omitempty"`
+}
+
+// CurrentFile describes the actual media file currently backing this
+// library item's selected release -- what drakkar is really serving right
+// now, as opposed to a log of past grab attempts.
+type CurrentFile struct {
+	FileName      string `json:"fileName"`
+	FileSizeBytes int64  `json:"fileSizeBytes"`
+	ReleaseTitle  string `json:"releaseTitle"`
+	IndexerName   string `json:"indexerName,omitempty"`
+	Resolution    string `json:"resolution,omitempty"`
+	Score         int    `json:"score"`
 }
 
 // SeasonDetail describes one TV season within LibraryDetail, including its
@@ -992,6 +1005,18 @@ func (s *Service) LibraryDetail(ctx context.Context, libraryItemID int64) (Libra
 	if selected.Valid {
 		value := selected.Int64
 		detail.SelectedReleaseID = &value
+	}
+	if current, found, err := s.db.GetCurrentFileDetail(ctx, libraryItemID); err != nil {
+		return LibraryDetail{}, err
+	} else if found {
+		detail.CurrentFile = &CurrentFile{
+			FileName:      current.FileName,
+			FileSizeBytes: current.FileSizeBytes,
+			ReleaseTitle:  current.ReleaseTitle,
+			IndexerName:   current.IndexerName,
+			Resolution:    current.Resolution,
+			Score:         current.Score,
+		}
 	}
 	if detail.MediaType == "movie" {
 		detail.Year = movieYear

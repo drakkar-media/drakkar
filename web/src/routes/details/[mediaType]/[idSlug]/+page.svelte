@@ -30,12 +30,11 @@
   import { bytes as fmtBytes } from '$lib/format';
   import { runAction, confirmed } from '$lib/actions';
   import { onMount } from 'svelte';
-  import type { DiscoverDetails, GrabHistoryEntry, LibraryDetail, LibraryItem, ManualSearchItem, QualityProfile, ReleaseItem } from '$lib/types';
+  import type { DiscoverDetails, LibraryDetail, LibraryItem, ManualSearchItem, QualityProfile, ReleaseItem } from '$lib/types';
 
   let detail: DiscoverDetails | null = null;
   let libraryMatch: LibraryItem | null = null;
   let localDetail: LibraryDetail | null = null;
-  let grabHistory: GrabHistoryEntry[] = [];
   let releaseCandidates: ReleaseItem[] = [];
   let profiles: QualityProfile[] = [];
   let activeProfileId: number | null = null;
@@ -184,20 +183,17 @@
       detail = discover;
       libraryMatch = library.items.find((item) => sameIdentity(item, mediaType, discover.title, discover.year, discover.tmdbId, discover.imdbId)) ?? null;
       if (libraryMatch) {
-        const [detailResult, historyResult, profilesResult, activeProfileResult] = await Promise.all([
+        const [detailResult, profilesResult, activeProfileResult] = await Promise.all([
           api.libraryDetail(libraryMatch.id),
-          api.grabHistory(libraryMatch.id).catch(() => ({ items: [] })),
           api.listProfiles().catch(() => ({ profiles: [] })),
           api.getLibraryProfile(libraryMatch.id).catch(() => ({ profile: null }))
         ]);
         if (token !== loadToken) return;
         localDetail = detailResult;
-        grabHistory = historyResult.items ?? [];
         profiles = profilesResult.profiles ?? [];
         activeProfileId = activeProfileResult.profile?.id ?? null;
       } else {
         localDetail = null;
-        grabHistory = [];
         profiles = [];
         activeProfileId = null;
       }
@@ -776,30 +772,22 @@
 
         {#if libraryMatch}
           <section class="panel">
-            <div class="panel-head">
-              <h2>Subtitles</h2>
-            </div>
-            <SubtitlePanel libraryItemId={libraryMatch.id} showManagerLink />
-          </section>
-
-          {#if grabHistory.length > 0}
-            <section class="panel">
-              <h2>Grab History</h2>
-              <div class="stack-list">
-                {#each grabHistory as entry}
-                  <div class="stack-item">
-                    <div class="gh-info">
-                      <strong class="gh-title">{entry.title}</strong>
-                      <span class="gh-meta">
-                        {entry.indexerName}{entry.resolution ? ` · ${entry.resolution}` : ''} · score {entry.score}
-                      </span>
-                      <span class="gh-date">{new Date(entry.grabbedAt).toLocaleString('en-GB', { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</span>
-                    </div>
-                  </div>
-                {/each}
+            <h2>Current File</h2>
+            {#if localDetail?.currentFile}
+              <div class="current-file">
+                <div class="cf-name" title={localDetail.currentFile.fileName}>{localDetail.currentFile.fileName}</div>
+                <div class="cf-release" title={localDetail.currentFile.releaseTitle}>{localDetail.currentFile.releaseTitle}</div>
+                <div class="kv">
+                  <div><span>Size</span><strong>{fmtBytes(localDetail.currentFile.fileSizeBytes)}</strong></div>
+                  <div><span>Indexer</span><strong>{localDetail.currentFile.indexerName || '—'}</strong></div>
+                  <div><span>Resolution</span><strong>{localDetail.currentFile.resolution || '—'}</strong></div>
+                  <div><span>Score</span><strong>{localDetail.currentFile.score}</strong></div>
+                </div>
               </div>
-            </section>
-          {/if}
+            {:else}
+              <div class="empty-side">No file currently selected.</div>
+            {/if}
+          </section>
         {/if}
       </aside>
     </section>
@@ -1024,8 +1012,6 @@
     min-height: 28px; padding: 0 10px; font-size: 12px;
     color: hsl(var(--muted-foreground)); border-color: transparent;
   }
-  .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-  .panel-head h2 { margin: 0; }
   .episode-subs {
     padding: 10px 12px 12px 30px; margin: -4px 0 6px;
     border-left: 2px solid hsl(0 0% 100% / 0.08);
@@ -1039,6 +1025,15 @@
     min-width: 0;
   }
   .panel h2 { margin: 0 0 14px; font-size: 18px; }
+  .current-file { display: grid; gap: 10px; }
+  .cf-name {
+    font-weight: 700; font-size: 14px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .cf-release {
+    color: hsl(var(--muted-foreground)); font-size: 12px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .stat-grid, .kv { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
   .stat-grid div, .kv div {
     display: grid; gap: 4px; padding: 12px; border-radius: 14px;
@@ -1052,16 +1047,6 @@
     background: hsl(0 0% 100% / 0.03);
     color: hsl(var(--muted-foreground));
     font-size: 13px;
-  }
-  .stack-list { display: grid; gap: 10px; }
-  .stack-item {
-    display: flex; align-items: center; justify-content: space-between; gap: 12px;
-    padding: 12px 14px; border-radius: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.03);
-  }
-  .stack-item strong, .stack-item span { display: block; }
-  .stack-item span {
-    margin-top: 4px; color: hsl(var(--muted-foreground)); font-size: 12px;
   }
   .stat-grid span, .kv span, .summary-meta, .person-card span { color: hsl(var(--muted-foreground)); font-size: 12px; }
   .season-stack, .episode-list { display: grid; gap: 12px; }
@@ -1130,10 +1115,6 @@
     .hero-grid { padding: 18px; gap: 18px; }
     .action-row { align-items: stretch; }
   }
-  .gh-info { display: grid; gap: 2px; min-width: 0; }
-  .gh-title { font-size: 12px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .gh-meta { font-size: 11px; color: hsl(var(--muted-foreground)); font-family: 'JetBrains Mono', monospace; }
-  .gh-date { font-size: 11px; color: hsl(var(--muted-foreground)); }
   .monitoring-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; padding-top: 12px; border-top: 1px solid hsl(0 0% 100% / 0.06); }
   .monitoring-row label { font-size: 12px; font-weight: 600; color: hsl(var(--muted-foreground)); white-space: nowrap; }
   .monitoring-row select { flex: 1; min-width: 0; height: 32px; border-radius: 8px; border: 1px solid hsl(0 0% 100% / 0.1); background: hsl(0 0% 100% / 0.05); color: inherit; font-size: 12px; padding: 0 8px; cursor: pointer; }

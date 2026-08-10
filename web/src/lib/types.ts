@@ -332,6 +332,16 @@ export type DiscoverDetails = {
   similar?: DiscoverMediaItem[];
 };
 
+/** The actual media file currently backing a library item's selected release -- what's really being served, not a log of past grab attempts. */
+export type CurrentFile = {
+  fileName: string;
+  fileSizeBytes: number;
+  releaseTitle: string;
+  indexerName?: string;
+  resolution?: string;
+  score: number;
+};
+
 export type LibraryDetail = {
   id: number;
   mediaType: string;
@@ -352,6 +362,7 @@ export type LibraryDetail = {
   seasons: SeasonDetail[];
   tvShowId?: number;
   monitoringMode?: string;
+  currentFile?: CurrentFile;
 };
 
 export type SeasonDetail = {

@@ -293,6 +293,50 @@ func (db *DB) detectStoredRarContinuationOffsets(ctx context.Context, sources ma
 	return offsets
 }
 
+// CurrentFileDetail describes the actual media file currently backing a
+// library item's selected release -- the file drakkar is really serving,
+// as opposed to grab_history's log of past grab attempts.
+type CurrentFileDetail struct {
+	FileName      string
+	FileSizeBytes int64
+	ReaderKind    string
+	ReleaseTitle  string
+	IndexerName   string
+	Resolution    string
+	Score         int
+}
+
+// GetCurrentFileDetail returns the largest virtual file (the main media
+// file, not a same-release companion like a tiny .nfo) backing
+// libraryItemID's current selected release, along with that release's own
+// metadata. found is false when the item has no selected release yet, or
+// the release has no virtual_files rows (e.g. still importing).
+func (db *DB) GetCurrentFileDetail(ctx context.Context, libraryItemID int64) (CurrentFileDetail, bool, error) {
+	var out CurrentFileDetail
+	var fileName, readerKind sql.NullString
+	var fileSize sql.NullInt64
+	err := db.SQL.QueryRowContext(ctx, `
+		select rc.title, rc.indexer_name, rc.resolution, rc.score,
+		       vf.file_name, vf.size_bytes, vf.reader_kind
+		from selected_releases sr
+		join release_candidates rc on rc.id = sr.release_candidate_id
+		left join virtual_files vf on vf.selected_release_id = sr.id
+		where sr.library_item_id = $1
+		order by sr.id desc, vf.size_bytes desc nulls last
+		limit 1`, libraryItemID,
+	).Scan(&out.ReleaseTitle, &out.IndexerName, &out.Resolution, &out.Score, &fileName, &fileSize, &readerKind)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return CurrentFileDetail{}, false, nil
+		}
+		return CurrentFileDetail{}, false, err
+	}
+	out.FileName = fileName.String
+	out.FileSizeBytes = fileSize.Int64
+	out.ReaderKind = readerKind.String
+	return out, true, nil
+}
+
 // ListContentMountEntriesForRelease returns the virtual files belonging to a
 // single selected release, ordered by path.
 func (db *DB) ListContentMountEntriesForRelease(ctx context.Context, selectedReleaseID int64) ([]ContentMountEntry, error) {
