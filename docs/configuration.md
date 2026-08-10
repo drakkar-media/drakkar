@@ -1,31 +1,44 @@
 # Configuration
 
-Drakkar reads `/app/data/settings.json`.
+Drakkar reads `/app/data/settings.json` on disk (outside git, `0600`) as
+its initial config, but most settings are now editable at runtime through
+the Settings UI and hot-reload without a restart — the file is no longer
+the only way to configure the app.
 
-Rules:
+- `GET /api/settings` / `PUT /api/settings` (admin-only) — read/update
+  settings at runtime. Secrets are redacted on read and never logged.
+- `GET /api/settings/privacy/status`, `POST /api/settings/privacy/test`
+  (admin-only) — privacy-routing (Direct/SOCKS5/WireGuard) status and a
+  live reachability test before committing a mode change.
+- `POST /api/integrations/probe` — live reachability/auth checks against
+  every configured integration, surfaced as "Probe Integrations" in
+  Settings.
+- `/api/status` reports config-derived readiness for Seerr, NZBHydra2,
+  Usenet, metadata, and subtitle providers — frontend actions that need an
+  unconfigured integration are disabled rather than making a doomed call.
 
-- keep file outside git
-- use `0600`
-- do not expose through API
-- do not log secrets
+To bootstrap a fresh install, copy
+[data/settings.example.json](/root/nzbproject/data/settings.example.json)
+to `data/settings.json` and fill in credentials, or just complete the
+first-run setup wizard (`/setup`), which writes the same file.
 
-Copy [data/settings.example.json](/root/nzbproject/data/settings.example.json) to `data/settings.json` and fill credentials.
+## Metadata
 
-Readiness notes:
+- `metadata.tmdb.apiKey` enables TMDB enrichment for Seerr-imported movie
+  and TV requests (canonical title, release year, IMDb ID).
+- `metadata.tvdb.apiKey` enables TVDB fallback enrichment for TV requests
+  when TMDB details are unavailable or no TMDB ID was provided.
 
-- `/api/status` now reports config-derived readiness for Seerr, NZBHydra2, Usenet, metadata, and subtitle providers.
-- frontend request/search actions are disabled when the required integration is not configured, so placeholder example settings do not just produce avoidable provider errors.
-- `POST /api/integrations/probe` runs live checks against configured integrations and is surfaced in the settings page as `Probe Integrations`.
+## Subtitle providers
 
-Metadata notes:
+- `subtitles.providers.subdl.apiKey` enables SubDL search/download.
+- `subtitles.providers.opensubtitles` requires `apiKey`, `username`, and
+  `password` for authenticated search/download.
+- Both providers share a per-provider daily call budget and a per-language
+  dedup pass — see [subtitles.md](subtitles.md).
 
-- `metadata.tmdb.apiKey` enables TMDB enrichment for Seerr-imported movie and TV requests
-- when enabled, Drakkar updates canonical movie/show titles, release years, and IMDb IDs from TMDB details
-- `metadata.tvdb.apiKey` enables TVDB fallback enrichment for Seerr-imported TV requests when TMDB details are unavailable or no TMDB ID was provided
-- TVDB fallback currently updates canonical show title, release year, and IMDb ID from TVDB series details
+## Privacy routing
 
-Subtitle provider notes:
-
-- `subtitles.providers.subdl.apiKey` enables SubDL search/download
-- `subtitles.providers.opensubtitles` requires `apiKey`, `username`, and `password`
-- when enabled, OpenSubtitles uses authenticated search plus download-by-`file_id`
+- `privacy.mode`: `direct` (default), `socks5`, or `wireguard`. Applies only
+  to NZB indexer HTTP traffic and Usenet NNTP traffic — every other
+  integration always goes direct. See `internal/privacy`.

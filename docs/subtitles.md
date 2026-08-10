@@ -1,53 +1,68 @@
 # Subtitles
 
-Subtitle publication now has a manual path plus provider-backed search/download paths.
+Subtitle acquisition has a manual upload path plus a provider-backed
+search/download path, with per-language deduplication and a per-provider
+daily call budget to stay under provider rate limits (~1000 calls/24h per
+provider token).
 
-Implemented:
+## API
 
-- list persisted subtitle files with `GET /api/subtitles/{libraryItemId}`
-- list persisted subtitle candidates with `GET /api/subtitle-candidates/{libraryItemId}`
-- search SubDL or OpenSubtitles subtitle candidates with `POST /api/subtitles/{libraryItemId}/search`
-- download one stored subtitle candidate with `POST /api/subtitle-candidates/{id}/download`
-- upload manual `.srt` or `.vtt` subtitle files with `POST /api/subtitles/{libraryItemId}/upload`
-- delete one persisted subtitle language/provider set with `DELETE /api/subtitle-files/{id}`
-- publish uploaded subtitle files next to the current media library symlink targets
-- republish persisted subtitle files when media publications are rebuilt or manually republished
-- trigger non-blocking provider subtitle search after media publication and republish
-- automatically download and publish the best provider candidate after background search when the item has no stored subtitles yet
-- persist published subtitle rows in `subtitle_files`
-- persist provider search results in `subtitle_candidates`
-- expose manual subtitle upload controls in the library page
-- expose provider candidate search and download controls in the library page
+- `GET /api/subtitles` — paginated Subtitle Manager listing across every
+  movie/episode (title, missing-languages filter, candidate count).
+- `POST /api/subtitles/bulk` — bulk search or delete across selected items.
+- `GET /api/subtitles/{libraryItemId}` — persisted subtitle files for one item.
+- `GET /api/subtitle-candidates/{libraryItemId}` — persisted provider search results.
+- `POST /api/subtitles/{libraryItemId}/search` — run a provider search for one item.
+- `POST /api/subtitle-candidates/{id}/download` — download+publish one stored candidate.
+- `POST /api/subtitles/{libraryItemId}/upload` — upload a manual `.srt`/`.vtt` file.
+- `DELETE /api/subtitle-files/{id}` — delete one persisted subtitle language/provider set.
 
-Current behavior:
+## Search behavior (`internal/subtitles/service.go`)
 
-- provider is recorded as `manual`
-- one uploaded subtitle file is replicated across all published media paths for the library item
-- language is operator-supplied and appended as `<basename>.<lang>.srt` or `.vtt`
-- persisted subtitle rows are replayed onto the current library paths after startup publication rebuilds
-- deleting one subtitle row removes the full replicated sidecar set for that provider/language group
-- SubDL search uses library metadata plus configured preferred languages and stores unpacked raw subtitle-file candidates
-- OpenSubtitles search uses authenticated API access with library metadata and returns download-by-`file_id` candidates
-- candidate ranking now prefers exact language order, exact episode matches over season packs, matching title/year tokens, and canonical `sXXeYY`/`2x03` release text
-- when candidates otherwise tie closely, provider-aware score bias now prefers OpenSubtitles slightly ahead of SubDL
-- provider download now supports direct raw `.srt` / `.vtt` files and zip-only subtitle bundles
-- zip downloads are unpacked in memory and the best subtitle file is selected by language plus release/title filename similarity
-- automatic provider search runs asynchronously after publish/republish and does not block media availability
-- automatic provider search now also auto-downloads the top-ranked candidate when no subtitle files are already stored for that item
-- if the highest-ranked subtitle candidate fails to download or publish, automatic acquisition now falls through to the next ranked candidate
-- existing stored subtitle rows prevent automatic provider downloads, so manual/operator-published subtitles remain authoritative
+- `SearchCandidates` first computes which requested languages the item is
+  still missing (`subtractLanguages` against `languagesWithFiles`) and
+  returns immediately with zero provider calls if nothing is missing — an
+  item that already has every requested language is never re-queried.
+- Providers are tried in a deterministic, per-item hash-based rotation
+  (`assignedProviderOrder`) rather than always querying every configured
+  provider for every item — this spreads load across providers instead of
+  hammering all of them on every search.
+- Each provider call is gated by a per-provider daily budget
+  (`defaultProviderDailyBudget = 900`, tracked via the `app_settings` table
+  under key `subtitle_provider_usage`, resetting at UTC day boundary). A
+  provider at budget is skipped for the rest of the day rather than erroring.
+- The search stops as soon as every requested language has a candidate,
+  without necessarily querying every configured provider.
+- `SearchAndDownloadBest` downloads the best-ranked candidate per still-missing
+  language (not just one candidate overall), falling through to the next
+  candidate for that language if the top one fails to download/publish.
+- Candidate ranking prefers exact language match, exact episode over
+  season-pack results, matching title/year tokens, canonical `sXXeYY`/`2x03`
+  release text, and (as a tie-break) OpenSubtitles slightly ahead of SubDL.
+- Provider download supports direct raw `.srt`/`.vtt` files and zip-only
+  bundles (unpacked in memory, best file picked by language + filename
+  similarity to the release title).
+- Existing stored subtitle rows for a language block automatic re-download
+  for that language — manual/operator-uploaded subtitles are authoritative
+  and are never silently overwritten by an automatic search.
 
-Configured providers:
+## Configured providers
 
 - SubDL
 - OpenSubtitles
 
-Preferred languages:
+## Frontend
 
-- `nl`
-- `en`
+- `web/src/lib/components/SubtitlePanel.svelte` is the single shared
+  implementation (file list, candidate list, search button, SSE-driven
+  refresh) used everywhere subtitles are managed — the movie details page's
+  "Subs" button, the per-episode Subtitles modal on the TV details page, and
+  the standalone Subtitle Manager page (`/subtitles`) all render the same
+  component rather than duplicating this logic per page.
+- The TV details page shows a per-episode language badge at a glance
+  (`episode.subtitleLanguages`, batch-loaded — no per-episode round trip)
+  without needing to open the modal.
 
-Still pending:
+## Still pending
 
-- broader subtitle candidate ranking heuristics
-- broader packed subtitle archive handling beyond simple zip bundles
+- Broader packed-subtitle-archive handling beyond simple zip bundles.

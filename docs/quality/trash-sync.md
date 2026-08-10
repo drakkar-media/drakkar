@@ -12,12 +12,12 @@ Drakkar supports importing custom formats and release block rules from [TRaSH Gu
 ### Custom formats
 
 1. Open [trash-guides.info](https://trash-guides.info/) and navigate to the Radarr or Sonarr custom format you want.
-2. Copy the JSON payload (the `json` block on the TRaSH page).
+2. Copy the JSON payload (the `json` block on the TRaSH page) — a single format or an array of formats both work.
 3. In Drakkar, go to **Settings > Quality > Custom Formats**.
 4. Click **Import from TRaSH**.
 5. Paste the JSON and confirm.
 
-The format is created if it does not exist. If a format with the same name already exists, it is updated.
+`POST /api/custom-formats/import` upserts by name: a format is created if it does not exist, or updated in place if a format with the same name already exists.
 
 ### Release block rules
 
@@ -30,7 +30,7 @@ The import endpoint (`POST /api/release-block-rules/import`) validates all rules
 
 ## Source tracking
 
-Imported custom formats do not track their source — they look identical to locally-created ones and can be freely edited or deleted.
+Custom formats do track their origin in a `source` column (`custom`, `trash`, or `default`), shown in the UI — but unlike release block rules, no field is locked based on it. A TRaSH-imported custom format can be freely edited or deleted just like a locally-created one.
 
 Release block rules track their origin in the `source` column:
 
@@ -75,7 +75,6 @@ If `imported` is less than `total`, some rules failed silently (usually a duplic
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/release-block-rules/import` | Bulk import release block rules |
+| `POST` | `/api/custom-formats/import` | Bulk import custom formats, upserting by name |
 | `POST` | `/api/custom-formats` | Create a single custom format |
 | `PUT` | `/api/custom-formats/{id}` | Update a custom format |
-
-There is no dedicated bulk-import endpoint for custom formats — import them one at a time via `POST /api/custom-formats` or write a short script that iterates the TRaSH JSON array.

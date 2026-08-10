@@ -25,6 +25,7 @@ The `custom_format_score` subtotal is stored separately on each release candidat
 | `POST` | `/api/custom-formats` | Create a custom format |
 | `PUT` | `/api/custom-formats/{id}` | Update a custom format |
 | `DELETE` | `/api/custom-formats/{id}` | Delete a custom format |
+| `POST` | `/api/custom-formats/import` | Bulk-import formats (e.g. from TRaSH Guides), upserting by name |
 
 ## Scoring explanations
 

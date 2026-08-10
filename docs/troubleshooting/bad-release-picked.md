@@ -55,17 +55,22 @@ The better release may be in the blocklist from a previous failure. Check the bl
 
 ## Step 3: Force a different release
 
-### Use the "Grab" button
+### Use the manual scrape modal
 
-In the release candidates list, find the release you want and click Grab. This immediately selects that candidate and starts the download workflow.
+Open the item's details page and use the "Manual Scrape" modal (Auto Scrape
+tab lists ranked candidates from the last search; Manual tab lets you
+free-text search indexers directly). Find the release you want and click
+**Download** (or **Re-grab** if a release is already selected) — this
+immediately selects that candidate and starts the download workflow
+(`POST /api/releases/{id}/select`).
 
-### Skip the current selection
+### Reject or skip via the API
 
-If you want to move to the next-best candidate without manually choosing, click Skip on the selected release. The next non-rejected candidate in score order is selected automatically.
-
-### Reject a candidate
-
-To permanently reject a candidate for this item (it will not be auto-selected again), click Reject. You can restore rejected candidates later if needed.
+There is currently no dedicated button for these on the details page, but
+the endpoints are live and used by other flows (e.g. automatic fallback):
+`POST /api/releases/{id}/reject` permanently rejects a candidate for this
+item (restorable later); `POST /api/releases/{id}/skip` moves past the
+current selection to the next-best candidate without blocklisting it.
 
 ## Step 4: Adjust scoring for the future
 

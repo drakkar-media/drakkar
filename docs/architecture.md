@@ -1,52 +1,87 @@
 # Architecture
 
-Drakkar splits responsibilities into small Go packages:
+Drakkar is a single Go binary (`cmd/drakkar`) that combines an HTTP API, a
+WebDAV/FUSE virtual filesystem for on-demand Usenet streaming, and a set of
+scheduled background workers, backed by PostgreSQL. The SvelteKit frontend
+(`web/`) is built and embedded into the binary (`internal/frontend`).
 
-- `config`: strict `settings.json` parsing, defaults, secret redaction, mount-layout validation
-- `database`: PostgreSQL connection and SQL migrations
-- `api`: `chi` router, status endpoints, queue endpoints, library/release listing endpoints, republish endpoint, maintenance endpoints, SSE broker
-- `api`: mutating endpoints now publish lightweight SSE events so operator pages can refresh immediately after sync/search/retry/republish/subtitle actions
-- `api`: `/api/status` now includes config-derived integration readiness so the frontend can disable unconfigured Seerr/Hydra/subtitle actions
-- `probe`: live integration reachability/auth checks for configured Seerr, Hydra, Usenet, and subtitle providers, exposed through the settings page
-- `workflow`: Seerr request sync, metadata-aware NZBHydra2 fallback query building, candidate scoring and selected-release persistence
-- `workflow`: Hydra search fallback now keeps trying later query variants when earlier results are all already rejected
-- `workflow`: repeated search refreshes now preserve transient failure history for the same external release URL so previously failing candidates are penalized across attempts
-- `workflow`: fallback query passes now merge candidate sets instead of replacing them, so later queries can improve the selected candidate without discarding earlier viable rows
-- `workflow`: queue retry now prefers a cleaner alternative existing candidate over reusing a currently selected candidate that already has transient failure history
-- `ranking`: release scoring now rejects obvious bad sources and uses movie-year plus episode-token awareness to prefer exact matches over looser packs
-- `workflow`: can bulk-process pending request-backed library rows so imported Seerr requests advance without one-by-one search clicks
-- `tmdb`: TMDB client used to enrich imported Seerr requests with canonical movie/show titles, years, and IMDb IDs
-- `tvdb`: TVDB client used as fallback enrichment for imported TV requests when TMDB details are unavailable
-- `fuse`: virtual namespace model, operation matrix, live `/nzbs` virtual file exposure and cancel path, `/content/releases/<release-id>/...` virtual file tree
-- `nzb`: NZB XML parsing and segment offset indexing
-- `database`: imported NZB persistence now creates `nzb_files`, `nzb_segments`, `virtual_files`, `virtual_file_ranges`
-- `library`: publishes indexed virtual files into host-side symlinks and publication metadata, using movie/tv layout when metadata exists, and can rebuild publications on startup
-- `library`: can bulk-republish pending selected library items so publication recovery does not require one-by-one item actions
-- `library`: exposes release candidates together with failed-attempt history so operators can see fallback progression
-- workflow state now distinguishes transient fetch/import failures from durable manual/archive rejection by persisting blocklisted release URLs across future searches
-- workflow now also short-circuits archive-incompatible selected releases immediately after indexing when archive inspection found no publishable virtual files
-- automatic next-candidate promotion after reject or fetch/import failure now prefers cleaner candidates with lower transient failure history before slightly higher-scoring degraded choices
-- operators can explicitly restore a rejected candidate row, which clears its durable blocklist state without requiring a new search
-- operators can bulk-restore all rejected candidates for one library item when a whole candidate set was blocked too aggressively
-- operators can also skip a currently selected candidate transiently, promoting the next viable fallback without blocklisting the skipped release
-- `maintenance`: host library cleanup tasks for orphaned content and stale publication metadata
-- `blocklist`: exposes durable blocked release URLs so operators can inspect them, clear one entry, or clear the active set in one action
-- `subtitles`: manual subtitle publication, stored-sidecar rebuild, asynchronous post-publish provider search, provider-backed candidate search/download, zip-bundle extraction, and best-candidate auto-download when no subtitles exist yet
-- `valkey`: go-redis maintnotifications probing is explicitly disabled for the current Valkey deployment because the server does not implement Redis `CLIENT MAINT_NOTIFICATIONS`
-- `subdl`: SubDL HTTP client for subtitle search and raw-file download
-- `opensubtitles`: authenticated OpenSubtitles client for search and file-id based download
-- `nntp`: article client and segment fetcher
-- `nntp`: reusable pooled sessions bounded by provider connection limits
-- `nntp`: priority scheduler now sits in front of pooled session execution
-- `yenc`: decoded article body handling
-- `ranking`: hard rejection and candidate scoring
-- `symlink`: deterministic host-side symlink publication
-- `stream`: central `VirtualMediaFile` interface, byte-backed reader, range-to-segment mapping, direct NZB reader
-- `cache`: keyed request deduplication for concurrent block fetches and bounded byte LRU storage
-- `cache`: decoded article bodies now also spill to bounded disk cache
+## Package map (`internal/`)
 
-Planned next layers:
+- `api` — chi router; every HTTP endpoint (status, auth, queue, library,
+  subtitles, health, settings, downloads, SABnzbd-compatible API, webhooks)
+  and the SSE broker mutating endpoints publish to so pages refresh live.
+- `app` — process wiring: reads config, opens the DB, constructs every
+  service, registers scheduled tasks (search, retry, publish, maintenance,
+  health checks), starts the HTTP/WebDAV/FUSE servers.
+- `auth` — session + API token authentication, `auth_tokens` table (sessions
+  and API tokens share one table, discriminated by a `kind` column),
+  first-run setup gating, multi-user/role management.
+- `workflow` — the core release lifecycle: search (NZBHydra2), candidate
+  ranking/selection, fetch/import, fallback-to-next-candidate on failure,
+  queue state machine (`queue_items`), the download dispatcher (priority
+  queue + worker pool that actually fetches/imports releases), per-item
+  pause/resume (cancels the in-flight fetch, marks the item `on_hold`,
+  excluded from all automatic search/retry/upgrade scans until resumed).
+- `catalog` — read-side library/dashboard views: `LibraryDetail`,
+  per-season/episode breakdown (TMDB-backed where available, falling back to
+  local DB rows), `CurrentFile` (the actual file backing a selected release,
+  resolved via `symlink_publications` since a season pack's virtual files
+  all live under the pack's own `selected_release_id`, not each sibling
+  episode's).
+- `ranking` — release scoring: resolution/source/codec/audio/HDR detection,
+  custom formats, release-block rules, indexer policy scores, playback
+  compatibility warnings (DV/TrueHD-Atmos/AV1), quality-profile preferences.
+- `blocklist` — durable blocked-release-URL store (operator-visible,
+  clearable per-entry or in bulk).
+- `subtitles` — provider search/download orchestration; see
+  [subtitles.md](subtitles.md) for the current per-language-dedup +
+  provider-rotation + daily-budget design. `subdl` and `opensubtitles` are
+  the two provider HTTP clients.
+- `library` — publishes indexed virtual files to host-side symlinks
+  (`symlink_publications`), season-pack episode fan-out
+  (`FindSeasonPackMatches`/`CreateSeasonPackEpisodeItems`, matching a
+  double-episode filename like `S03E17E18` against both episodes it
+  covers), startup publication rebuild.
+- `maintenance` — scheduled cleanup: orphaned content, stale publication
+  metadata, NZB article health checks, storage/content maintenance passes.
+- `privacy` / `privacy/wireguard` — optional privacy-routing layer (Direct /
+  SOCKS5 / userspace WireGuard) applied only to indexer HTTP and Usenet NNTP
+  traffic; every other integration (Plex, Jellyfin, Seerr, TMDB, TVDB,
+  subtitle providers) always goes direct. Runtime-hot-reloadable without a
+  restart.
+- `nntp` — article client, connection pooling bounded by provider
+  `maxConnections`, priority scheduler (interactive/read-ahead/background),
+  provider fallback/retry.
+- `nzb` — NZB XML parsing, segment offset indexing.
+- `archive` — multi-volume RAR detection/inspection for `stored_rar` virtual
+  files (releases posted as a compressed archive rather than a loose media
+  file).
+- `stream` — `VirtualMediaFile` interface, byte-backed reader, range-to-
+  segment mapping; `direct_nzb` and `stored_rar` are the two reader kinds.
+- `cache` — keyed request deduplication for concurrent block fetches, bounded
+  in-memory LRU plus a bounded on-disk spill cache for decoded article bodies.
+- `dav` — WebDAV server exposing the virtual filesystem to Plex/Jellyfin via
+  rclone.
+- `database` — PostgreSQL access + `migrations/` (plain numbered `.sql`
+  files, tracked in `schema_migrations`, applied via `cmd/migrate` or on
+  startup).
+- `config` — `settings.json` parsing/defaults/secret-redaction; most settings
+  are hot-reloadable at runtime, not just read at startup.
+- `probe` — live reachability/auth checks for configured Seerr, Hydra,
+  Usenet, and subtitle providers, exposed through the settings page.
+- `tmdb` / `tvdb` — metadata enrichment for Seerr-imported requests, with
+  TVDB as fallback when TMDB is disabled/unavailable.
+- `seerr`, `hydra`, `plex`, `jellyfin`, `mediaserver` — external integration
+  clients.
+- `policy` — user-configurable queue-management policy (auto blocklist+search
+  vs. leave-alone decisions for failed items).
+- `observability` — structured (zerolog/JSON) logging to stdout + a log file
+  consumed by the Settings > Logs UI (`/api/logs` bounds every read to a
+  fixed recent window rather than the whole file — the file itself is not
+  yet rotated).
+- `queue` — SABnzbd-compatible queue/history API shim.
 
-- `nntp`, `cache`, `workflow`
-- archive offset mapping, subtitle workers
-- deeper metadata resolution through TMDB/TVDB and broader Seerr/NZBHydra2 coverage
+## Data flow at a glance
+
+See [data-flow.md](data-flow.md) for the request→search→select→fetch→publish
+pipeline in detail.

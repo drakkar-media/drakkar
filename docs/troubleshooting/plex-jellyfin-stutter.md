@@ -47,9 +47,9 @@ Returns all open FUSE sessions with current byte offset. If multiple streams are
 
 ### Check metrics
 
-The status API (`GET /api/status`) includes:
-- `activeStreams` — current open sessions
-- `readAheadCancellations` — how often a seek cancelled in-flight read-ahead (normal for skipping; high counts during normal playback indicate seek thrashing)
+`GET /api/metrics` includes:
+- `active_streams` — current open sessions
+- `read_ahead_cancellations_total` — how often a seek cancelled in-flight read-ahead (normal for skipping; high counts during normal playback indicate seek thrashing)
 
 ### Check NNTP connection count
 
@@ -80,11 +80,9 @@ If the cache is too small for your typical file size (a 4K Remux can be 60+ GB),
 **Cause:** NNTP download speed is below the content's bitrate.
 
 **Fix:**
-1. Increase `maxDownloadConnections` up to your provider's connection limit.
+1. Increase `maxDownloadConnections` up to your provider's connection limit — read-ahead parallelism is a quarter of the streaming budget (`maxDownloadConnections * streamingPriorityPercent / 100 / 4`), so this is the main lever for more prefetch capacity.
 2. Add a backup Usenet provider to the provider list — Drakkar falls back to backup providers for missing articles and additional download capacity.
-3. Reduce `streamingPriorityPercent` to give more connections to read-ahead (default 80% means 80% of connections are reserved for streaming, with 20% for read-ahead). Counter-intuitively, lowering this value reserves more connections for prefetch.
-
-Wait — actually `streamingPriorityPercent` controls the streaming budget, and read-ahead is a quarter of that. To get more read-ahead parallelism, increase `maxDownloadConnections`.
+3. `streamingPriorityPercent` trades interactive-read budget against read-ahead budget within the same connection pool — raising it favors the player's current position over prefetch depth; it does not add connections.
 
 ### Stutter only with multiple simultaneous streams
 
@@ -111,8 +109,18 @@ Manually trigger a scan in the Plex or Jellyfin UI if automatic refresh is not w
 
 ## Calibration and seek accuracy
 
-On first access after a file is indexed, Drakkar calibrates the segment byte offsets by fetching the first and last segments from Usenet and measuring their actual decoded size. This corrects the estimated sizes from the NZB header.
+A batch background pass (`CalibrateNZBOffsetsBatch`, plus a full sweep at
+startup for anything still uncalibrated) fetches each file's first and last
+segments once and persists the corrected byte offsets (`calibrated_at`),
+replacing the NZB header's rough size estimate.
 
-Without calibration, seek positions are based on estimates and may be off by a few seconds. With calibration complete, seeks land accurately. Calibration runs in the background and is transparent to the player.
+Independently of that, every actual playback read parses the live
+`=ypart begin/end` header on each fetched article and realigns the segment
+span in memory on the spot — so seek accuracy no longer depends on
+calibration having already run for that file. This is a safety net, not a
+replacement: calibration still runs so a file's *persisted* offsets are
+correct for future reads too, not just the current one.
 
-If a seek puts the player past the end of the file (Plex reports "end of stream" unexpectedly), calibration may not have corrected a size overestimate yet. Wait a minute and try again.
+If a seek puts the player past the end of the file ("end of stream"
+unexpectedly), that's a case the live realignment doesn't cover — mainly
+an as-yet-unindexed or freshly-imported file. Wait a minute and try again.

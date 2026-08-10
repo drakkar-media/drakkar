@@ -15,7 +15,7 @@ A blocklist entry is created whenever a workflow failure triggers the `blocklist
 | `nzb_fetch_4xx` (401, 404, 410, 451) | blocklist_and_search |
 | `bad_source` | blocklist_and_search |
 
-Blocklist entries are also created manually from the UI when you click "Block and search again" on a queue item.
+Blocklist entries are also created manually from the UI when you click "Block and search again" on a queue item (`POST /api/blocklist/manual`).
 
 `preflight_failed` triggers `search_again` (not blocklist), so a preflight failure retries from the next candidate without blocklisting the URL.
 

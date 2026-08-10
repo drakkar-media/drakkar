@@ -1,71 +1,63 @@
 # Testing
 
-Current tests cover:
+## Running tests
 
-- strict `settings.json` parsing
-- secret redaction
-- startup path validation
-- virtual FUSE root layout
-- operation matrix
-- live `/nzbs` visible-name mapping
-- `/nzbs` unlink-to-cancel behavior
-- `/content` release directory mapping
-- inline virtual-file reads through FUSE content nodes
-- host-side publication symlink creation
-- metadata-aware movie publication path
-- metadata-aware tv publication path
-- completed-symlink metadata exposure
-- startup publication reconstruction
-- manual republish endpoint
-- manual maintenance endpoints
-- orphaned-content cleanup
-- broken media symlink cleanup
-- orphaned completed-symlink row cleanup
-- Seerr request parsing
-- NZBHydra2 search response parsing
-- request sync workflow
-- release search/ranking workflow
-- selected-release NZB fetch/import workflow
-- candidate fallback after selected-release fetch failure
-- yEnc article decoding
-- NNTP multiline body parsing
-- NNTP range extraction from decoded article body
-- bounded byte LRU eviction
-- decoded-article cache hit path
-- NNTP concurrency limiter
-- pooled NNTP session reuse
-- pooled NNTP max-open bound
-- scheduler priority ordering
-- disk cache put/get/trim
-- disk decoded-article cache hit path
-- read-ahead priority scheduling
-- read-ahead cancellation on seek/stop
-- provider fallback
-- provider retry on transient source failure
-- deterministic host-side symlink publishing
-- NZB XML parsing
-- staged NZB import
-- NZB invalid XML rejection
-- NZB upload-size limit
-- queue cancel semantics
-- imported NZB file metadata extraction
-- playable-media detection for direct virtual file creation
-- FUSE upload-handle import on flush/release
-- FUSE upload-handle size limit
-- library listing endpoint
-- release listing endpoint
-- requests listing endpoint
-- requests sync endpoint
-- library search endpoint
-- range-to-segment mapping
-- direct virtual reads
-- keyed singleflight cache deduplication
-- candidate ranking
-- queue retry against existing viable candidate rows before fresh search
+Most packages run standalone (`go test ./...`), but anything touching
+`internal/database` (repository methods) or `internal/workflow`/`internal/api`
+tests that exercise a repository skips itself unless a real Postgres is
+available:
 
-Still missing:
+```
+export DRAKKAR_TEST_DATABASE_URL=postgres://drakkar:test@localhost:5432/drakkar_test?sslmode=disable
+go test ./...
+```
 
-- live FUSE mount tests
-- staged NZB uploads
-- range-to-segment mapping
-- archive offset mapping
+Migrations apply automatically the first time a test opens that database,
+or run them explicitly via `go run ./cmd/migrate` (reads
+`DRAKKAR_TEST_DATABASE_URL`, falls back to `DATABASE_URL`).
+
+CI runs the full suite against a real Postgres service container — a test
+that only passes because `DRAKKAR_TEST_DATABASE_URL` was unset locally (and
+silently skips) will still be caught there.
+
+Frontend: `cd web && npm run check` (svelte-check, type/unused-CSS-selector
+linting) and `npm run build`.
+
+## What's covered
+
+Broad strokes, by area — see each package's `*_test.go` files for the
+actual current list, this is not meant to be an exhaustive index:
+
+- **Config**: `settings.json` parsing, secret redaction, startup path
+  validation.
+- **Virtual filesystem** (`internal/dav`): directory listing, `/nzbs`
+  create/write/flush/release/unlink, `/content` release mapping,
+  `/completed-symlinks` metadata.
+- **Workflow**: Seerr request sync, NZBHydra2 search/ranking, candidate
+  selection and fallback-on-failure, queue retry, season-pack episode
+  fan-out (including double-episode filenames), per-item pause/resume,
+  the stuck-queue dispatch-eligibility query.
+- **NNTP/streaming**: yEnc decoding, multiline body parsing, connection
+  pooling/limits, priority scheduler, provider fallback/retry, read-ahead
+  scheduling and cancellation, range-to-segment mapping.
+- **Cache**: bounded in-memory LRU, disk cache put/get/trim, singleflight
+  dedupe.
+- **Archive**: RAR4/RAR5 header parsing, span-coverage validation.
+- **Library/publishing**: host-side symlink publication, movie/TV path
+  generation, startup publication reconstruction, republish endpoints.
+- **Subtitles**: per-language dedup, provider rotation, daily budget
+  enforcement, candidate ranking, zip-bundle extraction.
+- **API**: every HTTP handler with a meaningful branch (auth, queue
+  actions, health, settings, SABnzbd-compatible endpoints).
+
+## Conventions worth following
+
+- **Adversarial verification for correctness-critical fixes**: revert the
+  fix, confirm the new test actually fails with the expected symptom,
+  restore the fix, confirm it passes. A test that passes against both the
+  buggy and fixed code isn't testing the fix.
+- Prefer a real Postgres test DB over mocking the database — this project
+  was burned before by mocked-DB tests passing while the real migration/
+  query broke in production.
+- Scratch verification programs (one-off `cmd/*_scratch/main.go` used to
+  probe a real bug) are deleted before committing, never left in the repo.

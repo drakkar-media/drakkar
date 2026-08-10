@@ -75,8 +75,13 @@ These are unconditional and cannot be overridden by a release rule or custom for
 | Title matches raw Blu-ray disc (BDMV, BD25/50/100, COMPLETE.BLURAY, BD-ISO) | `br_disk` |
 | Title contains hardcoded subtitle markers (HC, SUBBED, HARDSUB) | `hardsub` |
 | Size is outside MB/min limits (see quality definitions) | `too_small` or `too_large` |
+| Detected language doesn't match profile language preferences | `wrong_language` |
+| Release year doesn't match the requested year (movie), the show's first-air-date year (TV/season-pack), or — for a specific episode — either the show's debut year or that episode's own air year | `wrong_year` |
+| Season/episode parsed from the title doesn't match the requested episode | `wrong_episode` |
 
 CAM/TS detection uses word-boundary matching: ` ts `, `hdts`, `hd-ts`, etc. Single-letter tokens like `ts` require surrounding spaces or separator characters to avoid false positives on show titles.
+
+`wrong_year` is a hard reject (not a soft penalty) for all three media types: a same-titled but unrelated production can coincidentally share season/episode numbering with the real show too (confirmed live: a 1999 anime vs. a 2023 live-action show both having their own "S03E01"), so year is sometimes the only signal left to catch it. For a per-episode search, a year mismatch against the show's debut year is tolerated if it matches that specific episode's own air year instead — a long-running show's later seasons legitimately get release-tagged with a later year than the show's debut, which is a normal release convention, not a wrong-show signal.
 
 ---
 

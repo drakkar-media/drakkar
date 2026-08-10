@@ -7,7 +7,7 @@ Implemented:
 - detect `.partNN.rar`, `.rar`, `.r00`-style imported volume groups during NZB ingest
 - persist `archives` and `archive_volumes` rows linked to `selected_releases`
 - fetch a small prefix from the first RAR volume when NNTP access is available
-- parse basic RAR4 headers
+- parse basic RAR4 and RAR5 headers
 - persist `archive_entries`
 - persist archive entry source metadata such as packed size, source volume index and archive payload offset
 - persist `archive_ranges` for entries whose payload offsets are known from inspected headers
