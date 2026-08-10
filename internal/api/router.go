@@ -779,14 +779,6 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		publishMutation("queue.clear_failed", map[string]any{"cleared": n})
 		respondJSON(w, http.StatusOK, map[string]any{"cleared": n})
 	})
-	r.Get("/api/nzbs", func(w http.ResponseWriter, r *http.Request) {
-		items, err := queue.ListQueue(r.Context())
-		if err != nil {
-			respondError(w, http.StatusInternalServerError, err)
-			return
-		}
-		respondJSON(w, http.StatusOK, map[string]any{"items": items})
-	})
 	r.Post("/api/nzbs/import", func(w http.ResponseWriter, r *http.Request) {
 		item, err := importNZBRequest(r, queue)
 		if err != nil {
@@ -844,18 +836,6 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		publishMutation("nzb.import", map[string]any{"queueItemId": item.QueueItemID, "libraryItemId": item.LibraryItemID})
 		respondJSON(w, http.StatusCreated, item)
-	})
-	r.Delete("/api/nzbs/{id}", func(w http.ResponseWriter, r *http.Request) {
-		id, ok := parseInt64URLParam(w, r, "id")
-		if !ok {
-			return
-		}
-		if err := queue.CancelNZB(r.Context(), id); err != nil {
-			respondError(w, http.StatusNotFound, err)
-			return
-		}
-		publishMutation("nzb.cancel", map[string]any{"nzbDocumentId": id})
-		respondJSON(w, http.StatusOK, map[string]any{"status": "cancelled", "nzbDocumentId": id})
 	})
 	r.Get("/api/requests", func(w http.ResponseWriter, r *http.Request) {
 		if workflowSvc == nil {
@@ -1483,27 +1463,6 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 				return
 			}
 			publishMutation("library.push_library", map[string]any{"moviesPushed": result.MoviesPushed, "showsPushed": result.ShowsPushed, "moviesSkipped": result.MoviesSkipped, "showsSkipped": result.ShowsSkipped})
-		}()
-		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
-	})
-	r.Post("/api/requests/sync-plex-detected", func(w http.ResponseWriter, r *http.Request) {
-		if workflowSvc == nil {
-			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
-			return
-		}
-		// Backgrounded: loops every Seerr-partial show issuing a synchronous
-		// Seerr API call per item (plus a full SyncRequests reconciliation
-		// pass) — the same call already runs hourly as a background scheduled
-		// task (see taskSyncPlexDetected in app.go) precisely because it's too
-		// slow for inline/request-time execution.
-		go func() {
-			defer observability.Recover("requests-sync-plex-detected")
-			result, err := workflowSvc.SyncPlexDetectedShows(context.Background())
-			if err != nil {
-				slog.Error("sync plex detected background", "err", err)
-				return
-			}
-			publishMutation("requests.sync_plex_detected", map[string]any{"found": result.Found, "requested": result.Requested, "skipped": result.Skipped})
 		}()
 		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
 	})

@@ -550,29 +550,6 @@ func (s *subtitleStub) ListLibraryState(ctx context.Context, filter database.Sub
 	return database.SubtitleLibraryPage{}, nil
 }
 
-func TestCancelNZBEndpoint(t *testing.T) {
-	queueSvc := queue.NewService(queue.NewMemoryRepository(), nzb.NewImporter(t.TempDir(), 1024*1024))
-	item, err := queueSvc.ImportNZB(context.Background(), "dune.nzb", strings.NewReader(sampleNZB))
-	if err != nil {
-		t.Fatal(err)
-	}
-	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
-
-	req := httptest.NewRequest(http.MethodDelete, "/api/nzbs/"+itoa(*item.NZBDocumentID), nil)
-	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
-	}
-	listReq := httptest.NewRequest(http.MethodGet, "/api/queue", nil)
-	listRec := httptest.NewRecorder()
-	router.ServeHTTP(listRec, listReq)
-	body, _ := io.ReadAll(listRec.Body)
-	if !strings.Contains(string(body), `"failureReason":"cancelled"`) {
-		t.Fatalf("unexpected queue body %s", string(body))
-	}
-}
-
 func TestQueueEndpointIncludesWorkQueueStatus(t *testing.T) {
 	queueSvc := queue.NewService(queue.NewMemoryRepository(), nzb.NewImporter(t.TempDir(), 1024*1024))
 	workflowSvc := workflowStub{workQueue: workflow.WorkQueueStatus{Paused: true, Depth: 7}}
