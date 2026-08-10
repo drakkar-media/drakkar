@@ -202,6 +202,18 @@ type Service struct {
 	searchAttemptMu   sync.Mutex
 	searchAttempts    map[string]searchAttemptRecord
 
+	// dispatchAttemptMu/dispatchAttempts back shouldDispatchSelectedTarget's
+	// per-item backoff. queue_items.consecutive_failure_searches looked like
+	// the right counter to reuse but isn't: ReplaceSearchCandidates resets it
+	// to 0 on every successful *selection*, including a promotion mid-fallback
+	// cascade -- so it never actually accumulates across the repeated
+	// dispatch-and-fail cycle this backoff exists to slow down. In-memory
+	// per-libraryItemID instead, cleared on restart like recentURLHits;
+	// losing it on restart just means one extra immediate attempt, not a
+	// correctness problem.
+	dispatchAttemptMu sync.Mutex
+	dispatchAttempts  map[int64]dispatchAttemptRecord
+
 	// TTL caches for policy data, guarded by profileCacheMu (O-04).
 	// These are loaded from the DB at most once per 5 minutes.
 	customFormatsCache   []ranking.CustomFormat
@@ -380,6 +392,15 @@ type searchAttemptRecord struct {
 	at        time.Time
 	outcome   string
 	queryText string
+}
+
+// dispatchAttemptRecord tracks how many consecutive times the passive-resume
+// sweep (DispatchAutomaticPending) has dispatched a library item without it
+// leaving the pending set (i.e. without it succeeding), and when the most
+// recent attempt was, for shouldDispatchSelectedTarget's escalating backoff.
+type dispatchAttemptRecord struct {
+	count int
+	lastAt time.Time
 }
 
 // completionFastLaneKey marks a context so a submitted download job is given
@@ -586,8 +607,9 @@ func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service 
 		dispatchC:      make(chan struct{}, 1),
 		calibrateSem:   make(chan struct{}, asyncCalibrateWorkers),
 		tmdbEnrichSem:  make(chan struct{}, tmdbEnrichWorkers),
-		recentURLHits:  make(map[string]time.Time),
-		searchAttempts: make(map[string]searchAttemptRecord),
+		recentURLHits:    make(map[string]time.Time),
+		searchAttempts:   make(map[string]searchAttemptRecord),
+		dispatchAttempts: make(map[int64]dispatchAttemptRecord),
 	}
 }
 
@@ -1392,6 +1414,7 @@ func (s *Service) DispatchAutomaticPending(ctx context.Context) (BulkSearchResul
 		}) {
 			go func() { <-resultCh }()
 			result.Searched++
+			s.recordDispatchAttempt(target.LibraryItemID, now)
 		}
 	}
 	return result, nil
@@ -1464,25 +1487,21 @@ func (s *Service) shouldDispatchSelectedTarget(target database.PendingLibrarySea
 	// NZB download for a *different* release every single tick, indefinitely
 	// -- confirmed live 2026-08-10: "monitoring: pending dispatch complete"
 	// logged dispatched=~222 pending=~238 on every 30s tick without the
-	// pending count actually shrinking, visible as a sustained flood in
-	// NZBHydra's own download history, and very likely also the cause of a
-	// concurrent real-playback stall (NNTP connection/provider contention
-	// from hundreds of simultaneous background fetch attempts). Escalates
-	// with the same consecutive_failure_searches counter the search cooldown
-	// in ListPendingLibrarySearchTargets already escalates on (reset to 0 on
-	// any successful selection), keyed off target.UpdatedAt (bumped on every
-	// promotion) rather than last_searched_at, since a dispatch attempt is
-	// not a search.
-	switch {
-	case target.ConsecutiveFailureSearches >= 6:
-		return now.Sub(target.UpdatedAt) >= time.Hour
-	case target.ConsecutiveFailureSearches >= 3:
-		return now.Sub(target.UpdatedAt) >= 15*time.Minute
-	case target.ConsecutiveFailureSearches >= 1:
-		return now.Sub(target.UpdatedAt) >= 2*time.Minute
-	default:
-		return true
-	}
+	// pending count actually shrinking, visible as a sustained flood that
+	// got 3 indexers auto-disabled by NZBHydra (IndexerUnreachableException:
+	// 20s timeout) and very likely also starved a concurrent real playback
+	// session of NNTP connections.
+	//
+	// queue_items.consecutive_failure_searches looked like the right signal
+	// to escalate on but isn't: ReplaceSearchCandidates resets it to 0 on
+	// every successful *selection*, including a promotion mid-fallback
+	// cascade, so it never actually accumulates across the repeated
+	// dispatch-and-fail cycle this backoff exists to slow down (confirmed:
+	// shipping that version did not reduce the observed dispatch count at
+	// all). dispatchAttempts is separate, in-memory, per-libraryItemID state
+	// that only this sweep controls, so it doesn't get reset out from under
+	// it by an unrelated write.
+	return !s.peekDispatchBackoff(target.LibraryItemID, now)
 }
 
 // peekRecentlyDispatchedURL reports whether rawURL has an in-memory dispatch
@@ -1509,6 +1528,60 @@ func (s *Service) peekRecentlyDispatchedURL(rawURL string, now time.Time) bool {
 	defer s.recentURLMu.Unlock()
 	lastAt, ok := s.recentURLHits[rawURL]
 	return ok && now.Sub(lastAt) < selectedURLCooldown
+}
+
+// dispatchBackoff returns the minimum interval required between consecutive
+// passive-resume dispatch attempts for an item that has been dispatched
+// attempts times already without succeeding (leaving the pending set).
+func dispatchBackoff(attempts int) time.Duration {
+	switch {
+	case attempts >= 6:
+		return time.Hour
+	case attempts >= 3:
+		return 15 * time.Minute
+	case attempts >= 1:
+		return 2 * time.Minute
+	default:
+		return 0
+	}
+}
+
+// peekDispatchBackoff reports whether libraryItemID is currently inside its
+// escalating per-item dispatch backoff, WITHOUT recording a new attempt --
+// read-only pre-filter for shouldDispatchSelectedTarget, mirroring
+// peekRecentlyDispatchedURL. The actual attempt is recorded separately, by
+// recordDispatchAttempt, only once DispatchAutomaticPending has actually
+// submitted the job.
+func (s *Service) peekDispatchBackoff(libraryItemID int64, now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	s.dispatchAttemptMu.Lock()
+	defer s.dispatchAttemptMu.Unlock()
+	record, ok := s.dispatchAttempts[libraryItemID]
+	if !ok {
+		return false
+	}
+	return now.Sub(record.lastAt) < dispatchBackoff(record.count)
+}
+
+// recordDispatchAttempt increments libraryItemID's consecutive dispatch-
+// attempt count and stamps the current time, called only after
+// DispatchAutomaticPending has actually submitted a job for it. Entries are
+// intentionally never explicitly cleared on success -- once an item
+// succeeds it stops appearing in ListPendingLibrarySearchTargets entirely,
+// so it simply stops being looked up; a stray leftover entry for a
+// long-since-resolved item is harmless and bounded by total library size.
+func (s *Service) recordDispatchAttempt(libraryItemID int64, now time.Time) {
+	if s == nil {
+		return
+	}
+	s.dispatchAttemptMu.Lock()
+	defer s.dispatchAttemptMu.Unlock()
+	record := s.dispatchAttempts[libraryItemID]
+	record.count++
+	record.lastAt = now
+	s.dispatchAttempts[libraryItemID] = record
 }
 
 // claimURLInMemory atomically checks-and-sets rawURL's in-memory dispatch

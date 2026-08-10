@@ -855,7 +855,7 @@ func (db *DB) GetQueueRetryTarget(ctx context.Context, queueItemID int64) (Queue
 // still-plausible pending item, protecting the shared Hydra2 rate limit.
 func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceHours int) ([]PendingLibrarySearchTarget, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
-		select item.library_item_id, item.media_type, coalesce(item.tv_show_id, 0), coalesce(item.season_number, 0), item.selected, coalesce(item.selected_release_id, 0), coalesce(item.external_url, ''), item.state, item.updated_at, item.consecutive_failure_searches
+		select item.library_item_id, item.media_type, coalesce(item.tv_show_id, 0), coalesce(item.season_number, 0), item.selected, coalesce(item.selected_release_id, 0), coalesce(item.external_url, ''), item.state, item.updated_at
 		from (
 			select distinct on (q.library_item_id)
 				q.library_item_id,
@@ -868,8 +868,7 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceH
 				q.state,
 				q.updated_at,
 				q.created_at,
-				q.id,
-				q.consecutive_failure_searches
+				q.id
 			from queue_items q
 			join library_items li on li.id = q.library_item_id
 			left join episodes ep on ep.id = li.episode_id
@@ -987,7 +986,7 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceH
 	var out []PendingLibrarySearchTarget
 	for rows.Next() {
 		var item PendingLibrarySearchTarget
-		if err := rows.Scan(&item.LibraryItemID, &item.MediaType, &item.TVShowID, &item.SeasonNumber, &item.Selected, &item.SelectedReleaseID, &item.ExternalURL, &item.State, &item.UpdatedAt, &item.ConsecutiveFailureSearches); err != nil {
+		if err := rows.Scan(&item.LibraryItemID, &item.MediaType, &item.TVShowID, &item.SeasonNumber, &item.Selected, &item.SelectedReleaseID, &item.ExternalURL, &item.State, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, item)

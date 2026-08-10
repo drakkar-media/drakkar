@@ -2295,21 +2295,33 @@ func TestShouldDispatchSelectedTargetBlocksRecentlyDispatchedSameURL(t *testing.
 // candidate pool -- the 30-second passive-resume sweep kept re-dispatching a
 // real NZB download for a different release every single tick, confirmed
 // live as a sustained flood (dispatched=~222 pending=~238 every 30s,
-// visible in NZBHydra's own download history and likely starving a
-// concurrent real playback session for NNTP connections).
+// visible in NZBHydra's own download history -- which got 3 indexers
+// auto-disabled by NZBHydra's own 20s-timeout protection -- and likely
+// starving a concurrent real playback session for NNTP connections).
+//
+// A first attempt at this fix escalated on queue_items.consecutive_failure_searches,
+// which turned out not to work: ReplaceSearchCandidates resets that counter
+// to 0 on every successful *selection*, including a promotion mid-fallback
+// cascade, so it never accumulated across the dispatch-and-fail cycle this
+// backoff needs to slow down -- confirmed live, shipping that version did
+// not reduce the observed dispatch count at all. This exercises the
+// in-memory replacement (recordDispatchAttempt/peekDispatchBackoff) that
+// DispatchAutomaticPending actually drives, not a struct field.
 func TestShouldDispatchSelectedTargetAppliesPerItemBackoffOnRepeatedFailure(t *testing.T) {
 	now := time.Now()
 	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
 	target := database.PendingLibrarySearchTarget{
-		LibraryItemID:              42,
-		SelectedReleaseID:          303,
-		ExternalURL:                "http://example/brand-new-never-seen.nzb",
-		State:                      database.QueueSelected,
-		ConsecutiveFailureSearches: 1,
-		UpdatedAt:                  now,
+		LibraryItemID:     42,
+		SelectedReleaseID: 303,
+		ExternalURL:       "http://example/brand-new-never-seen.nzb",
+		State:             database.QueueSelected,
 	}
+	// Simulate one prior dispatch attempt, exactly as DispatchAutomaticPending
+	// would have recorded it after a successful submit().
+	service.recordDispatchAttempt(target.LibraryItemID, now)
+
 	if service.shouldDispatchSelectedTarget(target, now) {
-		t.Fatal("expected an item with 1+ consecutive failures to back off immediately after its last update, even with a never-before-seen url")
+		t.Fatal("expected an item with 1 recorded attempt to back off immediately after that attempt, even with a never-before-seen url")
 	}
 	if service.shouldDispatchSelectedTarget(target, now.Add(90*time.Second)) {
 		t.Fatal("expected the 2-minute backoff to still be in effect after only 90s")
@@ -2318,11 +2330,16 @@ func TestShouldDispatchSelectedTargetAppliesPerItemBackoffOnRepeatedFailure(t *t
 		t.Fatal("expected dispatch to resume once the 2-minute backoff elapsed")
 	}
 
-	target.ConsecutiveFailureSearches = 6
-	if service.shouldDispatchSelectedTarget(target, now.Add(3*time.Minute)) {
-		t.Fatal("expected the escalated 1-hour backoff to still block a 6-failure item after only 3 minutes")
+	// Simulate 5 more attempts (6 total) to reach the escalated tier.
+	attemptAt := now
+	for i := 0; i < 5; i++ {
+		attemptAt = attemptAt.Add(3 * time.Minute)
+		service.recordDispatchAttempt(target.LibraryItemID, attemptAt)
 	}
-	if !service.shouldDispatchSelectedTarget(target, now.Add(61*time.Minute)) {
+	if service.shouldDispatchSelectedTarget(target, attemptAt.Add(3*time.Minute)) {
+		t.Fatal("expected the escalated 1-hour backoff to still block a 6-attempt item after only 3 minutes")
+	}
+	if !service.shouldDispatchSelectedTarget(target, attemptAt.Add(61*time.Minute)) {
 		t.Fatal("expected dispatch to resume once the escalated 1-hour backoff elapsed")
 	}
 }
@@ -2331,15 +2348,49 @@ func TestShouldDispatchSelectedTargetDispatchesImmediatelyOnFirstAttempt(t *test
 	now := time.Now()
 	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
 	target := database.PendingLibrarySearchTarget{
-		LibraryItemID:              42,
-		SelectedReleaseID:          303,
-		ExternalURL:                "http://example/first-attempt.nzb",
-		State:                      database.QueueSelected,
-		ConsecutiveFailureSearches: 0,
-		UpdatedAt:                  now,
+		LibraryItemID:     42,
+		SelectedReleaseID: 303,
+		ExternalURL:       "http://example/first-attempt.nzb",
+		State:             database.QueueSelected,
 	}
 	if !service.shouldDispatchSelectedTarget(target, now) {
-		t.Fatal("expected a first attempt (no prior failures) to dispatch immediately, not wait on the per-item backoff")
+		t.Fatal("expected a first attempt (no prior recorded attempts) to dispatch immediately, not wait on the per-item backoff")
+	}
+}
+
+// TestDispatchAutomaticPendingRecordsAttemptOnActualSubmit guards the wiring
+// between DispatchAutomaticPending and recordDispatchAttempt: a target that's
+// been submitted twice must be backed off on a third pass within the
+// backoff window, since submit() itself is what's supposed to record the
+// attempt (shouldDispatchSelectedTarget's own peek must never record).
+func TestDispatchAutomaticPendingRecordsAttemptOnActualSubmit(t *testing.T) {
+	repo := &repoStub{
+		pending: []database.PendingLibrarySearchTarget{
+			{LibraryItemID: 42, SelectedReleaseID: 303, ExternalURL: "http://example/repeat-dispatch.nzb", State: database.QueueSelected},
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	service.downloader.incWorker() // hasWorkers() must be true for submit() to enqueue rather than run inline
+	defer service.downloader.decWorker()
+
+	if _, err := service.DispatchAutomaticPending(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Drain the one job now queued so a second submit() for the same
+	// selectedReleaseID isn't rejected by the dispatcher's own in-flight dedup
+	// (a different mechanism than the backoff this test is targeting).
+	job, ok := service.downloader.next(context.Background())
+	if !ok {
+		t.Fatal("expected a job to have been queued")
+	}
+	service.downloader.markDone(job.selectedReleaseID)
+
+	result, err := service.DispatchAutomaticPending(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Searched != 0 {
+		t.Fatalf("expected the second pass (within the 2-minute backoff) to skip dispatch, got Searched=%d", result.Searched)
 	}
 }
 
