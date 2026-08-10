@@ -2893,9 +2893,7 @@
     <!-- TASKS -->
     {:else if activeTab === 'tasks'}
       <div class="task-summary-grid">
-        <div class="task-summary-card"><div class="task-summary-value">{taskDefs.filter(t => t.group === 'Indexing').length}</div><div class="task-summary-label">Indexing tasks</div></div>
-        <div class="task-summary-card"><div class="task-summary-value">{taskDefs.filter(t => t.group === 'Publishing').length}</div><div class="task-summary-label">Publishing tasks</div></div>
-        <div class="task-summary-card"><div class="task-summary-value">{taskDefs.filter(t => t.group === 'Maintenance').length}</div><div class="task-summary-label">Maintenance tasks</div></div>
+        <div class="task-summary-card"><div class="task-summary-value">{taskDefs.length}</div><div class="task-summary-label">Scheduled tasks</div></div>
         <div class="task-summary-card"><div class="task-summary-value">{taskRunningCount}</div><div class="task-summary-label">Running now</div></div>
       </div>
       <Panel title="Scheduled Tasks" subtitle="Scheduled-job control plane for indexing, publishing, and maintenance work.">

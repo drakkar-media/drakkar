@@ -274,3 +274,92 @@ func TestLoadVFCacheInitializesNilCacheMap(t *testing.T) {
 		t.Fatalf("expected size 3, got %d", vf.Size())
 	}
 }
+
+// TestGetCurrentFileDetailResolvesSeasonPackEpisodeViaSymlinkPublication
+// covers a season pack: every episode's selected_releases row is created
+// independently (see FulfillEpisodeLibraryItem/season_pack_fulfillment.go),
+// but every virtual_files row for the pack still points at the single
+// triggering selected_release_id -- so a naive join on
+// vf.selected_release_id = sr.id (the per-episode row) never finds the
+// actual file. symlink_publications is the only table that actually maps
+// library_item_id -> the right virtual_file_id, and must be preferred.
+func TestGetCurrentFileDetailResolvesSeasonPackEpisodeViaSymlinkPublication(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	var packLibID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('episode', 'season-pack-check-triggering', true)
+		returning id`).Scan(&packLibID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, packLibID)
+
+	var episodeLibID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('episode', 'season-pack-check-episode', true)
+		returning id`).Scan(&episodeLibID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, episodeLibID)
+
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, selected, indexer_name, resolution, score)
+		values ($1, 'season-pack-check release', true, 'NZB Finder', '1080p', 1398)
+		returning id`, packLibID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+
+	var packSrID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, packLibID, rcID).Scan(&packSrID); err != nil {
+		t.Fatal(err)
+	}
+
+	// The per-episode selected_releases row FulfillEpisodeLibraryItem creates
+	// -- deliberately has no virtual_files of its own.
+	var episodeSrID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, episodeLibID, rcID).Scan(&episodeSrID); err != nil {
+		t.Fatal(err)
+	}
+
+	var vfID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, size_bytes, reader_kind, inline_bytes)
+		values ($1, 'Episode.mkv', 'Episode.mkv', 1887750951, 'inline', $2)
+		returning id`, packSrID, []byte("x")).Scan(&vfID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.UpsertSymlinkPublication(ctx, episodeLibID, vfID, "/library/Episode.mkv", "/downloads/Episode.mkv"); err != nil {
+		t.Fatal(err)
+	}
+
+	detail, found, err := db.GetCurrentFileDetail(ctx, episodeLibID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected found = true")
+	}
+	if detail.FileName != "Episode.mkv" || detail.FileSizeBytes != 1887750951 {
+		t.Fatalf("expected season-pack episode's real file via symlink_publications, got %+v", detail)
+	}
+}

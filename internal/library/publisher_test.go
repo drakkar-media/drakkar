@@ -658,3 +658,40 @@ func TestRepublishEpisodeFromSourceReleaseRefreshesContentDir(t *testing.T) {
 		t.Fatalf("expected the symlink to be published, got %+v", repo.publicated)
 	}
 }
+
+// TestRepublishEpisodeFromSourceReleaseMatchesDoubleEpisodeFile guards the
+// bug behind permanently-stuck health-page "Consistency Issues": a combined
+// double-episode release file (e.g. "S03E17E18") only parses to its first
+// episode number, so a library item for the second episode (E18 here) was
+// never matched and its symlink was silently skipped -- Republish Pending
+// looked like it did nothing because, for these items, it genuinely did
+// nothing. Confirmed live for "NCIS: New Orleans" S03E18 (file S03E17E18).
+func TestRepublishEpisodeFromSourceReleaseMatchesDoubleEpisodeFile(t *testing.T) {
+	repo := &repoStub{
+		byLibrary:     nil,
+		sourceRelease: 77,
+		episodeMeta: map[int64]database.EpisodeMetadata{
+			25716: {ShowTitle: "NCIS: New Orleans", ShowYear: 2014, SeasonNumber: 3, EpisodeNumber: 18},
+		},
+		files: []database.ReleaseVirtualFile{
+			{
+				VirtualFileID:     11,
+				SelectedReleaseID: 77,
+				Path:              "releases/77/NCIS.New.Orleans.S03E17E18.mkv",
+				FileName:          "NCIS.New.Orleans.S03E17E18.mkv",
+			},
+		},
+	}
+	root := t.TempDir()
+	rt := config.DefaultRuntime()
+	rt.TVLibraryPath = filepath.Join(root, "tv")
+	rt.FuseMountPath = filepath.Join(root, "vfs")
+	publisher := NewPublisher(repo, rt, "")
+
+	if err := publisher.RepublishLibraryItem(context.Background(), 25716); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.publicated) != 1 {
+		t.Fatalf("expected the double-episode file's symlink to be published for episode 18, got %+v", repo.publicated)
+	}
+}

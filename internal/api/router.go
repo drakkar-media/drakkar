@@ -178,6 +178,8 @@ type WorkflowService interface {
 	RestoreRejectedReleases(ctx context.Context, libraryItemID int64) (database.RejectedReleaseRestoreResult, error)
 	SkipRelease(ctx context.Context, releaseCandidateID int64) (workflow.ReleaseActionResult, error)
 	RetryQueueItem(ctx context.Context, queueItemID int64) (workflow.QueueRetryResult, error)
+	PauseQueueItem(ctx context.Context, queueItemID int64) error
+	ResumeQueueItem(ctx context.Context, queueItemID int64) error
 	ManageQueueItem(ctx context.Context, queueItemID int64, action string) (workflow.QueueManageResult, error)
 	ManageQueueItems(ctx context.Context, queueItemIDs []int64, action string) (workflow.BulkQueueRetryResult, error)
 	ManageFailedQueue(ctx context.Context, action string) (workflow.BulkQueueRetryResult, error)
@@ -633,6 +635,38 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		publishMutation("queue.retry", map[string]any{"queueItemId": id, "action": result.Action})
 		respondJSON(w, http.StatusAccepted, result)
+	})
+	r.Post("/api/queue/{id}/pause", func(w http.ResponseWriter, r *http.Request) {
+		if workflowSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
+			return
+		}
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
+			return
+		}
+		if err := workflowSvc.PauseQueueItem(r.Context(), id); err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		publishMutation("queue.pause", map[string]any{"queueItemId": id})
+		respondJSON(w, http.StatusAccepted, map[string]bool{"paused": true})
+	})
+	r.Post("/api/queue/{id}/resume", func(w http.ResponseWriter, r *http.Request) {
+		if workflowSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
+			return
+		}
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
+			return
+		}
+		if err := workflowSvc.ResumeQueueItem(r.Context(), id); err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		publishMutation("queue.resume", map[string]any{"queueItemId": id})
+		respondJSON(w, http.StatusAccepted, map[string]bool{"paused": false})
 	})
 	r.Post("/api/queue/retry-failed", func(w http.ResponseWriter, r *http.Request) {
 		if workflowSvc == nil {

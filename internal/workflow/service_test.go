@@ -52,6 +52,9 @@ type repoStub struct {
 	retryTarget               database.QueueRetryTarget
 	skipped                   []int64
 	requeued                  []int64
+	paused                    []int64
+	resumed                   []int64
+	pausedSelectedReleaseID   int64
 	stored                    database.StoredNZBDocument
 	restoredGroup             []int64
 	calibrateFn               func(context.Context, int64) error
@@ -183,6 +186,14 @@ func (r *repoStub) BlocklistQueueSelectedRelease(ctx context.Context, queueItemI
 }
 func (r *repoStub) ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) error {
 	r.skipped = append(r.skipped, queueItemID)
+	return nil
+}
+func (r *repoStub) PauseQueueItem(ctx context.Context, queueItemID int64) (int64, error) {
+	r.paused = append(r.paused, queueItemID)
+	return r.pausedSelectedReleaseID, nil
+}
+func (r *repoStub) ResumeQueueItem(ctx context.Context, queueItemID int64) error {
+	r.resumed = append(r.resumed, queueItemID)
 	return nil
 }
 func (r *repoStub) RequeueSelectedRelease(ctx context.Context, queueItemID int64) error {
@@ -2711,6 +2722,55 @@ func TestSelectReleaseReturnsGoneErrorWhenCandidateAlreadyConsumed(t *testing.T)
 	_, err := service.SelectRelease(context.Background(), 77)
 	if !errors.Is(err, ErrReleaseCandidateGone) {
 		t.Fatalf("expected ErrReleaseCandidateGone, got %v", err)
+	}
+}
+
+func TestPauseQueueItemCancelsInFlightFetch(t *testing.T) {
+	repo := &repoStub{pausedSelectedReleaseID: 101}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+
+	jobCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resultCh := make(chan downloadJobResult, 1)
+	if !service.downloader.submit(downloadJob{ctx: jobCtx, selectedReleaseID: 101, resultCh: resultCh}) {
+		t.Fatal("expected submit to accept the job")
+	}
+
+	if err := service.PauseQueueItem(context.Background(), 55); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.paused) != 1 || repo.paused[0] != 55 {
+		t.Fatalf("expected repo.PauseQueueItem to be called with 55, got %+v", repo.paused)
+	}
+
+	select {
+	case <-service.downloader.queue[0].ctx.Done():
+	default:
+		t.Fatal("expected the in-flight job's context to be cancelled")
+	}
+}
+
+func TestPauseQueueItemNoopWhenNothingSelected(t *testing.T) {
+	repo := &repoStub{pausedSelectedReleaseID: 0}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+
+	if err := service.PauseQueueItem(context.Background(), 55); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.paused) != 1 {
+		t.Fatalf("expected repo.PauseQueueItem to be called, got %+v", repo.paused)
+	}
+}
+
+func TestResumeQueueItemClearsHold(t *testing.T) {
+	repo := &repoStub{}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+
+	if err := service.ResumeQueueItem(context.Background(), 55); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.resumed) != 1 || repo.resumed[0] != 55 {
+		t.Fatalf("expected repo.ResumeQueueItem to be called with 55, got %+v", repo.resumed)
 	}
 }
 

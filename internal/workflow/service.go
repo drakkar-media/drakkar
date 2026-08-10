@@ -67,6 +67,8 @@ type Repository interface {
 	GetQueueRetryTarget(ctx context.Context, queueItemID int64) (database.QueueRetryTarget, error)
 	BlocklistQueueSelectedRelease(ctx context.Context, queueItemID int64, reason string, ttlDays int) error
 	ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) error
+	PauseQueueItem(ctx context.Context, queueItemID int64) (int64, error)
+	ResumeQueueItem(ctx context.Context, queueItemID int64) error
 	RequeueSelectedRelease(ctx context.Context, queueItemID int64) error
 	ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, candidates []database.SearchCandidateRecord, upgradeSearch bool) (*int64, error)
 	PromoteExistingCandidate(ctx context.Context, libraryItemID int64) (*int64, error)
@@ -431,13 +433,17 @@ type downloadDispatcher struct {
 	queue       []downloadJob
 	signal      chan struct{} // non-blocking notify: item added
 	workerCount int
-	inFlight    map[int64]bool // selectedReleaseID → true while queued or in progress
+	// inFlight tracks selectedReleaseIDs that are queued or in progress. The
+	// cancel func aborts that job's fetch immediately (used by PauseQueueItem);
+	// it is a no-op for jobs claimed via claimInFlight, which run inline on
+	// the caller's own goroutine rather than through submit()/next().
+	inFlight map[int64]context.CancelFunc
 }
 
 func newDownloadDispatcher() *downloadDispatcher {
 	return &downloadDispatcher{
 		signal:   make(chan struct{}, 1),
-		inFlight: make(map[int64]bool),
+		inFlight: make(map[int64]context.CancelFunc),
 	}
 }
 
@@ -460,11 +466,13 @@ func effectiveDownloadPriority(job downloadJob, now time.Time) int {
 // selectedReleaseID is already queued or being processed by a worker.
 func (d *downloadDispatcher) submit(job downloadJob) bool {
 	d.mu.Lock()
-	if d.inFlight[job.selectedReleaseID] {
+	if _, ok := d.inFlight[job.selectedReleaseID]; ok {
 		d.mu.Unlock()
 		return false
 	}
-	d.inFlight[job.selectedReleaseID] = true
+	jobCtx, cancel := context.WithCancel(job.ctx)
+	job.ctx = jobCtx
+	d.inFlight[job.selectedReleaseID] = cancel
 	d.queue = append(d.queue, job)
 	now := time.Now()
 	sort.SliceStable(d.queue, func(i, j int) bool {
@@ -486,8 +494,12 @@ func (d *downloadDispatcher) submit(job downloadJob) bool {
 // submit for the same release is accepted again.
 func (d *downloadDispatcher) markDone(selectedReleaseID int64) {
 	d.mu.Lock()
+	cancel := d.inFlight[selectedReleaseID]
 	delete(d.inFlight, selectedReleaseID)
 	d.mu.Unlock()
+	if cancel != nil {
+		cancel() // release context.WithCancel's resources now that the job is done
+	}
 }
 
 // claimInFlight marks selectedReleaseID as in-flight if it isn't already,
@@ -507,10 +519,23 @@ func (d *downloadDispatcher) markDone(selectedReleaseID int64) {
 func (d *downloadDispatcher) claimInFlight(selectedReleaseID int64) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.inFlight[selectedReleaseID] {
+	if _, ok := d.inFlight[selectedReleaseID]; ok {
 		return false
 	}
-	d.inFlight[selectedReleaseID] = true
+	d.inFlight[selectedReleaseID] = func() {} // no live job ctx to cancel; runs inline
+	return true
+}
+
+// cancel aborts the in-flight fetch for selectedReleaseID, if any, by
+// cancelling its job context. Returns false if nothing is in flight for it.
+func (d *downloadDispatcher) cancel(selectedReleaseID int64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	cancel, ok := d.inFlight[selectedReleaseID]
+	if !ok {
+		return false
+	}
+	cancel()
 	return true
 }
 
@@ -4208,6 +4233,29 @@ func (s *Service) RetryQueueItem(ctx context.Context, queueItemID int64) (QueueR
 		SelectedReleaseID:  search.SelectedReleaseID,
 		SearchCandidateCnt: search.CandidateCount,
 	}, nil
+}
+
+// PauseQueueItem puts a single queue item on hold: any in-flight fetch for
+// its currently selected release is cancelled immediately, its selection is
+// cleared, and it's excluded from every automatic scan (pending search,
+// failed retry, upgrade check) until ResumeQueueItem is called. Resuming
+// re-fetches from scratch -- cancelling mid-fetch discards whatever partial
+// data was in flight, there is no persisted resume point.
+func (s *Service) PauseQueueItem(ctx context.Context, queueItemID int64) error {
+	selectedReleaseID, err := s.repo.PauseQueueItem(ctx, queueItemID)
+	if err != nil {
+		return err
+	}
+	if selectedReleaseID != 0 {
+		s.downloader.cancel(selectedReleaseID)
+	}
+	return nil
+}
+
+// ResumeQueueItem clears a queue item's on_hold flag so it re-enters the
+// normal search/select/fetch cycle.
+func (s *Service) ResumeQueueItem(ctx context.Context, queueItemID int64) error {
+	return s.repo.ResumeQueueItem(ctx, queueItemID)
 }
 
 // ManageQueueItem applies a user-requested queue action (remove,

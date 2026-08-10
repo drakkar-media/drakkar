@@ -151,6 +151,8 @@ func (w workflowStub) RejectRelease(ctx context.Context, releaseCandidateID int6
 func (w workflowStub) RetryQueueItem(ctx context.Context, queueItemID int64) (workflow.QueueRetryResult, error) {
 	return w.retry, nil
 }
+func (w workflowStub) PauseQueueItem(ctx context.Context, queueItemID int64) error  { return nil }
+func (w workflowStub) ResumeQueueItem(ctx context.Context, queueItemID int64) error { return nil }
 
 func (w workflowStub) ManageQueueItem(ctx context.Context, queueItemID int64, action string) (workflow.QueueManageResult, error) {
 	return w.queueAct, nil

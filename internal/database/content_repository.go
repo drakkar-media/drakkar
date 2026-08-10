@@ -316,13 +316,24 @@ func (db *DB) GetCurrentFileDetail(ctx context.Context, libraryItemID int64) (Cu
 	var fileName, readerKind sql.NullString
 	var fileSize sql.NullInt64
 	err := db.SQL.QueryRowContext(ctx, `
+		with sp_file as (
+			select vf.file_name, vf.size_bytes, vf.reader_kind
+			from symlink_publications sp
+			join virtual_files vf on vf.id = sp.virtual_file_id
+			where sp.library_item_id = $1
+			order by vf.size_bytes desc nulls last
+			limit 1
+		)
 		select rc.title, rc.indexer_name, rc.resolution, rc.score,
-		       vf.file_name, vf.size_bytes, vf.reader_kind
+		       coalesce(spf.file_name, vf.file_name),
+		       coalesce(spf.size_bytes, vf.size_bytes),
+		       coalesce(spf.reader_kind, vf.reader_kind)
 		from selected_releases sr
 		join release_candidates rc on rc.id = sr.release_candidate_id
 		left join virtual_files vf on vf.selected_release_id = sr.id
+		left join sp_file spf on true
 		where sr.library_item_id = $1
-		order by sr.id desc, vf.size_bytes desc nulls last
+		order by sr.id desc, coalesce(spf.size_bytes, vf.size_bytes) desc nulls last
 		limit 1`, libraryItemID,
 	).Scan(&out.ReleaseTitle, &out.IndexerName, &out.Resolution, &out.Score, &fileName, &fileSize, &readerKind)
 	if err != nil {

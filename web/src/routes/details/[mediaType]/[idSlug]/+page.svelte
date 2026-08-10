@@ -485,6 +485,14 @@
     subtitleModalEpisodeId = null;
   }
 
+  /** Formats an episode's air date (YYYY-MM-DD) for display, or '' if absent/invalid. */
+  function fmtAirDate(airDate?: string): string {
+    if (!airDate) return '';
+    const date = new Date(airDate);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleDateString('en-GB', { year: 'numeric', month: 'short', day: '2-digit' });
+  }
+
   /** Fetches and shows the current-file info modal for one episode (or the movie/show item). */
   async function openEpisodeInfo(libraryItemId: number, label: string) {
     episodeInfoOpen = true;
@@ -651,6 +659,9 @@
                           {#if episode.title}
                             <span class="ep-title">{episode.title}</span>
                           {/if}
+                          {#if episode.status !== 'available' && fmtAirDate(episode.airDate)}
+                            <span class="ep-airdate" title="Expected release date">{fmtAirDate(episode.airDate)}</span>
+                          {/if}
                         </div>
                         <div class="ep-right">
                           <StatusPill tone={episode.status === 'available' ? 'ok' : 'neutral'}>{episode.status}</StatusPill>
@@ -670,16 +681,16 @@
                             {#if episode.status === 'available'}
                               <button
                                 class="ep-sub-btn"
-                                title="Episode file info"
-                                on:click={() => openEpisodeInfo(epId, epLabel)}
-                              ><Info size={11} /></button>
-                              <button
-                                class="ep-sub-btn"
                                 title="Manage subtitles for this episode"
                                 on:click={() => openSubtitleModal(epId, epLabel)}
                               ><Languages size={11} /> Subs</button>
                               <button
-                                class="ep-sub-btn ep-reset-btn"
+                                class="ep-sub-btn icon-only"
+                                title="Episode file info"
+                                on:click={() => openEpisodeInfo(epId, epLabel)}
+                              ><Info size={11} /></button>
+                              <button
+                                class="ep-sub-btn ep-reset-btn icon-only"
                                 title="Reset this episode"
                                 disabled={isBusy(`reset-${epId}`)}
                                 on:click={() => resetItem(epId, epLabel)}
@@ -807,6 +818,7 @@
         </section>
 
         {#if libraryMatch && localDetail?.mediaType === 'movie'}
+          {@const lm = libraryMatch}
           <section class="panel">
             <h2>Current File</h2>
             {#if localDetail?.currentFile}
@@ -819,8 +831,15 @@
                   <div><span>Resolution</span><strong>{localDetail.currentFile.resolution || '—'}</strong></div>
                   <div><span>Score</span><strong>{localDetail.currentFile.score}</strong></div>
                 </div>
-                <div class="cf-subs" class:missing={!localDetail.currentFile.subtitleLanguages?.length}>
-                  {localDetail.currentFile.subtitleLanguages?.length ? `Subtitles: ${localDetail.currentFile.subtitleLanguages.map((l) => l.toUpperCase()).join(', ')}` : 'No subtitles'}
+                <div class="cf-subs-row">
+                  <div class="cf-subs" class:missing={!localDetail.currentFile.subtitleLanguages?.length}>
+                    {localDetail.currentFile.subtitleLanguages?.length ? `Subtitles: ${localDetail.currentFile.subtitleLanguages.map((l) => l.toUpperCase()).join(', ')}` : 'No subtitles'}
+                  </div>
+                  <button
+                    class="ep-sub-btn"
+                    title="Manage subtitles for this movie"
+                    on:click={() => openSubtitleModal(lm.id, detail?.title ?? 'this movie')}
+                  ><Languages size={11} /> Subs</button>
                 </div>
               </div>
             {:else}
@@ -1128,8 +1147,10 @@
     color: hsl(var(--muted-foreground)); font-size: 12px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
+  .cf-subs-row { display: flex; align-items: center; gap: 8px; }
   .cf-subs {
-    display: inline-flex; align-self: start; padding: 3px 9px; border-radius: 8px;
+    display: inline-flex; align-items: center; box-sizing: border-box; min-height: 24px;
+    padding: 0 9px; border-radius: 8px;
     font-size: 11px; font-weight: 600;
     border: 1px solid hsl(142 60% 45% / 0.25); color: hsl(142 60% 55%);
     background: hsl(142 60% 45% / 0.1);
@@ -1170,8 +1191,13 @@
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .ep-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+  .ep-airdate {
+    font-size: 11px; color: hsl(var(--muted-foreground)); white-space: nowrap;
+  }
   .ep-subs {
-    padding: 3px 9px; border-radius: 8px; font-size: 11px; font-weight: 600;
+    display: inline-flex; align-items: center; justify-content: center;
+    box-sizing: border-box; min-height: 24px; padding: 0 9px;
+    border-radius: 8px; font-size: 11px; font-weight: 600;
     border: 1px solid hsl(142 60% 45% / 0.25); color: hsl(142 60% 55%);
     background: hsl(142 60% 45% / 0.1); white-space: nowrap;
   }
@@ -1180,11 +1206,13 @@
     background: hsl(0 0% 100% / 0.04);
   }
   .ep-sub-btn {
-    display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+    box-sizing: border-box; min-height: 24px; min-width: 24px; padding: 0 9px;
     border-radius: 8px; border: 1px solid hsl(0 0% 100% / 0.08);
     background: hsl(0 0% 100% / 0.04); color: hsl(var(--muted-foreground));
     font-size: 11px; cursor: pointer; flex-shrink: 0;
   }
+  .ep-sub-btn.icon-only { padding: 0; width: 24px; }
   .ep-sub-btn:hover { background: hsl(var(--primary) / 0.15); color: hsl(var(--primary)); border-color: hsl(var(--primary) / 0.3); }
   /* Only relevant to the summary "Request" span (role="button"), which uses
      aria-disabled since a <span> has no native disabled attribute/styling. */

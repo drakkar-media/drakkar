@@ -138,10 +138,18 @@
     });
   }
 
-  async function retryAll() {
-    await runAction(() => api.retryFailedQueue(), {
-      setWorking: (v) => setBusy('retry-all', v),
-      successMessage: () => 'Retry Failed Queue started in background',
+  async function pauseItem(id: number) {
+    await runAction(() => api.pauseQueueItem(id), {
+      setWorking: (v) => setBusy(`pause-${id}`, v),
+      successMessage: () => 'Item paused',
+      afterSuccess: load
+    });
+  }
+
+  async function resumeItem(id: number) {
+    await runAction(() => api.resumeQueueItem(id), {
+      setWorking: (v) => setBusy(`pause-${id}`, v),
+      successMessage: () => 'Item resumed',
       afterSuccess: load
     });
   }
@@ -169,20 +177,6 @@
     });
   }
 
-  async function manageAllFailed(action: 'remove' | 'remove_and_blocklist' | 'remove_blocklist_and_search') {
-    const messages: Record<typeof action, string> = {
-      remove: `Remove all ${failedItems.length} failed queue items from history and retry state?`,
-      remove_and_blocklist: `Remove and blocklist all ${failedItems.length} failed queue items?`,
-      remove_blocklist_and_search: `Remove, blocklist, and re-search all ${failedItems.length} failed queue items?`
-    };
-    if (!confirmed(messages[action])) return;
-    await runAction(() => api.failedQueueAction(action), {
-      setWorking: (v) => setBusy(`manage-all-${action}`, v),
-      successMessage: () => `${action.replaceAll('_', ' ')} started in background`,
-      afterSuccess: load
-    });
-  }
-
   async function manageSelectedFailed(action: 'remove' | 'remove_and_blocklist' | 'remove_blocklist_and_search') {
     if (selectedFailedIds.length === 0) return;
     const messages: Record<typeof action, string> = {
@@ -198,18 +192,6 @@
         selectedHistoryIds = new Set();
         await load();
       }
-    });
-  }
-
-  async function processPending() {
-    // Backend responds immediately with {queued: true} and does the real
-    // work in a background goroutine — actual processed/selected counts
-    // arrive later via a 'library.search_pending' event (see onMount below),
-    // not on this response. Reading those fields here was always undefined.
-    await runAction(() => api.searchPendingLibrary(), {
-      setWorking: (v) => setBusy('process-pending', v),
-      successMessage: () => 'Search queued — processing in background…',
-      afterSuccess: load
     });
   }
 
@@ -316,23 +298,7 @@
       Pause Queue
     {/if}
   </Button>
-  <Button kind="secondary" on:click={processPending} disabled={isBusy('process-pending')}>
-    <SearchCheck size={14} />
-    Process Pending
-  </Button>
   {#if failedItems.length > 0}
-    <Button kind="secondary" on:click={retryAll} disabled={isBusy('retry-all')}>
-      <RotateCcw size={14} />
-      Retry Failed ({failedItems.length})
-    </Button>
-    <Button kind="secondary" on:click={() => manageAllFailed('remove_and_blocklist')} disabled={isBusy('manage-all-remove_and_blocklist')}>
-      <Trash2 size={14} />
-      Blocklist Failed
-    </Button>
-    <Button kind="secondary" on:click={() => manageAllFailed('remove_blocklist_and_search')} disabled={isBusy('manage-all-remove_blocklist_and_search')}>
-      <SearchCheck size={14} />
-      Blocklist + Search
-    </Button>
     <Button kind="danger" on:click={clearFailed} disabled={isBusy('clear-failed')}>
       <Trash2 size={14} />
       Clear Failed
@@ -373,14 +339,6 @@
   <div class="summary-card">
     <div class="summary-value">{failedItems.length}</div>
     <div class="summary-label">Failed items</div>
-  </div>
-  <div class="summary-card">
-    <div class="summary-value">{workQueue.depth}</div>
-    <div class="summary-label">Background queue depth</div>
-  </div>
-  <div class="summary-card">
-    <div class="summary-value">{workQueue.paused ? 'Paused' : 'Running'}</div>
-    <div class="summary-label">Background queue state</div>
   </div>
 </section>
 
@@ -442,15 +400,26 @@
                   {item.nzbFileName ? `${item.nzbFileName} · ` : ''}{item.nzbSegmentCount} segments
                 </div>
               </div>
+              {#if item.onHold}
+                <Button kind="secondary" on:click={() => resumeItem(item.queueItemId)} disabled={isBusy(`pause-${item.queueItemId}`)}>
+                  <Play size={14} />
+                  Resume
+                </Button>
+              {:else}
+                <Button kind="secondary" on:click={() => pauseItem(item.queueItemId)} disabled={isBusy(`pause-${item.queueItemId}`)}>
+                  <Pause size={14} />
+                  Pause
+                </Button>
+              {/if}
               <Button kind="secondary" on:click={() => retryItem(item.queueItemId)} disabled={isBusy(`retry-${item.queueItemId}`)}>
                 <RotateCcw size={14} />
                 Retry
               </Button>
             </div>
-            <div class="progress-track"><div class="progress-fill" style={`width:${pct}%`}></div></div>
+            <div class="progress-track"><div class="progress-fill" style={`width:${item.onHold ? 0 : pct}%`}></div></div>
             <div class="row-foot">
-              <span>{stageLabel(item)}</span>
-              <span class="mono">{pct}%</span>
+              <span>{item.onHold ? 'Paused' : stageLabel(item)}</span>
+              <span class="mono">{item.onHold ? '' : `${pct}%`}</span>
             </div>
           </div>
         {/each}

@@ -89,7 +89,7 @@
   function rowLabel(item: SubtitleLibraryRow): string {
     if (item.mediaType === 'movie') return item.title;
     if (item.seasonNumber && item.episodeNumber) {
-      return `${item.showTitle || item.title} — S${String(item.seasonNumber).padStart(2, '0')}E${String(item.episodeNumber).padStart(2, '0')} ${item.title}`;
+      return `${item.showTitle || item.title} — S${String(item.seasonNumber).padStart(2, '0')}E${String(item.episodeNumber).padStart(2, '0')}`;
     }
     return item.showTitle ? `${item.showTitle} — ${item.title}` : item.title;
   }

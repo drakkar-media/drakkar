@@ -156,6 +156,7 @@ export type QueueItem = {
   nzbFileName?: string;
   nzbFileCount: number;
   nzbSegmentCount: number;
+  onHold: boolean;
   createdAt?: string;
   updatedAt?: string;
 };
@@ -383,6 +384,7 @@ export type EpisodeDetail = {
   libraryItemId?: number;
   /** Languages this episode already has a downloaded subtitle for, at a glance without expanding its subtitle panel. */
   subtitleLanguages?: string[];
+  airDate?: string;
 };
 
 export type ReleaseItem = {

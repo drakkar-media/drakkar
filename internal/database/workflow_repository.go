@@ -875,10 +875,19 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceH
 			left join tv_shows tv on tv.id = ep.tv_show_id
 			left join selected_releases sr on sr.id = q.selected_release_id
 			left join release_candidates rc on rc.id = sr.release_candidate_id
-			where li.available = false
-			  and li.media_type in ('movie', 'episode', 'tv')
+			where li.media_type in ('movie', 'episode', 'tv')
+			  and not q.on_hold
 			  and (
-			    -- Normal pending items: no release selected yet.
+			    -- Normal pending items: no release selected yet. Gated on
+			    -- li.available = false here (not globally) -- the resume and
+			    -- stranded-selected branches below cover a *new* selection
+			    -- being dispatched on an item that may already be available
+			    -- from a prior release (e.g. an upgrade re-check); requiring
+			    -- available = false for those too would permanently exclude
+			    -- them from ever being picked up once dispatched, since a
+			    -- re-selection on an already-available item doesn't flip
+			    -- available back to false. Confirmed live 2026-08-10: ~340
+			    -- queue_items stuck in requested/selected forever this way.
 			    -- last_searched_at cooldown (1 h) mirrors Sonarr/Radarr LastSearchTime:
 			    -- once searched, skip until the cooldown expires to avoid hammering Hydra2.
 			    -- The cooldown escalates with consecutive_failure_searches (reset to 0 on
@@ -895,7 +904,8 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceH
 			    -- escalation entirely and hammering Hydra hourly forever for items that had
 			    -- already failed dozens of times (confirmed live 2026-08-07: PAW Patrol, The
 			    -- Odyssey, Minions & Monsters, a full NCIS: LA back-catalog, Silo, The Ark).
-			    (q.selected_release_id is null and q.state in ($1, $2)
+			    (li.available = false
+			     and q.selected_release_id is null and q.state in ($1, $2)
 			     and (q.state != $2 or q.updated_at < now() - interval '2 hours')
 			     and (
 			         q.last_searched_at is null
@@ -1050,6 +1060,7 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int, releas
 		left join selected_releases sr on sr.id = q.selected_release_id
 		left join release_candidates rc on rc.id = sr.release_candidate_id
 		where li.available = false
+		  and not q.on_hold
 		  and (
 		    -- Failed items needing a fresh Hydra search (ActionSearchAgain /
 		    -- ActionBlocklistAndSearch) are throttled by a last_searched_at
@@ -1220,7 +1231,7 @@ func (db *DB) ListUpgradableLibraryItems(ctx context.Context) ([]int64, error) {
 			(select id from quality_profiles where is_default = true order by id limit 1)
 		)
 		join lateral (
-			select state, selected_release_id, last_searched_at from queue_items
+			select state, selected_release_id, last_searched_at, on_hold from queue_items
 			where library_item_id = li.id
 			order by created_at desc
 			limit 1
@@ -1229,6 +1240,7 @@ func (db *DB) ListUpgradableLibraryItems(ctx context.Context) ([]int64, error) {
 		left join release_candidates rc on rc.id = sr.release_candidate_id
 		where li.available = true
 		  and qp.allow_upgrade = true
+		  and not q.on_hold
 		  and q.state = $1
 		order by q.last_searched_at asc nulls first
 		limit $2`, QueueAvailable, upgradeSearchBatchLimit,
@@ -3657,6 +3669,85 @@ func (db *DB) ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) 
 	}
 
 	return tx.Commit()
+}
+
+// PauseQueueItem puts a queue item on hold: any selected release is cleared
+// (mirroring ClearQueueSelectedRelease's cleanup of its virtual files), the
+// item is reset to 'requested', and on_hold is set so every automatic scan
+// (ListPendingLibrarySearchTargets, ListFailedQueueRetryTargets,
+// ListUpgradableLibraryItems) leaves it alone until ResumeQueueItem clears
+// the flag. Returns the selected_release_id that was cleared (0 if none) so
+// the caller can cancel any in-flight fetch for it.
+func (db *DB) PauseQueueItem(ctx context.Context, queueItemID int64) (int64, error) {
+	tx, err := db.SQL.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var libraryItemID int64
+	if err = tx.QueryRowContext(ctx, `
+		select library_item_id
+		from queue_items
+		where id = $1`, queueItemID,
+	).Scan(&libraryItemID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = nil
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
+		return 0, err
+	}
+
+	var selectedReleaseID sql.NullInt64
+	if err = tx.QueryRowContext(ctx, `
+		select selected_release_id
+		from queue_items
+		where id = $1`, queueItemID,
+	).Scan(&selectedReleaseID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = nil
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	if selectedReleaseID.Valid {
+		if err = preDeleteVFRBySelectedRelease(ctx, tx, selectedReleaseID.Int64); err != nil {
+			return 0, err
+		}
+		if _, err = tx.ExecContext(ctx, `delete from selected_releases where id = $1`, selectedReleaseID.Int64); err != nil {
+			return 0, err
+		}
+	}
+
+	if _, err = tx.ExecContext(ctx, `
+		update queue_items
+		set state = $2, failure_reason = '', selected_release_id = null, on_hold = true, updated_at = now()
+		where id = $1`, queueItemID, QueueRequested,
+	); err != nil {
+		return 0, err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return selectedReleaseID.Int64, nil
+}
+
+// ResumeQueueItem clears a queue item's on_hold flag so the normal automatic
+// scans pick it up again.
+func (db *DB) ResumeQueueItem(ctx context.Context, queueItemID int64) error {
+	_, err := db.SQL.ExecContext(ctx, `
+		update queue_items set on_hold = false, updated_at = now() where id = $1`, queueItemID)
+	return err
 }
 
 // RequeueSelectedRelease resets a queue item that already has a selected

@@ -35,6 +35,7 @@ type QueueSnapshot struct {
 	NZBFileName     string     `json:"nzbFileName,omitempty"`
 	NZBFileCount    int        `json:"nzbFileCount"`
 	NZBSegmentCount int        `json:"nzbSegmentCount"`
+	OnHold          bool       `json:"onHold"`
 	CreatedAt       time.Time  `json:"createdAt"`
 	UpdatedAt       time.Time  `json:"updatedAt"`
 }

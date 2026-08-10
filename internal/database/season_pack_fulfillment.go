@@ -10,19 +10,51 @@ import (
 	"strings"
 )
 
-// episodePattern extracts SxxExx, sxex, or x×xx from a filename.
-var episodePattern = regexp.MustCompile(`(?i)[^a-z]s(\d{1,2})e(\d{1,3})[^0-9]`)
+// episodePattern extracts SxxExx, sxex, or x×xx from a filename, with an
+// optional trailing "Exx" for a combined double-episode file (e.g.
+// "S03E17E18").
+var episodePattern = regexp.MustCompile(`(?i)[^a-z]s(\d{1,2})e(\d{1,3})(?:e(\d{1,3}))?[^0-9]`)
 
 // ParseEpisodeFromFilename returns (season, episode) or (0, 0) if not found.
+// For a combined double-episode filename (e.g. "S03E17E18"), episode is the
+// first of the pair -- callers matching a specific target episode against a
+// filename should use EpisodeNumberMatchesFilename instead, which also
+// accepts the second episode of such a pair.
 func ParseEpisodeFromFilename(name string) (season, episode int) {
+	season, episode, _ = ParseEpisodeRangeFromFilename(name)
+	return season, episode
+}
+
+// ParseEpisodeRangeFromFilename returns the season and episode range encoded
+// in name. For a single-episode filename, episodeStart == episodeEnd. For a
+// combined double-episode filename (e.g. "S03E17E18"), episodeEnd is the
+// second episode number. Returns all zeros if no pattern is found.
+func ParseEpisodeRangeFromFilename(name string) (season, episodeStart, episodeEnd int) {
 	// Pad both sides to ensure the non-alpha boundary matches.
 	m := episodePattern.FindStringSubmatch(" " + strings.ToLower(name) + " ")
 	if m == nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	s, _ := strconv.Atoi(m[1])
 	e, _ := strconv.Atoi(m[2])
-	return s, e
+	episodeEnd = e
+	if m[3] != "" {
+		if e2, err := strconv.Atoi(m[3]); err == nil {
+			episodeEnd = e2
+		}
+	}
+	return s, e, episodeEnd
+}
+
+// EpisodeNumberMatchesFilename reports whether targetEpisode falls within the
+// episode (or double-episode) range encoded in name's season/episode
+// pattern, for the given targetSeason. Use this instead of a strict
+// ParseEpisodeFromFilename equality check when matching a specific known
+// episode against a season-pack filename, so a combined file like
+// "S03E17E18" correctly matches either episode 17 or 18.
+func EpisodeNumberMatchesFilename(targetSeason, targetEpisode int, name string) bool {
+	season, epStart, epEnd := ParseEpisodeRangeFromFilename(name)
+	return season > 0 && season == targetSeason && targetEpisode >= epStart && targetEpisode <= epEnd
 }
 
 // SeasonPackEpisodeMatch pairs a virtual file path with a library item.
@@ -101,27 +133,31 @@ func (db *DB) FindSeasonPackMatches(ctx context.Context, selectedReleaseID, trig
 	seen := map[[2]int]bool{}
 
 	for _, vf := range vfs {
-		season, episode := ParseEpisodeFromFilename(vf.name)
-		if season <= 0 || episode <= 0 {
+		season, epStart, epEnd := ParseEpisodeRangeFromFilename(vf.name)
+		if season <= 0 || epStart <= 0 {
 			continue
 		}
-		key := [2]int{season, episode}
-		if seen[key] {
-			continue
+		// A combined double-episode file (e.g. "S03E17E18") fulfils both
+		// library items, not just the first-parsed episode number.
+		for episode := epStart; episode <= epEnd; episode++ {
+			key := [2]int{season, episode}
+			if seen[key] {
+				continue
+			}
+			libraryItemID, ok := libraryItemByEpisode[key]
+			if !ok {
+				continue // no matching un-fulfilled library item
+			}
+			seen[key] = true
+			matches = append(matches, SeasonPackEpisodeMatch{
+				VirtualFileID:   vf.intID,
+				VirtualFilePath: vf.path,
+				FileName:        vf.name,
+				LibraryItemID:   libraryItemID,
+				SeasonNumber:    season,
+				EpisodeNumber:   episode,
+			})
 		}
-		libraryItemID, ok := libraryItemByEpisode[key]
-		if !ok {
-			continue // no matching un-fulfilled library item
-		}
-		seen[key] = true
-		matches = append(matches, SeasonPackEpisodeMatch{
-			VirtualFileID:   vf.intID,
-			VirtualFilePath: vf.path,
-			FileName:        vf.name,
-			LibraryItemID:   libraryItemID,
-			SeasonNumber:    season,
-			EpisodeNumber:   episode,
-		})
 	}
 	return matches, nil
 }

@@ -111,11 +111,11 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 		// alphabetically wins — typically the season finale.
 		if strings.EqualFold(file.MediaType, "episode") &&
 			file.SeasonNumber > 0 && file.EpisodeNumber > 0 && len(files) > 1 {
-			fs, fe := database.ParseEpisodeFromFilename(file.FileName)
-			if fs > 0 && fe > 0 && (fs != file.SeasonNumber || fe != file.EpisodeNumber) {
+			fs, feStart, _ := database.ParseEpisodeRangeFromFilename(file.FileName)
+			if fs > 0 && feStart > 0 && !database.EpisodeNumberMatchesFilename(file.SeasonNumber, file.EpisodeNumber, file.FileName) {
 				slog.Debug("publish: skipping file — belongs to different episode",
 					"file", file.FileName, "expectedSeason", file.SeasonNumber, "expectedEpisode", file.EpisodeNumber,
-					"parsedSeason", fs, "parsedEpisode", fe)
+					"parsedSeason", fs, "parsedEpisode", feStart)
 				libraryItemIDs[file.LibraryItemID] = struct{}{}
 				continue
 			}
@@ -268,8 +268,7 @@ func (p *Publisher) republishEpisodeFromSourceRelease(ctx context.Context, libra
 		return err
 	}
 	for _, f := range files {
-		s, e := database.ParseEpisodeFromFilename(f.FileName)
-		if s != meta.SeasonNumber || e != meta.EpisodeNumber {
+		if !database.EpisodeNumberMatchesFilename(meta.SeasonNumber, meta.EpisodeNumber, f.FileName) {
 			continue
 		}
 		enriched := f

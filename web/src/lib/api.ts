@@ -127,6 +127,10 @@ export const api = {
   resumeQueue: () => request<WorkQueueStatus>('/api/queue/resume', { method: 'POST' }),
   retryQueue: (queueItemID: number) =>
     request<{ queueItemId: number; action: string; selectedReleaseId?: number; searchCandidateCount?: number }>(`/api/queue/${queueItemID}/retry`, { method: 'POST' }),
+  pauseQueueItem: (queueItemID: number) =>
+    request<{ paused: boolean }>(`/api/queue/${queueItemID}/pause`, { method: 'POST' }),
+  resumeQueueItem: (queueItemID: number) =>
+    request<{ paused: boolean }>(`/api/queue/${queueItemID}/resume`, { method: 'POST' }),
   queueAction: (queueItemID: number, action: string) =>
     request<{ queueItemId: number; action: string; selectedReleaseId?: number; searchCandidateCount?: number }>(`/api/queue/${queueItemID}/action`, {
       method: 'POST',

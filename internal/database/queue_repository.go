@@ -81,6 +81,7 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 		with active as (
 			select q.id from queue_items q
 			where q.state not in ('requested', 'available', 'failed')
+			   or q.on_hold
 		),
 		recent_history as (
 			select q.id from queue_items q
@@ -101,6 +102,7 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 			coalesce(n.file_name, ''),
 			coalesce((select count(*) from nzb_files nf where nf.nzb_document_id = n.id), 0),
 			coalesce((select sum(array_length(nf.message_ids, 1)) from nzb_files nf where nf.nzb_document_id = n.id), 0),
+			q.on_hold,
 			q.created_at,
 			q.updated_at
 		from queue_items q
@@ -114,6 +116,7 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 			order by id desc limit 1
 		) n on sr.id is not null
 		order by
+			q.on_hold asc,
 			case q.state
 				when 'fetching_nzb' then 0
 				when 'indexing' then 1
@@ -150,6 +153,7 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 			&item.NZBFileName,
 			&item.NZBFileCount,
 			&item.NZBSegmentCount,
+			&item.OnHold,
 			&item.CreatedAt,
 			&item.UpdatedAt,
 		); err != nil {

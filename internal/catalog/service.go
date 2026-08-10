@@ -196,6 +196,7 @@ type EpisodeDetail struct {
 	Status            string   `json:"status"`
 	LibraryItemID     *int64   `json:"libraryItemId,omitempty"`
 	SubtitleLanguages []string `json:"subtitleLanguages,omitempty"`
+	AirDate           string   `json:"airDate,omitempty"`
 }
 
 type showEpisodeRow struct {
@@ -205,6 +206,7 @@ type showEpisodeRow struct {
 	Available         bool
 	LibraryItemID     int64
 	SubtitleLanguages []string
+	AirDate           string
 }
 
 // ListLibraryCards returns every movie and TV show in the local library as
@@ -1152,6 +1154,7 @@ func (s *Service) buildTVSeasons(ctx context.Context, detail LibraryDetail) ([]S
 		for _, episode := range season.Episodes {
 			status := "missing"
 			title := episode.Name
+			airDate := episode.AirDate
 			var libID *int64
 			var subtitleLanguages []string
 			if row, ok := available[episodeKey(seasonNumber, episode.EpisodeNumber)]; ok {
@@ -1169,6 +1172,9 @@ func (s *Service) buildTVSeasons(ctx context.Context, detail LibraryDetail) ([]S
 					libID = &id
 				}
 				subtitleLanguages = row.SubtitleLanguages
+				if strings.TrimSpace(row.AirDate) != "" {
+					airDate = row.AirDate
+				}
 			} else {
 				item.MissingCount++
 			}
@@ -1179,6 +1185,7 @@ func (s *Service) buildTVSeasons(ctx context.Context, detail LibraryDetail) ([]S
 				Status:            status,
 				LibraryItemID:     libID,
 				SubtitleLanguages: subtitleLanguages,
+				AirDate:           airDate,
 			})
 		}
 		item.EpisodeCount = len(item.Episodes)
@@ -1261,7 +1268,8 @@ func (s *Service) showEpisodes(ctx context.Context, tvShowID int64) ([]showEpiso
 			e.episode_number,
 			coalesce(e.title, ''),
 			li.available,
-			li.id
+			li.id,
+			coalesce(e.air_date::text, '')
 		from episodes e
 		join library_items li on li.episode_id = e.id
 		where e.tv_show_id = $1
@@ -1275,7 +1283,7 @@ func (s *Service) showEpisodes(ctx context.Context, tvShowID int64) ([]showEpiso
 	var libraryItemIDs []int64
 	for rows.Next() {
 		var item showEpisodeRow
-		if err := rows.Scan(&item.SeasonNumber, &item.EpisodeNumber, &item.Title, &item.Available, &item.LibraryItemID); err != nil {
+		if err := rows.Scan(&item.SeasonNumber, &item.EpisodeNumber, &item.Title, &item.Available, &item.LibraryItemID, &item.AirDate); err != nil {
 			return nil, err
 		}
 		out = append(out, item)
@@ -1341,6 +1349,7 @@ func fallbackTVSeasonsFromRows(rows []showEpisodeRow) []SeasonDetail {
 			Status:            status,
 			LibraryItemID:     libID,
 			SubtitleLanguages: row.SubtitleLanguages,
+			AirDate:           row.AirDate,
 		})
 		season.EpisodeCount++
 	}
