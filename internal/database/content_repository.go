@@ -483,6 +483,15 @@ func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, 
 	}
 
 	db.vfCacheMu.Lock()
+	// Lazily initialized rather than requiring every construction path to
+	// remember to do it -- confirmed live (CI, 2026-08-10): a *DB built
+	// directly as &DB{SQL: sqlDB} (bypassing Open, as several tests do to
+	// avoid a full pgxpool setup) left vfCache nil, and this write panicked
+	// ("assignment to entry in nil map") the moment a test actually reached
+	// a real virtual_files row instead of erroring out earlier.
+	if db.vfCache == nil {
+		db.vfCache = make(map[int64]*cachedVF)
+	}
 	db.vfCache[virtualFileID] = &entry
 	db.vfCacheMu.Unlock()
 	return &entry, nil

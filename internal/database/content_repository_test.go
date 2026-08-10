@@ -2,10 +2,13 @@ package database
 
 import (
 	"context"
+	"database/sql"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/drakkar-media/drakkar/internal/stream"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 type rangeInfoFetcherStub struct {
@@ -201,5 +204,73 @@ func TestReconstructStoredRarRangesFromLegacyFirstVolumeOnlyMapping(t *testing.T
 	spans := buildStoredRarSpans(sources, ranges)
 	if got := spanFileSize(spans); got != 180 {
 		t.Fatalf("expected reconstructed spans to cover 180 bytes, got %d", got)
+	}
+}
+
+// TestLoadVFCacheInitializesNilCacheMap guards a real CI failure
+// (2026-08-10): several tests in this package construct *DB directly as
+// &DB{SQL: sqlDB}, bypassing Open, to avoid a full pgxpool setup -- which
+// left vfCache nil. loadVFCache's cache-fill write then panicked
+// ("assignment to entry in nil map") the moment a test actually reached a
+// real virtual_files row instead of erroring out earlier, surfacing only
+// when shared CI test-database state happened to leave such a row behind.
+// vfCache must self-initialize on first write regardless of how *DB was
+// constructed.
+func TestLoadVFCacheInitializesNilCacheMap(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+
+	db := &DB{SQL: sqlDB}
+	if db.vfCache != nil {
+		t.Fatal("expected vfCache to start nil for this test to be meaningful")
+	}
+
+	var libID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('movie', 'vfcache-nil-map-check', true)
+		returning id`).Scan(&libID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, selected)
+		values ($1, 'vfcache-nil-map-check release', true)
+		returning id`, libID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+
+	var srID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, libID, rcID).Scan(&srID); err != nil {
+		t.Fatal(err)
+	}
+
+	var vfID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, size_bytes, reader_kind, inline_bytes)
+		values ($1, 'test.txt', 'test.txt', 3, 'inline', $2)
+		returning id`, srID, []byte("abc")).Scan(&vfID); err != nil {
+		t.Fatal(err)
+	}
+
+	vf, err := db.OpenVirtualMediaFile(ctx, vfID)
+	if err != nil {
+		t.Fatalf("expected no panic and no error, got: %v", err)
+	}
+	if vf.Size() != 3 {
+		t.Fatalf("expected size 3, got %d", vf.Size())
 	}
 }
