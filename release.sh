@@ -1,20 +1,58 @@
 #!/usr/bin/env bash
 # release.sh — bump version, commit, tag, push, and create a GitHub release.
-# Usage: ./release.sh v0.2.0 ["optional commit message"]
+# Usage: ./release.sh [v0.2.0|next] ["optional commit message"]
+#
+# "next" (or omitting the version entirely) auto-computes the next version
+# from the latest git tag, rolling PATCH over into MINOR once it hits 99
+# instead of continuing into 3 digits: v0.2.99 -> v0.3.00 -> ... -> v0.3.99
+# -> v0.4.00, and so on indefinitely. Pass an explicit version to override
+# this (e.g. for a MAJOR bump or a -rc suffix).
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="drakkar-media/drakkar"
 
-VERSION="${1:-}"
+RAW_VERSION="${1:-next}"
 COMMIT_MESSAGE="${2:-}"
 
-# ── Validation ────────────────────────────────────────────────────────────────
+# ── Resolve version ───────────────────────────────────────────────────────────
 
-if [[ -z "$VERSION" ]]; then
-  echo "Usage: ./release.sh v0.2.0 [\"optional commit message\"]"
-  exit 1
+next_version() {
+  local latest
+  latest="$(git -C "$ROOT_DIR" tag --list 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -1)"
+  if [[ -z "$latest" ]]; then
+    echo "v0.1.0"
+    return
+  fi
+  local ver="${latest#v}"
+  local major="${ver%%.*}"
+  local rest="${ver#*.}"
+  local minor="${rest%%.*}"
+  local patch="${rest#*.}"
+  patch="${patch%%[.-]*}" # drop any -rc1/.1 style suffix on the patch segment
+  # 10# forces base-10 parsing -- without it, a zero-padded segment like "09"
+  # is parsed as (invalid) octal and errors out.
+  major=$((10#$major))
+  minor=$((10#$minor))
+  patch=$((10#$patch))
+  if (( patch >= 99 )); then
+    minor=$((minor + 1))
+    patch=0
+  else
+    patch=$((patch + 1))
+  fi
+  printf "v%d.%d.%02d\n" "$major" "$minor" "$patch"
+}
+
+if [[ "$RAW_VERSION" == "next" ]]; then
+  git -C "$ROOT_DIR" fetch origin --tags >/dev/null 2>&1 || true
+  VERSION="$(next_version)"
+  echo "==> Auto-computed next version: $VERSION"
+else
+  VERSION="$RAW_VERSION"
 fi
+
+# ── Validation ────────────────────────────────────────────────────────────────
 
 if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9._-]+)?$ ]]; then
   echo "Version must look like v0.1.1 or v0.1.1-rc1"
