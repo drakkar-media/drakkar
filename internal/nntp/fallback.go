@@ -153,9 +153,15 @@ func (s *FallbackSource) BodyPriority(ctx context.Context, messageID string, pri
 	return nil, errors.Join(failures...)
 }
 
-// Stat mirrors BodyPriority's fallback/retry/circuit-breaker/conclusive-miss
-// logic but for an existence check rather than a body fetch.
+// Stat mirrors Stat at the default interactive priority. Equivalent to
+// StatPriority with stream.PriorityInteractive.
 func (s *FallbackSource) Stat(ctx context.Context, messageID string) error {
+	return s.StatPriority(ctx, messageID, stream.PriorityInteractive)
+}
+
+// StatPriority mirrors BodyPriority's fallback/retry/circuit-breaker/
+// conclusive-miss logic but for an existence check rather than a body fetch.
+func (s *FallbackSource) StatPriority(ctx context.Context, messageID string, priority stream.FetchPriority) error {
 	if s == nil || len(s.sources) == 0 {
 		return errors.New("fallback source unavailable")
 	}
@@ -177,7 +183,7 @@ func (s *FallbackSource) Stat(ctx context.Context, messageID string) error {
 				failures = append(failures, fmt.Errorf("%s attempt %d: %w", name, attempt+1, ErrProviderCircuitOpen))
 				continue
 			}
-			err := fetchArticleStat(ctx, source.Source, messageID)
+			err := fetchArticleStat(ctx, source.Source, messageID, priority)
 			if err == nil {
 				s.breaker.RecordSuccess(name)
 				return nil
@@ -205,10 +211,14 @@ func fetchArticleBody(ctx context.Context, source ArticleSource, messageID strin
 	return source.Body(ctx, messageID)
 }
 
-// fetchArticleStat uses source's Stat method when it implements StatSource,
-// falling back to a full Body fetch (discarding the body) for sources that
-// only support downloading the article.
-func fetchArticleStat(ctx context.Context, source ArticleSource, messageID string) error {
+// fetchArticleStat uses source's priority-aware StatPriority when available,
+// falling back to the plain Stat method (StatSource), and finally to a full
+// Body fetch (discarding the body) for sources that only support
+// downloading the article.
+func fetchArticleStat(ctx context.Context, source ArticleSource, messageID string, priority stream.FetchPriority) error {
+	if prioritySource, ok := source.(PriorityStatSource); ok {
+		return prioritySource.StatPriority(ctx, messageID, priority)
+	}
 	if statSource, ok := source.(StatSource); ok {
 		return statSource.Stat(ctx, messageID)
 	}

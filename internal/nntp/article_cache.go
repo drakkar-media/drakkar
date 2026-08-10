@@ -85,14 +85,20 @@ func (s *CachedFallbackSource) BodyPriority(ctx context.Context, messageID strin
 	})
 }
 
-// Stat mirrors BodyPriority's missing-cache short-circuit and coalescing,
-// but for an existence check instead of a body fetch.
+// Stat mirrors Stat at the default interactive priority. Equivalent to
+// StatPriority with stream.PriorityInteractive.
 func (s *CachedFallbackSource) Stat(ctx context.Context, messageID string) error {
+	return s.StatPriority(ctx, messageID, stream.PriorityInteractive)
+}
+
+// StatPriority mirrors BodyPriority's missing-cache short-circuit and
+// coalescing, but for an existence check instead of a body fetch.
+func (s *CachedFallbackSource) StatPriority(ctx context.Context, messageID string, priority stream.FetchPriority) error {
 	if s.isMissing(messageID) {
 		return errArticleNotFound(messageID)
 	}
 	_, err := s.statFlight.Do(ctx, messageID, func(ctx context.Context) ([]byte, error) {
-		err := s.inner.Stat(ctx, messageID)
+		err := s.inner.StatPriority(ctx, messageID, priority)
 		if err != nil {
 			if ttl, ok := classifyCacheableError(err); ok {
 				s.markMissing(messageID, ttl)

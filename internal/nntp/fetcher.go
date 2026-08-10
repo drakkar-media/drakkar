@@ -27,6 +27,16 @@ type PriorityArticleSource interface {
 	BodyPriority(ctx context.Context, messageID string, priority stream.FetchPriority) ([]byte, error)
 }
 
+// PriorityStatSource extends StatSource with a priority-aware existence
+// check, mirroring PriorityArticleSource -- needed so a background-priority
+// Stat (e.g. the deep health check) can be gated the same as a
+// background-priority Body fetch instead of silently reverting to
+// unrestricted access at the pool.
+type PriorityStatSource interface {
+	StatSource
+	StatPriority(ctx context.Context, messageID string, priority stream.FetchPriority) error
+}
+
 // SegmentFetcher resolves stream.SegmentRange requests against a
 // DecodedArticleSource, mapping each requested byte range onto the article's
 // actual decoded content and returning only the bytes that fall within it.

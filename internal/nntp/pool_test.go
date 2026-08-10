@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
 type fakeSession struct {
@@ -137,6 +139,75 @@ func TestPooledSourceWakesWaiterAfterDiscard(t *testing.T) {
 
 	if created.Load() != 2 {
 		t.Fatalf("expected 2 sessions created (A discarded, B opened fresh), got %d", created.Load())
+	}
+}
+
+// TestPooledSourceReservesCapacityForInteractivePriority guards the
+// 2026-08-11 fix for a real production stall (Landman S01E01 playback
+// dropping ~15s in): the pool's acquire() had zero priority awareness, so a
+// background health-check/calibration burst could occupy every connection
+// while an interactive player read waited behind it with nothing to
+// preempt. With maxOpen=2 and reserved=1, two concurrent low-priority
+// (background) fetches must never both be in flight at once -- the second
+// must block at the gate even though a physical connection slot is free --
+// while an interactive fetch started at the same time must succeed
+// immediately, using the reserved connection the low-priority traffic can
+// never touch.
+func TestPooledSourceReservesCapacityForInteractivePriority(t *testing.T) {
+	blockLow1 := make(chan struct{})
+	var created atomic.Int32
+	source := NewPooledSourceReserved(context.Background(), func(ctx context.Context) (BodySession, error) {
+		if created.Add(1) == 1 {
+			return &controllableSession{block: blockLow1}, nil
+		}
+		return &controllableSession{}, nil
+	}, 2, 1)
+
+	low1Started := make(chan struct{})
+	low1Done := make(chan error, 1)
+	go func() {
+		close(low1Started)
+		_, err := source.BodyPriority(context.Background(), "<low1>", stream.PriorityBackground)
+		low1Done <- err
+	}()
+	<-low1Started
+	time.Sleep(20 * time.Millisecond) // let low1 take the gate slot and block inside Body
+
+	low2Done := make(chan error, 1)
+	go func() {
+		_, err := source.BodyPriority(context.Background(), "<low2>", stream.PriorityBackground)
+		low2Done <- err
+	}()
+	time.Sleep(20 * time.Millisecond) // let low2 attempt the gate
+
+	select {
+	case err := <-low2Done:
+		t.Fatalf("expected low2 to block on the reserved-capacity gate (only 1 low-priority slot with reserved=1), but it returned early with err=%v", err)
+	default:
+	}
+
+	// An interactive fetch started now must succeed immediately, using the
+	// reserved connection low-priority traffic can never occupy.
+	interactiveDone := make(chan error, 1)
+	go func() {
+		_, err := source.BodyPriority(context.Background(), "<interactive>", stream.PriorityInteractive)
+		interactiveDone <- err
+	}()
+	select {
+	case err := <-interactiveDone:
+		if err != nil {
+			t.Fatalf("interactive fetch failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("interactive fetch was blocked behind background traffic -- reserved capacity was not honored")
+	}
+
+	close(blockLow1)
+	if err := <-low1Done; err != nil {
+		t.Fatalf("low1 fetch failed: %v", err)
+	}
+	if err := <-low2Done; err != nil {
+		t.Fatalf("low2 fetch failed: %v", err)
 	}
 }
 

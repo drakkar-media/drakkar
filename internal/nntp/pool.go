@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/drakkar-media/drakkar/internal/observability"
+	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
 // ErrArticleMissing is returned by Stat on a 430 status. Note that some
@@ -87,16 +88,46 @@ type PooledSource struct {
 	// request context that has no deadline (e.g. a FUSE/WebDAV read).
 	freed chan struct{}
 
+	// lowGate hard-caps how many connections priority < PriorityInteractive
+	// callers (read-ahead, background calibration/health-check) can hold at
+	// once, to maxOpen-reserved -- nil when reserved <= 0 (no gating, the
+	// original flat/unweighted behaviour). See acquireGate. Mirrors
+	// nzbdav-rs's prioritized_semaphore.rs low_gate: a sub-semaphore that
+	// low-priority work must pass through before the shared pool, giving a
+	// hard mathematical guarantee rather than merely preferential release
+	// ordering (which is all the existing scheduler lanes provide -- lane
+	// isolation only decides which goroutine picks up a request, not whether
+	// the underlying connection it then blocks on is available).
+	lowGate chan struct{}
+
 	cancel context.CancelFunc
 }
 
 // NewPooledSource creates a pool bounded at maxOpen connections (coerced to
 // 1 if given <= 0) and starts its background sweep and keep-warm goroutines,
 // scoped to ctx. Callers must call Close when the pool is no longer needed
-// to stop those goroutines.
+// to stop those goroutines. No capacity is reserved for interactive
+// priority -- equivalent to NewPooledSourceReserved with reserved=0.
 func NewPooledSource(ctx context.Context, factory SessionFactory, maxOpen int) *PooledSource {
+	return NewPooledSourceReserved(ctx, factory, maxOpen, 0)
+}
+
+// NewPooledSourceReserved is NewPooledSource but additionally reserves
+// `reserved` connections exclusively for priority >= PriorityInteractive
+// fetches: BodyPriority/StatPriority calls below that priority must first
+// pass through lowGate, which never admits more than maxOpen-reserved
+// concurrent holders. reserved is coerced into [0, maxOpen-1] so interactive
+// traffic always keeps at least one connection and low-priority traffic is
+// never starved to zero.
+func NewPooledSourceReserved(ctx context.Context, factory SessionFactory, maxOpen, reserved int) *PooledSource {
 	if maxOpen <= 0 {
 		maxOpen = 1
+	}
+	if reserved < 0 {
+		reserved = 0
+	}
+	if reserved > maxOpen-1 {
+		reserved = maxOpen - 1
 	}
 	poolCtx, cancel := context.WithCancel(ctx)
 	p := &PooledSource{
@@ -110,6 +141,9 @@ func NewPooledSource(ctx context.Context, factory SessionFactory, maxOpen int) *
 		idle:   make(chan pooledSession, maxOpen*2),
 		freed:  make(chan struct{}, maxOpen),
 		cancel: cancel,
+	}
+	if reserved > 0 {
+		p.lowGate = make(chan struct{}, maxOpen-reserved)
 	}
 	go p.sweepLoop(poolCtx)
 	go p.keepWarmLoop(poolCtx)
@@ -273,14 +307,28 @@ done:
 	}
 }
 
-// Body acquires a pooled session, fetches the article body, and returns the
-// session to the pool on success or discards it (closing the underlying
-// connection) on any error, since an error leaves the connection's protocol
-// state unknown.
+// Body acquires a pooled session at PriorityInteractive (unrestricted -- see
+// BodyPriority), fetches the article body, and returns the session to the
+// pool on success or discards it (closing the underlying connection) on any
+// error, since an error leaves the connection's protocol state unknown.
 func (p *PooledSource) Body(ctx context.Context, messageID string) ([]byte, error) {
+	return p.BodyPriority(ctx, messageID, stream.PriorityInteractive)
+}
+
+// BodyPriority is Body, but priority < PriorityInteractive (read-ahead,
+// background) must first pass through the pool's lowGate (see
+// NewPooledSourceReserved), so such traffic can never consume more than
+// maxOpen-reserved connections -- guaranteeing an interactive fetch always
+// has an immediate path to a connection regardless of background load.
+func (p *PooledSource) BodyPriority(ctx context.Context, messageID string, priority stream.FetchPriority) ([]byte, error) {
 	if p == nil || p.factory == nil {
 		return nil, errors.New("pooled source unavailable")
 	}
+	releaseGate, err := p.acquireGate(ctx, priority)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseGate()
 	session, err := p.acquire(ctx)
 	if err != nil {
 		return nil, err
@@ -294,13 +342,24 @@ func (p *PooledSource) Body(ctx context.Context, messageID string) ([]byte, erro
 	return body, nil
 }
 
-// Stat acquires a pooled session and checks article existence. Unlike Body,
-// an ErrArticleMissing result still releases the session back to the pool
+// Stat acquires a pooled session at PriorityInteractive (unrestricted -- see
+// StatPriority) and checks article existence. Unlike Body, an
+// ErrArticleMissing result still releases the session back to the pool
 // rather than discarding it -- see the inline comment below for why.
 func (p *PooledSource) Stat(ctx context.Context, messageID string) error {
+	return p.StatPriority(ctx, messageID, stream.PriorityInteractive)
+}
+
+// StatPriority is Stat, gated identically to BodyPriority.
+func (p *PooledSource) StatPriority(ctx context.Context, messageID string, priority stream.FetchPriority) error {
 	if p == nil || p.factory == nil {
 		return errors.New("pooled source unavailable")
 	}
+	releaseGate, err := p.acquireGate(ctx, priority)
+	if err != nil {
+		return err
+	}
+	defer releaseGate()
 	session, err := p.acquire(ctx)
 	if err != nil {
 		return err
@@ -319,6 +378,23 @@ func (p *PooledSource) Stat(ctx context.Context, messageID string) error {
 	}
 	p.release(session)
 	return nil
+}
+
+// acquireGate blocks until a low-priority slot is available when priority is
+// below PriorityInteractive and the pool reserves capacity (lowGate !=
+// nil); interactive-priority callers always bypass the gate entirely -- the
+// whole point of the reservation. Returns a release func that must be
+// called exactly once, regardless of outcome.
+func (p *PooledSource) acquireGate(ctx context.Context, priority stream.FetchPriority) (func(), error) {
+	if p.lowGate == nil || priority >= stream.PriorityInteractive {
+		return func() {}, nil
+	}
+	select {
+	case p.lowGate <- struct{}{}:
+		return func() { <-p.lowGate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // acquire returns an idle session if one is fresh, dials a new one if the

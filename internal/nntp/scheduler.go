@@ -335,7 +335,7 @@ func (s *ScheduledSource) handleRequestProtected(req fetchRequest) {
 	start := time.Now()
 	switch req.op {
 	case fetchOperationStat:
-		err = fetchArticleStat(req.ctx, s.source, req.messageID)
+		err = fetchArticleStat(req.ctx, s.source, req.messageID, req.priority)
 	default:
 		body, err = fetchArticleBody(req.ctx, s.source, req.messageID, req.priority)
 	}

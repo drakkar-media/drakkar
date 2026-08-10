@@ -110,12 +110,27 @@ func buildArticleSourceChain(ctx context.Context, rt config.Runtime, usenetCfg c
 				Msg("usenet: foreground + background NNTP lanes (2x maxDownloadConnections) have little or no headroom against the shared connection pool (sum of provider maxConnections) -- a background calibration/health-check burst could delay foreground playback fetches; consider raising provider maxConnections or lowering maxDownloadConnections")
 		}
 	}
+	interactiveWorkers, readAheadWorkers := splitForegroundWorkers(maxDownloadConnections, usenetCfg.StreamingPriorityPct)
 	for _, provider := range usenetCfg.Providers {
 		if !provider.Enabled || provider.Host == "" {
 			continue
 		}
 		client := nntp.NewArticleClient(provider, dialer)
-		pooled := nntp.NewPooledSource(ctx, client.NewSession, provider.MaxConnections)
+		// Reserve this provider's proportional share of the interactive lane
+		// so background/read-ahead traffic against THIS pool can never starve
+		// an interactive fetch of a connection, regardless of how many
+		// connections background work is holding elsewhere. See
+		// PooledSource.acquireGate; mirrors nzbdav-rs's prioritized_semaphore
+		// hard-reservation design (2026-08-11, Landman connection-pool
+		// contention investigation).
+		reserved := 0
+		if maxDownloadConnections > 0 {
+			reserved = provider.MaxConnections * interactiveWorkers / maxDownloadConnections
+		}
+		if reserved < 1 {
+			reserved = 1
+		}
+		pooled := nntp.NewPooledSourceReserved(ctx, client.NewSession, provider.MaxConnections, reserved)
 		pooledSources = append(pooledSources, pooled)
 		articleSources = append(articleSources, nntp.NamedArticleSource{
 			Name:   provider.Name,
@@ -128,7 +143,6 @@ func buildArticleSourceChain(ctx context.Context, rt config.Runtime, usenetCfg c
 
 	fallback := nntp.NewFallbackSource(articleSources, 1)
 	cachedFallback := nntp.NewCachedFallbackSource(fallback)
-	interactiveWorkers, readAheadWorkers := splitForegroundWorkers(maxDownloadConnections, usenetCfg.StreamingPriorityPct)
 	scheduled := nntp.NewScheduledSourceLanes(ctx, cachedFallback, interactiveWorkers, readAheadWorkers, maxDownloadConnections, maxDownloadConnections*8)
 	diskDecoded := nntp.NewDiskCachedDecodedSource(scheduled, rt.BlockCachePath, rt.DiskCacheLimitBytes)
 	decoded := nntp.NewCachedDecodedSource(diskDecoded, rt.MemoryHotCacheMaxBytes)
