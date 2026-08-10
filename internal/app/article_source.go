@@ -51,6 +51,33 @@ func (c *articleSourceChain) Close() {
 	}
 }
 
+// splitForegroundWorkers divides maxDownloadConnections between the
+// scheduler's interactive and read-ahead lanes using the same
+// streamingPriorityPct that already governs ReadAheadManager's own
+// per-session parallelism cap (SetConnectionBudget), so one setting
+// consistently expresses "how much of the download budget favors
+// speculative prefetch" at both layers. Confirmed live (2026-08-10, Venom:
+// Let There Be Carnage): before this split, interactive and read-ahead
+// shared one worker pool, so a read-ahead burst occupying every worker left
+// a new interactive fetch nothing to preempt -- it could only wait for one
+// to finish. Each side is floored at 1 so neither lane can ever end up with
+// zero workers regardless of how extreme the percentage is configured.
+func splitForegroundWorkers(maxDownloadConnections, streamingPriorityPct int) (interactiveWorkers, readAheadWorkers int) {
+	pct := streamingPriorityPct
+	if pct <= 0 || pct > 100 {
+		pct = 80
+	}
+	readAheadWorkers = maxDownloadConnections * pct / 100
+	interactiveWorkers = maxDownloadConnections - readAheadWorkers
+	if interactiveWorkers < 1 {
+		interactiveWorkers = 1
+	}
+	if readAheadWorkers < 1 {
+		readAheadWorkers = 1
+	}
+	return interactiveWorkers, readAheadWorkers
+}
+
 // buildArticleSourceChain constructs the full Usenet fetch pipeline for the
 // given provider list, exactly mirroring the pipeline built once at startup
 // in Run -- extracted here so both Run and a live Usenet-settings reload
@@ -101,7 +128,8 @@ func buildArticleSourceChain(ctx context.Context, rt config.Runtime, usenetCfg c
 
 	fallback := nntp.NewFallbackSource(articleSources, 1)
 	cachedFallback := nntp.NewCachedFallbackSource(fallback)
-	scheduled := nntp.NewScheduledSourceLanes(ctx, cachedFallback, maxDownloadConnections, maxDownloadConnections, maxDownloadConnections*8)
+	interactiveWorkers, readAheadWorkers := splitForegroundWorkers(maxDownloadConnections, usenetCfg.StreamingPriorityPct)
+	scheduled := nntp.NewScheduledSourceLanes(ctx, cachedFallback, interactiveWorkers, readAheadWorkers, maxDownloadConnections, maxDownloadConnections*8)
 	diskDecoded := nntp.NewDiskCachedDecodedSource(scheduled, rt.BlockCachePath, rt.DiskCacheLimitBytes)
 	decoded := nntp.NewCachedDecodedSource(diskDecoded, rt.MemoryHotCacheMaxBytes)
 

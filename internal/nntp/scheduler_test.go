@@ -94,9 +94,9 @@ func (s *startTrackingSource) startedAt(messageID string) (time.Time, bool) {
 // lane, the low-priority fetch starts immediately regardless.
 func TestScheduledSourceBackgroundLaneNotBlockedByForeground(t *testing.T) {
 	src := &startTrackingSource{wait: 200 * time.Millisecond}
-	// One foreground worker (kept busy for 200ms by "high-1"), one dedicated
-	// background worker.
-	scheduler := NewScheduledSourceLanes(context.Background(), src, 1, 1, 8)
+	// One interactive worker (kept busy for 200ms by "high-1"), one read-ahead
+	// worker, one dedicated background worker.
+	scheduler := NewScheduledSourceLanes(context.Background(), src, 1, 1, 1, 8)
 
 	testStart := time.Now()
 	go func() {
@@ -117,6 +117,44 @@ func TestScheduledSourceBackgroundLaneNotBlockedByForeground(t *testing.T) {
 	}
 	if d := startedAt.Sub(testStart); d > 100*time.Millisecond {
 		t.Fatalf("expected background fetch to START promptly via its own lane, started %v after test began (foreground worker was busy for 200ms)", d)
+	}
+}
+
+// TestScheduledSourceInteractiveLaneNotBlockedByReadAhead guards a real
+// production incident (2026-08-10, Venom: Let There Be Carnage): interactive
+// and read-ahead used to share one "foreground" worker pool, with priority
+// ordering (high checked before medium) as the only protection -- which only
+// helps a request still queued, not one that arrives after every worker in
+// the shared pool is already mid-fetch. A read-ahead burst busy long enough
+// left a new interactive fetch nothing to preempt, so it queued behind it
+// same as low priority used to queue behind foreground before the
+// background lane split. Interactive now gets its own dedicated lane that
+// read-ahead saturation can never reach into.
+func TestScheduledSourceInteractiveLaneNotBlockedByReadAhead(t *testing.T) {
+	src := &startTrackingSource{wait: 200 * time.Millisecond}
+	// One interactive worker, one read-ahead worker (kept busy for 200ms by
+	// "medium-1"), one dedicated background worker (unused here).
+	scheduler := NewScheduledSourceLanes(context.Background(), src, 1, 1, 1, 8)
+
+	testStart := time.Now()
+	go func() {
+		_, _ = scheduler.BodyPriority(context.Background(), "medium-1", stream.PriorityReadAhead)
+	}()
+	time.Sleep(10 * time.Millisecond) // let medium-1 claim the sole read-ahead worker
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = scheduler.BodyPriority(context.Background(), "high-1", stream.PriorityInteractive)
+		close(done)
+	}()
+	<-done
+
+	startedAt, ok := src.startedAt("high-1")
+	if !ok {
+		t.Fatal("high-1 never started")
+	}
+	if d := startedAt.Sub(testStart); d > 100*time.Millisecond {
+		t.Fatalf("expected interactive fetch to START promptly via its own lane, started %v after test began (read-ahead worker was busy for 200ms)", d)
 	}
 }
 

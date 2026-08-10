@@ -1362,6 +1362,7 @@
             <label class="form-field">
               <span>Streaming Priority %</span>
               <input type="number" bind:value={draft.usenet.streamingPriorityPercent} min="0" max="100" />
+              <small class="field-hint">Share of Max Download Connections given to the read-ahead (prefetch) lane. The rest goes to the interactive playback-read lane, which always has its own guaranteed workers and is never blocked by prefetch. Applies immediately.</small>
             </label>
             <label class="form-field">
               <span>Article Buffer Size</span>
@@ -1575,9 +1576,10 @@
             </div>
           </Panel>
 
-          <Panel title="Queue Behavior" subtitle="Priority tiers — interactive playback always takes precedence.">
+          <Panel title="Queue Behavior" subtitle="Three independent worker lanes — read-ahead can never block interactive playback reads, at any load.">
             <div class="kv-list">
-              <div><span>Playback lane</span><strong>{draft.usenet.streamingPriorityPercent}% of pool</strong></div>
+              <div><span>Interactive lane (playback reads)</span><strong>{100 - draft.usenet.streamingPriorityPercent}% of download connections</strong></div>
+              <div><span>Read-ahead lane (prefetch)</span><strong>{draft.usenet.streamingPriorityPercent}% of download connections</strong></div>
               <div><span>Background lane</span><strong>{status?.backgroundQueueDepth ?? 0} queued</strong></div>
               <div><span>Retry path</span><strong>candidate fallback first</strong></div>
               <div><span>Seek prefetch</span><strong>deferred until first read</strong></div>

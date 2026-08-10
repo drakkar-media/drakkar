@@ -32,13 +32,10 @@ const defaultSlowFetchThreshold = 2 * time.Second
 var ErrSchedulerQueueFull = errors.New("nntp scheduler queue full")
 
 // ScheduledSource dispatches NNTP article fetches using a three-tier priority
-// queue split across two independent worker lanes: a foreground lane for
-// download/streaming BODY fetches (capped at "Max Download Connections"),
-// and a background lane for calibration/health-check work so it's never
-// blocked behind download/streaming traffic.
+// queue split across three independent worker lanes, one per tier:
 //
-//	high   (priority ≥ Interactive=100) — direct player reads     -- foreground lane
-//	medium (priority ≥ ReadAhead=80)   — speculative prefetch     -- foreground lane
+//	high   (priority ≥ Interactive=100) — direct player reads            -- interactive lane
+//	medium (priority ≥ ReadAhead=80)   — speculative prefetch            -- read-ahead lane
 //	low    (priority < 80)             — background calibration / checks -- background lane
 //
 // Drakkar's calibration/health-check does a full body fetch+decode (a much
@@ -47,8 +44,22 @@ var ErrSchedulerQueueFull = errors.New("nntp scheduler queue full")
 // reintroduce the over-concurrency that caused corrupted reads under heavy
 // load (see calibrate.go's confirmPermanentCRCMismatch and the 2026-07-19
 // incident). Instead it gets its own separate, independently-sized worker
-// lane: never blocked behind foreground (high/medium) traffic, but still
+// lane: never blocked behind interactive/read-ahead traffic, but still
 // bounded, not run at up to the full account connection ceiling.
+//
+// interactive and read-ahead used to share one "foreground" lane/worker
+// pool, with priority ordering (high checked before medium) as the only
+// thing protecting interactive reads. That protects queued-but-not-yet-
+// dispatched requests, but not against a worker already mid-fetch: once
+// every foreground worker is busy processing NNTP round trips -- read-ahead
+// ramped up toward its parallelism share is enough on its own to do this --
+// a new interactive fetch has nothing to preempt and must wait for one to
+// finish. Confirmed live (2026-08-10): a lingering pre-seek session's
+// read-ahead (plus, before the two connected fixes shipped, its own
+// foreground reads) occupied the shared lane while a new seek's interactive
+// fetch queued behind it. Splitting interactive into its own dedicated
+// lane means it always has guaranteed worker capacity that read-ahead can
+// never occupy, at any load.
 type ScheduledSource struct {
 	source ArticleSource
 	high   chan fetchRequest
@@ -84,25 +95,32 @@ const (
 	fetchOperationStat
 )
 
-// NewScheduledSource starts two independent worker lanes: `workers` goroutines
-// serving only high/medium (foreground: interactive + read-ahead), and
-// `backgroundWorkers` goroutines serving only low (background: calibration /
-// health-check) — see the ScheduledSource doc comment for why these must not
-// share a pool. If backgroundWorkers <= 0, low falls back to being served by
-// the foreground workers too (old behaviour), so existing callers that don't
-// care about the split keep working.
+// NewScheduledSource starts a single shared worker pool serving all three
+// tiers in priority order -- the simple, unsplit form used by tests that
+// don't care about lane isolation. See NewScheduledSourceLanes for the real
+// three-lane split production actually uses.
 func NewScheduledSource(ctx context.Context, source ArticleSource, workers int, queueSize int) *ScheduledSource {
-	return NewScheduledSourceLanes(ctx, source, workers, 0, queueSize)
+	return NewScheduledSourceLanes(ctx, source, workers, 0, 0, queueSize)
 }
 
-// NewScheduledSourceLanes is NewScheduledSource with an explicit, independent
-// background-lane worker count. See the ScheduledSource doc comment.
-func NewScheduledSourceLanes(ctx context.Context, source ArticleSource, workers, backgroundWorkers, queueSize int) *ScheduledSource {
-	if workers <= 0 {
-		workers = 1
+// NewScheduledSourceLanes starts three independent worker lanes --
+// interactiveWorkers serving only high, readAheadWorkers serving only
+// medium, backgroundWorkers serving only low -- so none of the three tiers
+// can ever occupy another's dedicated capacity. See the ScheduledSource doc
+// comment for why interactive and read-ahead must not share a lane, and why
+// background needs its own separate one too.
+//
+// If backgroundWorkers <= 0, the read-ahead/background split is skipped
+// entirely and interactiveWorkers goroutines serve all three tiers from one
+// shared pool in priority order (the pre-three-lane-split behaviour), so
+// simple callers (NewScheduledSource, most tests) that don't care about lane
+// isolation keep working with a single worker-count knob.
+func NewScheduledSourceLanes(ctx context.Context, source ArticleSource, interactiveWorkers, readAheadWorkers, backgroundWorkers, queueSize int) *ScheduledSource {
+	if interactiveWorkers <= 0 {
+		interactiveWorkers = 1
 	}
 	if queueSize <= 0 {
-		queueSize = workers * 4
+		queueSize = (interactiveWorkers + max(readAheadWorkers, 1) + max(backgroundWorkers, 1)) * 4
 	}
 	schedCtx, cancel := context.WithCancel(ctx)
 	s := &ScheduledSource{
@@ -114,16 +132,22 @@ func NewScheduledSourceLanes(ctx context.Context, source ArticleSource, workers,
 		slowFetchThreshold: defaultSlowFetchThreshold,
 	}
 	if backgroundWorkers > 0 {
-		for range workers {
-			go s.foregroundWorker(schedCtx)
+		if readAheadWorkers <= 0 {
+			readAheadWorkers = 1
+		}
+		for range interactiveWorkers {
+			go s.interactiveWorker(schedCtx)
+		}
+		for range readAheadWorkers {
+			go s.readAheadWorker(schedCtx)
 		}
 		for range backgroundWorkers {
 			go s.backgroundWorker(schedCtx)
 		}
 	} else {
-		// No dedicated background lane: fall back to one shared pool serving
-		// all three tiers in priority order (matches the pre-split behaviour).
-		for range workers {
+		// No dedicated lane split: fall back to one shared pool serving all
+		// three tiers in priority order (matches the pre-split behaviour).
+		for range interactiveWorkers {
 			go s.worker(schedCtx)
 		}
 	}
@@ -244,22 +268,39 @@ func (s *ScheduledSource) worker(ctx context.Context) {
 	}
 }
 
-// foregroundWorker only ever serves high/medium (interactive + read-ahead) --
-// used when a dedicated background lane exists, so low-priority
-// calibration/health-check work can never occupy a foreground worker slot.
-func (s *ScheduledSource) foregroundWorker(ctx context.Context) {
+// interactiveWorker only ever serves high (direct player reads) -- its own
+// dedicated lane, so a read-ahead burst (or, before v0.2.98, a lingering
+// pre-seek session's read-ahead) can never occupy every worker capable of
+// serving an interactive fetch. See the ScheduledSource doc comment.
+func (s *ScheduledSource) interactiveWorker(ctx context.Context) {
 	for {
-		req, ok := s.nextForeground(ctx)
-		if !ok {
+		select {
+		case req := <-s.high:
+			s.handleRequestProtected(req)
+		case <-ctx.Done():
 			return
 		}
-		s.handleRequestProtected(req)
+	}
+}
+
+// readAheadWorker only ever serves medium (speculative prefetch) -- its own
+// dedicated lane, separately bounded from interactive so it can never starve
+// it, and from background so a calibration/health-check burst can't starve
+// read-ahead either.
+func (s *ScheduledSource) readAheadWorker(ctx context.Context) {
+	for {
+		select {
+		case req := <-s.medium:
+			s.handleRequestProtected(req)
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
 // backgroundWorker only ever serves low (calibration/health-check) -- its own
-// dedicated lane, never blocked behind foreground traffic, and separately
-// bounded rather than sharing the foreground worker count.
+// dedicated lane, never blocked behind interactive/read-ahead traffic, and
+// separately bounded rather than sharing their worker counts.
 func (s *ScheduledSource) backgroundWorker(ctx context.Context) {
 	for {
 		select {
@@ -268,25 +309,6 @@ func (s *ScheduledSource) backgroundWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		}
-	}
-}
-
-// nextForeground picks the highest-priority pending high/medium request,
-// blocking until one is available or ctx is cancelled. Mirrors next but never
-// looks at low -- see foregroundWorker.
-func (s *ScheduledSource) nextForeground(ctx context.Context) (req fetchRequest, ok bool) {
-	select {
-	case req := <-s.high:
-		return req, true
-	default:
-	}
-	select {
-	case req := <-s.high:
-		return req, true
-	case req := <-s.medium:
-		return req, true
-	case <-ctx.Done():
-		return fetchRequest{}, false
 	}
 }
 
