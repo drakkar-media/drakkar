@@ -74,8 +74,55 @@ func Handler(db ContentProvider, movieLibPath, tvLibPath string) http.Handler {
 	// without requiring vfs-cache-mode=full.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Encoding", "identity")
-		h.ServeHTTP(w, r)
+		h.ServeHTTP(newDeadlineResponseWriter(w), r)
 	})
+}
+
+// writeIdleTimeout bounds how long a single Write to the client can go
+// without the client acknowledging any data before it's treated as dead.
+// Confirmed live (2026-08-10): a seek opens a brand-new GET/Range request
+// while the old one -- still mid io.Copy from StoredRarReader into the TCP
+// connection -- lingers if the client abandons it without a clean TCP
+// close (no FIN/RST). Go's net/http.Server sets no write deadline of its
+// own, so that stale write blocks in the write() syscall for however long
+// the OS's own TCP retransmission timeout is, which defaults to several
+// minutes on Linux -- and for that whole time, the stale session's checked-
+// out NNTP connections (interactive fetch plus any in-flight read-ahead)
+// never return to the pool, so the new seek's fetch queues behind them.
+// Refreshed on every successful Write, so a real, slow-but-alive transfer
+// is never killed -- only a connection making zero progress for this long.
+var writeIdleTimeout = 20 * time.Second
+
+// deadlineResponseWriter wraps an http.ResponseWriter so every Write extends
+// a rolling deadline on the underlying connection via http.ResponseController,
+// converting an indefinitely-blocking write to a dead peer into a bounded
+// error a handful of seconds later instead of minutes.
+type deadlineResponseWriter struct {
+	http.ResponseWriter
+	rc *http.ResponseController
+}
+
+func newDeadlineResponseWriter(w http.ResponseWriter) *deadlineResponseWriter {
+	return &deadlineResponseWriter{ResponseWriter: w, rc: http.NewResponseController(w)}
+}
+
+func (w *deadlineResponseWriter) Write(p []byte) (int, error) {
+	// Best-effort: SetWriteDeadline can fail on response writers that don't
+	// support it (e.g. in tests using httptest.ResponseRecorder), in which
+	// case the write proceeds without a deadline rather than failing outright.
+	_ = w.rc.SetWriteDeadline(time.Now().Add(writeIdleTimeout))
+	return w.ResponseWriter.Write(p)
+}
+
+// Flush is not promoted automatically -- embedding the http.ResponseWriter
+// interface only exposes that interface's own methods, not every optional
+// interface (http.Flusher, http.Hijacker) the concrete value underneath it
+// happens to implement. net/http's chunked-transfer path relies on Flush
+// being reachable, so it's forwarded explicitly.
+func (w *deadlineResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // contentFS is a read-only webdav.FileSystem backed by the database rather

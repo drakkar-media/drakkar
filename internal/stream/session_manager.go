@@ -246,7 +246,21 @@ func (m *ReadAheadManager) Register(sessionID string, spans []SegmentSpan, fetch
 	m.mu.Unlock()
 }
 
-// RegisterMeta attaches display metadata to an already-registered session.
+// RegisterMeta attaches display metadata to an already-registered session,
+// and stops read-ahead for any other session already open on the same
+// VirtualFileID.
+//
+// A seek from a WebDAV client (e.g. Plex) doesn't reuse the existing
+// connection -- it opens a brand-new GET/Range request while the old one
+// may still be lingering (see deadlineResponseWriter in internal/dav for
+// why that lingering can itself take a while to resolve). Until now, the
+// old session's read-ahead kept running the whole time, competing with the
+// new session's interactive fetch for the same finite NNTP connection pool
+// at exactly the moment that fetch needs a connection fastest. Since
+// VirtualFileID only becomes known here (Register, called from
+// StartSession, has none yet), this is the first point two sessions for the
+// same file can be recognized as the same logical playback -- so this is
+// where the stale one's read-ahead gets cut loose.
 func (m *ReadAheadManager) RegisterMeta(sessionID string, meta SessionMeta) {
 	if m == nil || sessionID == "" {
 		return
@@ -254,6 +268,22 @@ func (m *ReadAheadManager) RegisterMeta(sessionID string, meta SessionMeta) {
 	m.mu.Lock()
 	if s := m.sessions[sessionID]; s != nil {
 		s.meta = meta
+	}
+	var stale []string
+	if meta.VirtualFileID != 0 {
+		for id, s := range m.sessions {
+			if id != sessionID && s.meta.VirtualFileID == meta.VirtualFileID {
+				stale = append(stale, id)
+			}
+		}
+	}
+	for _, id := range stale {
+		if s := m.sessions[id]; s != nil {
+			if s.cancel != nil {
+				s.cancel()
+			}
+			delete(m.sessions, id)
+		}
 	}
 	m.mu.Unlock()
 }

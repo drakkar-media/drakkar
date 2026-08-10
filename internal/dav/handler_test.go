@@ -2,6 +2,9 @@ package dav
 
 import (
 	"context"
+	"io"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
@@ -18,6 +21,7 @@ import (
 type countingProvider struct {
 	pubs      []database.SymlinkPublication
 	entries   []database.ContentMountEntry
+	vf        stream.VirtualMediaFile
 	calls     int64
 	openCalls int64
 }
@@ -40,7 +44,22 @@ func (p *countingProvider) ListContentMountEntriesForRelease(ctx context.Context
 }
 func (p *countingProvider) OpenVirtualMediaFile(ctx context.Context, virtualFileID int64) (stream.VirtualMediaFile, error) {
 	atomic.AddInt64(&p.openCalls, 1)
-	return nil, nil
+	return p.vf, nil
+}
+
+// endlessVirtualFile is a huge (but never actually backed by real data)
+// VirtualMediaFile: ReadAt always fills the destination with zero bytes and
+// succeeds, so a handler serving it can be made to write far more than any
+// test's client will ever read.
+type endlessVirtualFile struct{ size int64 }
+
+func (f endlessVirtualFile) Name() string { return "endless.mkv" }
+func (f endlessVirtualFile) Size() int64  { return f.size }
+func (f endlessVirtualFile) ReadAt(_ context.Context, dst []byte, offset int64) (int, error) {
+	if offset >= f.size {
+		return 0, io.EOF
+	}
+	return len(dst), nil
 }
 
 // TestGetTreeCachesWithinTTL guards a real production incident: statCompleted
@@ -160,5 +179,62 @@ func TestPropfindDoesNotOpenVirtualMediaFile(t *testing.T) {
 	}
 	if calls := atomic.LoadInt64(&provider.openCalls); calls != 0 {
 		t.Fatalf("expected PROPFIND to never call OpenVirtualMediaFile, got %d calls", calls)
+	}
+}
+
+// TestHandlerWriteDeadlineUnsticksAbandonedConnection guards a real
+// production incident (2026-08-10): a seek opens a brand-new GET/Range
+// request while the old one, still mid-copy from the reader into the TCP
+// connection, lingers if the client abandons it without a clean TCP close.
+// Go's net/http.Server sets no write deadline of its own, so that stale
+// write blocks in the write() syscall for however long the OS's own TCP
+// retransmission timeout is (several minutes on Linux by default) -- and
+// for that whole time the stale session never releases back to the pool,
+// so a new seek's fetch queues behind it. This must resolve in roughly
+// writeIdleTimeout, not minutes: a real client that stops reading (without
+// closing) must cause the server's Write to fail well within a few
+// multiples of the deadline.
+func TestHandlerWriteDeadlineUnsticksAbandonedConnection(t *testing.T) {
+	orig := writeIdleTimeout
+	writeIdleTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { writeIdleTimeout = orig })
+
+	provider := &countingProvider{
+		entries: []database.ContentMountEntry{
+			{SelectedReleaseID: 1, FileName: "movie.mkv", SizeBytes: 64 << 20, VirtualFileID: 1},
+		},
+		vf: endlessVirtualFile{size: 64 << 20},
+	}
+	h := Handler(provider, "/movies", "/tv")
+
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.ServeHTTP(w, r)
+		close(done)
+	}))
+	defer srv.Close()
+
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("GET /content/releases/1/movie.mkv HTTP/1.1\r\nHost: test\r\n\r\n")); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	// Read just enough to get past the response headers, then stop reading
+	// entirely without closing the connection -- simulating a client that
+	// abandoned the stream without a clean TCP close.
+	buf := make([]byte, 4096)
+	if _, err := conn.Read(buf); err != nil {
+		t.Fatalf("read headers: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not return within a reasonable multiple of writeIdleTimeout -- it blocked on the abandoned connection")
 	}
 }

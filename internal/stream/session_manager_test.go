@@ -326,3 +326,76 @@ func TestReadAheadManagerCapsArticleBuffer(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// TestRegisterMetaStopsStaleSessionForSameVirtualFile guards a real
+// production incident (2026-08-10): a seek opens a brand-new WebDAV
+// GET/Range request (and thus a brand-new session) while the old one is
+// still lingering, rather than reusing it. Before this fix, the old
+// session's read-ahead kept running -- and kept consuming NNTP connection
+// budget -- until it independently noticed the client was gone, competing
+// with the new session's interactive fetch for the same pool at exactly the
+// moment it needs a connection fastest. RegisterMeta is where a new
+// session's VirtualFileID first becomes known, so that's where the old
+// session for the same file must be recognized and cut loose.
+func TestRegisterMetaStopsStaleSessionForSameVirtualFile(t *testing.T) {
+	manager := NewReadAheadManager(32)
+	fetcher := &priorityFetcherStub{calls: make(chan priorityFetchCall, 2)}
+	manager.Register("old-session", []SegmentSpan{{SegmentID: 1, MessageID: "<msg1>", Start: 0, End: 128}}, fetcher)
+	manager.RegisterMeta("old-session", SessionMeta{VirtualFileID: 42})
+
+	manager.NotifyRead("old-session", 0)
+	oldCall := <-fetcher.calls
+
+	manager.Register("new-session", []SegmentSpan{{SegmentID: 1, MessageID: "<msg1>", Start: 0, End: 128}}, fetcher)
+	manager.RegisterMeta("new-session", SessionMeta{VirtualFileID: 42})
+
+	select {
+	case <-oldCall.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("expected the old session's in-flight read-ahead to be cancelled when a new session opened for the same VirtualFileID")
+	}
+
+	active := manager.ActiveSessions()
+	for _, s := range active {
+		if s.SessionID == "old-session" {
+			t.Fatalf("expected the old session to be removed from tracking, still present: %#v", s)
+		}
+	}
+
+	manager.Stop("new-session")
+}
+
+// TestRegisterMetaLeavesUnrelatedSessionsAlone guards against an
+// overcorrection: sessions for a *different* VirtualFileID must never be
+// touched just because some other session's metadata was registered.
+func TestRegisterMetaLeavesUnrelatedSessionsAlone(t *testing.T) {
+	manager := NewReadAheadManager(32)
+	fetcher := &priorityFetcherStub{calls: make(chan priorityFetchCall, 2)}
+	manager.Register("other-file", []SegmentSpan{{SegmentID: 1, MessageID: "<msg1>", Start: 0, End: 128}}, fetcher)
+	manager.RegisterMeta("other-file", SessionMeta{VirtualFileID: 7})
+
+	manager.NotifyRead("other-file", 0)
+	otherCall := <-fetcher.calls
+
+	manager.Register("new-session", []SegmentSpan{{SegmentID: 1, MessageID: "<msg1>", Start: 0, End: 128}}, fetcher)
+	manager.RegisterMeta("new-session", SessionMeta{VirtualFileID: 42})
+
+	select {
+	case <-otherCall.ctx.Done():
+		t.Fatal("expected the unrelated session's in-flight read-ahead to survive")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	found := false
+	for _, s := range manager.ActiveSessions() {
+		if s.SessionID == "other-file" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected the unrelated session to remain tracked")
+	}
+
+	manager.Stop("other-file")
+	manager.Stop("new-session")
+}
