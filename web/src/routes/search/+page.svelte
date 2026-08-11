@@ -8,7 +8,6 @@
    * reuse PosterCard.
    */
   import { page } from '$app/state';
-  import SearchIcon from '@lucide/svelte/icons/search';
   import PosterCard from '$lib/components/PosterCard.svelte';
   import { api } from '$lib/api';
   import { detailsHref } from '$lib/detailsHref';
@@ -77,85 +76,41 @@
 
 <svelte:head><title>Search — Drakkar</title></svelte:head>
 
-<div class="page">
-  <header class="head">
-    <div class="title-wrap">
-      <div class="icon"><SearchIcon size={18} /></div>
-      <div>
-        <h1>Search</h1>
-        <p>{query ? `Metadata results for "${query}"` : 'Search movies and shows from top bar.'}</p>
-      </div>
-    </div>
+<div class="flex flex-col gap-5.5">
+  <header>
+    <h1>Search</h1>
+    <p class="mt-1.5 text-sm text-muted-foreground">{query ? `Metadata results for "${query}"` : 'Search movies and shows from top bar.'}</p>
   </header>
 
   {#if loading}
-    <div class="empty">Searching…</div>
+    <div class="rounded-[20px] border border-white/[0.06] bg-white/[0.02] p-7 text-center text-muted-foreground">Searching…</div>
   {:else if !query}
-    <div class="empty">Type in top bar. Press Enter.</div>
+    <div class="rounded-[20px] border border-white/[0.06] bg-white/[0.02] p-7 text-center text-muted-foreground">Type in top bar. Press Enter.</div>
   {:else}
-    <section class="section">
-      <div class="section-head"><h2>Movies</h2><span>{result.movies.length}</span></div>
+    <section class="grid gap-3">
+      <div class="flex items-center justify-between gap-3"><h2 class="m-0">Movies</h2><span class="text-sm text-muted-foreground">{result.movies.length}</span></div>
       {#if result.movies.length > 0}
-        <div class="poster-grid">
+        <div class="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-2.5">
           {#each result.movies as item}
             <PosterCard item={asLibraryLike(item)} href={detailsHref(item)} showStatus={false} />
           {/each}
         </div>
       {:else}
-        <div class="empty small">No movies found.</div>
+        <div class="rounded-[20px] border border-white/[0.06] bg-white/[0.02] p-5 text-center text-muted-foreground">No movies found.</div>
       {/if}
     </section>
 
-    <section class="section">
-      <div class="section-head"><h2>TV Shows</h2><span>{result.tv.length}</span></div>
+    <section class="grid gap-3">
+      <div class="flex items-center justify-between gap-3"><h2 class="m-0">TV Shows</h2><span class="text-sm text-muted-foreground">{result.tv.length}</span></div>
       {#if result.tv.length > 0}
-        <div class="poster-grid">
+        <div class="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-2.5">
           {#each result.tv as item}
             <PosterCard item={asLibraryLike(item)} href={detailsHref(item)} showStatus={false} />
           {/each}
         </div>
       {:else}
-        <div class="empty small">No TV shows found.</div>
+        <div class="rounded-[20px] border border-white/[0.06] bg-white/[0.02] p-5 text-center text-muted-foreground">No TV shows found.</div>
       {/if}
     </section>
   {/if}
 </div>
-
-<style>
-  .page { display: flex; flex-direction: column; gap: 22px; }
-  .head { display: flex; align-items: flex-end; gap: 16px; }
-  .title-wrap { display: flex; align-items: center; gap: 14px; }
-  .icon {
-    display: grid; place-items: center;
-    width: 42px; height: 42px;
-    border-radius: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04);
-  }
-  h1, h2 { margin: 0; }
-  p { margin: 6px 0 0; color: hsl(var(--muted-foreground)); font-size: 14px; }
-  .section { display: grid; gap: 12px; }
-  .section-head {
-    display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  }
-  .section-head span { color: hsl(var(--muted-foreground)); font-size: 13px; }
-  .poster-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 10px;
-  }
-  @media (min-width: 480px)  { .poster-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-  @media (min-width: 700px)  { .poster-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
-  @media (min-width: 900px)  { .poster-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
-  @media (min-width: 1100px) { .poster-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
-  @media (min-width: 1400px) { .poster-grid { grid-template-columns: repeat(8, minmax(0, 1fr)); } }
-  .empty {
-    padding: 28px;
-    border-radius: 20px;
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(0 0% 100% / 0.02);
-    color: hsl(var(--muted-foreground));
-    text-align: center;
-  }
-  .empty.small { padding: 20px; }
-</style>

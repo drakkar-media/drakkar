@@ -46,14 +46,7 @@
 <svelte:head><title>Redirecting… — Drakkar</title></svelte:head>
 
 {#if loading}
-  <div class="empty">Opening merged details…</div>
+  <div class="empty-state">Opening merged details…</div>
 {:else if errorMessage}
-  <div class="empty">{errorMessage}</div>
+  <div class="empty-state">{errorMessage}</div>
 {/if}
-
-<style>
-  .empty {
-    padding: 28px; text-align: center; color: hsl(var(--muted-foreground));
-    border-radius: 20px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.02);
-  }
-</style>

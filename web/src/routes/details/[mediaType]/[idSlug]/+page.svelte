@@ -25,6 +25,9 @@
   import PosterCard from '$lib/components/PosterCard.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
   import SubtitlePanel from '$lib/components/SubtitlePanel.svelte';
+  import * as Select from '$lib/components/ui/select/index.js';
+  import * as Tabs from '$lib/components/ui/tabs/index.js';
+  import { Input } from '$lib/components/ui/input/index.js';
   import { api, subscribeEvents } from '$lib/api';
   import { idFromSlug } from '$lib/detailsHref';
   import { toastError, toastSuccess } from '$lib/toast';
@@ -49,6 +52,24 @@
   // drives the real update (updateQualityProfile / setTVShowMonitoring).
   $: profileSelectValue = activeProfileId == null ? '' : String(activeProfileId);
   $: monitoringSelectValue = localDetail?.monitoringMode ?? 'all';
+  // Select.Trigger's children is exactly what's rendered -- there's no
+  // automatic "show selected option's text" like a native <select> -- so
+  // these derive the visible label from the current bound value.
+  $: currentProfileLabel = profileSelectValue
+    ? (() => {
+        const p = profiles.find((profile) => String(profile.id) === profileSelectValue);
+        return p ? `${p.name}${p.isDefault ? ' · default' : ''}` : 'Default profile';
+      })()
+    : 'Default profile';
+  const MONITORING_LABELS: Record<string, string> = {
+    all: 'All episodes',
+    future: 'Future only',
+    missing: 'Missing only',
+    recent: 'Recent (30d)',
+    pilot: 'Pilot only',
+    none: 'None (paused)'
+  };
+  $: currentMonitoringLabel = MONITORING_LABELS[monitoringSelectValue] ?? 'All episodes';
   let showReleasePicker = false;
   let pickerLabel = '';
   let pickerLibraryItemID: number | null = null;
@@ -536,22 +557,22 @@
 <svelte:head><title>{detail?.title ?? 'Details'} — Drakkar</title></svelte:head>
 
 {#if loading}
-  <div class="empty">Loading details…</div>
+  <div class="rounded-[20px] border border-white/[0.06] bg-white/[0.02] p-7 text-center text-muted-foreground">Loading details…</div>
 {:else if detail}
-  <div class="page">
-    <section class="hero">
-      {#if detail.backdropUrl}<img class="hero-bg" src={detail.backdropUrl} alt="" />{/if}
+  <div class="grid gap-5.5">
+    <section class="hero relative overflow-hidden rounded-[28px] border border-white/[0.08]">
+      {#if detail.backdropUrl}<img class="hero-backdrop" src={detail.backdropUrl} alt="" />{/if}
       <div class="hero-shade"></div>
-      <div class="hero-grid">
-        <div class="poster">
+      <div class="relative z-10 grid min-h-[420px] grid-cols-[220px_minmax(0,1fr)] items-end gap-6 p-6 max-[980px]:grid-cols-1">
+        <div class="aspect-[2/3] overflow-hidden rounded-[20px] border border-white/10 bg-muted max-[980px]:max-w-[220px]">
           {#if detail.posterUrl}
-            <img src={detail.posterUrl} alt="" />
+            <img class="h-full w-full object-cover" src={detail.posterUrl} alt="" />
           {:else}
-            <div class="poster-fallback"><Tv size={28} /></div>
+            <div class="grid h-full w-full place-items-center text-muted-foreground"><Tv size={28} /></div>
           {/if}
         </div>
-        <div class="copy">
-          <div class="badge-row">
+        <div class="grid min-w-0 content-end gap-3 max-[980px]:content-start">
+          <div class="flex flex-wrap gap-2.5">
             <StatusPill tone="neutral">{detail.mediaType}</StatusPill>
             {#if detail.year}<StatusPill tone="neutral">{detail.year}</StatusPill>{/if}
             {#if detail.originalLanguage}<StatusPill tone="neutral">{detail.originalLanguage.toUpperCase()}</StatusPill>{/if}
@@ -563,10 +584,10 @@
               <StatusPill tone="neutral">not in library</StatusPill>
             {/if}
           </div>
-          <h1>{detail.title}</h1>
-          {#if detail.tagline}<div class="tagline">{detail.tagline}</div>{/if}
-          {#if detail.overview}<p>{detail.overview}</p>{/if}
-          <div class="action-row">
+          <h1 class="mt-2 text-[clamp(2rem,5vw,3.7rem)] leading-[1.04]">{detail.title}</h1>
+          {#if detail.tagline}<div class="mt-2.5 font-bold" style="color: color-mix(in oklch, var(--foreground) 82%, transparent)">{detail.tagline}</div>{/if}
+          {#if detail.overview}<p class="max-w-[900px] leading-[1.65]" style="color: color-mix(in oklch, var(--foreground) 80%, transparent)">{detail.overview}</p>{/if}
+          <div class="flex flex-wrap items-center gap-2.5 max-[700px]:items-stretch">
             {#if libraryMatch}
               <Button kind="secondary" on:click={runLocalSearch}>
                 <Search size={15} />
@@ -591,7 +612,7 @@
                 Reset
               </Button>
             {/if}
-            <a class="link-btn secondary" href="/search">Back To Search</a>
+            <a class="inline-flex h-8 items-center justify-center rounded-lg bg-secondary px-2.5 text-sm font-medium text-secondary-foreground no-underline transition-colors hover:bg-secondary/80" href="/search">Back To Search</a>
             <Button kind="ghost" on:click={loadDetail} disabled={loading}>
               <RefreshCw size={15} />
               Refresh
@@ -601,32 +622,32 @@
       </div>
     </section>
 
-    <section class="grid">
-      <div class="main">
-        <section class="panel stats">
-          <h2>Details</h2>
-          <div class="stat-grid">
-            <div><span>Rating</span><strong>{detail.voteAverage ? detail.voteAverage.toFixed(1) : '—'}</strong></div>
-            <div><span>Votes</span><strong>{detail.voteCount || '—'}</strong></div>
-            <div><span>Runtime</span><strong>{detail.runtimeMinutes ? `${detail.runtimeMinutes}m` : '—'}</strong></div>
-            <div><span>Status</span><strong>{detail.status || '—'}</strong></div>
-            <div><span>Language</span><strong>{detail.originalLanguage?.toUpperCase() || '—'}</strong></div>
-            <div><span>Companies</span><strong>{detail.productionCompanies?.length || '—'}</strong></div>
+    <section class="grid grid-cols-[minmax(0,1.7fr)_minmax(300px,0.8fr)] items-start gap-5 max-[980px]:grid-cols-1">
+      <div class="grid gap-4.5">
+        <section class="rounded-2xl border border-white/[0.08] bg-card/[0.82] p-4.5 min-w-0">
+          <h2 class="mb-3.5 text-lg">Details</h2>
+          <div class="grid grid-cols-2 gap-3 max-[700px]:grid-cols-1">
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Rating</span><strong>{detail.voteAverage ? detail.voteAverage.toFixed(1) : '—'}</strong></div>
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Votes</span><strong>{detail.voteCount || '—'}</strong></div>
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Runtime</span><strong>{detail.runtimeMinutes ? `${detail.runtimeMinutes}m` : '—'}</strong></div>
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Status</span><strong>{detail.status || '—'}</strong></div>
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Language</span><strong>{detail.originalLanguage?.toUpperCase() || '—'}</strong></div>
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Companies</span><strong>{detail.productionCompanies?.length || '—'}</strong></div>
           </div>
           {#if detail.genres?.length}
-            <div class="chips genre-chips">{#each detail.genres as genre}<StatusPill tone="neutral">{genre}</StatusPill>{/each}</div>
+            <div class="mt-4.5 flex flex-wrap gap-2.5">{#each detail.genres as genre}<StatusPill tone="neutral">{genre}</StatusPill>{/each}</div>
           {/if}
         </section>
 
         {#if localDetail?.mediaType !== 'movie' && localDetail?.seasons?.length}
-          <section class="panel">
-            <h2>Local Seasons</h2>
-            <div class="season-stack">
+          <section class="rounded-2xl border border-white/[0.08] bg-card/[0.82] p-4.5 min-w-0">
+            <h2 class="mb-3.5 text-lg">Local Seasons</h2>
+            <div class="grid gap-3">
               {#each localDetail.seasons as season}
-                <details class="season-panel" open={season.missingCount > 0}>
-                  <summary>
+                <details class="overflow-hidden rounded-[18px] border border-white/[0.06] bg-white/[0.02]" open={season.missingCount > 0}>
+                  <summary class="grid list-none gap-1.5 p-3.5 cursor-pointer [&::-webkit-details-marker]:hidden">
                     <strong>{season.name}</strong>
-                    <div class="summary-meta">
+                    <div class="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                       {season.availableCount}/{season.episodeCount} available · {season.missingCount} missing
                       {#if season.missingCount > 0 && detail?.tmdbId}
                         <!-- role="button" span, not a real <button>: a <summary> is itself
@@ -636,7 +657,9 @@
                              both actions. A span can't be interactive content, so this keeps
                              the exact same click behavior/position without the invalid nesting. -->
                         <span
-                          class="ep-sub-btn"
+                          class="action-btn"
+                          class:opacity-50={isBusy(`season-request-${season.seasonNumber}`)}
+                          class:pointer-events-none={isBusy(`season-request-${season.seasonNumber}`)}
                           role="button"
                           tabindex="0"
                           aria-disabled={isBusy(`season-request-${season.seasonNumber}`)}
@@ -651,51 +674,56 @@
                       {/if}
                     </div>
                   </summary>
-                  <div class="episode-list">
+                  <div class="grid gap-3">
                     {#each season.episodes as episode}
-                      <div class="episode-row">
-                        <div class="ep-info">
-                          <span class="ep-code">E{String(episode.episodeNumber).padStart(2, '0')}</span>
+                      <div class="flex flex-wrap items-center justify-between gap-2 border-t border-white/[0.05] px-3.5 py-2.5">
+                        <div class="grid min-w-0 flex-1 gap-0.5">
+                          <span class="mono text-xs font-bold text-foreground">E{String(episode.episodeNumber).padStart(2, '0')}</span>
                           {#if episode.title}
-                            <span class="ep-title">{episode.title}</span>
+                            <span class="truncate text-xs text-muted-foreground">{episode.title}</span>
                           {/if}
                           {#if episode.status !== 'available' && fmtAirDate(episode.airDate)}
-                            <span class="ep-airdate" title="Expected release date">{fmtAirDate(episode.airDate)}</span>
+                            <span class="whitespace-nowrap text-[11px] text-muted-foreground" title="Expected release date">{fmtAirDate(episode.airDate)}</span>
                           {/if}
                         </div>
-                        <div class="ep-right">
-                          <StatusPill tone={episode.status === 'available' ? 'ok' : 'neutral'}>{episode.status}</StatusPill>
-                          {#if episode.status === 'available'}
-                            <span class="ep-subs" class:missing={!episode.subtitleLanguages?.length} title="Subtitle languages available for this episode">
-                              {episode.subtitleLanguages?.length ? episode.subtitleLanguages.map((l) => l.toUpperCase()).join(', ') : 'No subs'}
-                            </span>
-                          {/if}
+                        <div class="flex flex-wrap shrink-0 items-center gap-2.5 max-[480px]:basis-full max-[480px]:justify-end">
+                          <div class="flex flex-wrap items-center gap-1.5">
+                            <StatusPill tone={episode.status === 'available' ? 'ok' : 'neutral'}>{episode.status}</StatusPill>
+                            {#if episode.status === 'available'}
+                              <StatusPill tone={episode.subtitleLanguages?.length ? 'ok' : 'neutral'}>
+                                {episode.subtitleLanguages?.length ? episode.subtitleLanguages.map((l) => l.toUpperCase()).join(', ') : 'No subs'}
+                              </StatusPill>
+                            {/if}
+                          </div>
                           {#if episode.libraryItemId}
                             {@const epId = episode.libraryItemId}
                             {@const epLabel = `S${String(episode.seasonNumber).padStart(2,'0')}E${String(episode.episodeNumber).padStart(2,'0')} ${episode.title}`}
-                            <button
-                              class="ep-sub-btn"
-                              title="Search releases for this episode (includes season packs)"
-                              on:click={() => runEpisodeSearch(epId, episode.seasonNumber, episode.episodeNumber, episode.title)}
-                            ><Search size={11} /> Search</button>
-                            {#if episode.status === 'available'}
+                            <div class="h-4 w-px shrink-0 bg-white/10"></div>
+                            <div class="flex items-center gap-1">
                               <button
-                                class="ep-sub-btn"
-                                title="Manage subtitles for this episode"
-                                on:click={() => openSubtitleModal(epId, epLabel)}
-                              ><Languages size={11} /> Subs</button>
-                              <button
-                                class="ep-sub-btn icon-only"
-                                title="Episode file info"
-                                on:click={() => openEpisodeInfo(epId, epLabel)}
-                              ><Info size={11} /></button>
-                              <button
-                                class="ep-sub-btn ep-reset-btn icon-only"
-                                title="Reset this episode"
-                                disabled={isBusy(`reset-${epId}`)}
-                                on:click={() => resetItem(epId, epLabel)}
-                              ><Trash2 size={11} /></button>
-                            {/if}
+                                class="action-btn"
+                                title="Search releases for this episode (includes season packs)"
+                                on:click={() => runEpisodeSearch(epId, episode.seasonNumber, episode.episodeNumber, episode.title)}
+                              ><Search size={11} /> Search</button>
+                              {#if episode.status === 'available'}
+                                <button
+                                  class="action-btn"
+                                  title="Manage subtitles for this episode"
+                                  on:click={() => openSubtitleModal(epId, epLabel)}
+                                ><Languages size={11} /> Subs</button>
+                                <button
+                                  class="action-btn action-btn-icon"
+                                  title="Episode file info"
+                                  on:click={() => openEpisodeInfo(epId, epLabel)}
+                                ><Info size={11} /></button>
+                                <button
+                                  class="action-btn action-btn-icon action-btn-danger"
+                                  title="Reset this episode"
+                                  disabled={isBusy(`reset-${epId}`)}
+                                  on:click={() => resetItem(epId, epLabel)}
+                                ><Trash2 size={11} /></button>
+                              {/if}
+                            </div>
                           {/if}
                         </div>
                       </div>
@@ -708,15 +736,15 @@
         {/if}
 
         {#if detail.cast?.length}
-          <section class="panel">
-            <h2>Cast</h2>
-            <div class="drag-scroll media-strip">
-              {#each detail.cast.slice(0, 12) as person}
-                <div class="person-slot">
-                  <div class="person-card">
-                    <div class="person-photo">{#if person.profileUrl}<img src={person.profileUrl} alt="" />{/if}</div>
-                    <strong>{person.name}</strong>
-                    <span>{person.character || 'cast'}</span>
+          <section class="rounded-2xl border border-white/[0.08] bg-card/[0.82] p-4.5 min-w-0">
+            <h2 class="mb-3.5 text-lg">Cast</h2>
+            <div class="drag-scroll flex gap-2 overflow-x-auto pb-1">
+              {#each detail.cast.slice(0, 8) as person}
+                <div class="w-[104px] shrink-0 min-[820px]:w-[calc((100%-3.5rem)/8)]">
+                  <div class="grid min-h-full gap-1.5 rounded-xl border border-white/[0.06] bg-white/[0.03] p-2">
+                    <div class="aspect-[2/3] overflow-hidden rounded-xl bg-muted">{#if person.profileUrl}<img class="h-full w-full object-cover" src={person.profileUrl} alt="" loading="lazy" />{/if}</div>
+                    <strong class="text-sm">{person.name}</strong>
+                    <span class="text-xs text-muted-foreground">{person.character || 'cast'}</span>
                   </div>
                 </div>
               {/each}
@@ -725,11 +753,11 @@
         {/if}
 
         {#if detail.recommendations?.length}
-          <section class="panel">
-            <h2>Recommendations</h2>
-            <div class="drag-scroll media-strip">
-              {#each detail.recommendations as item}
-                <div class="poster-slot">
+          <section class="rounded-2xl border border-white/[0.08] bg-card/[0.82] p-4.5 min-w-0">
+            <h2 class="mb-3.5 text-lg">Recommendations</h2>
+            <div class="drag-scroll flex gap-2 overflow-x-auto pb-1">
+              {#each detail.recommendations.slice(0, 8) as item}
+                <div class="w-[104px] shrink-0 min-[820px]:w-[calc((100%-3.5rem)/8)]">
                   <PosterCard item={{ id:0, mediaType:item.mediaType, title:item.title, year:item.year, overview:item.overview, posterUrl:item.posterUrl, backdropUrl:item.backdropUrl, available:false, requestedAt:'', queueState:'requested', failureReason:'', tmdbId:item.tmdbId, imdbId:item.imdbId }} showStatus={false} href={`/details/${item.mediaType === 'tv' ? 'tv' : 'movie'}/${item.tmdbId}-${item.title.toLowerCase().replace(/[^a-z0-9]+/g,'-')}`} compact />
                 </div>
               {/each}
@@ -738,11 +766,11 @@
         {/if}
 
         {#if detail.similar?.length}
-          <section class="panel">
-            <h2>Similar</h2>
-            <div class="drag-scroll media-strip">
-              {#each detail.similar as item}
-                <div class="poster-slot">
+          <section class="rounded-2xl border border-white/[0.08] bg-card/[0.82] p-4.5 min-w-0">
+            <h2 class="mb-3.5 text-lg">Similar</h2>
+            <div class="drag-scroll flex gap-2 overflow-x-auto pb-1">
+              {#each detail.similar.slice(0, 8) as item}
+                <div class="w-[104px] shrink-0 min-[820px]:w-[calc((100%-3.5rem)/8)]">
                   <PosterCard item={{ id:0, mediaType:item.mediaType, title:item.title, year:item.year, overview:item.overview, posterUrl:item.posterUrl, backdropUrl:item.backdropUrl, available:false, requestedAt:'', queueState:'requested', failureReason:'', tmdbId:item.tmdbId, imdbId:item.imdbId }} showStatus={false} href={`/details/${item.mediaType === 'tv' ? 'tv' : 'movie'}/${item.tmdbId}-${item.title.toLowerCase().replace(/[^a-z0-9]+/g,'-')}`} compact />
                 </div>
               {/each}
@@ -751,99 +779,109 @@
         {/if}
       </div>
 
-      <aside class="side">
-        <section class="panel">
-          <h2>Library State</h2>
+      <aside class="grid gap-4.5">
+        <section class="rounded-2xl border border-white/[0.08] bg-card/[0.82] p-4.5 min-w-0">
+          <h2 class="mb-3.5 text-lg">Library State</h2>
           {#if libraryMatch}
-            <div class="kv">
-              <div><span>Presence</span><strong>{libraryMatch.available ? 'Available' : 'Tracked'}</strong></div>
-              <div><span>Queue</span><strong>{libraryMatch.queueState || '—'}</strong></div>
-              <div><span>Available</span><strong>{libraryMatch.availableCount ?? 0}</strong></div>
-              <div><span>Missing</span><strong>{libraryMatch.missingCount ?? 0}</strong></div>
+            <div class="grid grid-cols-2 gap-3">
+              <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Presence</span><strong>{libraryMatch.available ? 'Available' : 'Tracked'}</strong></div>
+              <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Queue</span><strong>{libraryMatch.queueState || '—'}</strong></div>
+              <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Available</span><strong>{libraryMatch.availableCount ?? 0}</strong></div>
+              <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Missing</span><strong>{libraryMatch.missingCount ?? 0}</strong></div>
             </div>
-            <div class="monitoring-row">
-              <label for="profile-select">Quality Profile</label>
-              <select
-                id="profile-select"
+            <div class="mt-3 flex items-center justify-between gap-2.5 border-t border-white/[0.06] pt-3">
+              <label for="profile-select" class="whitespace-nowrap text-xs font-semibold text-muted-foreground">Quality Profile</label>
+              <Select.Root
+                type="single"
                 bind:value={profileSelectValue}
-                disabled={isBusy('quality-profile') || profiles.length === 0}
-                on:change={(e) => updateQualityProfile((e.currentTarget as HTMLSelectElement).value)}
+                onValueChange={(v) => updateQualityProfile(v)}
               >
-                <option value="">Default profile</option>
-                {#each profiles as profile}
-                  <option value={String(profile.id)}>{profile.name}{profile.isDefault ? ' · default' : ''}</option>
-                {/each}
-              </select>
+                <Select.Trigger id="profile-select" class="flex-1 min-w-0" disabled={isBusy('quality-profile') || profiles.length === 0}>
+                  {currentProfileLabel}
+                </Select.Trigger>
+                <Select.Content>
+                  <Select.Item value="">Default profile</Select.Item>
+                  {#each profiles as profile}
+                    <Select.Item value={String(profile.id)}>{profile.name}{profile.isDefault ? ' · default' : ''}</Select.Item>
+                  {/each}
+                </Select.Content>
+              </Select.Root>
             </div>
             {#if libraryMatch.failureReason}
-              <div class="failure-box">{libraryMatch.failureReason.replaceAll('_', ' ')}</div>
+              <div class="mt-3.5 rounded-[14px] border border-white/[0.06] bg-white/[0.03] px-3.5 py-3 text-[13px] text-muted-foreground">{libraryMatch.failureReason.replaceAll('_', ' ')}</div>
             {/if}
             {#if localDetail?.tvShowId}
-              <div class="monitoring-row">
-                <label for="monitoring-select">Monitoring</label>
-                <select
-                  id="monitoring-select"
+              <div class="mt-3 flex items-center justify-between gap-2.5 border-t border-white/[0.06] pt-3">
+                <label for="monitoring-select" class="whitespace-nowrap text-xs font-semibold text-muted-foreground">Monitoring</label>
+                <Select.Root
+                  type="single"
                   bind:value={monitoringSelectValue}
-                  on:change={async (e) => {
+                  onValueChange={async (mode) => {
                     if (!localDetail?.tvShowId) return;
-                    const mode = (e.currentTarget as HTMLSelectElement).value;
                     try {
                       await api.setTVShowMonitoring(localDetail.tvShowId, mode);
                       localDetail = { ...localDetail, monitoringMode: mode };
                     } catch (err) { toastError(err instanceof Error ? err.message : String(err)); }
                   }}
                 >
-                  <option value="all">All episodes</option>
-                  <option value="future">Future only</option>
-                  <option value="missing">Missing only</option>
-                  <option value="recent">Recent (30d)</option>
-                  <option value="pilot">Pilot only</option>
-                  <option value="none">None (paused)</option>
-                </select>
+                  <Select.Trigger id="monitoring-select" class="flex-1 min-w-0">
+                    {currentMonitoringLabel}
+                  </Select.Trigger>
+                  <Select.Content>
+                    <Select.Item value="all">All episodes</Select.Item>
+                    <Select.Item value="future">Future only</Select.Item>
+                    <Select.Item value="missing">Missing only</Select.Item>
+                    <Select.Item value="recent">Recent (30d)</Select.Item>
+                    <Select.Item value="pilot">Pilot only</Select.Item>
+                    <Select.Item value="none">None (paused)</Select.Item>
+                  </Select.Content>
+                </Select.Root>
               </div>
             {/if}
           {:else}
-            <div class="empty-side">No local library item linked yet.</div>
+            <div class="rounded-[14px] border border-white/[0.06] bg-white/[0.03] px-3.5 py-3 text-[13px] text-muted-foreground">No local library item linked yet.</div>
           {/if}
         </section>
 
-        <section class="panel">
-          <h2>Source</h2>
-          <div class="kv">
-            <div><span>TMDB</span><strong>{detail.tmdbId || '—'}</strong></div>
-            <div><span>IMDb</span><strong>{detail.imdbId || '—'}</strong></div>
-            <div><span>Network</span><strong>{detail.network || '—'}</strong></div>
-            <div><span>Seasons</span><strong>{detail.numberOfSeasons || '—'}</strong></div>
+        <section class="rounded-2xl border border-white/[0.08] bg-card/[0.82] p-4.5 min-w-0">
+          <h2 class="mb-3.5 text-lg">Source</h2>
+          <div class="grid grid-cols-2 gap-3">
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">TMDB</span><strong>{detail.tmdbId || '—'}</strong></div>
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">IMDb</span><strong>{detail.imdbId || '—'}</strong></div>
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Network</span><strong>{detail.network || '—'}</strong></div>
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Seasons</span><strong>{detail.numberOfSeasons || '—'}</strong></div>
           </div>
         </section>
 
         {#if libraryMatch && localDetail?.mediaType === 'movie'}
           {@const lm = libraryMatch}
-          <section class="panel">
-            <h2>Current File</h2>
+          <section class="rounded-2xl border border-white/[0.08] bg-card/[0.82] p-4.5 min-w-0">
+            <h2 class="mb-3.5 text-lg">Current File</h2>
             {#if localDetail?.currentFile}
-              <div class="current-file">
-                <div class="cf-name" title={localDetail.currentFile.fileName}>{localDetail.currentFile.fileName}</div>
-                <div class="cf-release" title={localDetail.currentFile.releaseTitle}>{localDetail.currentFile.releaseTitle}</div>
-                <div class="kv">
-                  <div><span>Size</span><strong>{fmtBytes(localDetail.currentFile.fileSizeBytes)}</strong></div>
-                  <div><span>Indexer</span><strong>{localDetail.currentFile.indexerName || '—'}</strong></div>
-                  <div><span>Resolution</span><strong>{localDetail.currentFile.resolution || '—'}</strong></div>
-                  <div><span>Score</span><strong>{localDetail.currentFile.score}</strong></div>
+              <div class="grid gap-2.5">
+                <div class="truncate text-sm font-bold" title={localDetail.currentFile.fileName}>{localDetail.currentFile.fileName}</div>
+                <div class="truncate text-xs text-muted-foreground" title={localDetail.currentFile.releaseTitle}>{localDetail.currentFile.releaseTitle}</div>
+                <div class="grid grid-cols-2 gap-3">
+                  <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Size</span><strong>{fmtBytes(localDetail.currentFile.fileSizeBytes)}</strong></div>
+                  <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Indexer</span><strong>{localDetail.currentFile.indexerName || '—'}</strong></div>
+                  <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Resolution</span><strong>{localDetail.currentFile.resolution || '—'}</strong></div>
+                  <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Score</span><strong>{localDetail.currentFile.score}</strong></div>
                 </div>
-                <div class="cf-subs-row">
-                  <div class="cf-subs" class:missing={!localDetail.currentFile.subtitleLanguages?.length}>
+                <div class="flex items-center gap-2">
+                  <div
+                    class="inline-flex h-6 items-center rounded-lg px-2.5 text-[11px] font-semibold {localDetail.currentFile.subtitleLanguages?.length ? 'border border-[hsl(142_60%_45%/0.25)] bg-[hsl(142_60%_45%/0.1)] text-[hsl(142_60%_55%)]' : 'border border-white/[0.08] bg-white/[0.04] text-muted-foreground'}"
+                  >
                     {localDetail.currentFile.subtitleLanguages?.length ? `Subtitles: ${localDetail.currentFile.subtitleLanguages.map((l) => l.toUpperCase()).join(', ')}` : 'No subtitles'}
                   </div>
                   <button
-                    class="ep-sub-btn"
+                    class="action-btn"
                     title="Manage subtitles for this movie"
                     on:click={() => openSubtitleModal(lm.id, detail?.title ?? 'this movie')}
                   ><Languages size={11} /> Subs</button>
                 </div>
               </div>
             {:else}
-              <div class="empty-side">No file currently selected.</div>
+              <div class="rounded-[14px] border border-white/[0.06] bg-white/[0.03] px-3.5 py-3 text-[13px] text-muted-foreground">No file currently selected.</div>
             {/if}
           </section>
         {/if}
@@ -851,27 +889,30 @@
     </section>
   </div>
 {:else}
-  <div class="empty">No details found.</div>
+  <div class="rounded-[20px] border border-white/[0.06] bg-white/[0.02] p-7 text-center text-muted-foreground">No details found.</div>
 {/if}
 
 {#if showReleasePicker}
   <div
-    class="modal-backdrop"
+    class="fixed inset-0 z-[900] flex items-center justify-center bg-black/50 p-4"
     on:click={(e) => e.target === e.currentTarget && (showReleasePicker = false)}
     on:keydown={(e) => e.key === 'Escape' && (showReleasePicker = false)}
     role="button"
     tabindex="0"
     aria-label="Close release picker"
   >
-    <div class="rel-modal" role="dialog" aria-modal="true" aria-label="Manual scrape" tabindex="-1">
-      <div class="rel-header">
-        <div class="rel-header-top">
-          <h2>Manual Scrape</h2>
-          <button class="close-btn" on:click={() => (showReleasePicker = false)} aria-label="Close">
+    <div
+      class="flex w-full max-h-[80vh] max-w-[min(calc(100%-2rem),896px)] flex-col gap-4 overflow-hidden rounded-2xl border border-white/10 bg-card p-6 text-foreground shadow-[0_10px_15px_-3px_hsl(0_0%_0%/0.3),0_4px_6px_-4px_hsl(0_0%_0%/0.3)]"
+      role="dialog" aria-modal="true" aria-label="Manual scrape" tabindex="-1"
+    >
+      <div class="flex shrink-0 flex-col gap-2">
+        <div class="flex items-center justify-between">
+          <h2 class="m-0 text-lg font-semibold leading-none">Manual Scrape</h2>
+          <button class="flex size-7 items-center justify-center rounded-md text-foreground opacity-70 transition-opacity hover:opacity-100" on:click={() => (showReleasePicker = false)} aria-label="Close">
             <X size={16} />
           </button>
         </div>
-        <div class="rel-header-desc">
+        <div class="text-sm text-muted-foreground">
           {#if pickerTab === 'search'}
             Choose how to find streams for "{pickerLabel || detail?.title || 'this item'}"
           {:else}
@@ -880,24 +921,26 @@
         </div>
       </div>
 
-      <div class="rel-tabs">
-        <button type="button" class:active={pickerTab === 'search'} on:click={() => selectPickerTab('search')}>Search</button>
-        <button type="button" class:active={pickerTab === 'auto'} on:click={() => selectPickerTab('auto')}>Auto Scrape</button>
-      </div>
+      <Tabs.Root bind:value={pickerTab} onValueChange={(v) => selectPickerTab(v as 'search' | 'auto')} class="shrink-0">
+        <Tabs.List class="w-full grid-cols-2">
+          <Tabs.Trigger value="search" class="flex-1">Search</Tabs.Trigger>
+          <Tabs.Trigger value="auto" class="flex-1">Auto Scrape</Tabs.Trigger>
+        </Tabs.List>
+      </Tabs.Root>
 
-      <div class="rel-tab-body">
+      <div class="min-h-0 flex-1 overflow-y-auto">
         {#if pickerTab === 'search'}
-          <div class="manual-search-block">
-            <form class="manual-search-form" on:submit|preventDefault={runManualSearch}>
-              <div class="manual-search-input-wrap">
-                <Search size={15} />
-                <input
-                  class="manual-search-input"
+          <div class="flex flex-col gap-3.5">
+            <form class="flex flex-col gap-1.5" on:submit|preventDefault={runManualSearch}>
+              <div class="relative flex items-center">
+                <Search size={15} class="pointer-events-none absolute left-2.5 text-muted-foreground" />
+                <Input
                   type="text"
                   placeholder="Search (e.g. show name S01 complete)"
                   bind:value={manualQuery}
                   disabled={manualSearching || manualImporting}
-                  on:keydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); runManualSearch(); } }}
+                  class="!h-9 pl-8"
+                  onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); runManualSearch(); } }}
                 />
               </div>
               <Button kind="secondary" type="submit" disabled={manualSearching || manualImporting || !manualQuery.trim()}>
@@ -906,13 +949,13 @@
               </Button>
             </form>
 
-            <label class="upload-row" class:disabled={uploadingNzb}>
+            <label class="flex h-9 items-center gap-2 rounded-md border border-dashed border-white/15 bg-white/[0.02] px-3 text-[13px] text-muted-foreground transition-colors {uploadingNzb ? 'cursor-default opacity-60' : 'cursor-pointer hover:bg-white/5 hover:border-primary/40'}">
               <Upload size={14} />
               {uploadingNzb ? 'Uploading…' : 'Or upload an NZB file directly'}
               <input
                 type="file"
                 accept=".nzb,application/x-nzb,application/xml,text/xml"
-                class="upload-input"
+                class="hidden"
                 disabled={uploadingNzb}
                 on:change={(e) => {
                   const file = (e.currentTarget as HTMLInputElement).files?.[0];
@@ -923,28 +966,24 @@
             </label>
 
             {#if manualResults.length > 0}
-              <input
-                class="rel-filter-input"
-                type="text"
-                placeholder="Filter results…"
-                bind:value={manualFilterText}
-              />
-              <div class="rel-list">
+              <Input type="text" placeholder="Filter results…" bind:value={manualFilterText} class="!h-8 text-[13px]" />
+              <div class="flex flex-col gap-2">
                 {#each filteredManualResults as item}
                   {@const tags = [item.resolution, item.source, item.codec, item.audio, item.hdr].filter(Boolean) as string[]}
-                  <div class="rel-card" on:click={() => importManualResult(item)} role="button" tabindex="0" on:keydown={(e) => e.key === 'Enter' && importManualResult(item)}>
-                    <div class="rel-card-top">
-                      <p class="rel-card-title">{item.title}</p>
-                      <span class="rel-badge" class:rel-badge-neg={item.score <= 0}>Rank: {item.score}</span>
+                  <div class="flex flex-col gap-2 rounded-xl border border-white/[0.08] bg-white/[0.03] p-3 px-4 cursor-pointer transition-colors hover:border-primary/50" on:click={() => importManualResult(item)} role="button" tabindex="0" on:keydown={(e) => e.key === 'Enter' && importManualResult(item)}>
+                    <div class="flex items-start justify-between gap-2">
+                      <p class="m-0 min-w-0 flex-1 break-all text-[13px] font-semibold leading-[1.4] text-foreground">{item.title}</p>
+                      <span class="shrink-0 whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-bold leading-none {item.score <= 0 ? 'bg-destructive/15 text-destructive' : 'bg-primary/[0.18] text-primary'}">Rank: {item.score}</span>
                     </div>
-                    <div class="rel-card-badges">
+                    <div class="flex flex-wrap items-center gap-1.5">
                       {#each tags as tag}
-                        <span class={`rel-badge-outline tone-${badgeTone(tag)}`}>{tag}</span>
+                        {@const toned = badgeTone(tag) !== 'default'}
+                        <span class="rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap {toned ? 'border border-transparent bg-primary/[0.16] text-primary' : 'border border-white/[0.12] font-normal text-muted-foreground'}">{tag}</span>
                       {/each}
-                      {#if item.indexer}<span class="rel-badge-outline">{item.indexer}</span>{/if}
-                      <span class="rel-badge-outline mono">{fmtBytes(item.sizeBytes)}</span>
+                      {#if item.indexer}<span class="rounded-full border border-white/[0.12] px-2 py-0.5 text-[11px] text-muted-foreground whitespace-nowrap">{item.indexer}</span>{/if}
+                      <span class="mono rounded-full border border-white/[0.12] px-2 py-0.5 text-[11px] text-muted-foreground whitespace-nowrap">{fmtBytes(item.sizeBytes)}</span>
                     </div>
-                    <Button kind="secondary" on:click={(e) => { e.stopPropagation(); importManualResult(item); }} disabled={manualImporting}>
+                    <Button kind="secondary" class="self-start" on:click={(e) => { e.stopPropagation(); importManualResult(item); }} disabled={manualImporting}>
                       <Download size={14} />
                       Import
                     </Button>
@@ -952,64 +991,60 @@
                 {/each}
               </div>
             {:else if manualSearching}
-              <div class="rel-empty">Searching streams…</div>
+              <div class="p-9 text-center text-sm text-muted-foreground">Searching streams…</div>
             {/if}
           </div>
         {:else}
           <Button kind="secondary" on:click={searchAgain} disabled={pickerSearching}>
-            {#if pickerSearching}<RefreshCw size={14} class="spin" />{:else}<Search size={14} />{/if}
+            {#if pickerSearching}<RefreshCw size={14} class="animate-spin" />{:else}<Search size={14} />{/if}
             {pickerSearching ? 'Searching…' : 'Search Again'}
           </Button>
           {#if pickerSearching}
-            <div class="rel-searching-banner">
-              <RefreshCw size={14} class="spin" />
+            <div class="mt-2.5 flex items-center gap-2 rounded-[10px] bg-primary/[0.08] px-3.5 py-2.5 text-[13px] text-muted-foreground">
+              <RefreshCw size={14} class="animate-spin" />
               Searching indexers — results will refresh automatically…
             </div>
           {/if}
           {#if releaseCandidates.length === 0 && !pickerSearching}
-            <div class="rel-empty">No candidates yet — click "Search Again" to run an indexer search.</div>
+            <div class="p-9 text-center text-sm text-muted-foreground">No candidates yet — click "Search Again" to run an indexer search.</div>
           {:else if releaseCandidates.length > 0}
-            <input
-              class="rel-filter-input"
-              type="text"
-              placeholder="Filter results…"
-              bind:value={autoFilterText}
-            />
-            <div class="rel-list">
+            <Input type="text" placeholder="Filter results…" bind:value={autoFilterText} class="!h-8 mt-2.5 text-[13px]" />
+            <div class="mt-2.5 flex flex-col gap-2">
               {#each filteredAutoCandidates as c}
                 {@const tags = qualityTags(c.title)}
-                <div class="rel-card" class:rel-selected={c.selected} class:rel-rejected={c.rejected && !c.selected}>
-                  <div class="rel-card-top">
-                    <p class="rel-card-title">{c.title}</p>
-                    <span class="rel-badge" class:rel-badge-neg={c.rejected && !c.selected}>Score: {c.score}</span>
+                <div class="flex flex-col gap-2 rounded-xl border border-white/[0.08] bg-white/[0.03] p-3 px-4 transition-colors {c.selected ? 'border-primary/40 bg-primary/[0.06]' : ''} {c.rejected && !c.selected ? 'opacity-50' : ''}">
+                  <div class="flex items-start justify-between gap-2">
+                    <p class="m-0 min-w-0 flex-1 break-all text-[13px] font-semibold leading-[1.4] text-foreground">{c.title}</p>
+                    <span class="shrink-0 whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-bold leading-none {c.rejected && !c.selected ? 'bg-destructive/15 text-destructive' : 'bg-primary/[0.18] text-primary'}">Score: {c.score}</span>
                   </div>
-                  <div class="rel-card-badges">
+                  <div class="flex flex-wrap items-center gap-1.5">
                     {#each tags as tag}
-                      <span class={`rel-badge-outline tone-${badgeTone(tag)}`}>{tag}</span>
+                      {@const toned = badgeTone(tag) !== 'default'}
+                      <span class="rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap {toned ? 'border border-transparent bg-primary/[0.16] text-primary' : 'border border-white/[0.12] font-normal text-muted-foreground'}">{tag}</span>
                     {/each}
-                    {#if c.indexerName}<span class="rel-badge-outline">{c.indexerName}</span>{/if}
-                    <span class="rel-badge-outline mono">{fmtBytes(c.sizeBytes)}</span>
-                    <span class="rel-badge-outline mono">cf {c.customFormatScore}</span>
-                    {#if c.selected}<span class="rel-badge-outline rel-pill-ok">selected</span>{/if}
-                    {#if c.rejected && !c.selected}<span class="rel-badge-outline rel-pill-danger">{c.rejectReason || 'rejected'}</span>{/if}
-                    {#if c.failureCount > 0}<span class="rel-badge-outline rel-pill-warn">{c.failureCount}× failed</span>{/if}
+                    {#if c.indexerName}<span class="rounded-full border border-white/[0.12] px-2 py-0.5 text-[11px] text-muted-foreground whitespace-nowrap">{c.indexerName}</span>{/if}
+                    <span class="mono rounded-full border border-white/[0.12] px-2 py-0.5 text-[11px] text-muted-foreground whitespace-nowrap">{fmtBytes(c.sizeBytes)}</span>
+                    <span class="mono rounded-full border border-white/[0.12] px-2 py-0.5 text-[11px] text-muted-foreground whitespace-nowrap">cf {c.customFormatScore}</span>
+                    {#if c.selected}<span class="rounded-full border border-[hsl(142_70%_45%/0.3)] bg-[hsl(142_70%_45%/0.15)] px-2 py-0.5 text-[11px] font-semibold text-[hsl(142_60%_55%)] whitespace-nowrap">selected</span>{/if}
+                    {#if c.rejected && !c.selected}<span class="rounded-full border border-destructive/25 bg-destructive/15 px-2 py-0.5 text-[11px] text-destructive whitespace-nowrap">{c.rejectReason || 'rejected'}</span>{/if}
+                    {#if c.failureCount > 0}<span class="rounded-full border border-[hsl(40_90%_50%/0.25)] bg-[hsl(40_90%_50%/0.15)] px-2 py-0.5 text-[11px] font-semibold text-[hsl(40_80%_60%)] whitespace-nowrap">{c.failureCount}× failed</span>{/if}
                   </div>
                   {#if c.compatibilityWarnings && c.compatibilityWarnings.length > 0}
-                    <div class="compat-warnings">
+                    <div class="mt-1 flex flex-wrap gap-1">
                       {#each c.compatibilityWarnings as w}
-                        <span class="compat-badge" title={w}>⚠ {w.split('—')[0].trim()}</span>
+                        <span class="cursor-default rounded-lg border border-[hsl(38_92%_50%/0.3)] bg-[hsl(38_92%_50%/0.15)] px-1.75 py-0.5 text-[10px] font-semibold text-[hsl(38_92%_70%)]" title={w}>⚠ {w.split('—')[0].trim()}</span>
                       {/each}
                     </div>
                   {/if}
                   {#if c.explanations && c.explanations.length > 0}
-                    <details class="rel-why">
-                      <summary class="rel-why-toggle">Why? ({c.explanations.length} factors)</summary>
-                      <div class="rel-explanations">
+                    <details class="disclosure-caret mt-1">
+                      <summary class="inline-flex select-none items-center gap-1 py-0.5 text-[11px] text-muted-foreground cursor-pointer">Why? ({c.explanations.length} factors)</summary>
+                      <div class="grid gap-0.5 pt-1.5">
                         {#each c.explanations as line}
                           {@const ex = parseExplanation(line)}
-                          <div class="rel-explanation" class:rel-exp-reject={ex.isReject} class:rel-exp-pos={!ex.isReject && ex.delta !== null && ex.delta > 0} class:rel-exp-neg={!ex.isReject && ex.delta !== null && ex.delta < 0}>
+                          <div class="flex items-baseline gap-1.5 text-[11px] leading-[1.5] {ex.isReject ? 'font-medium text-[hsl(0_72%_62%)]' : ex.delta !== null && ex.delta > 0 ? 'text-[hsl(142_71%_55%/0.9)]' : ex.delta !== null && ex.delta < 0 ? 'text-[hsl(0_72%_62%/0.85)]' : 'text-muted-foreground'}">
                             {#if ex.delta !== null}
-                              <span class="rel-exp-delta">{ex.delta > 0 ? '+' : ''}{ex.delta}</span>
+                              <span class="mono min-w-9 shrink-0 text-right text-[10px] opacity-90">{ex.delta > 0 ? '+' : ''}{ex.delta}</span>
                             {/if}
                             <span>{ex.text}</span>
                           </div>
@@ -1017,7 +1052,7 @@
                       </div>
                     </details>
                   {/if}
-                  <Button kind={c.selected ? 'primary' : 'secondary'} on:click={() => pickRelease(c)} disabled={isBusy('pick-release') || pickerSearching}>
+                  <Button kind={c.selected ? 'primary' : 'secondary'} class="self-start" on:click={() => pickRelease(c)} disabled={isBusy('pick-release') || pickerSearching}>
                     <Download size={14} />
                     {c.selected ? 'Re-grab' : 'Download'}
                   </Button>
@@ -1033,38 +1068,38 @@
 
 {#if episodeInfoOpen}
   <div
-    class="modal-backdrop"
+    class="fixed inset-0 z-[900] flex items-center justify-center bg-black/50 p-4"
     on:click={(e) => e.target === e.currentTarget && closeEpisodeInfo()}
     on:keydown={(e) => e.key === 'Escape' && closeEpisodeInfo()}
     role="button"
     tabindex="0"
     aria-label="Close file info"
   >
-    <div class="info-modal" role="dialog" aria-modal="true" aria-label="File info" tabindex="-1">
-      <div class="rel-header-top">
-        <h2>{episodeInfoLabel || 'File Info'}</h2>
-        <button class="close-btn" on:click={closeEpisodeInfo} aria-label="Close">
+    <div class="grid w-full max-h-[80vh] max-w-[440px] gap-3.5 overflow-y-auto rounded-[20px] border border-white/10 bg-card p-5" role="dialog" aria-modal="true" aria-label="File info" tabindex="-1">
+      <div class="flex items-center justify-between">
+        <h2 class="m-0 text-base font-semibold">{episodeInfoLabel || 'File Info'}</h2>
+        <button class="flex size-7 items-center justify-center rounded-md text-foreground opacity-70 transition-opacity hover:opacity-100" on:click={closeEpisodeInfo} aria-label="Close">
           <X size={16} />
         </button>
       </div>
       {#if episodeInfoLoading}
-        <div class="empty-side">Loading…</div>
+        <div class="rounded-[14px] border border-white/[0.06] bg-white/[0.03] px-3.5 py-3 text-[13px] text-muted-foreground">Loading…</div>
       {:else if episodeInfoData}
-        <div class="current-file">
-          <div class="cf-name" title={episodeInfoData.fileName}>{episodeInfoData.fileName}</div>
-          <div class="cf-release" title={episodeInfoData.releaseTitle}>{episodeInfoData.releaseTitle}</div>
-          <div class="kv">
-            <div><span>Size</span><strong>{fmtBytes(episodeInfoData.fileSizeBytes)}</strong></div>
-            <div><span>Indexer</span><strong>{episodeInfoData.indexerName || '—'}</strong></div>
-            <div><span>Resolution</span><strong>{episodeInfoData.resolution || '—'}</strong></div>
-            <div><span>Score</span><strong>{episodeInfoData.score}</strong></div>
+        <div class="grid gap-2.5">
+          <div class="truncate text-sm font-bold" title={episodeInfoData.fileName}>{episodeInfoData.fileName}</div>
+          <div class="truncate text-xs text-muted-foreground" title={episodeInfoData.releaseTitle}>{episodeInfoData.releaseTitle}</div>
+          <div class="grid grid-cols-2 gap-3">
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Size</span><strong>{fmtBytes(episodeInfoData.fileSizeBytes)}</strong></div>
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Indexer</span><strong>{episodeInfoData.indexerName || '—'}</strong></div>
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Resolution</span><strong>{episodeInfoData.resolution || '—'}</strong></div>
+            <div class="grid gap-1 rounded-[14px] border border-white/[0.06] bg-white/[0.03] p-3"><span class="text-xs text-muted-foreground">Score</span><strong>{episodeInfoData.score}</strong></div>
           </div>
-          <div class="cf-subs" class:missing={!episodeInfoData.subtitleLanguages?.length}>
+          <div class="inline-flex h-6 w-fit items-center rounded-lg px-2.5 text-[11px] font-semibold {episodeInfoData.subtitleLanguages?.length ? 'border border-[hsl(142_60%_45%/0.25)] bg-[hsl(142_60%_45%/0.1)] text-[hsl(142_60%_55%)]' : 'border border-white/[0.08] bg-white/[0.04] text-muted-foreground'}">
             {episodeInfoData.subtitleLanguages?.length ? `Subtitles: ${episodeInfoData.subtitleLanguages.map((l) => l.toUpperCase()).join(', ')}` : 'No subtitles'}
           </div>
         </div>
       {:else}
-        <div class="empty-side">No file currently selected.</div>
+        <div class="rounded-[14px] border border-white/[0.06] bg-white/[0.03] px-3.5 py-3 text-[13px] text-muted-foreground">No file currently selected.</div>
       {/if}
     </div>
   </div>
@@ -1072,17 +1107,17 @@
 
 {#if subtitleModalOpen && subtitleModalEpisodeId}
   <div
-    class="modal-backdrop"
+    class="fixed inset-0 z-[900] flex items-center justify-center bg-black/50 p-4"
     on:click={(e) => e.target === e.currentTarget && closeSubtitleModal()}
     on:keydown={(e) => e.key === 'Escape' && closeSubtitleModal()}
     role="button"
     tabindex="0"
     aria-label="Close subtitle manager"
   >
-    <div class="info-modal" role="dialog" aria-modal="true" aria-label="Subtitles" tabindex="-1">
-      <div class="rel-header-top">
-        <h2>Subtitles — {subtitleModalLabel}</h2>
-        <button class="close-btn" on:click={closeSubtitleModal} aria-label="Close">
+    <div class="grid w-full max-h-[80vh] max-w-[440px] gap-3.5 overflow-y-auto rounded-[20px] border border-white/10 bg-card p-5" role="dialog" aria-modal="true" aria-label="Subtitles" tabindex="-1">
+      <div class="flex items-center justify-between">
+        <h2 class="m-0 text-base font-semibold">Subtitles — {subtitleModalLabel}</h2>
+        <button class="flex size-7 items-center justify-center rounded-md text-foreground opacity-70 transition-opacity hover:opacity-100" on:click={closeSubtitleModal} aria-label="Close">
           <X size={16} />
         </button>
       </div>
@@ -1091,312 +1126,3 @@
   </div>
 {/if}
 
-<style>
-  .page { display: grid; gap: 22px; }
-  .hero {
-    position: relative; overflow: hidden; border-radius: 28px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-  }
-  .hero-bg, .hero-shade { position: absolute; inset: 0; }
-  .hero-bg { width: 100%; height: 100%; object-fit: cover; }
-  .hero-shade { background: linear-gradient(180deg, hsl(0 0% 0% / 0.2), hsl(0 0% 0% / 0.86)); }
-  .hero-grid {
-    position: relative; z-index: 1; min-height: 420px;
-    display: grid; grid-template-columns: 220px minmax(0,1fr);
-    gap: 24px; align-items: end; padding: 24px;
-  }
-  .poster { aspect-ratio: 2 / 3; overflow: hidden; border-radius: 20px; border: 1px solid hsl(0 0% 100% / 0.1); background: hsl(var(--muted)); }
-  .poster img, .person-photo img { width: 100%; height: 100%; object-fit: cover; }
-  .poster-fallback, .person-photo { display: grid; place-items: center; width: 100%; height: 100%; color: hsl(var(--muted-foreground)); }
-  .copy { min-width: 0; display: grid; gap: 12px; align-content: end; }
-  .copy h1 { margin: 8px 0 0; font-size: clamp(2rem, 5vw, 3.7rem); line-height: 1.04; }
-  .copy p { max-width: 900px; color: hsl(var(--foreground) / 0.8); line-height: 1.65; }
-  .tagline { margin-top: 10px; color: hsl(var(--foreground) / 0.82); font-weight: 700; }
-  .badge-row, .action-row, .chips { display: flex; flex-wrap: wrap; gap: 10px; }
-  .genre-chips { margin-top: 18px; }
-  .action-row { align-items: center; }
-  .action-row :global(button) { min-height: 42px; }
-  .action-row :global(button),
-  .action-row .link-btn { flex: 0 0 auto; }
-  .link-btn {
-    display: inline-flex; align-items: center; justify-content: center;
-    min-height: 42px; padding: 0 14px; border-radius: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.08); text-decoration: none;
-  }
-  .link-btn.secondary {
-    background: hsl(0 0% 100% / 0.05); color: hsl(var(--foreground));
-  }
-  .link-btn.ghost {
-    min-height: 28px; padding: 0 10px; font-size: 12px;
-    color: hsl(var(--muted-foreground)); border-color: transparent;
-  }
-  .grid { display: grid; grid-template-columns: minmax(0,1.7fr) minmax(300px,0.8fr); gap: 20px; align-items: start; }
-  .main, .side { display: grid; gap: 18px; }
-  .panel {
-    border-radius: 24px; border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(var(--card) / 0.82); padding: 18px;
-    min-width: 0;
-  }
-  .panel h2 { margin: 0 0 14px; font-size: 18px; }
-  .current-file { display: grid; gap: 10px; }
-  .cf-name {
-    font-weight: 700; font-size: 14px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .cf-release {
-    color: hsl(var(--muted-foreground)); font-size: 12px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .cf-subs-row { display: flex; align-items: center; gap: 8px; }
-  .cf-subs {
-    display: inline-flex; align-items: center; box-sizing: border-box; min-height: 24px;
-    padding: 0 9px; border-radius: 8px;
-    font-size: 11px; font-weight: 600;
-    border: 1px solid hsl(142 60% 45% / 0.25); color: hsl(142 60% 55%);
-    background: hsl(142 60% 45% / 0.1);
-  }
-  .cf-subs.missing {
-    border-color: hsl(0 0% 100% / 0.08); color: hsl(var(--muted-foreground));
-    background: hsl(0 0% 100% / 0.04);
-  }
-  .stat-grid, .kv { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px; }
-  .stat-grid div, .kv div {
-    display: grid; gap: 4px; padding: 12px; border-radius: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.03);
-  }
-  .failure-box, .empty-side {
-    margin-top: 14px;
-    padding: 12px 14px;
-    border-radius: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(0 0% 100% / 0.03);
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-  .stat-grid span, .kv span, .summary-meta, .person-card span { color: hsl(var(--muted-foreground)); font-size: 12px; }
-  .season-stack, .episode-list { display: grid; gap: 12px; }
-  .season-panel { border-radius: 18px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.02); overflow: hidden; }
-  .season-panel summary { list-style: none; cursor: pointer; padding: 14px 16px; display: grid; gap: 6px; }
-  .episode-row {
-    display: flex; align-items: center; justify-content: space-between; gap: 12px;
-    padding: 10px 16px; border-top: 1px solid hsl(0 0% 100% / 0.05);
-  }
-  .ep-info { flex: 1; min-width: 0; display: grid; gap: 2px; }
-  .ep-code {
-    font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 700;
-    color: hsl(var(--foreground));
-  }
-  .ep-title {
-    font-size: 12px; color: hsl(var(--muted-foreground));
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .ep-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-  .ep-airdate {
-    font-size: 11px; color: hsl(var(--muted-foreground)); white-space: nowrap;
-  }
-  .ep-subs {
-    display: inline-flex; align-items: center; justify-content: center;
-    box-sizing: border-box; min-height: 24px; padding: 0 9px;
-    border-radius: 8px; font-size: 11px; font-weight: 600;
-    border: 1px solid hsl(142 60% 45% / 0.25); color: hsl(142 60% 55%);
-    background: hsl(142 60% 45% / 0.1); white-space: nowrap;
-  }
-  .ep-subs.missing {
-    border-color: hsl(0 0% 100% / 0.08); color: hsl(var(--muted-foreground));
-    background: hsl(0 0% 100% / 0.04);
-  }
-  .ep-sub-btn {
-    display: inline-flex; align-items: center; justify-content: center; gap: 4px;
-    box-sizing: border-box; min-height: 24px; min-width: 24px; padding: 0 9px;
-    border-radius: 8px; border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04); color: hsl(var(--muted-foreground));
-    font-size: 11px; cursor: pointer; flex-shrink: 0;
-  }
-  .ep-sub-btn.icon-only { padding: 0; width: 24px; }
-  .ep-sub-btn:hover { background: hsl(var(--primary) / 0.15); color: hsl(var(--primary)); border-color: hsl(var(--primary) / 0.3); }
-  /* Only relevant to the summary "Request" span (role="button"), which uses
-     aria-disabled since a <span> has no native disabled attribute/styling. */
-  .ep-sub-btn[aria-disabled='true'] { opacity: 0.5; pointer-events: none; }
-  .ep-reset-btn:hover { background: hsl(0 70% 50% / 0.15); color: hsl(0 70% 60%); border-color: hsl(0 70% 50% / 0.3); }
-  .media-strip { padding-bottom: 4px; }
-  .person-slot { width: 146px; flex: 0 0 auto; }
-  .poster-slot { width: 146px; flex: 0 0 auto; }
-  .person-card {
-    display: grid; gap: 8px; padding: 10px; border-radius: 16px;
-    border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.03);
-    min-height: 100%;
-  }
-  .person-photo { aspect-ratio: 2 / 3; overflow: hidden; border-radius: 12px; background: hsl(var(--muted)); }
-  .empty {
-    padding: 28px; text-align: center; color: hsl(var(--muted-foreground));
-    border-radius: 20px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.02);
-  }
-  @media (max-width: 1200px) {
-    .grid { grid-template-columns: 1fr; }
-    .stat-grid, .kv { grid-template-columns: repeat(2, minmax(0,1fr)); }
-  }
-
-  @media (max-width: 980px) {
-    .hero-grid, .grid { grid-template-columns: 1fr; }
-    .poster { max-width: 220px; }
-    .copy { align-content: start; }
-  }
-
-  @media (max-width: 700px) {
-    .stat-grid, .kv { grid-template-columns: 1fr; }
-    .hero-grid { padding: 18px; gap: 18px; }
-    .action-row { align-items: stretch; }
-  }
-  .monitoring-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; padding-top: 12px; border-top: 1px solid hsl(0 0% 100% / 0.06); }
-  .monitoring-row label { font-size: 12px; font-weight: 600; color: hsl(var(--muted-foreground)); white-space: nowrap; }
-  .monitoring-row select { flex: 1; min-width: 0; height: 32px; border-radius: 8px; border: 1px solid hsl(0 0% 100% / 0.1); background: hsl(0 0% 100% / 0.05); color: inherit; font-size: 12px; padding: 0 8px; cursor: pointer; }
-
-  /* Release picker modal */
-  .modal-backdrop {
-    position: fixed; inset: 0; z-index: 900;
-    background: rgba(0, 0, 0, 0.5); /* bg-black/50, Dialog.Overlay */
-    display: flex; align-items: center; justify-content: center; padding: 16px;
-  }
-  /* Structure (tabs + card list) borrowed from riven-frontend's manual-scrape
-     dialog, but every color comes from Drakkar's own theme tokens (app.css)
-     so it matches the rest of the app, not riven's palette. */
-  .rel-modal {
-    background: hsl(var(--card));
-    border: 1px solid hsl(0 0% 100% / 0.1);
-    border-radius: var(--radius-2xl);
-    box-shadow: 0 10px 15px -3px hsl(0 0% 0% / 0.3), 0 4px 6px -4px hsl(0 0% 0% / 0.3);
-    padding: 24px;
-    display: flex; flex-direction: column; gap: 16px;
-    width: 100%; max-width: min(calc(100% - 2rem), 896px);
-    max-height: 80vh; overflow: hidden;
-    color: hsl(var(--foreground));
-  }
-  .rel-header { flex-shrink: 0; display: flex; flex-direction: column; gap: 8px; }
-  .info-modal {
-    background: hsl(var(--card)); border: 1px solid hsl(0 0% 100% / 0.1);
-    border-radius: 20px; padding: 20px; width: 100%; max-width: 440px;
-    max-height: 80vh; overflow-y: auto; display: grid; gap: 14px;
-  }
-  .info-modal h2 { margin: 0; font-size: 16px; font-weight: 600; }
-  .rel-header-top { display: flex; align-items: center; justify-content: space-between; }
-  .rel-header h2 { margin: 0; font-size: 18px; font-weight: 600; line-height: 1; }
-  .rel-header-desc { font-size: 14px; color: hsl(var(--muted-foreground)); }
-  .close-btn {
-    display: flex; align-items: center; justify-content: center;
-    width: 28px; height: 28px; border-radius: var(--radius-sm);
-    border: none; background: transparent;
-    color: hsl(var(--foreground)); opacity: 0.7; cursor: pointer;
-  }
-  .close-btn:hover { opacity: 1; }
-  .rel-tabs {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 0;
-    height: 36px; padding: 3px; border-radius: var(--radius-lg);
-    background: hsl(var(--muted)); color: hsl(var(--muted-foreground)); flex-shrink: 0;
-  }
-  .rel-tabs button {
-    border-radius: var(--radius-md); border: 1px solid transparent; background: transparent;
-    color: hsl(var(--muted-foreground)); font-size: 14px; font-weight: 500; cursor: pointer;
-  }
-  .rel-tabs button.active {
-    background: hsl(var(--background)); color: hsl(var(--foreground));
-    box-shadow: 0px 1px 4px 0px hsl(0 0% 0% / 0.05), 0px 1px 2px -1px hsl(0 0% 0% / 0.05);
-  }
-  .rel-tab-body { flex: 1; min-height: 0; overflow-y: auto; }
-  .rel-list { display: flex; flex-direction: column; gap: 8px; }
-  .manual-search-block { display: flex; flex-direction: column; gap: 14px; }
-  .manual-search-form { display: flex; flex-direction: column; gap: 6px; }
-  .manual-search-input-wrap { position: relative; display: flex; align-items: center; }
-  .manual-search-input-wrap :global(svg) {
-    position: absolute; left: 10px; color: hsl(var(--muted-foreground)); pointer-events: none;
-  }
-  .manual-search-input {
-    height: 36px; width: 100%; padding: 0 12px 0 34px;
-    border-radius: var(--radius-md); border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--foreground)); font-size: 14px; outline: none;
-  }
-  .manual-search-input::placeholder { color: hsl(var(--muted-foreground)); }
-  .upload-row {
-    display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 12px;
-    border-radius: var(--radius-md); border: 1px dashed hsl(0 0% 100% / 0.15);
-    background: hsl(0 0% 100% / 0.02); color: hsl(var(--muted-foreground));
-    font-size: 13px; cursor: pointer;
-  }
-  .upload-row:hover:not(.disabled) { background: hsl(0 0% 100% / 0.05); border-color: hsl(var(--primary) / 0.4); }
-  .upload-row.disabled { opacity: 0.6; cursor: default; }
-  .upload-input { display: none; }
-  .rel-filter-input {
-    height: 32px; padding: 0 12px; border-radius: var(--radius-md);
-    border: 1px solid hsl(0 0% 100% / 0.08); background: hsl(0 0% 100% / 0.03);
-    color: hsl(var(--foreground)); font-size: 13px; outline: none;
-  }
-  .rel-filter-input::placeholder { color: hsl(var(--muted-foreground)); }
-  .rel-empty { padding: 36px; text-align: center; color: hsl(var(--muted-foreground)); font-size: 14px; }
-  .rel-searching-banner { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-radius: 10px; background: hsl(var(--primary) / 0.08); color: hsl(var(--muted-foreground)); font-size: 13px; }
-  :global(.spin) { animation: spin 1s linear infinite; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .rel-card {
-    display: flex; flex-direction: column; gap: 8px; padding: 12px 16px;
-    border-radius: var(--radius-xl);
-    border: 1px solid hsl(0 0% 100% / 0.08); background: hsl(0 0% 100% / 0.03);
-    cursor: pointer; transition: border-color .15s, box-shadow .15s;
-  }
-  .rel-card:hover { border-color: hsl(var(--primary) / 0.5); }
-  .rel-selected { border-color: hsl(var(--primary) / 0.4); background: hsl(var(--primary) / 0.06); }
-  .rel-rejected { opacity: 0.5; }
-  .rel-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
-  .rel-card-title {
-    margin: 0; flex: 1; min-width: 0; font-size: 13px; font-weight: 600;
-    color: hsl(var(--foreground)); line-height: 1.4; word-break: break-all;
-  }
-  .rel-badge {
-    flex-shrink: 0; font-size: 11px; font-weight: 700; line-height: 1;
-    padding: 2px 9px; border-radius: 999px;
-    background: hsl(var(--primary) / 0.18); color: hsl(var(--primary)); white-space: nowrap;
-  }
-  .rel-badge-neg { background: hsl(var(--danger) / 0.15); color: hsl(var(--danger)); }
-  .rel-card-badges { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-  .rel-badge-outline {
-    font-size: 11px; padding: 2px 8px; border-radius: 999px;
-    border: 1px solid hsl(0 0% 100% / 0.12); color: hsl(var(--muted-foreground));
-    background: transparent; white-space: nowrap;
-  }
-  .rel-badge-outline.mono { font-family: 'JetBrains Mono', monospace; }
-  .rel-badge-outline.tone-res-2160,
-  .rel-badge-outline.tone-res-1080,
-  .rel-badge-outline.tone-res-720 {
-    background: hsl(var(--primary) / 0.16); border-color: transparent; color: hsl(var(--primary));
-    font-weight: 600;
-  }
-  .rel-pill-ok { background: hsl(142 70% 45% / 0.15); border-color: hsl(142 70% 45% / 0.3); color: hsl(142 60% 55%); font-weight: 600; }
-  .rel-pill-danger { background: hsl(var(--danger) / 0.15); border-color: hsl(var(--danger) / 0.25); color: hsl(var(--danger)); }
-  .rel-pill-warn { background: hsl(40 90% 50% / 0.15); border-color: hsl(40 90% 50% / 0.25); color: hsl(40 80% 60%); }
-  .rel-card :global(button) { align-self: flex-start; }
-  .compat-warnings { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
-  .compat-badge {
-    font-size: 10px; font-weight: 600; padding: 2px 7px; border-radius: 8px;
-    background: hsl(38 92% 50% / 0.15); color: hsl(38 92% 70%);
-    border: 1px solid hsl(38 92% 50% / 0.3); cursor: default;
-  }
-  .rel-why { margin-top: 4px; }
-  .rel-why-toggle {
-    font-size: 11px; color: hsl(var(--muted-foreground)); cursor: pointer;
-    padding: 2px 0; list-style: none; display: inline-flex; align-items: center; gap: 4px;
-    user-select: none;
-  }
-  .rel-why-toggle::-webkit-details-marker { display: none; }
-  .rel-why-toggle::before { content: '▶'; font-size: 9px; transition: transform 0.15s; }
-  details[open] .rel-why-toggle::before { transform: rotate(90deg); }
-  .rel-explanations { display: grid; gap: 3px; padding-top: 6px; }
-  .rel-explanation {
-    font-size: 11px; color: hsl(var(--muted-foreground)); line-height: 1.5;
-    display: flex; align-items: baseline; gap: 6px;
-  }
-  .rel-exp-pos { color: hsl(142 71% 55% / 0.9); }
-  .rel-exp-neg { color: hsl(0 72% 62% / 0.85); }
-  .rel-exp-reject { color: hsl(0 72% 62%); font-weight: 500; }
-  .rel-exp-delta {
-    font-family: 'JetBrains Mono', monospace; font-size: 10px; min-width: 36px;
-    text-align: right; flex-shrink: 0; opacity: 0.9;
-  }
-</style>

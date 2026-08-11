@@ -98,22 +98,31 @@
   });
 </script>
 
-<div class="subtitle-panel" class:compact>
+<div class="grid gap-2.5">
   {#if showManagerLink}
-    <div class="panel-head-inline">
-      <a class="manager-link" href="/subtitles">Manager</a>
+    <div class="flex justify-end">
+      <a
+        class="inline-flex items-center justify-center min-h-7 px-2.5 rounded-[12px] border border-transparent text-muted-foreground text-xs"
+        href="/subtitles">Manager</a
+      >
     </div>
   {/if}
   {#if loading}
-    <div class="empty-side">Loading subtitles…</div>
+    <div class="rounded-[14px] border border-[hsl(0_0%_100%/0.06)] bg-[hsl(0_0%_100%/0.03)] px-3.5 py-3 text-[13px] text-muted-foreground">
+      Loading subtitles…
+    </div>
   {:else}
     {#if files.length > 0}
-      <div class="stack-list">
+      <div class="grid gap-2.5">
         {#each files as file (file.id)}
-          <div class="stack-item">
+          <div
+            class="flex items-center justify-between gap-3 rounded-[14px] border border-[hsl(0_0%_100%/0.06)] bg-[hsl(0_0%_100%/0.03)] {compact
+              ? 'px-3 py-2.5'
+              : 'px-3.5 py-3'}"
+          >
             <div>
-              <strong>{file.language.toUpperCase()}</strong>
-              <span>{file.provider}</span>
+              <strong class="block">{file.language.toUpperCase()}</strong>
+              <span class="block mt-1 text-muted-foreground text-xs">{file.provider}</span>
             </div>
             <Button kind="ghost" on:click={() => deleteFile(file.id)} disabled={isBusy(`delete-${file.id}`)}>
               <Trash2 size={iconSize} />
@@ -122,15 +131,30 @@
         {/each}
       </div>
     {:else}
-      <div class="empty-side">No published subtitles yet.</div>
+      <div class="rounded-[14px] border border-[hsl(0_0%_100%/0.06)] bg-[hsl(0_0%_100%/0.03)] px-3.5 py-3 text-[13px] text-muted-foreground">
+        No published subtitles yet.
+      </div>
     {/if}
     {#if candidates.length > 0}
-      <div class="stack-list candidates">
+      <div class="grid gap-2.5">
         {#each candidates.slice(0, 8) as candidate (candidate.id)}
-          <div class="stack-item candidate">
-            <div>
-              <strong>{candidate.language.toUpperCase()} · {candidate.provider}</strong>
-              <span>{candidate.releaseName || candidate.title}</span>
+          <div
+            class="flex items-start justify-between gap-3 rounded-[14px] border border-[hsl(0_0%_100%/0.06)] bg-[hsl(0_0%_100%/0.03)] {compact
+              ? 'px-3 py-2.5'
+              : 'px-3.5 py-3'}"
+          >
+            <!-- Release-name/candidate text (e.g. "Show.Name.S01E04.1080p.WEB-DL-GROUP")
+                 is one long unbroken token with no spaces, so as a flex child its
+                 default min-content width is the full string width -- without
+                 min-w-0 here, the row (and its Button) rendered past the panel's
+                 edge instead of truncating. -->
+            <div class="min-w-0 overflow-hidden">
+              <strong class="block overflow-hidden text-ellipsis whitespace-nowrap"
+                >{candidate.language.toUpperCase()} · {candidate.provider}</strong
+              >
+              <span class="block mt-1 text-muted-foreground text-xs overflow-hidden text-ellipsis whitespace-nowrap"
+                >{candidate.releaseName || candidate.title}</span
+              >
             </div>
             <Button kind="secondary" on:click={() => download(candidate.id)} disabled={isBusy(`download-${candidate.id}`)}>
               <Languages size={iconSize} />
@@ -146,93 +170,3 @@
     </Button>
   {/if}
 </div>
-
-<style>
-  .subtitle-panel {
-    display: grid;
-    gap: 10px;
-  }
-
-  .panel-head-inline {
-    display: flex;
-    justify-content: flex-end;
-  }
-
-  .manager-link {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-height: 28px;
-    padding: 0 10px;
-    border-radius: 12px;
-    border: 1px solid transparent;
-    color: hsl(var(--muted-foreground));
-    font-size: 12px;
-    text-decoration: none;
-  }
-
-  .empty-side {
-    padding: 12px 14px;
-    border-radius: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(0 0% 100% / 0.03);
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .stack-list {
-    display: grid;
-    gap: 10px;
-  }
-
-  .stack-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 12px 14px;
-    border-radius: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(0 0% 100% / 0.03);
-  }
-
-  .stack-item strong,
-  .stack-item span {
-    display: block;
-  }
-
-  .stack-item span {
-    margin-top: 4px;
-    color: hsl(var(--muted-foreground));
-    font-size: 12px;
-  }
-
-  /* Release-name/candidate text (e.g. "Show.Name.S01E04.1080p.WEB-DL-GROUP")
-     is one long unbroken token with no spaces, so as a flex child its
-     default min-content width is the full string width -- without
-     min-width: 0 here, the row (and its Button) rendered past the panel's
-     edge instead of truncating. */
-  .stack-item.candidate > div {
-    min-width: 0;
-    overflow: hidden;
-  }
-
-  .stack-item.candidate strong,
-  .stack-item.candidate span {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .stack-item.candidate > :global(.button) {
-    flex-shrink: 0;
-  }
-
-  .candidate {
-    align-items: flex-start;
-  }
-
-  .compact .stack-item {
-    padding: 10px 12px;
-  }
-</style>

@@ -57,12 +57,15 @@
   import Pagination from '$lib/components/Pagination.svelte';
   import Panel from '$lib/components/Panel.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
+  import * as Table from '$lib/components/ui/table/index.js';
+  import * as Select from '$lib/components/ui/select/index.js';
   import { api, subscribeEvents } from '$lib/api';
   import { bytes, dateTime } from '$lib/format';
   import { toastError, toastSuccess } from '$lib/toast';
+  import { copyToClipboard } from '$lib/clipboard';
   import { runAction, confirmed } from '$lib/actions';
   import { debounce } from '$lib/debounce';
-  import type { BlocklistItem, BlocklistMutation, BlockTestResult, CustomFormat, FullSettings, IndexerPolicy, IntegrationProbeReport, PolicySettings, PrivacyStatus, QualityDefinition, QualityProfile, ReleaseBlockRule, SpeedTestResult, Status, SubtitleProfile, TaskSchedule, UsenetProvider } from '$lib/types';
+  import type { BlocklistItem, BlocklistMutation, BlockTestResult, CustomFormat, FullSettings, IndexerPolicy, IntegrationProbeReport, PolicySettings, PrivacyStatus, QualityDefinition, QualityProfile, QueueDecisionAction, ReleaseBlockRule, SpeedTestResult, Status, SubtitleProfile, TaskSchedule, UsenetProvider } from '$lib/types';
 
   type SettingsTab = 'integrations' | 'providers' | 'indexers' | 'queue' | 'library' | 'rules' | 'quality' | 'formats' | 'filtering' | 'subtitle-profiles' | 'notifications' | 'privacy' | 'logs' | 'tasks' | 'media-players' | 'speed-test' | 'system';
 
@@ -111,6 +114,11 @@
   let blStats: { total: number; active: number; expired: number; byReason: Record<string, number> } | null = null;
   let lastProbe: IntegrationProbeReport | null = null;
   let profiles: QualityProfile[] = [];
+  function profileOptionLabel(name: string): string {
+    if (!name) return '— none —';
+    const p = profiles.find((x) => x.name === name);
+    return p ? `${p.name}${p.isDefault ? ' (default)' : ''}` : name;
+  }
   let qualityDefs: QualityDefinition[] = [];
   let qualityDefsDirty: Set<number> = new Set();
   let qualityDefsSaving: Set<number> = new Set();
@@ -171,7 +179,7 @@
   $: webhookUrl = (typeof window !== 'undefined' ? window.location.origin : '') + '/api/webhooks/seerr';
 
   async function copyWebhookUrl() {
-    await navigator.clipboard.writeText(webhookUrl);
+    await copyToClipboard(webhookUrl);
     webhookCopied = true;
     setTimeout(() => { webhookCopied = false; }, 2000);
   }
@@ -190,7 +198,7 @@
 
   async function copyWebhookToken() {
     if (!webhookToken) return;
-    await navigator.clipboard.writeText(webhookToken);
+    await copyToClipboard(webhookToken);
     webhookTokenCopied = true;
     setTimeout(() => { webhookTokenCopied = false; }, 2000);
   }
@@ -667,6 +675,18 @@
     search_again:            'Search Again'
   };
 
+  // ── Select-trigger label maps (shadcn Select has no built-in "show selected
+  // option" behaviour like a native <select>, so the trigger label is looked
+  // up here) ──────────────────────────────────────────────────────────────
+  const duplicateNzbBehaviorLabels: Record<string, string> = { mark_failed: 'Mark Failed', ignore_existing: 'Ignore Existing', download_again_with_suffix: 'Download Again (with suffix)', replace_existing: 'Replace Existing' };
+  const importStrategyLabels: Record<string, string> = { symlink: 'Symlink', strm: 'STRM', copy: 'Copy' };
+  const blockEditorKeyTypeLabels: Record<string, string> = { external_url: 'External URL', release_signature: 'Release Signature', raw: 'Raw Key' };
+  const rfTypeLabels: Record<string, string> = { release_group: 'Release Group', title_pattern: 'Title Pattern', regex: 'Regex', missing_release_group: 'Missing Release Group' };
+  const rfMediaTypeLabels: Record<string, string> = { both: 'Both', movie: 'Movie only', tv: 'TV only' };
+  const rfActionLabels: Record<string, string> = { block: 'Block (reject release)', penalty: 'Penalty (reduce score)' };
+  const testMediaTypeLabels: Record<string, string> = { both: 'Both', movie: 'Movie', tv: 'TV' };
+  const logLevelLabels: Record<string, string> = { all: 'All levels', info: 'Info', warn: 'Warn', error: 'Error', debug: 'Debug' };
+
   function readTabFromURL(): SettingsTab {
     if (typeof window === 'undefined') return 'integrations';
     const raw = new URL(window.location.href).searchParams.get('tab');
@@ -873,7 +893,7 @@
 
   async function copyBlocklistKey(key: string) {
     try {
-      await navigator.clipboard.writeText(key);
+      await copyToClipboard(key);
       toastSuccess('Blocklist key copied');
     } catch (e) {
       toastError(e instanceof Error ? e.message : String(e));
@@ -1070,18 +1090,7 @@
   $: if (activeTab === 'rules' && !blLoading && blStats === null) { void loadBlocklist(); }
   $: filteredBlocklist = blocklist;
 
-  $: configuredCount = integrationEntries.filter(([, v]) => v.configured).length;
-  $: enabledProviders = (draft?.usenet.providers ?? []).filter((p) => p.enabled).length;
-  // Falls back to the Library tab's per-media-type defaults (the mechanism
-  // actually used to assign a profile to new movies/shows) when no quality
-  // profile is flagged is_default -- that flag is only a DB-level fallback
-  // for orphaned items, not what most installs actually configure.
-  $: defaultProfile = profiles.find((p) => p.isDefault)?.name
-    ?? (draft?.library.defaultMovieProfile && draft?.library.defaultTvProfile
-      ? (draft.library.defaultMovieProfile === draft.library.defaultTvProfile
-        ? draft.library.defaultMovieProfile
-        : `${draft.library.defaultMovieProfile} / ${draft.library.defaultTvProfile}`)
-      : draft?.library.defaultMovieProfile || draft?.library.defaultTvProfile || '—');
+
 </script>
 
 <svelte:head><title>Settings — Drakkar</title></svelte:head>
@@ -1096,27 +1105,6 @@
     Probe
   </Button>
 </PageHeader>
-
-{#if status}
-  <div class="summary-strip">
-    <div class="summary-card">
-      <strong>{configuredCount}</strong>
-      <span>configured integrations</span>
-    </div>
-    <div class="summary-card">
-      <strong>{enabledProviders}</strong>
-      <span>enabled providers</span>
-    </div>
-    <div class="summary-card">
-      <strong>{defaultProfile}</strong>
-      <span>default quality profile</span>
-    </div>
-    <div class="summary-card">
-      <strong>{status.backgroundQueueDepth}</strong>
-      <span>background queue depth</span>
-    </div>
-  </div>
-{/if}
 
 <div class="settings-shell">
   <aside class="tab-rail">
@@ -1301,21 +1289,27 @@
           <div class="form-grid">
             <label class="form-field">
               <span>Default Movie Profile</span>
-              <select bind:value={draft.library.defaultMovieProfile}>
-                <option value="">— none —</option>
-                {#each profiles as p}
-                  <option value={p.name}>{p.name}{p.isDefault ? ' (default)' : ''}</option>
-                {/each}
-              </select>
+              <Select.Root type="single" bind:value={draft.library.defaultMovieProfile}>
+                <Select.Trigger class="w-full">{profileOptionLabel(draft.library.defaultMovieProfile)}</Select.Trigger>
+                <Select.Content>
+                  <Select.Item value="">— none —</Select.Item>
+                  {#each profiles as p}
+                    <Select.Item value={p.name}>{p.name}{p.isDefault ? ' (default)' : ''}</Select.Item>
+                  {/each}
+                </Select.Content>
+              </Select.Root>
             </label>
             <label class="form-field">
               <span>Default TV Profile</span>
-              <select bind:value={draft.library.defaultTvProfile}>
-                <option value="">— none —</option>
-                {#each profiles as p}
-                  <option value={p.name}>{p.name}{p.isDefault ? ' (default)' : ''}</option>
-                {/each}
-              </select>
+              <Select.Root type="single" bind:value={draft.library.defaultTvProfile}>
+                <Select.Trigger class="w-full">{profileOptionLabel(draft.library.defaultTvProfile)}</Select.Trigger>
+                <Select.Content>
+                  <Select.Item value="">— none —</Select.Item>
+                  {#each profiles as p}
+                    <Select.Item value={p.name}>{p.name}{p.isDefault ? ' (default)' : ''}</Select.Item>
+                  {/each}
+                </Select.Content>
+              </Select.Root>
             </label>
           </div>
         </Panel>
@@ -1506,28 +1500,28 @@
       {/if}
 
       <Panel title="Per-Indexer Policies" subtitle="Assign a static score modifier to releases from a specific indexer. Positive boosts, negative penalises.">
-        <div class="cf-layout">
-          <div class="cf-list">
-            <div class="cf-list-header">
+        <div class="settings-list-layout">
+          <div class="settings-list">
+            <div class="settings-list-header">
               <span>Policies</span>
-              <Button kind="ghost" on:click={() => { editingPolicy = { indexerName: '', scoreModifier: 0, enabled: true, note: '' }; }}>
-                <Plus size={14} /> Add
+              <Button kind="secondary" on:click={() => { editingPolicy = { indexerName: '', scoreModifier: 0, enabled: true, note: '' }; }}>
+                <Plus size={14} /> New
               </Button>
             </div>
             {#if indexerPolicies.length === 0}
-              <div class="cf-empty">No per-indexer policies yet.</div>
+              <div class="empty-state">No per-indexer policies yet.</div>
             {/if}
             {#each indexerPolicies as p (p.id)}
-              <button class="cf-item" class:cf-active={editingPolicy?.id === p.id} on:click={() => { editingPolicy = { ...p }; }}>
-                <span class="cf-item-name">{p.indexerName}</span>
+              <button class="settings-list-item" class:active={editingPolicy?.id === p.id} on:click={() => { editingPolicy = { ...p }; }}>
+                <span class="settings-list-item-name">{p.indexerName}</span>
                 <div style="display:flex;align-items:center;gap:4px;flex-shrink:0">
-                  <span class="cf-item-score" class:cf-pos={p.scoreModifier > 0} class:cf-neg={p.scoreModifier < 0}>{p.scoreModifier > 0 ? '+' : ''}{p.scoreModifier}</span>
-                  {#if !p.enabled}<span class="cf-disabled-badge">off</span>{/if}
+                  <span class="settings-list-item-score" class:positive={p.scoreModifier > 0} class:negative={p.scoreModifier < 0}>{p.scoreModifier > 0 ? '+' : ''}{p.scoreModifier}</span>
+                  {#if !p.enabled}<span class="settings-disabled-badge">off</span>{/if}
                 </div>
               </button>
             {/each}
           </div>
-          <div class="cf-editor">
+          <div class="settings-editor">
             {#if editingPolicy}
               <div class="field">
                 <label class="field-label" for="ip-name">Indexer Name <span class="field-hint">(exact match — case-sensitive)</span></label>
@@ -1557,7 +1551,7 @@
                 </Button>
               </div>
             {:else}
-              <div class="cf-empty">Select a policy to edit, or add a new one.</div>
+              <div class="empty-state">Select a policy to edit, or add a new one.</div>
             {/if}
           </div>
         </div>
@@ -1593,20 +1587,26 @@
           <div class="form-grid">
             <label class="form-field">
               <span>Duplicate NZB Behavior</span>
-              <select bind:value={policySettings.duplicateNzbBehavior}>
-                <option value="mark_failed">Mark Failed</option>
-                <option value="ignore_existing">Ignore Existing</option>
-                <option value="download_again_with_suffix">Download Again (with suffix)</option>
-                <option value="replace_existing">Replace Existing</option>
-              </select>
+              <Select.Root type="single" bind:value={policySettings.duplicateNzbBehavior}>
+                <Select.Trigger class="w-full">{duplicateNzbBehaviorLabels[policySettings.duplicateNzbBehavior] ?? policySettings.duplicateNzbBehavior}</Select.Trigger>
+                <Select.Content>
+                  <Select.Item value="mark_failed">Mark Failed</Select.Item>
+                  <Select.Item value="ignore_existing">Ignore Existing</Select.Item>
+                  <Select.Item value="download_again_with_suffix">Download Again (with suffix)</Select.Item>
+                  <Select.Item value="replace_existing">Replace Existing</Select.Item>
+                </Select.Content>
+              </Select.Root>
             </label>
             <label class="form-field">
               <span>Import Strategy</span>
-              <select bind:value={policySettings.importStrategy}>
-                <option value="symlink">Symlink</option>
-                <option value="strm">STRM</option>
-                <option value="copy">Copy</option>
-              </select>
+              <Select.Root type="single" bind:value={policySettings.importStrategy}>
+                <Select.Trigger class="w-full">{importStrategyLabels[policySettings.importStrategy] ?? policySettings.importStrategy}</Select.Trigger>
+                <Select.Content>
+                  <Select.Item value="symlink">Symlink</Select.Item>
+                  <Select.Item value="strm">STRM</Select.Item>
+                  <Select.Item value="copy">Copy</Select.Item>
+                </Select.Content>
+              </Select.Root>
             </label>
             <label class="form-field">
               <span>Manual Upload Category</span>
@@ -1636,11 +1636,14 @@
             {#each queueDecisionRows as [key, label]}
               <label class="rule-row">
                 <span class="rule-label">{label}</span>
-                <select bind:value={policySettings.queueDecisionActions[key]}>
-                  {#each Object.entries(queueDecisionLabels) as [v, text]}
-                    <option value={v}>{text}</option>
-                  {/each}
-                </select>
+                <Select.Root type="single" value={policySettings.queueDecisionActions[key]} onValueChange={(v) => { if (policySettings) policySettings.queueDecisionActions[key] = v as QueueDecisionAction; }}>
+                  <Select.Trigger class="w-full">{queueDecisionLabels[policySettings.queueDecisionActions[key]] ?? policySettings.queueDecisionActions[key]}</Select.Trigger>
+                  <Select.Content>
+                    {#each Object.entries(queueDecisionLabels) as [v, text]}
+                      <Select.Item value={v}>{text}</Select.Item>
+                    {/each}
+                  </Select.Content>
+                </Select.Root>
               </label>
             {/each}
           </div>
@@ -1738,11 +1741,14 @@
           <div class="form-grid form-grid--3col">
             <label class="form-field">
               <span>Entry Type</span>
-              <select bind:value={blockEditor.keyType} disabled={!!blockEditor.id}>
-                <option value="external_url">External URL</option>
-                <option value="release_signature">Release Signature</option>
-                <option value="raw">Raw Key</option>
-              </select>
+              <Select.Root type="single" value={blockEditor.keyType} onValueChange={(v) => { blockEditor.keyType = v as BlocklistEditor['keyType']; }} disabled={!!blockEditor.id}>
+                <Select.Trigger class="w-full">{blockEditorKeyTypeLabels[blockEditor.keyType]}</Select.Trigger>
+                <Select.Content>
+                  <Select.Item value="external_url">External URL</Select.Item>
+                  <Select.Item value="release_signature">Release Signature</Select.Item>
+                  <Select.Item value="raw">Raw Key</Select.Item>
+                </Select.Content>
+              </Select.Root>
             </label>
             <label class="form-field">
               <span>Reason</span>
@@ -1843,11 +1849,14 @@
           <div class="bl-stats-text mono">
             {blTotal} entr{blTotal === 1 ? 'y' : 'ies'}
           </div>
-          <select class="bl-page-size" bind:value={blPageSize} on:change={() => { blPage = 1; void loadBlocklist(); }}>
-            <option value={25}>25 / page</option>
-            <option value={50}>50 / page</option>
-            <option value={100}>100 / page</option>
-          </select>
+          <Select.Root type="single" value={String(blPageSize)} onValueChange={(v) => { blPageSize = Number(v); blPage = 1; void loadBlocklist(); }}>
+            <Select.Trigger class="w-auto">{blPageSize} / page</Select.Trigger>
+            <Select.Content>
+              <Select.Item value="25">25 / page</Select.Item>
+              <Select.Item value="50">50 / page</Select.Item>
+              <Select.Item value="100">100 / page</Select.Item>
+            </Select.Content>
+          </Select.Root>
           {#if blTotal > 0}
             <Button kind="ghost" on:click={clearAllBlocklist} disabled={loading || isBusy('clear-all-blocklist')}>
               <X size={14} />
@@ -1861,32 +1870,32 @@
           <div class="empty">Loading…</div>
         {:else if filteredBlocklist.length > 0}
           <div class="bl-table-wrap">
-            <table class="bl-table">
-              <thead>
-                <tr>
-                  <th class="sortable" on:click={() => { if (blockSortCol === 'reason') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'reason'; blockSortDir = 'asc'; } void loadBlocklist(); }}>
+            <Table.Root class="bl-table">
+              <Table.Header>
+                <Table.Row>
+                  <Table.Head class="sortable" onclick={() => { if (blockSortCol === 'reason') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'reason'; blockSortDir = 'asc'; } void loadBlocklist(); }}>
                     Reason {blockSortCol === 'reason' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
-                  </th>
-                  <th class="sortable" on:click={() => { if (blockSortCol === 'key') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'key'; blockSortDir = 'asc'; } void loadBlocklist(); }}>
+                  </Table.Head>
+                  <Table.Head class="sortable" onclick={() => { if (blockSortCol === 'key') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'key'; blockSortDir = 'asc'; } void loadBlocklist(); }}>
                     Runtime Key {blockSortCol === 'key' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
-                  </th>
-                  <th>Matched Release</th>
-                  <th class="sortable" on:click={() => { if (blockSortCol === 'createdAt') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'createdAt'; blockSortDir = 'desc'; } void loadBlocklist(); }}>
+                  </Table.Head>
+                  <Table.Head>Matched Release</Table.Head>
+                  <Table.Head class="sortable" onclick={() => { if (blockSortCol === 'createdAt') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'createdAt'; blockSortDir = 'desc'; } void loadBlocklist(); }}>
                     Added {blockSortCol === 'createdAt' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
-                  </th>
-                  <th class="sortable" on:click={() => { if (blockSortCol === 'expires') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'expires'; blockSortDir = 'asc'; } void loadBlocklist(); }}>
+                  </Table.Head>
+                  <Table.Head class="sortable" onclick={() => { if (blockSortCol === 'expires') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'expires'; blockSortDir = 'asc'; } void loadBlocklist(); }}>
                     Expires {blockSortCol === 'expires' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
-                  </th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
+                  </Table.Head>
+                  <Table.Head></Table.Head>
+                </Table.Row>
+              </Table.Header>
+              <Table.Body>
                 {#each filteredBlocklist as item (item.id)}
-                  <tr>
-                    <td>
+                  <Table.Row>
+                    <Table.Cell>
                       <span class="reason-badge reason-{item.reason.split('_')[0]}">{item.reason}</span>
-                    </td>
-                    <td class="bl-key-cell">
+                    </Table.Cell>
+                    <Table.Cell class="bl-key-cell">
                       <div class="bl-key-top">
                         {#if item.keyType === 'external_url' || item.keyType === 'release_signature'}
                           <span class="reason-badge neutral">{blocklistKeyLabel(item)}</span>
@@ -1896,8 +1905,8 @@
                           <Copy size={13} />
                         </button>
                       </div>
-                    </td>
-                    <td class="bl-context-cell">
+                    </Table.Cell>
+                    <Table.Cell class="bl-context-cell">
                       {#if blocklistContext(item)}
                         <div class="bl-context-title">{item.releaseTitle || 'Matched release'}</div>
                         <div class="muted mono">{blocklistContext(item)}</div>
@@ -1911,10 +1920,10 @@
                       {:else}
                         <span class="muted" title="No linked release metadata available.">—</span>
                       {/if}
-                    </td>
-                    <td class="muted mono">{item.createdAt ? new Date(item.createdAt).toLocaleDateString('en-GB') : '—'}</td>
-                    <td class="muted mono">{item.expiresAt ? new Date(item.expiresAt).toLocaleDateString('en-GB') : 'Never'}</td>
-                    <td class="bl-action">
+                    </Table.Cell>
+                    <Table.Cell class="muted mono">{item.createdAt ? new Date(item.createdAt).toLocaleDateString('en-GB') : '—'}</Table.Cell>
+                    <Table.Cell class="muted mono">{item.expiresAt ? new Date(item.expiresAt).toLocaleDateString('en-GB') : 'Never'}</Table.Cell>
+                    <Table.Cell class="bl-action">
                       <div class="bl-row-actions">
                         <button class="icon-btn" type="button" on:click={() => clearBlocklistByReason(item.reason)} disabled={isBusy(`clear-blocklist-reason-${item.reason}`)} title="Clear all with this reason">
                           <Trash2 size={13} />
@@ -1926,11 +1935,11 @@
                         <X size={13} />
                         </button>
                       </div>
-                    </td>
-                  </tr>
+                    </Table.Cell>
+                  </Table.Row>
                 {/each}
-              </tbody>
-            </table>
+              </Table.Body>
+            </Table.Root>
           </div>
           <!-- Pagination -->
           <div class="bl-pagination">
@@ -1995,46 +2004,46 @@
         {@const episodeDefs = qualityDefs.filter(d => d.mediaType === 'episode')}
         <div class="qdef-shell">
           <Panel title="Movie Quality Definitions" subtitle="Per-tier size limits (MB/min) applied when ranking movie releases. Requires runtime metadata. Set 0 for no limit.">
-            <table class="qdef-table">
-              <thead><tr><th>Quality</th><th>Min (MB/min)</th><th>Max (MB/min)</th><th></th></tr></thead>
-              <tbody>
+            <Table.Root class="qdef-table">
+              <Table.Header><Table.Row><Table.Head>Quality</Table.Head><Table.Head>Min (MB/min)</Table.Head><Table.Head>Max (MB/min)</Table.Head><Table.Head></Table.Head></Table.Row></Table.Header>
+              <Table.Body>
                 {#each movieDefs as d (d.id)}
-                  <tr>
-                    <td class="qdef-title">{d.title}</td>
-                    <td><input type="number" min="0" class="qdef-input" bind:value={d.minMbPerMinute} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></td>
-                    <td><input type="number" min="0" class="qdef-input" bind:value={d.maxMbPerMinute} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></td>
-                    <td><button class="qdef-save-btn" disabled={!qualityDefsDirty.has(d.id) || qualityDefsSaving.has(d.id)} on:click={() => saveQualityDef(d)} type="button">{qualityDefsSaving.has(d.id) ? '…' : 'Save'}</button></td>
-                  </tr>
+                  <Table.Row>
+                    <Table.Cell class="qdef-title">{d.title}</Table.Cell>
+                    <Table.Cell><input type="number" min="0" class="qdef-input" bind:value={d.minMbPerMinute} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></Table.Cell>
+                    <Table.Cell><input type="number" min="0" class="qdef-input" bind:value={d.maxMbPerMinute} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></Table.Cell>
+                    <Table.Cell><Button kind="ghost" disabled={!qualityDefsDirty.has(d.id) || qualityDefsSaving.has(d.id)} on:click={() => saveQualityDef(d)} type="button">{qualityDefsSaving.has(d.id) ? '…' : 'Save'}</Button></Table.Cell>
+                  </Table.Row>
                 {/each}
-              </tbody>
-            </table>
+              </Table.Body>
+            </Table.Root>
           </Panel>
           <Panel title="TV / Episode Quality Definitions" subtitle="Per-tier size limits (MB/min) applied when ranking TV episode releases. Set 0 for no limit.">
-            <table class="qdef-table">
-              <thead><tr><th>Quality</th><th>Min (MB/min)</th><th>Max (MB/min)</th><th></th></tr></thead>
-              <tbody>
+            <Table.Root class="qdef-table">
+              <Table.Header><Table.Row><Table.Head>Quality</Table.Head><Table.Head>Min (MB/min)</Table.Head><Table.Head>Max (MB/min)</Table.Head><Table.Head></Table.Head></Table.Row></Table.Header>
+              <Table.Body>
                 {#each episodeDefs as d (d.id)}
-                  <tr>
-                    <td class="qdef-title">{d.title}</td>
-                    <td><input type="number" min="0" class="qdef-input" bind:value={d.minMbPerMinute} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></td>
-                    <td><input type="number" min="0" class="qdef-input" bind:value={d.maxMbPerMinute} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></td>
-                    <td><button class="qdef-save-btn" disabled={!qualityDefsDirty.has(d.id) || qualityDefsSaving.has(d.id)} on:click={() => saveQualityDef(d)} type="button">{qualityDefsSaving.has(d.id) ? '…' : 'Save'}</button></td>
-                  </tr>
+                  <Table.Row>
+                    <Table.Cell class="qdef-title">{d.title}</Table.Cell>
+                    <Table.Cell><input type="number" min="0" class="qdef-input" bind:value={d.minMbPerMinute} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></Table.Cell>
+                    <Table.Cell><input type="number" min="0" class="qdef-input" bind:value={d.maxMbPerMinute} on:input={() => { qualityDefsDirty = new Set([...qualityDefsDirty, d.id]); }} /></Table.Cell>
+                    <Table.Cell><Button kind="ghost" disabled={!qualityDefsDirty.has(d.id) || qualityDefsSaving.has(d.id)} on:click={() => saveQualityDef(d)} type="button">{qualityDefsSaving.has(d.id) ? '…' : 'Save'}</Button></Table.Cell>
+                  </Table.Row>
                 {/each}
-              </tbody>
-            </table>
+              </Table.Body>
+            </Table.Root>
           </Panel>
         </div>
       {:else}
-      <div class="qp-shell">
-        <aside class="qp-list">
+      <div class="settings-list-layout">
+        <aside class="settings-list">
           {#each profiles as p (p.id ?? p.name)}
-            <button class="qp-item" class:selected={selectedProfile?.id === p.id} on:click={() => { selectedProfile = { ...p }; }} type="button">
-              <div class="qp-item-name">
-                {#if p.isDefault}<Star size={12} class="qp-star" />{/if}
+            <button class="settings-list-item" class:active={selectedProfile?.id === p.id} on:click={() => { selectedProfile = { ...p }; }} type="button">
+              <div class="settings-list-item-name flex items-center gap-1.5">
+                {#if p.isDefault}<Star size={12} class="text-primary" />{/if}
                 {p.name}
               </div>
-              <div class="qp-item-meta">{p.resolutions.slice(0,2).join(', ')}</div>
+              <div class="settings-list-item-meta">{p.resolutions.slice(0,2).join(', ')}</div>
             </button>
           {/each}
           {#if profiles.length === 0 && !loading}<div class="empty">No profiles yet.</div>{/if}
@@ -2044,7 +2053,7 @@
         </aside>
 
         {#if selectedProfile}
-          <div class="qp-editor">
+          <div class="settings-editor">
             <Panel title={selectedProfile.id ? `Edit: ${selectedProfile.name}` : 'New Profile'} subtitle="Settings control how releases are ranked and filtered.">
               <div slot="actions">
                 {#if selectedProfile.isDefault}<StatusPill tone="ok">Default</StatusPill>{/if}
@@ -2204,12 +2213,15 @@
                 <div class="size-row">
                   <label>
                     <span>Cutoff Resolution</span>
-                    <select bind:value={selectedProfile.cutoffResolution} class="size-input">
-                      <option value="">No cutoff</option>
-                      {#each ALL_RESOLUTIONS as r}
-                        <option value={r}>{r}</option>
-                      {/each}
-                    </select>
+                    <Select.Root type="single" bind:value={selectedProfile.cutoffResolution}>
+                      <Select.Trigger class="size-input w-full">{selectedProfile.cutoffResolution || 'No cutoff'}</Select.Trigger>
+                      <Select.Content>
+                        <Select.Item value="">No cutoff</Select.Item>
+                        {#each ALL_RESOLUTIONS as r}
+                          <Select.Item value={r}>{r}</Select.Item>
+                        {/each}
+                      </Select.Content>
+                    </Select.Root>
                   </label>
                   <label>
                     <span>Minimum Age (hours)</span>
@@ -2273,7 +2285,7 @@
             </Panel>
           </div>
         {:else}
-          <div class="qp-no-selection">Select a profile to edit, or create a new one.</div>
+          <div class="empty-state">Select a profile to edit, or create a new one.</div>
         {/if}
       </div>
       {/if}
@@ -2282,12 +2294,12 @@
     {:else if activeTab === 'formats'}
       <Panel title="Custom Formats" subtitle="User-defined scoring rules applied to release titles. Positive scores boost, negative scores penalise.">
         {#if cfImportOpen}
-          <div class="cf-import-box">
-            <div class="cf-import-header">
+          <div class="settings-import-box">
+            <div class="settings-import-header">
               <strong>Import Custom Formats</strong>
               <span class="field-hint">Paste a JSON array of custom format objects. Fields: name, pattern, score, enabled.</span>
             </div>
-            <textarea class="cf-import-textarea" bind:value={cfImportJson} rows={8} placeholder={`[{"name":"BluRay","pattern":"(?i)bluray","score":50,"enabled":true}]`}></textarea>
+            <textarea class="settings-import-textarea" bind:value={cfImportJson} rows={8} placeholder={`[{"name":"BluRay","pattern":"(?i)bluray","score":50,"enabled":true}]`}></textarea>
             <div class="editor-actions" style="margin-top:10px">
               <Button kind="ghost" on:click={() => { cfImportOpen = false; cfImportJson = ''; }}>Cancel</Button>
               <Button kind="primary" on:click={importCustomFormats} disabled={cfImporting || !cfImportJson.trim()}>
@@ -2296,34 +2308,34 @@
             </div>
           </div>
         {/if}
-        <div class="cf-layout">
-          <div class="cf-list">
-            <div class="cf-list-header">
+        <div class="settings-list-layout">
+          <div class="settings-list">
+            <div class="settings-list-header">
               <span>Formats</span>
-              <div style="display:flex;gap:6px">
-                <Button kind="ghost" on:click={() => { cfImportOpen = !cfImportOpen; cfImportJson = ''; }}>
+              <div class="flex gap-1.5">
+                <Button kind="secondary" on:click={() => { cfImportOpen = !cfImportOpen; cfImportJson = ''; }}>
                   Import
                 </Button>
-                <Button kind="ghost" on:click={() => { editingFormat = blankFormat(); }}>
+                <Button kind="secondary" on:click={() => { editingFormat = blankFormat(); }}>
                   <Plus size={14} /> New
                 </Button>
               </div>
             </div>
             {#if customFormats.length === 0}
-              <div class="cf-empty">No custom formats yet.</div>
+              <div class="empty-state">No custom formats yet.</div>
             {/if}
             {#each customFormats as f (f.id)}
-              <button class="cf-item" class:cf-active={editingFormat?.id === f.id} on:click={() => { editingFormat = { ...f }; }}>
-                <span class="cf-item-name">{f.name}</span>
+              <button class="settings-list-item" class:active={editingFormat?.id === f.id} on:click={() => { editingFormat = { ...f }; }}>
+                <span class="settings-list-item-name">{f.name}</span>
                 <div style="display:flex;align-items:center;gap:4px;flex-shrink:0">
-                  {#if f.source && f.source !== 'custom'}<span class="rf-badge rf-badge-src">{f.source}</span>{/if}
-                  <span class="cf-item-score" class:cf-pos={f.score > 0} class:cf-neg={f.score < 0}>{f.score > 0 ? '+' : ''}{f.score}</span>
-                  {#if !f.enabled}<span class="cf-disabled-badge">off</span>{/if}
+                  {#if f.source && f.source !== 'custom'}<span class="settings-badge settings-badge-info">{f.source}</span>{/if}
+                  <span class="settings-list-item-score" class:positive={f.score > 0} class:negative={f.score < 0}>{f.score > 0 ? '+' : ''}{f.score}</span>
+                  {#if !f.enabled}<span class="settings-disabled-badge">off</span>{/if}
                 </div>
               </button>
             {/each}
           </div>
-          <div class="cf-editor">
+          <div class="settings-editor">
             {#if editingFormat}
               <div class="field">
                 <label class="field-label" for="cf-name">Name</label>
@@ -2353,7 +2365,7 @@
                 </Button>
               </div>
             {:else}
-              <div class="cf-empty">Select a format to edit, or create a new one.</div>
+              <div class="empty-state">Select a format to edit, or create a new one.</div>
             {/if}
           </div>
         </div>
@@ -2362,31 +2374,31 @@
     <!-- RELEASE FILTERING -->
     {:else if activeTab === 'filtering'}
       <Panel title="Release Filtering" subtitle="Block or penalise known low-quality releases by group, title pattern, or regex. Default rules are from TRaSH Guides LQ lists.">
-        <div class="rf-layout">
+        <div class="settings-list-layout">
           <!-- Rule list -->
-          <div class="rf-list">
-            <div class="rf-list-header">
+          <div class="settings-list">
+            <div class="settings-list-header">
               <span>Rules ({blockRules.filter(r => r.enabled).length}/{blockRules.length} enabled)</span>
-              <Button kind="ghost" on:click={() => { editingRule = blankRule(); }}>
-                <Plus size={14} /> Add
+              <Button kind="secondary" on:click={() => { editingRule = blankRule(); }}>
+                <Plus size={14} /> New
               </Button>
             </div>
 
             {#each [['release_group','Release Groups'], ['title_pattern','Title Patterns'], ['regex','Regex'], ['missing_release_group','Missing Group']] as [typeKey, typeLabel] (typeKey)}
               {@const group = blockRules.filter(r => r.type === typeKey)}
               {#if group.length > 0}
-                <div class="rf-type-header">{typeLabel} <span class="rf-count">{group.filter(r => r.enabled).length}/{group.length}</span></div>
+                <div class="settings-type-header">{typeLabel} <span class="settings-count-badge">{group.filter(r => r.enabled).length}/{group.length}</span></div>
                 {#each group as rule (rule.id)}
-                  <button class="rf-item" class:rf-active={editingRule?.id === rule.id} class:rf-disabled={!rule.enabled}
+                  <button class="settings-list-item" class:active={editingRule?.id === rule.id} class:disabled={!rule.enabled}
                     on:click={() => { editingRule = { ...rule }; testResult = null; }}>
-                    <span class="rf-pattern">{rule.pattern || '(any)'}</span>
-                    <span class="rf-badges">
-                      {#if rule.mediaType !== 'both'}<span class="rf-badge rf-badge-mt">{rule.mediaType}</span>{/if}
-                      <span class="rf-badge" class:rf-badge-block={rule.action === 'block'} class:rf-badge-penalty={rule.action === 'penalty'}>
+                    <span class="settings-list-item-name">{rule.pattern || '(any)'}</span>
+                    <span class="settings-badge-row">
+                      {#if rule.mediaType !== 'both'}<span class="settings-badge settings-badge-media">{rule.mediaType}</span>{/if}
+                      <span class="settings-badge {rule.action === 'block' ? 'settings-badge-block' : 'settings-badge-penalty'}">
                         {rule.action === 'block' ? 'block' : `-${rule.scorePenalty}`}
                       </span>
-                      {#if rule.source !== 'custom'}<span class="rf-badge rf-badge-src">{rule.source}</span>{/if}
-                      {#if !rule.enabled}<span class="rf-badge rf-badge-off">off</span>{/if}
+                      {#if rule.source !== 'custom'}<span class="settings-badge settings-badge-info">{rule.source}</span>{/if}
+                      {#if !rule.enabled}<span class="settings-badge settings-disabled-badge">off</span>{/if}
                     </span>
                   </button>
                 {/each}
@@ -2394,48 +2406,57 @@
             {/each}
 
             {#if blockRules.length === 0}
-              <div class="cf-empty">No rules yet.</div>
+              <div class="empty-state">No rules yet.</div>
             {/if}
           </div>
 
           <!-- Editor + test tool -->
-          <div class="rf-editor">
+          <div class="settings-editor">
             {#if editingRule}
               <div class="field">
                 <label class="field-label" for="rf-type">Type</label>
-                <select id="rf-type" bind:value={editingRule.type} disabled={editingRule.id !== undefined && editingRule.source !== 'custom'}>
-                  <option value="release_group">Release Group</option>
-                  <option value="title_pattern">Title Pattern</option>
-                  <option value="regex">Regex</option>
-                  <option value="missing_release_group">Missing Release Group</option>
-                </select>
+                <Select.Root type="single" value={editingRule.type} onValueChange={(v) => { if (editingRule) editingRule.type = v as ReleaseBlockRule['type']; }} disabled={editingRule.id !== undefined && editingRule.source !== 'custom'}>
+                  <Select.Trigger id="rf-type" class="w-full">{rfTypeLabels[editingRule.type]}</Select.Trigger>
+                  <Select.Content>
+                    <Select.Item value="release_group">Release Group</Select.Item>
+                    <Select.Item value="title_pattern">Title Pattern</Select.Item>
+                    <Select.Item value="regex">Regex</Select.Item>
+                    <Select.Item value="missing_release_group">Missing Release Group</Select.Item>
+                  </Select.Content>
+                </Select.Root>
               </div>
               {#if editingRule.type !== 'missing_release_group'}
                 <div class="field">
-                  <label class="field-label" for="rf-pattern">Pattern
+                  <label class="field-label" for="rf-pattern-input">Pattern
                     {#if editingRule.type === 'regex'}<span class="field-hint">(regex, case-insensitive)</span>{/if}
                     {#if editingRule.type === 'title_pattern'}<span class="field-hint">(substring match, dots normalised)</span>{/if}
                     {#if editingRule.type === 'release_group'}<span class="field-hint">(parsed group after last "-")</span>{/if}
                   </label>
-                  <input id="rf-pattern" type="text" bind:value={editingRule.pattern}
+                  <input id="rf-pattern-input" type="text" bind:value={editingRule.pattern}
                     placeholder={editingRule.type === 'release_group' ? 'e.g. GalaxyRG' : editingRule.type === 'title_pattern' ? 'e.g. AI Upscale' : '(?i)upscal(e|ed)'}
                     disabled={editingRule.id !== undefined && editingRule.source !== 'custom'} />
                 </div>
               {/if}
               <div class="field">
                 <label class="field-label" for="rf-mediatype">Media type</label>
-                <select id="rf-mediatype" bind:value={editingRule.mediaType} disabled={editingRule.id !== undefined && editingRule.source !== 'custom'}>
-                  <option value="both">Both</option>
-                  <option value="movie">Movie only</option>
-                  <option value="tv">TV only</option>
-                </select>
+                <Select.Root type="single" value={editingRule.mediaType} onValueChange={(v) => { if (editingRule) editingRule.mediaType = v as ReleaseBlockRule['mediaType']; }} disabled={editingRule.id !== undefined && editingRule.source !== 'custom'}>
+                  <Select.Trigger id="rf-mediatype" class="w-full">{rfMediaTypeLabels[editingRule.mediaType]}</Select.Trigger>
+                  <Select.Content>
+                    <Select.Item value="both">Both</Select.Item>
+                    <Select.Item value="movie">Movie only</Select.Item>
+                    <Select.Item value="tv">TV only</Select.Item>
+                  </Select.Content>
+                </Select.Root>
               </div>
               <div class="field">
                 <label class="field-label" for="rf-action">Action</label>
-                <select id="rf-action" bind:value={editingRule.action} disabled={editingRule.id !== undefined && editingRule.source !== 'custom'}>
-                  <option value="block">Block (reject release)</option>
-                  <option value="penalty">Penalty (reduce score)</option>
-                </select>
+                <Select.Root type="single" value={editingRule.action} onValueChange={(v) => { if (editingRule) editingRule.action = v as ReleaseBlockRule['action']; }} disabled={editingRule.id !== undefined && editingRule.source !== 'custom'}>
+                  <Select.Trigger id="rf-action" class="w-full">{rfActionLabels[editingRule.action]}</Select.Trigger>
+                  <Select.Content>
+                    <Select.Item value="block">Block (reject release)</Select.Item>
+                    <Select.Item value="penalty">Penalty (reduce score)</Select.Item>
+                  </Select.Content>
+                </Select.Root>
               </div>
               {#if editingRule.action === 'penalty'}
                 <div class="field">
@@ -2464,34 +2485,37 @@
                 </Button>
               </div>
               {#if editingRule.source !== 'custom'}
-                <p class="rf-readonly-note">Default and TRaSH rules: only <strong>enabled</strong> and <strong>note</strong> can be changed. To customise, add a new custom rule.</p>
+                <p class="settings-readonly-note">Default and TRaSH rules: only <strong>enabled</strong> and <strong>note</strong> can be changed. To customise, add a new custom rule.</p>
               {/if}
             {:else}
-              <div class="cf-empty">Select a rule to edit, or add a new custom rule.</div>
+              <div class="empty-state">Select a rule to edit, or add a new custom rule.</div>
             {/if}
 
             <!-- Test tool -->
-            <div class="rf-test-panel">
-              <div class="rf-test-header">Test a release title</div>
-              <div class="rf-test-row">
+            <div class="settings-test-panel">
+              <div class="settings-test-header">Test a release title</div>
+              <div class="settings-test-row">
                 <input type="text" bind:value={testTitle} placeholder="Movie.Title.2025.1080p.WEB-DL-GalaxyRG"
                   style="flex:1" on:keydown={(e) => e.key === 'Enter' && runBlockTest()} />
-                <select bind:value={testMediaType} style="width:100px">
-                  <option value="both">Both</option>
-                  <option value="movie">Movie</option>
-                  <option value="tv">TV</option>
-                </select>
+                <Select.Root type="single" value={testMediaType} onValueChange={(v) => { testMediaType = v as 'movie' | 'tv' | 'both'; }}>
+                  <Select.Trigger style="width:100px">{testMediaTypeLabels[testMediaType]}</Select.Trigger>
+                  <Select.Content>
+                    <Select.Item value="both">Both</Select.Item>
+                    <Select.Item value="movie">Movie</Select.Item>
+                    <Select.Item value="tv">TV</Select.Item>
+                  </Select.Content>
+                </Select.Root>
                 <Button kind="secondary" on:click={runBlockTest} disabled={testRunning || !testTitle.trim()}>
                   {testRunning ? '…' : 'Test'}
                 </Button>
               </div>
               {#if testResult}
-                <div class="rf-test-result" class:rf-test-blocked={testResult.blocked} class:rf-test-allowed={testResult.allowed && testResult.scorePenalty === 0}>
+                <div class="settings-test-result" class:blocked={testResult.blocked} class:allowed={testResult.allowed && testResult.scorePenalty === 0}>
                   <strong>{testResult.blocked ? '🚫 Blocked' : testResult.scorePenalty > 0 ? `⚠ Penalty −${testResult.scorePenalty}` : '✓ Allowed'}</strong>
                   {#if testResult.matchedRules.length > 0}
-                    <ul class="rf-test-matches">
+                    <ul class="settings-test-matches">
                       {#each testResult.matchedRules as m}
-                        <li><span class="rf-badge rf-badge-src">{m.type}</span> {m.reason}</li>
+                        <li><span class="settings-badge settings-badge-info">{m.type}</span> {m.reason}</li>
                       {/each}
                     </ul>
                   {/if}
@@ -2505,28 +2529,28 @@
     <!-- SUBTITLE PROFILES -->
     {:else if activeTab === 'subtitle-profiles'}
       <Panel title="Subtitle Profiles" subtitle="Named language preference sets for subtitle acquisition. Assign a profile per library item to override the global language settings.">
-        <div class="cf-layout">
-          <div class="cf-list">
-            <div class="cf-list-header">
+        <div class="settings-list-layout">
+          <div class="settings-list">
+            <div class="settings-list-header">
               <span>Profiles</span>
-              <Button kind="ghost" on:click={() => { editingSubtitleProfile = { name: '', languages: [], preferHearingImpaired: false, requireExactLanguage: false, isDefault: false }; }}>
+              <Button kind="secondary" on:click={() => { editingSubtitleProfile = { name: '', languages: [], preferHearingImpaired: false, requireExactLanguage: false, isDefault: false }; }}>
                 <Plus size={14} /> New
               </Button>
             </div>
             {#if subtitleProfiles.length === 0}
-              <div class="cf-empty">No subtitle profiles yet.</div>
+              <div class="empty-state">No subtitle profiles yet.</div>
             {/if}
             {#each subtitleProfiles as p (p.id)}
-              <button class="cf-item" class:cf-active={editingSubtitleProfile?.id === p.id} on:click={() => { editingSubtitleProfile = { ...p }; }}>
-                <span class="cf-item-name">{p.name}</span>
+              <button class="settings-list-item" class:active={editingSubtitleProfile?.id === p.id} on:click={() => { editingSubtitleProfile = { ...p }; }}>
+                <span class="settings-list-item-name">{p.name}</span>
                 <div style="display:flex;align-items:center;gap:4px;flex-shrink:0">
-                  {#if p.isDefault}<span class="rf-badge rf-badge-src">default</span>{/if}
-                  {#if p.languages.length > 0}<span class="cf-disabled-badge">{p.languages.slice(0,2).join(', ')}{p.languages.length > 2 ? '…' : ''}</span>{/if}
+                  {#if p.isDefault}<span class="settings-badge settings-badge-info">default</span>{/if}
+                  {#if p.languages.length > 0}<span class="settings-disabled-badge">{p.languages.slice(0,2).join(', ')}{p.languages.length > 2 ? '…' : ''}</span>{/if}
                 </div>
               </button>
             {/each}
           </div>
-          <div class="cf-editor">
+          <div class="settings-editor">
             {#if editingSubtitleProfile}
               <div class="field">
                 <label class="field-label" for="sp-name">Profile Name</label>
@@ -2563,7 +2587,7 @@
                 </Button>
               </div>
             {:else}
-              <div class="cf-empty">Select a profile to edit, or create a new one.</div>
+              <div class="empty-state">Select a profile to edit, or create a new one.</div>
             {/if}
           </div>
         </div>
@@ -2706,7 +2730,7 @@
                 {#if draft.privacy.wireguard.configText}<span class="field-hint-inline">A configuration is already saved. Import a new one to replace it.</span>{/if}
               </div>
             {:else}
-              <textarea id="wg-import" class="cf-import-textarea" bind:value={wireguardImportText} rows={10}
+              <textarea id="wg-import" class="settings-import-textarea" bind:value={wireguardImportText} rows={10}
                 placeholder={"[Interface]\nPrivateKey = ...\nAddress = 10.x.x.x/32\nDNS = ...\n\n[Peer]\nPublicKey = ...\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = vpn.example.com:51820\nPersistentKeepalive = 25"}></textarea>
               <input type="file" accept=".conf,text/plain" on:change={async (e) => {
                 const file = (e.currentTarget as HTMLInputElement).files?.[0];
@@ -2832,18 +2856,22 @@
 
     <!-- LOGS -->
     {:else if activeTab === 'logs'}
+      <Panel title="Logs" subtitle="Operational events assembled from backend runtime and job state.">
       <div class="log-toolbar">
         <div class="log-search-wrap">
           <Search size={14} />
           <input bind:value={logTerm} placeholder="Search logs, service names, request IDs…" class="log-search-input" />
         </div>
-        <select bind:value={logLevelFilter} on:change={changeLogLevel} class="log-level-select">
-          <option value="all">All levels</option>
-          <option value="info">Info</option>
-          <option value="warn">Warn</option>
-          <option value="error">Error</option>
-          <option value="debug">Debug</option>
-        </select>
+        <Select.Root type="single" value={logLevelFilter} onValueChange={(v) => { logLevelFilter = v; changeLogLevel(); }}>
+          <Select.Trigger class="w-auto">{logLevelLabels[logLevelFilter] ?? logLevelFilter}</Select.Trigger>
+          <Select.Content>
+            <Select.Item value="all">All levels</Select.Item>
+            <Select.Item value="info">Info</Select.Item>
+            <Select.Item value="warn">Warn</Select.Item>
+            <Select.Item value="error">Error</Select.Item>
+            <Select.Item value="debug">Debug</Select.Item>
+          </Select.Content>
+        </Select.Root>
         <Button kind="secondary" on:click={loadLogs} disabled={logLoading}>
           <RefreshCw size={14} /> Refresh
         </Button>
@@ -2857,38 +2885,39 @@
         <Pagination page={logPage} totalPages={logTotalPages} on:change={changeLogPage} />
       </div>
       <div class="log-table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th class="log-col-time">Time</th>
-              <th class="log-col-level">Level</th>
-              <th class="log-col-service">Service</th>
-              <th class="log-col-message">Message</th>
-            </tr>
-          </thead>
-          <tbody>
+        <Table.Root>
+          <Table.Header>
+            <Table.Row>
+              <Table.Head class="log-col-time">Time</Table.Head>
+              <Table.Head class="log-col-level">Level</Table.Head>
+              <Table.Head class="log-col-service">Service</Table.Head>
+              <Table.Head class="log-col-message">Message</Table.Head>
+            </Table.Row>
+          </Table.Header>
+          <Table.Body>
             {#if logLoading && logEntries.length === 0}
-              <tr><td colspan="4" class="log-empty">Loading…</td></tr>
+              <Table.Row><Table.Cell colspan={4} class="log-empty">Loading…</Table.Cell></Table.Row>
             {:else if filteredLogs.length === 0}
-              <tr><td colspan="4" class="log-empty">No log entries match the current filter.</td></tr>
+              <Table.Row><Table.Cell colspan={4} class="log-empty">No log entries match the current filter.</Table.Cell></Table.Row>
             {:else}
               {#each filteredLogs as entry, i (i)}
-                <tr class="log-row-{entry.level === 'error' ? 'error' : entry.level === 'warn' ? 'warn' : 'default'}">
-                  <td class="log-col-time mono muted">{fmtLogDate(entry.time)}</td>
-                  <td class="log-col-level">
+                <Table.Row class="log-row-{entry.level === 'error' ? 'error' : entry.level === 'warn' ? 'warn' : 'default'}">
+                  <Table.Cell class="log-col-time mono muted">{fmtLogDate(entry.time)}</Table.Cell>
+                  <Table.Cell class="log-col-level">
                     <span class="log-badge log-badge-{entry.level || 'default'}">{(entry.level || '?').toUpperCase()}</span>
-                  </td>
-                  <td class="log-col-service mono muted">{entry.service || '—'}</td>
-                  <td class="log-col-message">{entry.message}</td>
-                </tr>
+                  </Table.Cell>
+                  <Table.Cell class="log-col-service mono muted">{entry.service || '—'}</Table.Cell>
+                  <Table.Cell class="log-col-message">{entry.message}</Table.Cell>
+                </Table.Row>
               {/each}
             {/if}
-          </tbody>
-        </table>
+          </Table.Body>
+        </Table.Root>
       </div>
       <div class="pager-row">
         <Pagination page={logPage} totalPages={logTotalPages} on:change={changeLogPage} />
       </div>
+      </Panel>
 
     <!-- TASKS -->
     {:else if activeTab === 'tasks'}
@@ -2898,35 +2927,35 @@
       </div>
       <Panel title="Scheduled Tasks" subtitle="Scheduled-job control plane for indexing, publishing, and maintenance work.">
         <div class="task-table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Interval</th>
-                <th>Status</th>
-                <th>Last Execution</th>
-                <th>Action</th>
-              </tr>
-            </thead>
-            <tbody>
+          <Table.Root>
+            <Table.Header>
+              <Table.Row>
+                <Table.Head>Name</Table.Head>
+                <Table.Head>Interval</Table.Head>
+                <Table.Head>Status</Table.Head>
+                <Table.Head>Last Execution</Table.Head>
+                <Table.Head>Action</Table.Head>
+              </Table.Row>
+            </Table.Header>
+            <Table.Body>
               {#each taskGroups as group}
                 {@const groupCollapsed = collapsedTaskGroups.has(group)}
-                <tr class="task-group-row" on:click={() => toggleTaskGroup(group)}>
-                  <td colspan="5">
+                <Table.Row class="task-group-row" onclick={() => toggleTaskGroup(group)}>
+                  <Table.Cell colspan={5}>
                     <span class="task-group-toggle">
                       <svelte:component this={groupCollapsed ? ChevronRight : ChevronDown} size={14} />
                       {group}
                       <span class="task-group-count">{taskDefs.filter(t => t.group === group).length}</span>
                     </span>
-                  </td>
-                </tr>
+                  </Table.Cell>
+                </Table.Row>
                 {#if !groupCollapsed}
                 {#each taskDefs.filter(t => t.group === group) as task}
                   {@const busy = taskRunning[task.id]}
                   {@const result = taskResults[task.id]}
                   {@const schedule = taskScheduleFor(task)}
-                  <tr>
-                    <td>
+                  <Table.Row>
+                    <Table.Cell>
                       <div class="task-row-title">{task.label}</div>
                       <div class="task-row-sub">{task.description}</div>
                       {#if result}
@@ -2935,9 +2964,9 @@
                           <span>{result.detail}</span>
                         </div>
                       {/if}
-                    </td>
-                    <td class="muted">{schedule?.interval ?? task.interval}</td>
-                    <td>
+                    </Table.Cell>
+                    <Table.Cell class="muted">{schedule?.interval ?? task.interval}</Table.Cell>
+                    <Table.Cell>
                       {#if busy}
                         <StatusPill tone="warn">Running</StatusPill>
                       {:else if schedule?.automated}
@@ -2949,8 +2978,8 @@
                       {:else}
                         <StatusPill tone="neutral">Idle</StatusPill>
                       {/if}
-                    </td>
-                    <td class="muted">
+                    </Table.Cell>
+                    <Table.Cell class="muted">
                       {#if result}
                         <span class="time-cell"><Clock3 size={12} /> {fmtTaskTime(result.ranAt)}</span>
                       {:else if schedule?.lastRunAt}
@@ -2960,18 +2989,18 @@
                       {:else}
                         <span class="time-cell dim">Never</span>
                       {/if}
-                    </td>
-                    <td>
+                    </Table.Cell>
+                    <Table.Cell>
                       <Button kind="secondary" on:click={() => runTask(task)} disabled={busy || !task.manual}>
-                        {#if busy}<RefreshCw size={14} class="spin" /> Running…{:else}<Play size={14} /> Run{/if}
+                        {#if busy}<RefreshCw size={14} class="animate-spin" /> Running…{:else}<Play size={14} /> Run{/if}
                       </Button>
-                    </td>
-                  </tr>
+                    </Table.Cell>
+                  </Table.Row>
                 {/each}
                 {/if}
               {/each}
-            </tbody>
-          </table>
+            </Table.Body>
+          </Table.Root>
         </div>
       </Panel>
 
@@ -3176,23 +3205,6 @@
 </div>
 
 <style>
-  /* summary strip */
-  .summary-strip {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 12px;
-    margin-bottom: 16px;
-  }
-
-  .summary-card {
-    padding: 14px 16px;
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    border-radius: 18px;
-    background: hsl(0 0% 100% / 0.03);
-  }
-
-  .summary-card strong { display: block; font-size: 1.4rem; line-height: 1; }
-  .summary-card span   { display: block; margin-top: 6px; color: hsl(var(--muted-foreground)); font-size: 13px; }
 
   /* shell */
   .settings-shell {
@@ -3208,112 +3220,6 @@
     gap: 2px;
     position: sticky;
     top: 88px;
-  }
-
-  .tab-btn {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 9px 12px;
-    border-radius: 8px;
-    border: none;
-    background: transparent;
-    color: hsl(var(--muted-foreground));
-    cursor: pointer;
-    text-align: left;
-    font-size: 13px;
-    font-weight: 500;
-    transition: background 0.12s, color 0.12s;
-  }
-  .tab-btn:hover {
-    background: hsl(0 0% 100% / 0.06);
-    color: hsl(var(--foreground));
-  }
-  .tab-btn.active {
-    background: hsl(var(--primary) / 0.12);
-    color: hsl(var(--primary));
-  }
-
-  /* content area */
-  .tab-content { display: grid; gap: 16px; }
-  .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-
-  /* form fields */
-  .form-grid {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 14px;
-  }
-  .form-grid--3col { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .form-grid--2col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .form-grid--compact { gap: 10px; margin-top: 10px; }
-
-  .form-field {
-    display: grid;
-    gap: 5px;
-  }
-  .form-field span {
-    font-size: 12px;
-    font-weight: 500;
-    color: hsl(var(--muted-foreground));
-  }
-  .form-field input[type="text"],
-  .form-field input[type="url"],
-  .form-field input[type="password"],
-  .form-field input[type="number"] {
-    height: 40px;
-    padding: 0 12px;
-    border-radius: 10px;
-    border: 1px solid hsl(0 0% 100% / 0.12);
-    background: hsl(0 0% 100% / 0.05);
-    color: hsl(var(--foreground));
-    font-size: 13px;
-    transition: border-color 0.15s, background 0.15s;
-    width: 100%;
-  }
-  .form-field input:focus,
-  .form-field select:focus {
-    outline: none;
-    border-color: hsl(var(--primary) / 0.5);
-    background: hsl(0 0% 100% / 0.08);
-  }
-  .form-field input::placeholder { color: hsl(var(--muted-foreground)); }
-  .form-field select {
-    height: 40px;
-    padding: 0 12px;
-    border-radius: 10px;
-    border: 1px solid hsl(0 0% 100% / 0.12);
-    background: hsl(0 0% 100% / 0.05);
-    color: hsl(var(--foreground));
-    font-size: 13px;
-    cursor: pointer;
-    appearance: auto;
-    transition: border-color 0.15s, background 0.15s;
-    width: 100%;
-  }
-  .form-field select option { background: hsl(215 36% 10%); }
-
-  .form-field--toggle {
-    flex-direction: row;
-    align-items: center;
-    gap: 10px;
-  }
-
-  .field-hint {
-    display: block;
-    font-size: 11px;
-    color: hsl(var(--muted-foreground));
-    font-weight: 400;
-    text-transform: none;
-    letter-spacing: 0;
-    margin-top: 2px;
-  }
-  .field-hint-inline {
-    font-size: 11px;
-    color: hsl(var(--muted-foreground));
-    font-weight: 400;
-    text-transform: none;
-    letter-spacing: 0;
   }
 
   /* subtitle provider */
@@ -3508,17 +3414,6 @@
     padding: 14px 0 4px;
   }
 
-  .bl-page-size {
-    height: 32px;
-    padding: 0 8px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 10px;
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--foreground));
-    font-size: 12px;
-    cursor: pointer;
-  }
-
   .bl-stats-text { color: hsl(var(--muted-foreground)); font-size: 12px; white-space: nowrap; }
 
   .bl-show-more {
@@ -3599,31 +3494,23 @@
     border-radius: 14px;
   }
 
-  .bl-table { width: 100%; min-width: 560px; border-collapse: collapse; }
+  .bl-table { width: 100%; min-width: 560px; }
 
-  .bl-table th {
-    padding: 10px 14px;
-    text-align: left;
+  :global(.bl-table th) {
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.12em;
-    color: hsl(var(--muted-foreground));
-    border-bottom: 1px solid hsl(0 0% 100% / 0.06);
   }
 
-  .bl-table th.sortable { cursor: pointer; user-select: none; }
-  .bl-table th.sortable:hover { color: hsl(var(--foreground)); }
+  :global(.bl-table th.sortable) { cursor: pointer; user-select: none; }
+  :global(.bl-table th.sortable:hover) { color: hsl(var(--foreground)); }
 
-  .bl-table td {
-    padding: 6px 14px;
-    border-bottom: 1px solid hsl(0 0% 100% / 0.04);
+  :global(.bl-table td) {
     font-size: 13px;
     vertical-align: middle;
   }
 
-  .bl-table tr:last-child td { border-bottom: none; }
-
-  .bl-key-cell, .bl-context-cell { min-width: 220px; }
+  :global(.bl-key-cell), :global(.bl-context-cell) { min-width: 220px; }
   .bl-key-top, .bl-row-actions {
     display: flex;
     align-items: center;
@@ -3645,7 +3532,7 @@
     font-weight: 600;
     margin-bottom: 3px;
   }
-  .bl-action { width: 84px; text-align: right; }
+  :global(.bl-action) { width: 84px; text-align: right; }
 
   .clear-btn {
     display: inline-grid;
@@ -3684,30 +3571,11 @@
   @media (max-width: 900px) { .queue-rules { grid-template-columns: 1fr; } }
   .rule-row { display: grid; gap: 6px; }
   .rule-label { color: hsl(var(--muted-foreground)); font-size: 13px; }
-  .rule-row select, .pattern-box {
-    width: 100%;
-    padding: 10px 12px;
-    border-radius: 12px;
-    border: 1px solid hsl(0 0% 100% / 0.15);
-    background: hsl(0 0% 100% / 0.06);
-    color: hsl(var(--foreground));
-    font-size: 13px;
-    cursor: pointer;
-    appearance: auto;
-    transition: border-color 0.15s, background 0.15s;
-  }
-  .rule-row select:hover, .rule-row select:focus {
-    border-color: hsl(var(--primary) / 0.5);
-    background: hsl(0 0% 100% / 0.09);
-    outline: none;
-  }
-  .rule-row select option { background: hsl(215 36% 10%); }
   .pattern-box {
+    width: 100%;
     min-height: 160px; resize: vertical;
     font-family: 'JetBrains Mono', monospace; font-size: 12px;
-    cursor: text;
   }
-  .pattern-box:focus { border-color: hsl(var(--primary) / 0.5); outline: none; }
 
   /* seerr webhook */
   .webhook-setup {
@@ -3933,10 +3801,7 @@
   }
 
   @media (max-width: 900px) {
-    .summary-strip, .grid-2, .form-grid, .form-grid--3col { grid-template-columns: 1fr; }
     .profile-meta, .result-grid { grid-template-columns: 1fr; }
-    .qp-shell { grid-template-columns: 1fr; }
-    .qp-list { position: static; }
   }
 
   @media (max-width: 600px) {
@@ -3959,25 +3824,17 @@
     color: hsl(var(--foreground)); font-size: 13px;
   }
   .log-search-input::placeholder { color: hsl(var(--muted-foreground)); }
-  .log-level-select {
-    height: 40px; padding: 0 12px;
-    border: 1px solid hsl(0 0% 100% / 0.08); border-radius: 14px;
-    background: hsl(0 0% 100% / 0.04); color: hsl(var(--foreground)); font-size: 13px; cursor: pointer;
-  }
   .log-download-link { display: contents; }
   .log-error { margin-bottom: 10px; padding: 10px 14px; border-radius: 12px; background: hsl(0 72% 51% / 0.15); color: hsl(0 96% 82%); font-size: 13px; }
   .pager-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 10px 0; }
   .pager-total { font-size: 13px; color: hsl(var(--muted-foreground)); }
   .log-table-wrap { overflow-x: auto; border: 1px solid hsl(0 0% 100% / 0.08); border-radius: 18px; background: hsl(var(--background) / 0.6); }
-  .log-table-wrap table { width: 100%; min-width: 760px; border-collapse: collapse; }
-  .log-table-wrap thead { border-bottom: 1px solid hsl(0 0% 100% / 0.06); }
-  .log-table-wrap th { padding: 12px 14px; text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.14em; color: hsl(var(--muted-foreground)); white-space: nowrap; }
-  .log-table-wrap td { padding: 11px 14px; border-bottom: 1px solid hsl(0 0% 100% / 0.04); vertical-align: top; font-size: 13px; }
-  .log-table-wrap tr:last-child td { border-bottom: none; }
-  .log-col-time { width: 140px; } .log-col-level { width: 72px; } .log-col-service { width: 160px; } .log-col-message { min-width: 200px; }
+  :global(.log-table-wrap th) { white-space: nowrap; }
+  :global(.log-table-wrap td) { vertical-align: top; font-size: 13px; }
+  :global(.log-col-time) { width: 140px; } :global(.log-col-level) { width: 72px; } :global(.log-col-service) { width: 160px; } :global(.log-col-message) { min-width: 200px; }
   .log-empty { padding: 32px; text-align: center; color: hsl(var(--muted-foreground)); }
-  .log-row-error td { background: hsl(0 72% 51% / 0.06); }
-  .log-row-warn td  { background: hsl(38 96% 55% / 0.06); }
+  :global(.log-row-error td) { background: hsl(0 72% 51% / 0.06); }
+  :global(.log-row-warn td) { background: hsl(38 96% 55% / 0.06); }
   .log-badge { display: inline-block; padding: 2px 8px; border-radius: 8px; font-size: 10px; font-weight: 700; font-family: 'JetBrains Mono', monospace; letter-spacing: 0.06em; }
   .log-badge-error   { background: hsl(0 72% 51% / 0.2);   color: hsl(0 96% 82%); }
   .log-badge-warn    { background: hsl(38 96% 55% / 0.2);  color: hsl(38 100% 72%); }
@@ -3991,11 +3848,10 @@
   .task-summary-value { font-size: 1.8rem; font-weight: 700; line-height: 1; }
   .task-summary-label { margin-top: 6px; color: hsl(var(--muted-foreground)); font-size: 12px; }
   .task-table-wrap { overflow-x: auto; }
-  .task-table-wrap table { width: 100%; min-width: 760px; border-collapse: collapse; }
-  .task-table-wrap th, .task-table-wrap td { padding: 12px 10px; border-bottom: 1px solid hsl(0 0% 100% / 0.05); text-align: left; vertical-align: top; }
-  .task-table-wrap th { font-size: 11px; text-transform: uppercase; letter-spacing: 0.18em; color: hsl(var(--muted-foreground)); }
-  .task-group-row { cursor: pointer; user-select: none; }
-  .task-group-row td { padding-top: 20px; font-size: 12px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: hsl(var(--primary)); }
+  :global(.task-table-wrap td) { vertical-align: top; }
+  :global(.task-table-wrap th) { font-size: 11px; text-transform: uppercase; letter-spacing: 0.18em; }
+  :global(.task-group-row) { cursor: pointer; user-select: none; }
+  :global(.task-group-row td) { padding-top: 20px; font-size: 12px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: hsl(var(--primary)); }
   .task-group-toggle { display: inline-flex; align-items: center; gap: 6px; }
   .task-group-count { font-weight: 500; color: hsl(var(--muted-foreground)); letter-spacing: normal; text-transform: none; }
   .task-row-title { font-weight: 600; }
@@ -4005,29 +3861,7 @@
   .task-result.fail { color: hsl(0 96% 82%); }
   .time-cell { display: inline-flex; align-items: center; gap: 6px; color: hsl(var(--muted-foreground)); font-size: 12px; }
   .time-cell.dim { opacity: 0.4; }
-  :global(.spin) { animation: spin 1s linear infinite; }
-  @keyframes spin { to { transform: rotate(360deg); } }
   @media (max-width: 900px) { .task-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-
-  /* ── Quality Profiles tab ──────────────────────────────────── */
-  .qp-shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 16px; align-items: start; }
-  .qp-list { display: grid; gap: 8px; position: sticky; top: 88px; }
-  .qp-item {
-    display: grid; gap: 3px; padding: 10px 12px;
-    border-radius: 14px; border: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(0 0% 100% / 0.03); text-align: left; cursor: pointer; transition: background 0.12s;
-  }
-  .qp-item:hover, .qp-item.selected { background: hsl(var(--primary) / 0.12); border-color: hsl(var(--primary) / 0.28); }
-  .qp-item-name { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; }
-  .qp-item-name :global(.qp-star) { color: hsl(var(--primary)); }
-  .qp-item-meta { font-size: 11px; color: hsl(var(--muted-foreground)); font-family: 'JetBrains Mono', monospace; }
-  .qp-editor { display: grid; }
-  .qp-no-selection { padding: 32px; border-radius: 18px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.02); color: hsl(var(--muted-foreground)); text-align: center; }
-  .field { margin-bottom: 20px; }
-  .field-label { font-size: 13px; font-weight: 600; margin-bottom: 10px; display: flex; align-items: baseline; gap: 8px; }
-  .field-hint { font-size: 11px; font-weight: 400; color: hsl(var(--muted-foreground)); }
-  .field-input { width: 100%; padding: 10px 12px; border-radius: 12px; border: 1px solid hsl(0 0% 100% / 0.08); background: hsl(0 0% 100% / 0.04); color: hsl(var(--foreground)); font-size: 13px; }
-  .divider { height: 1px; background: hsl(0 0% 100% / 0.06); margin: 6px 0 20px; }
   .ordered-list { display: grid; gap: 6px; }
   .ordered-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 10px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.03); }
   .rank { min-width: 22px; font-size: 11px; font-weight: 700; font-family: 'JetBrains Mono', monospace; color: hsl(var(--primary)); }
@@ -4038,7 +3872,7 @@
   .rank-btn.remove:hover { background: hsl(0 72% 51% / 0.15); color: hsl(0 96% 82%); }
   .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .chip { padding: 5px 12px; border-radius: 10px; border: 1px solid hsl(0 0% 100% / 0.08); background: hsl(0 0% 100% / 0.04); color: hsl(var(--muted-foreground)); font-size: 12px; font-family: 'JetBrains Mono', monospace; cursor: pointer; transition: all 0.12s; }
-  .chip.on { background: hsl(var(--primary) / 0.18); border-color: hsl(var(--primary) / 0.4); color: hsl(var(--primary)); }
+  .chip.on { background: var(--primary); border-color: var(--primary); color: var(--primary-foreground); }
   .chip.add { border-style: dashed; font-size: 11px; }
   .chip.add:hover, .chip:not(.on):hover { background: hsl(0 0% 100% / 0.08); color: hsl(var(--foreground)); }
   .flags-grid { display: grid; gap: 10px; }
@@ -4053,94 +3887,25 @@
   .size-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   .size-row label { display: grid; gap: 6px; }
   .size-row span { font-size: 12px; color: hsl(var(--muted-foreground)); }
-  .size-input { width: 100%; padding: 10px 12px; border-radius: 12px; border: 1px solid hsl(0 0% 100% / 0.08); background: hsl(0 0% 100% / 0.04); color: hsl(var(--foreground)); font-size: 13px; font-family: 'JetBrains Mono', monospace; }
+  .size-input { width: 100%; font-family: 'JetBrains Mono', monospace; }
   .editor-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 6px; }
-  .exclude-patterns-input { width: 100%; padding: 10px 12px; border-radius: 12px; border: 1px solid hsl(0 0% 100% / 0.08); background: hsl(0 0% 100% / 0.04); color: hsl(var(--foreground)); font-size: 12px; font-family: 'JetBrains Mono', monospace; resize: vertical; }
+  .exclude-patterns-input { width: 100%; font-family: 'JetBrains Mono', monospace; resize: vertical; }
 
   /* ── Quality sub-tabs ───────────────────────────────────────── */
   .quality-sub-tabs { display: flex; gap: 4px; margin-bottom: 16px; padding: 4px; border-radius: 12px; background: hsl(0 0% 100% / 0.04); border: 1px solid hsl(0 0% 100% / 0.06); width: fit-content; }
-  .sub-tab-btn { padding: 6px 18px; border-radius: 9px; border: none; background: transparent; color: hsl(var(--muted-foreground)); font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.12s; }
-  .sub-tab-btn:hover { color: hsl(var(--foreground)); background: hsl(0 0% 100% / 0.06); }
-  .sub-tab-btn.active { background: hsl(var(--primary) / 0.18); color: hsl(var(--primary)); }
   .qdef-shell { display: grid; gap: 20px; }
-  .qdef-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  .qdef-table thead th { text-align: left; padding: 8px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: hsl(var(--muted-foreground)); border-bottom: 1px solid hsl(0 0% 100% / 0.08); }
-  .qdef-table tbody tr:hover { background: hsl(0 0% 100% / 0.02); }
-  .qdef-table td { padding: 6px 12px; border-bottom: 1px solid hsl(0 0% 100% / 0.04); }
+  :global(.qdef-table td) { padding: 6px 12px; }
   .qdef-title { font-size: 13px; min-width: 180px; }
-  .qdef-input { width: 90px; padding: 6px 10px; border-radius: 8px; border: 1px solid hsl(0 0% 100% / 0.08); background: hsl(0 0% 100% / 0.04); color: hsl(var(--foreground)); font-size: 12px; font-family: 'JetBrains Mono', monospace; }
-  .qdef-input:focus { outline: none; border-color: hsl(var(--primary) / 0.5); }
-  .qdef-save-btn { padding: 4px 12px; border-radius: 6px; border: 1px solid hsl(var(--primary) / 0.5); background: hsl(var(--primary) / 0.12); color: hsl(var(--primary)); font-size: 11px; font-weight: 600; cursor: pointer; transition: opacity 0.15s; }
-  .qdef-save-btn:disabled { opacity: 0.25; cursor: default; }
+  .qdef-input { width: 90px; font-size: 12px; font-family: 'JetBrains Mono', monospace; }
 
   /* ── Plex OAuth ─────────────────────────────────────────────── */
   .plex-token-row { display: flex; gap: 10px; align-items: center; }
   .plex-token-row input { flex: 1; }
   .plex-oauth-status { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .plex-open-link { display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 14px; border-radius: 12px; border: 1px solid hsl(var(--primary) / 0.4); background: hsl(var(--primary) / 0.12); color: hsl(var(--primary)); font-size: 13px; font-weight: 600; text-decoration: none; }
+  .plex-open-link { display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 14px; border-radius: 12px; border: 1px solid var(--primary); background: var(--primary); color: var(--primary-foreground); font-size: 13px; font-weight: 600; text-decoration: none; }
   .plex-oauth-hint { font-size: 12px; color: hsl(var(--muted-foreground)); }
   .plex-cancel-btn { height: 36px; padding: 0 12px; border-radius: 12px; border: 1px solid hsl(0 0% 100% / 0.08); background: transparent; color: hsl(var(--muted-foreground)); font-size: 12px; cursor: pointer; }
   .plex-cancel-btn:hover { background: hsl(0 0% 100% / 0.08); }
 
-  /* ── Custom Formats ─────────────────────────────────────────── */
-  .cf-layout { display: grid; grid-template-columns: 200px 1fr; gap: 16px; }
-  /* min-width: 0 on every level here: a grid/flex item's default min-width is
-     "auto", i.e. its content's min-content size -- for a button containing a
-     white-space:nowrap name span, that's the FULL unwrapped text width, not
-     0. Without overriding it, a long format name (e.g. "TRaSH HD BluRay Tier
-     1 (trusted groups)") forced .cf-layout's 200px first track to grow to fit
-     it instead of the name ellipsis-truncating, visually pushing/overlapping
-     the editor column that was supposed to occupy the remaining 1fr space. */
-  .cf-list { display: grid; gap: 4px; align-content: start; min-width: 0; }
-  .cf-list-header { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 600; color: hsl(var(--muted-foreground)); padding: 0 4px 6px; text-transform: uppercase; letter-spacing: 0.06em; }
-  .cf-item { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 8px 12px; border-radius: 10px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.03); cursor: pointer; text-align: left; min-width: 0; }
-  .cf-item:hover, .cf-item.cf-active { background: hsl(var(--primary) / 0.12); border-color: hsl(var(--primary) / 0.3); }
-  .cf-item-name { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-  .cf-item-score { font-size: 12px; font-family: 'JetBrains Mono', monospace; font-weight: 700; flex-shrink: 0; }
-  .cf-item-score.cf-pos { color: hsl(140 60% 50%); }
-  .cf-item-score.cf-neg { color: hsl(0 70% 60%); }
-  .cf-disabled-badge { font-size: 10px; background: hsl(0 0% 100% / 0.08); border-radius: 4px; padding: 1px 5px; color: hsl(var(--muted-foreground)); }
-  .cf-editor { display: grid; gap: 14px; }
-  .cf-empty { padding: 24px; color: hsl(var(--muted-foreground)); font-size: 13px; text-align: center; }
-  .cf-import-box { display: grid; gap: 10px; padding: 14px 16px; border-radius: 14px; border: 1px solid hsl(var(--primary) / 0.3); background: hsl(var(--primary) / 0.05); margin-bottom: 16px; }
-  .cf-import-header { display: grid; gap: 4px; }
-  .cf-import-textarea { width: 100%; min-height: 140px; border-radius: 10px; border: 1px solid hsl(0 0% 100% / 0.1); background: hsl(0 0% 100% / 0.04); color: inherit; font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 10px; resize: vertical; }
-  @media (max-width: 600px) {
-    .cf-layout { grid-template-columns: 1fr; }
-  }
 
-  /* ── Release Filtering ─────────────────────────────────────────────────── */
-  .rf-layout { display: grid; grid-template-columns: 240px 1fr; gap: 16px; }
-  /* min-width: 0 throughout: same fix as .cf-list/.cf-item above -- a long
-     regex pattern in .rf-pattern would otherwise force this column wider
-     than 240px instead of ellipsis-truncating, overlapping the editor
-     column meant to occupy the remaining 1fr space. */
-  .rf-list { display: grid; gap: 3px; align-content: start; max-height: 600px; overflow-y: auto; min-width: 0; }
-  .rf-list-header { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 600; color: hsl(var(--muted-foreground)); padding: 0 4px 6px; text-transform: uppercase; letter-spacing: 0.06em; }
-  .rf-type-header { font-size: 11px; font-weight: 600; color: hsl(var(--muted-foreground)); padding: 10px 4px 3px; text-transform: uppercase; letter-spacing: 0.06em; display: flex; align-items: center; gap: 6px; }
-  .rf-count { font-size: 10px; background: hsl(0 0% 100% / 0.08); border-radius: 4px; padding: 1px 5px; }
-  .rf-item { display: flex; align-items: center; justify-content: space-between; gap: 4px; padding: 6px 10px; border-radius: 9px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.03); cursor: pointer; text-align: left; transition: background 0.1s; min-width: 0; }
-  .rf-item:hover, .rf-item.rf-active { background: hsl(var(--primary) / 0.12); border-color: hsl(var(--primary) / 0.3); }
-  .rf-item.rf-disabled { opacity: 0.45; }
-  .rf-pattern { font-size: 12px; font-family: 'JetBrains Mono', monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
-  .rf-badges { display: flex; gap: 3px; flex-shrink: 0; }
-  .rf-badge { font-size: 10px; border-radius: 4px; padding: 1px 5px; white-space: nowrap; }
-  .rf-badge-block { background: hsl(0 70% 50% / 0.2); color: hsl(0 70% 65%); }
-  .rf-badge-penalty { background: hsl(43 90% 50% / 0.2); color: hsl(43 90% 65%); }
-  .rf-badge-src { background: hsl(0 0% 100% / 0.08); color: hsl(var(--muted-foreground)); }
-  .rf-badge-mt { background: hsl(217 80% 60% / 0.2); color: hsl(217 80% 72%); }
-  .rf-badge-off { background: hsl(0 0% 100% / 0.06); color: hsl(var(--muted-foreground)); }
-  .rf-editor { display: grid; gap: 14px; align-content: start; }
-  .rf-readonly-note { font-size: 12px; color: hsl(var(--muted-foreground)); background: hsl(0 0% 100% / 0.03); border: 1px solid hsl(0 0% 100% / 0.06); border-radius: 10px; padding: 10px 12px; margin: 0; }
-  .rf-test-panel { margin-top: 24px; padding: 14px; border: 1px solid hsl(0 0% 100% / 0.06); border-radius: 14px; background: hsl(0 0% 100% / 0.02); display: grid; gap: 10px; }
-  .rf-test-header { font-size: 12px; font-weight: 600; color: hsl(var(--muted-foreground)); text-transform: uppercase; letter-spacing: 0.06em; }
-  .rf-test-row { display: flex; gap: 8px; align-items: center; }
-  .rf-test-result { padding: 10px 12px; border-radius: 10px; border: 1px solid hsl(0 0% 100% / 0.08); background: hsl(0 0% 100% / 0.03); font-size: 13px; }
-  .rf-test-result.rf-test-blocked { background: hsl(0 70% 50% / 0.1); border-color: hsl(0 70% 50% / 0.3); color: hsl(0 70% 65%); }
-  .rf-test-result.rf-test-allowed { background: hsl(140 60% 40% / 0.1); border-color: hsl(140 60% 40% / 0.3); color: hsl(140 60% 60%); }
-  .rf-test-matches { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 4px; list-style: disc; }
-  .rf-test-matches li { font-size: 12px; color: inherit; }
-  @media (max-width: 700px) {
-    .rf-layout { grid-template-columns: 1fr; }
-  }
 </style>

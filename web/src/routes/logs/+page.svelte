@@ -15,6 +15,8 @@
   import PageHeader from '$lib/components/PageHeader.svelte';
   import Button from '$lib/components/Button.svelte';
   import Pagination from '$lib/components/Pagination.svelte';
+  import * as Table from '$lib/components/ui/table/index.js';
+  import * as Select from '$lib/components/ui/select/index.js';
   import { api } from '$lib/api';
 
   type LogEntry = {
@@ -77,6 +79,15 @@
     } catch { return iso; }
   }
 
+  const levelLabels: Record<string, string> = {
+    all: 'All levels',
+    info: 'Info',
+    warn: 'Warn',
+    error: 'Error',
+    debug: 'Debug'
+  };
+  $: levelFilterLabel = levelLabels[levelFilter] ?? 'All levels';
+
   function levelTone(level: string) {
     return level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'default';
   }
@@ -116,223 +127,81 @@
     <RefreshCw size={14} />
     Refresh
   </Button>
-  <a class="btn-link" href="/api/logs?limit=2000" target="_blank" rel="noreferrer" download>
+  <a
+    class="inline-flex min-h-9 items-center gap-2 rounded-md border border-border bg-transparent px-3.5 font-medium text-foreground transition-colors hover:bg-muted"
+    href="/api/logs?limit=2000" target="_blank" rel="noreferrer" download
+  >
     <Download size={14} />
     Download
   </a>
 </PageHeader>
 
-{#if loadError}<div class="load-error">Error: {loadError}</div>{/if}
+{#if loadError}<div class="mb-3 rounded-xl px-3.5 py-2.5 text-sm" style="background: hsl(var(--status-failed) / 0.15); color: hsl(var(--status-failed))">Error: {loadError}</div>{/if}
 
-<div class="toolbar">
-  <div class="search-wrap">
-    <Search size={14} class="search-icon" />
-    <input bind:value={term} placeholder="Search this page — time, service, request IDs…" class="search-input" />
+<div class="mb-3 grid grid-cols-1 items-center gap-3 sm:grid-cols-[1fr_auto]">
+  <div class="flex h-11 items-center gap-2 rounded-xl border border-border bg-muted/40 px-3.5 text-muted-foreground">
+    <Search size={14} />
+    <input bind:value={term} placeholder="Search this page — time, service, request IDs…" class="!h-auto flex-1 !border-0 !bg-transparent p-0 text-sm text-foreground" />
   </div>
-  <select bind:value={levelFilter} on:change={changeLevel} class="level-select">
-    <option value="all">All levels</option>
-    <option value="info">Info</option>
-    <option value="warn">Warn</option>
-    <option value="error">Error</option>
-    <option value="debug">Debug</option>
-  </select>
+  <Select.Root type="single" bind:value={levelFilter} onValueChange={changeLevel}>
+    <Select.Trigger class="!h-11 w-full">
+      {levelFilterLabel}
+    </Select.Trigger>
+    <Select.Content>
+      <Select.Item value="all">All levels</Select.Item>
+      <Select.Item value="info">Info</Select.Item>
+      <Select.Item value="warn">Warn</Select.Item>
+      <Select.Item value="error">Error</Select.Item>
+      <Select.Item value="debug">Debug</Select.Item>
+    </Select.Content>
+  </Select.Root>
 </div>
 
-<div class="pager-row">
-  <span class="pager-total">{total.toLocaleString()} matching entries</span>
+<div class="my-2.5 flex items-center justify-between gap-3">
+  <span class="text-sm text-muted-foreground">{total.toLocaleString()} matching entries</span>
   <Pagination {page} {totalPages} on:change={changePage} />
 </div>
 
-<div class="table-wrap">
-  <table>
-    <thead>
-      <tr>
-        <th class="col-time">Time</th>
-        <th class="col-level">Level</th>
-        <th class="col-service">Service</th>
-        <th class="col-message">Message</th>
-      </tr>
-    </thead>
-    <tbody>
+<div class="rounded-2xl border border-border bg-background/60">
+  <Table.Root class="min-w-[760px]">
+    <Table.Header class="border-b border-border">
+      <Table.Row>
+        <Table.Head class="w-35 whitespace-nowrap text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Time</Table.Head>
+        <Table.Head class="w-18 whitespace-nowrap text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Level</Table.Head>
+        <Table.Head class="w-40 whitespace-nowrap text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Service</Table.Head>
+        <Table.Head class="min-w-50 whitespace-nowrap text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">Message</Table.Head>
+      </Table.Row>
+    </Table.Header>
+    <Table.Body>
       {#if loading && entries.length === 0}
-        <tr><td colspan="4" class="empty">Loading…</td></tr>
+        <Table.Row><Table.Cell colspan={4} class="p-8 text-center text-sm text-muted-foreground">Loading…</Table.Cell></Table.Row>
       {:else if filtered.length === 0}
-        <tr><td colspan="4" class="empty">No log entries match the current filter.</td></tr>
+        <Table.Row><Table.Cell colspan={4} class="p-8 text-center text-sm text-muted-foreground">No log entries match the current filter.</Table.Cell></Table.Row>
       {:else}
         {#each filtered as entry, i (i)}
-          <tr class="row-{levelTone(entry.level)}">
-            <td class="col-time mono muted">{fmtDate(entry.time)}</td>
-            <td class="col-level">
-              <span class="badge badge-{entry.level || 'default'}">{(entry.level || '?').toUpperCase()}</span>
-            </td>
-            <td class="col-service mono muted">{entry.service || '—'}</td>
-            <td class="col-message">{entry.message}</td>
-          </tr>
+          <Table.Row
+            class="border-b border-white/[0.04] last:border-b-0"
+            style={levelTone(entry.level) === 'error' ? 'background: hsl(var(--status-failed) / 0.06)' : levelTone(entry.level) === 'warn' ? 'background: hsl(var(--status-warning) / 0.06)' : undefined}
+          >
+            <Table.Cell class="w-35 whitespace-nowrap align-top font-mono text-xs text-muted-foreground">{fmtDate(entry.time)}</Table.Cell>
+            <Table.Cell class="w-18 align-top">
+              <span
+                class="inline-block rounded-md px-2 py-0.5 font-mono text-[10px] font-bold tracking-[0.06em]"
+                style={entry.level === 'error' ? 'background: hsl(var(--status-failed) / 0.2); color: hsl(var(--status-failed))'
+                  : entry.level === 'warn' ? 'background: hsl(var(--status-warning) / 0.2); color: hsl(var(--status-warning))'
+                  : entry.level === 'info' ? 'background: hsl(var(--status-unreleased) / 0.15); color: hsl(var(--status-unreleased))'
+                  : 'background: color-mix(in oklch, var(--muted-foreground) 15%, transparent); color: var(--muted-foreground)'}
+              >{(entry.level || '?').toUpperCase()}</span>
+            </Table.Cell>
+            <Table.Cell class="w-40 whitespace-nowrap align-top font-mono text-xs text-muted-foreground">{entry.service || '—'}</Table.Cell>
+            <Table.Cell class="min-w-50 whitespace-normal align-top text-sm">{entry.message}</Table.Cell>
+          </Table.Row>
         {/each}
       {/if}
-    </tbody>
-  </table>
+    </Table.Body>
+  </Table.Root>
 </div>
 
-<div class="pager-row">
+<div class="my-2.5 flex items-center justify-between gap-3">
   <Pagination {page} {totalPages} on:change={changePage} />
 </div>
-
-<style>
-  .pager-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    margin: 10px 0;
-  }
-
-  .pager-total {
-    font-size: 13px;
-    color: hsl(var(--muted-foreground));
-  }
-
-  .toolbar {
-    display: grid;
-    grid-template-columns: 1fr auto;
-    gap: 12px;
-    margin-bottom: 12px;
-    align-items: center;
-  }
-
-  .search-wrap {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    height: 44px;
-    padding: 0 14px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 14px;
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--muted-foreground));
-  }
-
-  .search-input {
-    flex: 1;
-    background: transparent;
-    border: none;
-    outline: none;
-    color: hsl(var(--foreground));
-    font-size: 14px;
-  }
-
-  .search-input::placeholder { color: hsl(var(--muted-foreground)); }
-
-  .level-select {
-    height: 44px;
-    padding: 0 14px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 14px;
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--foreground));
-    font-size: 13px;
-    cursor: pointer;
-  }
-
-  .table-wrap {
-    overflow-x: auto;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 18px;
-    background: hsl(var(--background) / 0.6);
-  }
-
-  table {
-    width: 100%;
-    min-width: 760px;
-    border-collapse: collapse;
-  }
-
-  thead { border-bottom: 1px solid hsl(0 0% 100% / 0.06); }
-
-  th {
-    padding: 12px 14px;
-    text-align: left;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.14em;
-    color: hsl(var(--muted-foreground));
-    white-space: nowrap;
-  }
-
-  td {
-    padding: 11px 14px;
-    border-bottom: 1px solid hsl(0 0% 100% / 0.04);
-    vertical-align: top;
-    font-size: 13px;
-  }
-
-  tr:last-child td { border-bottom: none; }
-
-  .col-time    { width: 140px; }
-  .col-level   { width: 72px; }
-  .col-service { width: 160px; }
-  .col-message { min-width: 200px; }
-
-  .mono { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
-  .muted { color: hsl(var(--muted-foreground)); }
-
-  .empty {
-    padding: 32px;
-    text-align: center;
-    color: hsl(var(--muted-foreground));
-  }
-
-  .row-error td { background: hsl(0 72% 51% / 0.06); }
-  .row-warn  td { background: hsl(38 96% 55% / 0.06); }
-
-  .badge {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 8px;
-    font-size: 10px;
-    font-weight: 700;
-    font-family: 'JetBrains Mono', monospace;
-    letter-spacing: 0.06em;
-  }
-
-  .badge-error   { background: hsl(0 72% 51% / 0.2);   color: hsl(0 96% 82%); }
-  .badge-warn    { background: hsl(38 96% 55% / 0.2);  color: hsl(38 100% 72%); }
-  .badge-info    { background: hsl(171 82% 55% / 0.15); color: hsl(171 82% 72%); }
-  .badge-debug   { background: hsl(var(--muted-foreground) / 0.15); color: hsl(var(--muted-foreground)); }
-  .badge-default { background: hsl(var(--muted-foreground) / 0.15); color: hsl(var(--muted-foreground)); }
-
-  .load-error {
-    margin-bottom: 12px;
-    padding: 10px 14px;
-    border-radius: 12px;
-    background: hsl(0 72% 51% / 0.15);
-    color: hsl(0 96% 82%);
-    font-size: 13px;
-  }
-
-  .btn-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    min-height: 42px;
-    padding: 0 14px;
-    border-radius: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.05);
-    color: hsl(var(--foreground));
-    font-weight: 600;
-    text-decoration: none;
-    cursor: pointer;
-    transition: background 0.15s ease, border-color 0.15s ease;
-  }
-
-  .btn-link:hover {
-    background: hsl(0 0% 100% / 0.09);
-    border-color: hsl(0 0% 100% / 0.18);
-  }
-
-  @media (max-width: 700px) {
-    .toolbar { grid-template-columns: 1fr; }
-  }
-</style>

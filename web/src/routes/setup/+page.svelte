@@ -7,6 +7,7 @@
    */
   import { goto } from '$app/navigation';
   import DrakkarLogo from '$lib/components/DrakkarLogo.svelte';
+  import Button from '$lib/components/Button.svelte';
 
   let username = '';
   let password = '';
@@ -44,178 +45,43 @@
 
 <svelte:head><title>Setup — Drakkar</title></svelte:head>
 
-<div class="page">
-  <div class="card">
-    <div class="brand">
-      <div class="logo"><DrakkarLogo size={28} /></div>
-      <h1>Welcome to Drakkar</h1>
-      <p>Create your admin account to get started. You can configure NNTP providers, indexers, and media servers in Settings afterwards.</p>
+<div class="flex min-h-screen items-center justify-center p-6">
+  <div class="flex w-full max-w-105 flex-col gap-7 rounded-2xl border border-border bg-card/90 p-9">
+    <div class="flex flex-col items-center gap-2.5 text-center">
+      <div class="grid size-13 place-items-center rounded-2xl bg-primary text-primary-foreground"><DrakkarLogo size={28} /></div>
+      <h1 class="m-0 text-xl font-bold tracking-[-0.01em]">Welcome to Drakkar</h1>
+      <p class="m-0 max-w-80 text-sm leading-relaxed text-muted-foreground">Create your admin account to get started. You can configure NNTP providers, indexers, and media servers in Settings afterwards.</p>
     </div>
 
-    <form on:submit|preventDefault={complete}>
-      <div class="field">
-        <label for="username">Username</label>
+    <form class="flex flex-col gap-4" on:submit|preventDefault={complete}>
+      <div class="flex flex-col gap-1.5">
+        <label class="text-sm font-semibold text-muted-foreground" for="username">Username</label>
         <input id="username" type="text" bind:value={username} autocomplete="username" required minlength="1" />
       </div>
-      <div class="field">
-        <label for="password">Password <span class="hint">(min. 8 characters)</span></label>
+      <div class="flex flex-col gap-1.5">
+        <label class="flex items-baseline gap-1.5 text-sm font-semibold text-muted-foreground" for="password">Password <span class="text-xs font-normal">(min. 8 characters)</span></label>
         <input id="password" type="password" bind:value={password} autocomplete="new-password" required minlength="8" />
       </div>
-      <div class="field">
-        <label for="confirm">Confirm password</label>
+      <div class="flex flex-col gap-1.5">
+        <label class="text-sm font-semibold text-muted-foreground" for="confirm">Confirm password</label>
         <input
           id="confirm"
           type="password"
           bind:value={confirm}
           autocomplete="new-password"
-          class:invalid={passwordMismatch}
+          style={passwordMismatch ? 'border-color: hsl(var(--danger) / 0.7)' : undefined}
           required
         />
-        {#if passwordMismatch}<span class="field-err">Passwords do not match.</span>{/if}
+        {#if passwordMismatch}<span class="text-xs" style="color: hsl(var(--danger))">Passwords do not match.</span>{/if}
       </div>
 
       {#if error}
-        <p class="err">{error}</p>
+        <p class="m-0 text-sm" style="color: hsl(var(--danger))">{error}</p>
       {/if}
 
-      <button type="submit" class="btn" disabled={!canSubmit}>
+      <Button kind="primary" type="submit" disabled={!canSubmit}>
         {loading ? 'Creating account…' : 'Create account & continue'}
-      </button>
+      </Button>
     </form>
   </div>
 </div>
-
-<style>
-  .page {
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 24px;
-  }
-
-  .card {
-    width: 100%;
-    max-width: 420px;
-    border: 1px solid hsl(var(--border) / 0.9);
-    border-radius: 24px;
-    background: hsl(var(--card) / 0.9);
-    padding: 40px 36px;
-    display: flex;
-    flex-direction: column;
-    gap: 28px;
-    box-shadow: 0 24px 64px hsl(0 0% 0% / 0.4);
-    backdrop-filter: blur(20px);
-  }
-
-  .brand {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 10px;
-    text-align: center;
-  }
-
-  .logo {
-    width: 52px;
-    height: 52px;
-    border-radius: 16px;
-    background: hsl(var(--primary));
-    color: hsl(var(--primary-foreground));
-    display: grid;
-    place-items: center;
-  }
-
-  .brand h1 {
-    margin: 0;
-    font-size: 20px;
-    font-weight: 700;
-    letter-spacing: -0.01em;
-  }
-
-  .brand p {
-    margin: 0;
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-    line-height: 1.55;
-    max-width: 320px;
-  }
-
-  form {
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-  }
-
-  .field {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-
-  label {
-    font-size: 13px;
-    font-weight: 600;
-    color: hsl(var(--muted-foreground));
-    display: flex;
-    gap: 6px;
-    align-items: baseline;
-  }
-
-  .hint {
-    font-weight: 400;
-    font-size: 11px;
-  }
-
-  input {
-    height: 44px;
-    padding: 0 14px;
-    border-radius: 14px;
-    border: 1px solid hsl(var(--border) / 0.8);
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--foreground));
-    font-size: 14px;
-    outline: none;
-    transition: border-color 0.15s;
-  }
-
-  input:focus {
-    border-color: hsl(var(--primary) / 0.6);
-  }
-
-  input.invalid {
-    border-color: hsl(var(--danger) / 0.7);
-  }
-
-  .field-err {
-    font-size: 12px;
-    color: hsl(var(--danger));
-  }
-
-  .err {
-    margin: 0;
-    font-size: 13px;
-    color: hsl(var(--danger));
-  }
-
-  .btn {
-    height: 46px;
-    border-radius: 14px;
-    border: none;
-    background: hsl(var(--primary));
-    color: hsl(var(--primary-foreground));
-    font-size: 14px;
-    font-weight: 700;
-    cursor: pointer;
-    transition: opacity 0.15s;
-  }
-
-  .btn:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-
-  .btn:not(:disabled):hover {
-    opacity: 0.88;
-  }
-</style>

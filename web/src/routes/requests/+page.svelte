@@ -17,6 +17,7 @@
   import PageHeader from '$lib/components/PageHeader.svelte';
   import Panel from '$lib/components/Panel.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
+  import * as Select from '$lib/components/ui/select/index.js';
   import { api, subscribeEvents } from '$lib/api';
   import { dateTime, sentence } from '$lib/format';
   import { toastError, toastSuccess } from '$lib/toast';
@@ -117,6 +118,13 @@
     }
   }
 
+  /** Label shown on a row's profile trigger, mirroring what the native <option> list used to show. */
+  function profileLabel(item: RequestItem): string {
+    if (item.qualityProfileId == null) return 'Default profile';
+    const profile = profiles.find((p) => p.id === item.qualityProfileId);
+    return profile ? `${profile.name}${profile.isDefault ? ' · default' : ''}` : 'Default profile';
+  }
+
   const debouncedLoadRequests = debounce(() => void loadRequests(), 500);
 
   onMount(() => {
@@ -166,19 +174,19 @@
   </Button>
 </PageHeader>
 
-{#if errorMessage}<div class="banner error">{errorMessage}</div>{/if}
-{#if infoMessage}<div class="banner info">{infoMessage}</div>{/if}
+{#if errorMessage}<div class="mb-4 rounded-2xl border px-3.5 py-3 text-sm" style="border-color: hsl(var(--status-failed) / 0.28); background: hsl(var(--status-failed) / 0.12); color: hsl(var(--status-failed))">{errorMessage}</div>{/if}
+{#if infoMessage}<div class="mb-4 rounded-2xl border border-primary bg-primary px-3.5 py-3 text-sm text-primary-foreground">{infoMessage}</div>{/if}
 {#if status && !seerrReady}
-  <div class="banner warn">Request sync disabled: {status.integrations.seerr.detail}.</div>
+  <div class="mb-4 rounded-2xl border px-3.5 py-3 text-sm" style="border-color: hsl(var(--status-warning) / 0.28); background: hsl(var(--status-warning) / 0.12); color: hsl(var(--status-warning))">Request sync disabled: {status.integrations.seerr.detail}.</div>
 {/if}
 {#if status && !hydraReady}
-  <div class="banner warn">Pending search disabled: {status.integrations.nzbhydra2.detail}.</div>
+  <div class="mb-4 rounded-2xl border px-3.5 py-3 text-sm" style="border-color: hsl(var(--status-warning) / 0.28); background: hsl(var(--status-warning) / 0.12); color: hsl(var(--status-warning))">Pending search disabled: {status.integrations.nzbhydra2.detail}.</div>
 {/if}
 
 <Panel title="Request Feed" subtitle="Sorted by creation time descending." flush>
   {#if requests.length > 0}
-    <div class="request-table">
-      <div class="thead">
+    <div class="grid gap-2.5">
+      <div class="grid grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(180px,1fr)_130px_minmax(0,1fr)] items-center gap-3 px-1 text-xs uppercase text-muted-foreground max-md:hidden">
         <span>Title</span>
         <span>Type</span>
         <span>Profile</span>
@@ -186,24 +194,27 @@
         <span>Created</span>
       </div>
       {#each requests as item}
-        <div class="row">
-          <span><strong>{item.title || item.externalId}</strong></span>
+        <div class="grid grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(180px,1fr)_130px_minmax(0,1fr)] items-center gap-3 rounded-2xl border border-border bg-muted/20 p-3.5 max-md:grid-cols-1 max-md:gap-2">
+          <span><strong class="block">{item.title || item.externalId}</strong></span>
           <span>{item.requestType} · {item.mediaType}</span>
           <span>
             {#if item.libraryItemId}
-              <select
-                class="profile-select"
+              <Select.Root
+                type="single"
                 value={item.qualityProfileId == null ? '' : String(item.qualityProfileId)}
                 disabled={!!profileSaving[item.id]}
-                on:change={(event) => setProfile(item.id, (event.currentTarget as HTMLSelectElement).value)}
+                onValueChange={(value) => setProfile(item.id, value)}
               >
-                <option value="">Default profile</option>
-                {#each profiles as profile}
-                  <option value={profile.id}>{profile.name}{profile.isDefault ? ' · default' : ''}</option>
-                {/each}
-              </select>
+                <Select.Trigger class="w-full">{profileLabel(item)}</Select.Trigger>
+                <Select.Content>
+                  <Select.Item value="">Default profile</Select.Item>
+                  {#each profiles as profile}
+                    <Select.Item value={String(profile.id)}>{profile.name}{profile.isDefault ? ' · default' : ''}</Select.Item>
+                  {/each}
+                </Select.Content>
+              </Select.Root>
             {:else}
-              <span class="muted">Unlinked</span>
+              <span class="text-muted-foreground">Unlinked</span>
             {/if}
           </span>
           <span><StatusPill tone={item.queueState === 'available' ? 'ok' : 'neutral'}>{sentence(item.queueState)}</StatusPill></span>
@@ -212,89 +223,8 @@
       {/each}
     </div>
   {:else if loading}
-    <div class="empty">Loading requests.</div>
+    <div class="text-sm text-muted-foreground">Loading requests.</div>
   {:else}
-    <div class="empty">No requests.</div>
+    <div class="text-sm text-muted-foreground">No requests.</div>
   {/if}
 </Panel>
-
-<style>
-  .banner {
-    margin-bottom: 16px;
-    padding: 12px 14px;
-    border-radius: 16px;
-    font-size: 14px;
-  }
-
-  .error {
-    border: 1px solid hsl(0 72% 51% / 0.28);
-    background: hsl(0 72% 51% / 0.12);
-    color: hsl(0 96% 82%);
-  }
-
-  .info {
-    border: 1px solid hsl(171 82% 55% / 0.2);
-    background: hsl(171 82% 55% / 0.1);
-    color: hsl(171 82% 82%);
-  }
-
-  .warn {
-    border: 1px solid hsl(42 95% 55% / 0.28);
-    background: hsl(42 95% 55% / 0.12);
-    color: hsl(48 100% 84%);
-  }
-
-  .request-table {
-    display: grid;
-    gap: 10px;
-  }
-
-  .thead,
-  .row {
-    display: grid;
-    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) minmax(180px, 1fr) 130px minmax(0, 1fr);
-    gap: 12px;
-    align-items: center;
-  }
-
-  .thead {
-    color: hsl(var(--muted-foreground));
-    font-size: 12px;
-    text-transform: uppercase;
-    padding: 0 4px;
-  }
-
-  .row {
-    padding: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    border-radius: 18px;
-    background: hsl(0 0% 100% / 0.03);
-  }
-
-  strong {
-    display: block;
-  }
-
-  .empty,
-  .muted {
-    color: hsl(var(--muted-foreground));
-  }
-
-  .profile-select {
-    width: 100%;
-    min-height: 36px;
-    border-radius: 12px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--foreground));
-    padding: 0 10px;
-    font-size: 13px;
-  }
-
-  @media (max-width: 900px) {
-    .thead,
-    .row {
-      grid-template-columns: 1fr;
-    }
-  }
-</style>

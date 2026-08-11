@@ -167,11 +167,14 @@
 </PageHeader>
 
 {#if status}
-  <section class="summary-grid">
+  <section class="mb-5 grid grid-cols-2 gap-3.5 md:grid-cols-4">
     {#each runtimeCards as card}
-      <div class="summary-card">
-        <div class={`summary-value ${card.tone}`}>{card.value}</div>
-        <div class="summary-label">{card.label}</div>
+      <div class="rounded-xl border border-border bg-white/[0.03] px-4 py-3.5">
+        <div
+          class="text-2xl font-bold leading-none"
+          style={card.tone === 'ok' ? 'color: hsl(var(--status-available))' : card.tone === 'warn' ? 'color: hsl(var(--status-warning))' : card.tone === 'primary' ? 'color: var(--primary)' : 'color: var(--foreground)'}
+        >{card.value}</div>
+        <div class="mt-2 text-sm text-muted-foreground">{card.label}</div>
       </div>
     {/each}
   </section>
@@ -180,24 +183,24 @@
     <div slot="actions">
       <StatusPill tone={status.healthy ? 'ok' : 'warn'}>{status.healthy ? 'Healthy' : 'Attention needed'}</StatusPill>
     </div>
-    <div class="service-grid">
+    <div class="grid grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-3.5">
       {#each serviceCards as row}
-        <div class="service-card">
-          <div class="service-head">
-            <div class="service-ident">
-              <div class="icon-shell">
+        <div class="rounded-xl border border-border bg-white/[0.03] p-4.5">
+          <div class="flex items-start justify-between gap-3">
+            <div class="flex items-start gap-3">
+              <div class="grid size-11 shrink-0 place-items-center rounded-2xl bg-white/[0.06] text-primary">
                 <svelte:component this={row.icon} size={18} />
               </div>
               <div>
-                <div class="service-name">{row.label}</div>
-                <div class="service-detail">{row.detail}</div>
+                <div class="font-semibold">{row.label}</div>
+                <div class="mt-2 text-sm text-muted-foreground">{row.detail}</div>
               </div>
             </div>
-            <span class:ok={row.ok} class:fail={!row.ok}>
+            <span style={row.ok ? 'color: hsl(var(--status-available))' : 'color: hsl(var(--status-failed))'}>
               <svelte:component this={row.ok ? CheckCircle2 : XCircle} size={18} />
             </span>
           </div>
-          <div class="service-foot">
+          <div class="mt-3.5">
             <StatusPill tone={row.ok ? 'ok' : 'warn'}>{row.ok ? 'Ready' : 'Needs config'}</StatusPill>
           </div>
         </div>
@@ -205,41 +208,41 @@
     </div>
   </Panel>
 
-  <div class="two-col">
+  <div class="my-5 grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,0.9fr)]">
     <Panel title="Runtime" subtitle="Current pool, stream, and cache posture.">
-      <div class="runtime-grid">
-        <div class="runtime-tile">
-          <div class="runtime-value">{fmtCount(metrics.active_nntp_connections)}</div>
-          <div class="runtime-label">Active NNTP</div>
+      <div class="mb-3.5 grid grid-cols-2 gap-3.5">
+        <div class="rounded-xl border border-border bg-white/[0.03] p-4">
+          <div class="text-xl font-bold leading-none">{fmtCount(metrics.active_nntp_connections)}</div>
+          <div class="mt-2 text-sm text-muted-foreground">Active NNTP</div>
         </div>
-        <div class="runtime-tile">
-          <div class="runtime-value">{fmtCount(metrics.idle_nntp_connections)}</div>
-          <div class="runtime-label">Idle NNTP</div>
+        <div class="rounded-xl border border-border bg-white/[0.03] p-4">
+          <div class="text-xl font-bold leading-none">{fmtCount(metrics.idle_nntp_connections)}</div>
+          <div class="mt-2 text-sm text-muted-foreground">Idle NNTP</div>
         </div>
-        <div class="runtime-tile">
-          <div class="runtime-value">{fmtCount(metrics.queued_background_fetches)}</div>
-          <div class="runtime-label">Queued background</div>
+        <div class="rounded-xl border border-border bg-white/[0.03] p-4">
+          <div class="text-xl font-bold leading-none">{fmtCount(metrics.queued_background_fetches)}</div>
+          <div class="mt-2 text-sm text-muted-foreground">Queued background</div>
         </div>
-        <div class="runtime-tile">
-          <div class="runtime-value">{fmtCount(metrics.active_streams)}</div>
-          <div class="runtime-label">Streaming sessions</div>
+        <div class="rounded-xl border border-border bg-white/[0.03] p-4">
+          <div class="text-xl font-bold leading-none">{fmtCount(metrics.active_streams)}</div>
+          <div class="mt-2 text-sm text-muted-foreground">Streaming sessions</div>
         </div>
       </div>
-      <div class="policy-list">
-        <div class="policy-row"><span>Max download connections</span><strong>{usenet.maxDownloadConnections ?? 0}</strong></div>
-        <div class="policy-row"><span>Streaming priority</span><strong>{usenet.streamingPriorityPercent ?? 0}%</strong></div>
-        <div class="policy-row"><span>Article buffer size</span><strong>{usenet.articleBufferSize ?? 0}</strong></div>
-        <div class="policy-row"><span>Read-ahead limit</span><strong>{fmtBytes(status.readAheadLimitBytes)}</strong></div>
+      <div class="grid gap-2.5">
+        <div class="flex justify-between gap-3 border-t border-white/5 py-2.5 text-sm"><span>Max download connections</span><strong>{usenet.maxDownloadConnections ?? 0}</strong></div>
+        <div class="flex justify-between gap-3 border-t border-white/5 py-2.5 text-sm"><span>Streaming priority</span><strong>{usenet.streamingPriorityPercent ?? 0}%</strong></div>
+        <div class="flex justify-between gap-3 border-t border-white/5 py-2.5 text-sm"><span>Article buffer size</span><strong>{usenet.articleBufferSize ?? 0}</strong></div>
+        <div class="flex justify-between gap-3 border-t border-white/5 py-2.5 text-sm"><span>Read-ahead limit</span><strong>{fmtBytes(status.readAheadLimitBytes)}</strong></div>
       </div>
     </Panel>
 
     <Panel title="Providers" subtitle="Configured provider pool and subtitle integrations.">
-      <div class="provider-list">
+      <div class="grid gap-2.5">
         {#each providers as provider}
-          <div class="provider-row">
+          <div class="flex items-start justify-between gap-3 rounded-xl border border-border bg-white/[0.03] px-4 py-3.5">
             <div>
-              <div class="provider-name">{String(provider.name ?? 'Usenet')}</div>
-              <div class="provider-detail">{String(provider.host ?? '')}</div>
+              <div class="font-semibold">{String(provider.name ?? 'Usenet')}</div>
+              <div class="mt-2 text-sm text-muted-foreground">{String(provider.host ?? '')}</div>
             </div>
             <StatusPill tone={provider.enabled ? 'ok' : 'neutral'}>
               {provider.enabled ? `${provider.maxConnections ?? 0} conn` : 'disabled'}
@@ -247,12 +250,12 @@
           </div>
         {/each}
         {#if providers.length === 0}
-          <div class="empty-state">No usenet providers configured.</div>
+          <div class="text-sm text-muted-foreground">No usenet providers configured.</div>
         {/if}
       </div>
-      <div class="subtitle-box">
-        <div class="subtitle-head">Subtitle providers</div>
-        <div class="subtitle-row">
+      <div class="mt-3.5 rounded-xl border border-border bg-white/[0.03] px-4 py-3.5">
+        <div class="font-semibold">Subtitle providers</div>
+        <div class="mt-2.5 flex flex-wrap items-start gap-3">
           {#each Object.entries(status.integrations.subtitleProviders) as [name, info]}
             <StatusPill tone={info.configured ? 'ok' : info.enabled ? 'warn' : 'neutral'}>
               {name}
@@ -265,16 +268,16 @@
 
   {#if probeReport}
     <Panel title="Last Probe" subtitle="Live integration probe results.">
-      <div class="probe-grid">
+      <div class="grid grid-cols-[repeat(auto-fit,minmax(240px,1fr))] gap-3.5">
         {#each probeReport.results as result}
-          <div class="probe-row">
+          <div class="flex items-start justify-between gap-3 rounded-xl border border-border bg-white/[0.03] px-4 py-3.5">
             <div>
-              <div class="probe-name">{result.name}</div>
-              <div class="probe-detail">{result.detail || (result.ok ? 'reachable' : 'unreachable')}</div>
+              <div class="font-semibold">{result.name}</div>
+              <div class="mt-2 text-sm text-muted-foreground">{result.detail || (result.ok ? 'reachable' : 'unreachable')}</div>
             </div>
-            <div class="probe-meta">
+            <div class="flex shrink-0 items-center gap-3">
               <StatusPill tone={result.ok ? 'ok' : 'danger'}>{result.ok ? 'OK' : 'Fail'}</StatusPill>
-              <span class="mono probe-time">{fmtMs(result.durationMs)}</span>
+              <span class="font-mono text-xs text-muted-foreground">{fmtMs(result.durationMs)}</span>
             </div>
           </div>
         {/each}
@@ -283,191 +286,6 @@
   {/if}
 {:else}
   <Panel title="Services" subtitle="Loading live service state.">
-    <div class="empty-state">{loading ? 'Loading services…' : 'No status available.'}</div>
+    <div class="text-sm text-muted-foreground">{loading ? 'Loading services…' : 'No status available.'}</div>
   </Panel>
 {/if}
-
-<style>
-  .summary-grid,
-  .service-grid,
-  .runtime-grid,
-  .probe-grid {
-    display: grid;
-    gap: 14px;
-  }
-
-  .summary-grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    margin-bottom: 20px;
-  }
-
-  .summary-card,
-  .service-card,
-  .runtime-tile,
-  .probe-row,
-  .provider-row,
-  .subtitle-box {
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 18px;
-    background: hsl(0 0% 100% / 0.03);
-  }
-
-  .summary-card {
-    padding: 18px 20px;
-  }
-
-  .summary-value {
-    font-size: 2rem;
-    font-weight: 700;
-    line-height: 1;
-  }
-
-  .summary-value.ok { color: hsl(141 80% 68%); }
-  .summary-value.primary { color: hsl(var(--primary)); }
-  .summary-value.warn { color: hsl(47 100% 77%); }
-  .summary-value.neutral { color: hsl(var(--foreground)); }
-
-  .summary-label,
-  .service-detail,
-  .runtime-label,
-  .provider-detail,
-  .probe-detail,
-  .empty-state {
-    margin-top: 8px;
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .service-grid {
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  }
-
-  .service-card {
-    padding: 18px;
-  }
-
-  .service-head,
-  .service-ident,
-  .provider-row,
-  .probe-row,
-  .probe-meta,
-  .subtitle-row {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-  }
-
-  .service-head,
-  .provider-row,
-  .probe-row {
-    justify-content: space-between;
-  }
-
-  .icon-shell {
-    display: grid;
-    place-items: center;
-    width: 44px;
-    height: 44px;
-    border-radius: 14px;
-    background: hsl(0 0% 100% / 0.06);
-    color: hsl(var(--primary));
-    flex-shrink: 0;
-  }
-
-  .service-name,
-  .provider-name,
-  .probe-name,
-  .subtitle-head {
-    font-weight: 600;
-  }
-
-  .service-foot {
-    margin-top: 14px;
-  }
-
-  .ok { color: hsl(141 80% 68%); }
-  .fail { color: hsl(0 96% 82%); }
-
-  .two-col {
-    display: grid;
-    grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
-    gap: 20px;
-    margin: 20px 0;
-  }
-
-  .runtime-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    margin-bottom: 14px;
-  }
-
-  .runtime-tile {
-    padding: 16px;
-  }
-
-  .runtime-value {
-    font-size: 1.8rem;
-    font-weight: 700;
-    line-height: 1;
-  }
-
-  .policy-list {
-    display: grid;
-    gap: 10px;
-  }
-
-  .policy-row {
-    display: flex;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 10px 0;
-    border-top: 1px solid hsl(0 0% 100% / 0.05);
-    font-size: 13px;
-  }
-
-  .provider-list {
-    display: grid;
-    gap: 10px;
-  }
-
-  .provider-row,
-  .probe-row {
-    padding: 14px 16px;
-  }
-
-  .subtitle-box {
-    margin-top: 14px;
-    padding: 14px 16px;
-  }
-
-  .subtitle-row {
-    flex-wrap: wrap;
-    margin-top: 10px;
-  }
-
-  .probe-grid {
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  }
-
-  .probe-meta {
-    align-items: center;
-    flex-shrink: 0;
-  }
-
-  .probe-time {
-    color: hsl(var(--muted-foreground));
-    font-size: 12px;
-  }
-
-  @media (max-width: 980px) {
-    .summary-grid,
-    .two-col {
-      grid-template-columns: 1fr;
-    }
-  }
-
-  @media (max-width: 640px) {
-    .runtime-grid {
-      grid-template-columns: 1fr 1fr;
-    }
-  }
-</style>

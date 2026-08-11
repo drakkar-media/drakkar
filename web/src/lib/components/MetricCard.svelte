@@ -23,7 +23,7 @@
     padding: 16px 18px;
     border-radius: var(--radius-lg, 0.75rem);
     border: 1px solid hsl(0 0% 100% / 0.07);
-    background: hsl(var(--card) / 0.85);
+    background: color-mix(in oklch, var(--card) 85%, transparent);
     display: flex;
     flex-direction: column;
     gap: 4px;
@@ -31,8 +31,8 @@
   }
 
   .metric-card.accent {
-    border-color: hsl(var(--primary) / 0.2);
-    background: hsl(var(--primary) / 0.05);
+    border-color: color-mix(in oklch, var(--primary) 20%, transparent);
+    background: color-mix(in oklch, var(--primary) 5%, transparent);
   }
 
   .metric-label {
@@ -40,7 +40,7 @@
     font-weight: 700;
     letter-spacing: 0.1em;
     text-transform: uppercase;
-    color: hsl(var(--muted-foreground));
+    color: var(--muted-foreground);
   }
 
   .metric-value {
@@ -49,12 +49,12 @@
     font-family: 'JetBrains Mono', monospace;
     letter-spacing: -0.02em;
     line-height: 1;
-    color: hsl(var(--foreground));
+    color: var(--foreground);
   }
 
   .metric-detail {
     font-size: 11px;
-    color: hsl(var(--muted-foreground));
+    color: var(--muted-foreground);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;

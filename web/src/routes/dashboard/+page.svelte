@@ -17,6 +17,8 @@
   import CheckCircle from '@lucide/svelte/icons/check-circle';
   import AlertCircle from '@lucide/svelte/icons/alert-circle';
   import MediaRow from '$lib/components/MediaRow.svelte';
+  import { Badge } from '$lib/components/ui/badge/index.js';
+  import { Button } from '$lib/components/ui/button/index.js';
   import { api, subscribeEvents } from '$lib/api';
   import { detailsHref } from '$lib/detailsHref';
   import { toastError, toastSuccess } from '$lib/toast';
@@ -102,100 +104,115 @@
 
 <svelte:head><title>Dashboard — Drakkar</title></svelte:head>
 
-<!-- Hero carousel (reference: 420px/500px, full-width with backdrop+gradient) -->
+<!-- Hero carousel -->
 {#if hero}
-  <section class="hero">
+  <section class="relative mb-7 h-[420px] overflow-hidden rounded-2xl border border-white/[0.07] md:h-[500px]">
     {#if hero.backdropUrl}
-      <img class="hero-bg" src={hero.backdropUrl} alt="" />
+      <img class="absolute inset-0 size-full object-cover" src={hero.backdropUrl} alt="" />
     {/if}
-    <div class="hero-gradient"></div>
-    <div class="hero-content">
-      <div class="hero-tags">
-        <span class="tag">{heroKind}</span>
-        {#if hero.year}<span class="tag">{hero.year}</span>{/if}
-        {#if heroStatus}<span class="tag">{heroStatus}</span>{/if}
+    <div
+      class="absolute inset-0"
+      style="background: linear-gradient(90deg, hsl(215 36% 4% / 0.95) 0%, hsl(215 36% 4% / 0.65) 50%, transparent 100%), linear-gradient(0deg, hsl(215 36% 4% / 0.6) 0%, transparent 50%);"
+    ></div>
+    <div class="relative z-10 flex h-full max-w-[680px] flex-col justify-end p-4 sm:p-8 sm:pl-[72px]">
+      <div class="mb-3 flex gap-2">
+        <Badge variant="outline" class="border-white/15 bg-white/8 uppercase tracking-wide">{heroKind}</Badge>
+        {#if hero.year}<Badge variant="outline" class="border-white/15 bg-white/8 uppercase tracking-wide">{hero.year}</Badge>{/if}
+        {#if heroStatus}<Badge variant="outline" class="border-white/15 bg-white/8 uppercase tracking-wide">{heroStatus}</Badge>{/if}
         {#if hero.availableCount || hero.missingCount}
-          <span class="tag">{hero.availableCount ?? 0} avail / {hero.missingCount ?? 0} miss</span>
+          <Badge variant="outline" class="border-white/15 bg-white/8 uppercase tracking-wide">{hero.availableCount ?? 0} avail / {hero.missingCount ?? 0} miss</Badge>
         {/if}
       </div>
-      <h1 class="hero-title">{hero.title}</h1>
+      <h1 class="mb-2.5 text-[clamp(1.8rem,4vw,3rem)] font-bold leading-[1.05]">{hero.title}</h1>
       {#if hero.overview}
-        <p class="hero-overview">{hero.overview}</p>
+        <p class="mb-5 line-clamp-3 max-w-[560px] text-sm leading-relaxed text-foreground/80">{hero.overview}</p>
       {/if}
-      <div class="hero-actions">
-        <a class="hero-btn primary" href={detailsHref(hero)}>More Info</a>
+      <div class="mt-0.5 flex flex-wrap gap-2.5">
+        <Button href={detailsHref(hero)} size="lg" class="h-[42px] rounded-xl px-5 text-[13px] font-bold">More Info</Button>
         {#if heroInLibrary}
-          <a class="hero-btn secondary" href={`/library/${hero.id}`}>Open Library</a>
+          <Button href={`/library/${hero.id}`} variant="outline" size="lg" class="h-[42px] rounded-xl border-white/10 bg-white/8 px-5 text-[13px] font-bold">Open Library</Button>
         {:else if hero.tmdbId}
-          <button class="hero-btn secondary" on:click={() => hero && requestItem(hero)}>+ Request</button>
+          <Button onclick={() => hero && requestItem(hero)} variant="outline" size="lg" class="h-[42px] rounded-xl border-white/10 bg-white/8 px-5 text-[13px] font-bold">+ Request</Button>
         {/if}
       </div>
     </div>
     {#if heroItems.length > 1}
-      <button class="hero-nav left" aria-label="Previous hero" on:click={() => { heroIndex = (heroIndex - 1 + heroItems.length) % heroItems.length; }}>
+      <button
+        class="absolute left-3.5 top-1/2 z-20 hidden size-10 -translate-y-1/2 place-items-center rounded-full border border-white/15 bg-black/40 text-foreground sm:grid"
+        aria-label="Previous hero"
+        on:click={() => { heroIndex = (heroIndex - 1 + heroItems.length) % heroItems.length; }}
+      >
         <ChevronLeft size={18} />
       </button>
-      <button class="hero-nav right" aria-label="Next hero" on:click={() => { heroIndex = (heroIndex + 1) % heroItems.length; }}>
+      <button
+        class="absolute right-3.5 top-1/2 z-20 hidden size-10 -translate-y-1/2 place-items-center rounded-full border border-white/15 bg-black/40 text-foreground sm:grid"
+        aria-label="Next hero"
+        on:click={() => { heroIndex = (heroIndex + 1) % heroItems.length; }}
+      >
         <ChevronRight size={18} />
       </button>
-      <div class="hero-dots">
+      <div class="absolute bottom-4 left-1/2 z-20 flex -translate-x-1/2 gap-1.5 rounded-full border border-white/10 bg-black/35 px-3 py-2">
         {#each heroItems as _, i}
-          <button aria-label={`Hero ${i + 1}`} class:active={i === heroIndex} on:click={() => (heroIndex = i)}></button>
+          <button
+            aria-label={`Hero ${i + 1}`}
+            class="h-1 rounded-full bg-white/30 transition-all {i === heroIndex ? 'w-7 bg-primary' : 'w-3.5'}"
+            on:click={() => (heroIndex = i)}
+          ></button>
         {/each}
       </div>
     {/if}
   </section>
 {:else if loading}
-  <div class="hero-placeholder">Loading dashboard…</div>
+  <div class="mb-7 grid h-[200px] place-items-center text-sm text-muted-foreground">Loading dashboard…</div>
 {/if}
 
-<div class="dashboard-body">
+<div class="flex flex-col gap-6">
   <!-- System status tiles -->
   {#if status}
-    <div class="stat-band">
-      <div class="stat-tile">
+    <div class="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+      <div class="flex items-center gap-3 rounded-xl border border-white/[0.07] bg-card/80 p-3.5 text-primary">
         <HardDrive size={14} />
         <div>
-          <div class="st-label">Disk Cache</div>
-          <div class="st-value">{fmt(status.diskCacheLimitBytes)} limit</div>
+          <div class="mb-0.5 text-[11px] font-semibold text-muted-foreground">Disk Cache</div>
+          <div class="text-[13px] font-bold text-foreground">{fmt(status.diskCacheLimitBytes)} limit</div>
         </div>
       </div>
-      <div class="stat-tile">
+      <div class="flex items-center gap-3 rounded-xl border border-white/[0.07] bg-card/80 p-3.5 text-primary">
         <Layers size={14} />
         <div>
-          <div class="st-label">Read-ahead</div>
-          <div class="st-value">{fmt(status.readAheadLimitBytes)}</div>
+          <div class="mb-0.5 text-[11px] font-semibold text-muted-foreground">Read-ahead</div>
+          <div class="text-[13px] font-bold text-foreground">{fmt(status.readAheadLimitBytes)}</div>
         </div>
       </div>
-      <div class="stat-tile">
+      <div class="flex items-center gap-3 rounded-xl border border-white/[0.07] bg-card/80 p-3.5 text-primary">
         <Database size={14} />
         <div>
-          <div class="st-label">Hot Cache</div>
-          <div class="st-value">{fmt(status.memoryHotCacheBytes)}</div>
+          <div class="mb-0.5 text-[11px] font-semibold text-muted-foreground">Hot Cache</div>
+          <div class="text-[13px] font-bold text-foreground">{fmt(status.memoryHotCacheBytes)}</div>
         </div>
       </div>
-      <div class="stat-tile">
+      <div class="flex items-center gap-3 rounded-xl border border-white/[0.07] bg-card/80 p-3.5 text-primary">
         <Activity size={14} />
         <div>
-          <div class="st-label">FUSE Mount</div>
-          <div class="st-value ellipsis">{status.fuseMountPath || '—'}</div>
+          <div class="mb-0.5 text-[11px] font-semibold text-muted-foreground">FUSE Mount</div>
+          <div class="max-w-[120px] truncate text-[11px] font-bold text-foreground">{status.fuseMountPath || '—'}</div>
         </div>
       </div>
     </div>
 
     <!-- Integration health -->
     {#if integrations}
-      <div class="integrations">
+      <div class="flex flex-wrap gap-2">
         {#each Object.entries(integrations) as [name, info]}
           {#if name !== 'subtitleProviders' && typeof info === 'object' && info !== null && !Array.isArray(info) && 'enabled' in info}
-            <div class="int-chip" class:disabled={!info.enabled}>
+            <div class="flex items-center gap-1.5 rounded-xl border border-white/[0.07] bg-card/70 px-3 py-1.5 text-xs font-semibold {!info.enabled ? 'opacity-50' : ''}">
               <svelte:component
                 this={info.enabled && info.configured ? CheckCircle : AlertCircle}
                 size={12}
-                class={info.enabled && info.configured ? 'ok' : 'warn'}
+                style={info.enabled && info.configured ? 'color: hsl(var(--status-available))' : 'color: hsl(var(--status-warning))'}
               />
               <span>{name}</span>
-              <span class="int-status" class:ok={info.enabled && info.configured}>
+              <span class="text-[11px] {info.enabled && info.configured ? '' : 'text-muted-foreground'}" style={info.enabled && info.configured ? 'color: hsl(var(--status-available))' : ''}>
                 {!info.enabled ? 'off' : info.configured ? 'ok' : 'not configured'}
               </span>
             </div>
@@ -203,14 +220,14 @@
         {/each}
         {#if privacyStatus}
           {@const privacyOk = privacyStatus.mode === 'direct' || privacyStatus.status === 'connected'}
-          <div class="int-chip" class:disabled={privacyStatus.status === 'error'}>
+          <div class="flex items-center gap-1.5 rounded-xl border border-white/[0.07] bg-card/70 px-3 py-1.5 text-xs font-semibold {privacyStatus.status === 'error' ? 'opacity-50' : ''}">
             <svelte:component
               this={privacyOk ? CheckCircle : AlertCircle}
               size={12}
-              class={privacyOk ? 'ok' : 'warn'}
+              style={privacyOk ? 'color: hsl(var(--status-available))' : 'color: hsl(var(--status-warning))'}
             />
             <span>privacy</span>
-            <span class="int-status" class:ok={privacyOk}>
+            <span class="text-[11px] {privacyOk ? '' : 'text-muted-foreground'}" style={privacyOk ? 'color: hsl(var(--status-available))' : ''}>
               {privacyStatus.mode}{privacyStatus.mode !== 'direct' ? ` · ${privacyStatus.status}` : ''}
             </span>
           </div>
@@ -255,175 +272,8 @@
   {/if}
 
   {#if !loading && !home?.recentlyAdded?.length && !(home?.trendingMovies ?? []).length}
-    <div class="empty-state">No media yet. Sync Seerr requests to get started.</div>
+    <div class="rounded-2xl border border-white/[0.06] bg-white/[0.02] p-8 text-center text-sm text-muted-foreground">
+      No media yet. Sync Seerr requests to get started.
+    </div>
   {/if}
 </div>
-
-<style>
-  /* ── Hero ─────────────────────────────────────────────────────────────────── */
-  .hero {
-    position: relative;
-    height: 420px;
-    overflow: hidden;
-    border-radius: var(--radius-2xl, 1.5rem);
-    border: 1px solid hsl(0 0% 100% / 0.07);
-    margin-bottom: 28px;
-  }
-
-  @media (min-width: 900px) { .hero { height: 500px; } }
-
-  .hero-bg {
-    position: absolute; inset: 0;
-    width: 100%; height: 100%;
-    object-fit: cover;
-  }
-
-  .hero-gradient {
-    position: absolute; inset: 0;
-    background:
-      linear-gradient(90deg, hsl(215 36% 4% / 0.95) 0%, hsl(215 36% 4% / 0.65) 50%, transparent 100%),
-      linear-gradient(0deg, hsl(215 36% 4% / 0.6) 0%, transparent 50%);
-  }
-
-  .hero-content {
-    position: relative; z-index: 1;
-    display: flex; flex-direction: column; justify-content: flex-end;
-    height: 100%; max-width: 680px; padding: 32px 36px 32px 72px;
-  }
-  @media (max-width: 600px) {
-    .hero-content { padding: 16px; }
-  }
-
-  .hero-tags { display: flex; gap: 8px; margin-bottom: 12px; }
-
-  .tag {
-    padding: 4px 10px; border-radius: 999px;
-    border: 1px solid hsl(0 0% 100% / 0.15);
-    background: hsl(0 0% 100% / 0.08);
-    font-size: 11px; font-weight: 700; text-transform: uppercase;
-    letter-spacing: 0.06em;
-  }
-
-  .hero-title {
-    font-size: clamp(1.8rem, 4vw, 3rem);
-    font-weight: 700; line-height: 1.05;
-    margin: 0 0 10px;
-  }
-
-  .hero-overview {
-    margin: 0 0 20px;
-    font-size: 14px; line-height: 1.65;
-    color: hsl(var(--foreground) / 0.8);
-    max-width: 560px;
-    display: -webkit-box; line-clamp: 3; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
-    overflow: hidden;
-  }
-
-  .hero-actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 10px;
-    margin-top: 2px;
-  }
-
-  .hero-btn {
-    display: inline-flex; align-items: center;
-    height: 42px; padding: 0 20px;
-    border-radius: var(--radius-lg, 0.75rem);
-    font-size: 13px; font-weight: 700;
-    text-decoration: none;
-    transition: opacity 0.15s;
-  }
-  .hero-btn.primary {
-    background: hsl(var(--primary));
-    color: hsl(var(--primary-foreground));
-  }
-  .hero-btn.secondary {
-    background: hsl(0 0% 100% / 0.08);
-    border: 1px solid hsl(0 0% 100% / 0.1);
-    color: hsl(var(--foreground));
-  }
-  .hero-btn:hover { opacity: 0.88; }
-
-  .hero-nav {
-    position: absolute; top: 50%; z-index: 2;
-    transform: translateY(-50%);
-    width: 40px; height: 40px;
-    display: grid; place-items: center;
-    border-radius: 999px;
-    border: 1px solid hsl(0 0% 100% / 0.15);
-    background: hsl(0 0% 0% / 0.4);
-    color: hsl(var(--foreground)); cursor: pointer;
-  }
-  .hero-nav.left  { left: 14px; }
-  .hero-nav.right { right: 14px; }
-
-  .hero-dots {
-    position: absolute; bottom: 16px; left: 50%; z-index: 2;
-    transform: translateX(-50%);
-    display: flex; gap: 6px;
-    padding: 8px 12px; border-radius: 999px;
-    background: hsl(0 0% 0% / 0.35);
-    border: 1px solid hsl(0 0% 100% / 0.1);
-  }
-  .hero-dots button {
-    width: 14px; height: 4px; border-radius: 999px;
-    background: hsl(0 0% 100% / 0.3); border: 0; cursor: pointer;
-    transition: all 0.2s;
-  }
-  .hero-dots button.active { width: 28px; background: hsl(var(--primary)); }
-
-  .hero-placeholder {
-    height: 200px; display: grid; place-items: center;
-    color: hsl(var(--muted-foreground)); font-size: 14px;
-    margin-bottom: 28px;
-  }
-
-  /* ── Dashboard body ───────────────────────────────────────────────────────── */
-  .dashboard-body { display: flex; flex-direction: column; gap: 24px; }
-
-  /* Stat band */
-  .stat-band {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 10px;
-  }
-  @media (max-width: 700px) { .stat-band { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-
-  .stat-tile {
-    display: flex; align-items: center; gap: 12px;
-    padding: 14px 16px;
-    border-radius: var(--radius-lg, 0.75rem);
-    border: 1px solid hsl(0 0% 100% / 0.07);
-    background: hsl(var(--card) / 0.8);
-    color: hsl(var(--primary));
-  }
-  .st-label { font-size: 11px; color: hsl(var(--muted-foreground)); font-weight: 600; margin-bottom: 3px; }
-  .st-value { font-size: 13px; font-weight: 700; color: hsl(var(--foreground)); }
-  .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 120px; font-size: 11px; }
-
-  /* Integrations */
-  .integrations { display: flex; flex-wrap: wrap; gap: 8px; }
-
-  .int-chip {
-    display: flex; align-items: center; gap: 6px;
-    padding: 6px 12px;
-    border-radius: var(--radius-lg, 0.75rem);
-    border: 1px solid hsl(0 0% 100% / 0.07);
-    background: hsl(var(--card) / 0.7);
-    font-size: 12px; font-weight: 600;
-  }
-  .int-chip.disabled { opacity: 0.5; }
-  .int-status { font-size: 11px; color: hsl(var(--muted-foreground)); }
-  .int-status.ok { color: hsl(var(--status-available, 142 70% 45%)); }
-
-  .empty-state {
-    padding: 32px; text-align: center;
-    border-radius: var(--radius-xl, 1rem);
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(0 0% 100% / 0.02);
-    color: hsl(var(--muted-foreground));
-    font-size: 14px;
-  }
-
-</style>

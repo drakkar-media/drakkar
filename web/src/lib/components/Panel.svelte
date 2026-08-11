@@ -11,57 +11,17 @@
   export let flush = false;
 </script>
 
-<section class:wide class:flush class="panel">
+<section class:wide class="min-w-0 rounded-xl bg-card ring-1 ring-foreground/10">
   {#if title || subtitle}
-    <header class="panel-head">
+    <header class="flex items-start justify-between gap-3 pt-[18px] px-5 pb-3.5 border-b border-border">
       <div>
-        {#if title}<h2>{title}</h2>{/if}
-        {#if subtitle}<p>{subtitle}</p>{/if}
+        {#if title}<h2 class="m-0 text-lg leading-[1.1]">{title}</h2>{/if}
+        {#if subtitle}<p class="mt-1.5 mb-0 text-[13px] text-muted-foreground">{subtitle}</p>{/if}
       </div>
       <slot name="actions" />
     </header>
   {/if}
-  <div class="panel-body">
+  <div class="px-5 pb-5 {flush ? 'pt-0' : 'pt-4'}">
     <slot />
   </div>
 </section>
-
-<style>
-  .panel {
-    min-width: 0;
-    border: 1px solid hsl(var(--border) / 0.9);
-    border-radius: 24px;
-    background: hsl(var(--card) / 0.82);
-    box-shadow: 0 20px 60px hsl(190 80% 6% / 0.24);
-    backdrop-filter: blur(20px);
-  }
-
-  .panel-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: start;
-    gap: 12px;
-    padding: 18px 20px 14px;
-    border-bottom: 1px solid hsl(0 0% 100% / 0.05);
-  }
-
-  h2 {
-    margin: 0;
-    font-size: 18px;
-    line-height: 1.1;
-  }
-
-  p {
-    margin: 6px 0 0;
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .panel-body {
-    padding: 16px 20px 20px;
-  }
-
-  .flush .panel-body {
-    padding-top: 0;
-  }
-</style>

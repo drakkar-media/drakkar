@@ -96,73 +96,35 @@
 
 <svelte:head><title>{mediaType === 'movie' ? 'Trending Movies' : 'Trending TV'} — Drakkar</title></svelte:head>
 
-<div class="page">
-  <header class="head">
+<div class="flex flex-col gap-5">
+  <header class="flex flex-wrap items-end justify-between gap-4">
     <div>
-      <h1>{mediaType === 'movie' ? 'Trending Movies' : 'Trending TV Shows'}</h1>
-      <p>Daily TMDB trending list with paging.</p>
+      <h1 class="m-0">{mediaType === 'movie' ? 'Trending Movies' : 'Trending TV Shows'}</h1>
+      <p class="mt-1.5 text-sm text-muted-foreground">Daily TMDB trending list with paging.</p>
     </div>
-    <a class="back-link" href="/dashboard">Back To Dashboard</a>
+    <a class="rounded-full border border-border px-3.5 py-2.5 text-xs font-bold text-muted-foreground no-underline transition-colors hover:bg-muted hover:text-foreground" href="/dashboard">Back To Dashboard</a>
   </header>
 
   {#if loading}
-    <div class="empty">Loading…</div>
+    <div class="rounded-[20px] border border-white/[0.06] bg-white/[0.02] p-7 text-center text-muted-foreground">Loading…</div>
   {:else if items.length === 0}
-    <div class="empty">No trending media found.</div>
+    <div class="rounded-[20px] border border-white/[0.06] bg-white/[0.02] p-7 text-center text-muted-foreground">No trending media found.</div>
   {:else}
-    <div class="poster-grid">
+    <div class="grid grid-cols-[repeat(auto-fill,minmax(140px,1fr))] gap-2.5">
       {#each items as item}
         <PosterCard item={asLibraryLike(item)} href={detailsHref(item)} showStatus={false} />
       {/each}
     </div>
 
     {#if currentPage < totalPages}
-      <div class="more-wrap">
-        <button class="more-btn" on:click={() => void loadMore()} disabled={loadingMore}>
+      <div class="flex justify-center">
+        <button
+          class="h-10.5 rounded-2xl border border-border bg-white/[0.05] px-4.5 text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 disabled:opacity-55"
+          on:click={() => void loadMore()} disabled={loadingMore}
+        >
           {loadingMore ? 'Loading…' : 'Load More'}
         </button>
       </div>
     {/if}
   {/if}
 </div>
-
-<style>
-  .page { display: flex; flex-direction: column; gap: 20px; }
-  .head {
-    display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap;
-  }
-  h1 { margin: 0; }
-  p { margin: 6px 0 0; color: hsl(var(--muted-foreground)); font-size: 14px; }
-  .back-link {
-    text-decoration: none;
-    padding: 10px 14px;
-    border-radius: 999px;
-    border: 1px solid hsl(0 0% 100% / 0.1);
-    color: hsl(var(--muted-foreground));
-    font-size: 12px;
-    font-weight: 700;
-  }
-  .poster-grid {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 10px;
-  }
-  @media (min-width: 480px)  { .poster-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
-  @media (min-width: 700px)  { .poster-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
-  @media (min-width: 900px)  { .poster-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); } }
-  @media (min-width: 1400px) { .poster-grid { grid-template-columns: repeat(8, minmax(0, 1fr)); } }
-  .more-wrap { display: flex; justify-content: center; }
-  .more-btn {
-    height: 42px; padding: 0 18px; border-radius: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.1);
-    background: hsl(0 0% 100% / 0.05);
-    color: hsl(var(--foreground));
-    cursor: pointer;
-  }
-  .empty {
-    padding: 28px; border-radius: 20px; text-align: center;
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(0 0% 100% / 0.02);
-    color: hsl(var(--muted-foreground));
-  }
-</style>

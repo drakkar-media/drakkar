@@ -1,5 +1,9 @@
-/* ─── Google Fonts: Space Grotesk + JetBrains Mono ─────────────────────────── */
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+/* ─── Google Fonts: Roboto (preset) + JetBrains Mono ─────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
 
 /* ─── CSS custom properties (match reference project exactly) ───────────────── */
 :root {
@@ -9,17 +13,17 @@
      <option>s falls back to the browser's light native background --
      white text on a white background, unreadable. */
   color-scheme: dark;
-  --background:        215 36%  4%;
-  --foreground:        188 34% 91%;
-  --card:              211 31%  7%;
-  --card-foreground:   188 34% 91%;
-  --muted:             209 26% 12%;
-  --muted-foreground:  190 13% 58%;
-  --border:            197 29% 18%;
-  --primary:           171 82% 55%;
-  --primary-foreground: 191 65%  6%;
-  --accent:             83 72% 58%;
-  --accent-foreground:  190 64%  7%;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.141 0.005 285.823);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.141 0.005 285.823);
+  --muted: oklch(0.967 0.001 286.375);
+  --muted-foreground: oklch(0.552 0.016 285.938);
+  --border: oklch(0.92 0.004 286.32);
+  --primary: oklch(0.508 0.118 165.612);
+  --primary-foreground: oklch(0.979 0.021 166.113);
+  --accent: oklch(0.967 0.001 286.375);
+  --accent-foreground: oklch(0.21 0.006 285.885);
   --danger:              0 72% 51%;
 
   /* Status colors — exact match to reference project Library.tsx */
@@ -32,16 +36,36 @@
   --status-unmonitored:  217 100% 68%;  /* #5f98ff  Completed (Unmonitored)   */
   --status-warning:       43  96% 55%;  /* amber — misc warning               */
 
-  /* Radii (match reference) */
-  --radius-sm:   0.25rem;
-  --radius:      0.375rem;
-  --radius-md:   0.5rem;
-  --radius-lg:   0.75rem;
-  --radius-xl:   1rem;
-  --radius-2xl:  1.5rem;
+  /* Radius -- single source of truth; --radius-sm/md/lg/xl/2xl/3xl/4xl are
+     derived from this one value in the @theme inline block below (the
+     official shadcn pattern). Do not redeclare the derived names here --
+     a duplicate :root declaration earlier in the cascade gets silently
+     shadowed by the @theme block's later one, which caused real bugs twice. */
+  --radius: 0.625rem;
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.141 0.005 285.823);
+  --secondary: oklch(0.967 0.001 286.375);
+  --secondary-foreground: oklch(0.21 0.006 285.885);
+  --destructive: oklch(0.577 0.245 27.325);
+  --input: oklch(0.92 0.004 286.32);
+  --ring: oklch(0.705 0.015 286.067);
+  --chart-1: oklch(0.871 0.15 154.449);
+  --chart-2: oklch(0.723 0.219 149.579);
+  --chart-3: oklch(0.627 0.194 149.214);
+  --chart-4: oklch(0.527 0.154 150.069);
+  --chart-5: oklch(0.448 0.119 151.328);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.141 0.005 285.823);
+  --sidebar-primary: oklch(0.596 0.145 163.225);
+  --sidebar-primary-foreground: oklch(0.979 0.021 166.113);
+  --sidebar-accent: oklch(0.967 0.001 286.375);
+  --sidebar-accent-foreground: oklch(0.21 0.006 285.885);
+  --sidebar-border: oklch(0.92 0.004 286.32);
+  --sidebar-ring: oklch(0.705 0.015 286.067);
 }
 
 /* ─── Reset ─────────────────────────────────────────────────────────────────── */
+@layer base {
 *, *::before, *::after { box-sizing: border-box; }
 
 html, body {
@@ -50,20 +74,14 @@ html, body {
 }
 
 body {
-  background:
-    linear-gradient(90deg,  hsl(171 80% 56% / 0.03) 1px, transparent 1px),
-    linear-gradient(180deg, hsl(171 80% 56% / 0.025) 1px, transparent 1px),
-    radial-gradient(circle at 80% 18%, hsl(171 82% 18% / 0.32), transparent 28rem),
-    radial-gradient(circle at 15% 80%, hsl(83  72% 15% / 0.16), transparent 34rem),
-    linear-gradient(180deg, hsl(215 36% 5%), hsl(215 36% 3%) 50rem);
-  background-size: 40px 40px, 40px 40px, auto, auto, auto;
-  color: hsl(var(--foreground));
-  font-family: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+  color: var(--foreground);
+  font-family: 'Roboto', system-ui, -apple-system, sans-serif;
   font-size: 15px;
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
   overflow-x: hidden;
+	@apply bg-background text-foreground;
 }
 
 /* Monospace elements use JetBrains Mono */
@@ -76,39 +94,39 @@ a { color: inherit; text-decoration: none; }
 
 button, input, textarea, select { font: inherit; color: inherit; }
 
-:where(
-  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]):not([type="button"]):not([type="submit"]):not([type="reset"]),
-  textarea,
-  select
-) {
+button:not(:disabled), [role="button"]:not([aria-disabled="true"]) { cursor: pointer; }
+button:disabled, [role="button"][aria-disabled="true"] { cursor: default; }
+
+/* Base tokens mirror shadcn-svelte's Input/Textarea/Select components
+   (h-8, rounded-lg, border-input, bg-transparent, px-2.5, text-sm) exactly,
+   so every native input/textarea/select in the app -- migrated to a shadcn
+   component or not -- renders identically to one. */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]):not([type="button"]):not([type="submit"]):not([type="reset"]),
+textarea,
+select {
   width: 100%;
-  min-height: 44px;
-  padding: 0.75rem 0.9rem;
-  border: 1px solid hsl(var(--border) / 0.95);
-  border-radius: 12px;
-  background:
-    linear-gradient(180deg, hsl(0 0% 100% / 0.075), hsl(0 0% 100% / 0.045)),
-    hsl(var(--muted) / 0.72);
-  color: hsl(var(--foreground));
-  box-shadow:
-    inset 0 1px 0 hsl(0 0% 100% / 0.04),
-    0 0 0 0 hsl(var(--primary) / 0);
+  min-height: 2rem;
+  padding: 0.25rem 0.625rem;
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg, 10px);
+  background: transparent;
+  color: var(--foreground);
+  font-size: 0.875rem;
   transition:
     border-color 0.16s ease,
     box-shadow 0.16s ease,
-    background-color 0.16s ease,
-    transform 0.16s ease;
+    background-color 0.16s ease;
 }
 
-:where(
-  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]):not([type="button"]):not([type="submit"]):not([type="reset"]),
-  textarea
-)::placeholder {
-  color: hsl(var(--muted-foreground) / 0.9);
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]):not([type="button"]):not([type="submit"]):not([type="reset"])::placeholder,
+textarea::placeholder {
+  color: color-mix(in oklch, var(--muted-foreground) 90%, transparent);
 }
 
 textarea {
-  min-height: 120px;
+  min-height: 4rem;
+  padding-top: 0.5rem;
+  padding-bottom: 0.5rem;
   resize: vertical;
 }
 
@@ -116,61 +134,49 @@ select option {
   /* Belt-and-suspenders alongside :root's color-scheme: dark -- some
      browsers still render the popup list with the OS theme unless the
      option itself has an explicit background/color. */
-  background-color: hsl(var(--card));
-  color: hsl(var(--foreground));
+  background-color: var(--card);
+  color: var(--foreground);
 }
 
 select {
   appearance: none;
   padding-right: 2.6rem;
   background-image:
-    linear-gradient(45deg, transparent 50%, hsl(var(--muted-foreground)) 50%),
-    linear-gradient(135deg, hsl(var(--muted-foreground)) 50%, transparent 50%),
-    linear-gradient(180deg, hsl(0 0% 100% / 0.075), hsl(0 0% 100% / 0.045));
+    linear-gradient(45deg, transparent 50%, var(--muted-foreground) 50%),
+    linear-gradient(135deg, var(--muted-foreground) 50%, transparent 50%);
   background-position:
     calc(100% - 18px) calc(50% - 2px),
-    calc(100% - 12px) calc(50% - 2px),
-    0 0;
-  background-size:
-    6px 6px,
-    6px 6px,
-    100% 100%;
+    calc(100% - 12px) calc(50% - 2px);
+  background-size: 6px 6px, 6px 6px;
   background-repeat: no-repeat;
 }
 
-:where(
-  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]):not([type="button"]):not([type="submit"]):not([type="reset"]),
-  textarea,
-  select
-):hover {
-  border-color: hsl(var(--primary) / 0.28);
-  background-color: hsl(var(--muted) / 0.88);
-}
-
-:where(
-  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]):not([type="button"]):not([type="submit"]):not([type="reset"]),
-  textarea,
-  select
-):focus-visible {
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]):not([type="button"]):not([type="submit"]):not([type="reset"]):focus-visible,
+textarea:focus-visible,
+select:focus-visible {
   outline: none;
-  border-color: hsl(var(--primary) / 0.92);
-  box-shadow:
-    inset 0 1px 0 hsl(0 0% 100% / 0.05),
-    0 0 0 3px hsl(var(--primary) / 0.18);
+  border-color: var(--ring);
+  box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring) 50%, transparent);
 }
 
-:where(
-  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]):not([type="button"]):not([type="submit"]):not([type="reset"]),
-  textarea,
-  select
-):disabled {
-  opacity: 0.58;
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]):not([type="button"]):not([type="submit"]):not([type="reset"]):disabled,
+textarea:disabled,
+select:disabled {
+  opacity: 0.5;
   cursor: not-allowed;
+  pointer-events: none;
 }
 
 input[type="checkbox"],
 input[type="radio"] {
-  accent-color: hsl(var(--primary));
+  accent-color: var(--primary);
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
+input[type="checkbox"] {
+  border-radius: 4px;
 }
 
 img, svg, canvas, video { max-width: 100%; }
@@ -198,7 +204,13 @@ img, svg, canvas, video { max-width: 100%; }
   user-select: none;
   -webkit-overflow-scrolling: touch;
   scrollbar-width: none;
+  /* Without snap, scrolling can come to rest with the last visible card cut
+     off mid-image, which reads as a broken/incorrectly-sized poster rather
+     than "more content, keep scrolling". Snapping each child to the start
+     of the viewport means the row only ever rests on a fully-visible card. */
+  scroll-snap-type: x proximity;
 }
+.drag-scroll > * { scroll-snap-align: start; }
 .drag-scroll::-webkit-scrollbar { display: none; }
 .drag-scroll:active { cursor: grabbing; }
 
@@ -211,9 +223,13 @@ img, svg, canvas, video { max-width: 100%; }
 .status-bar-neutral      { background: hsl(0 0% 100% / 0.15); }
 
 /* Heading clamp scale matching reference */
-h1 { font-size: clamp(1.9rem, 4vw, 3rem);   font-weight: 700; line-height: 1.1; margin: 0; }
-h2 { font-size: clamp(1.35rem, 2.5vw, 2.2rem); font-weight: 700; line-height: 1.15; margin: 0; }
-h3 { font-size: clamp(1.1rem, 1.8vw, 1.5rem);  font-weight: 600; line-height: 1.2;  margin: 0; }
+h1 { font-size: clamp(1.4rem, 2.4vw, 1.875rem); font-weight: 700; line-height: 1.2; margin: 0; }
+h2 { font-size: clamp(1.15rem, 1.8vw, 1.5rem); font-weight: 700; line-height: 1.2; margin: 0; }
+h3 { font-size: clamp(1rem, 1.4vw, 1.25rem);  font-weight: 600; line-height: 1.25;  margin: 0; }
+	* {
+		@apply border-border outline-ring/50;
+  }
+} /* @layer base */
 
 /* Metric card value */
 .metric-value {
@@ -222,4 +238,563 @@ h3 { font-size: clamp(1.1rem, 1.8vw, 1.5rem);  font-weight: 600; line-height: 1.
   font-family: 'JetBrains Mono', monospace;
   letter-spacing: -0.02em;
   line-height: 1;
+}
+
+/* Empty-state box, used by every page's "nothing here" placeholder. */
+.empty-state {
+  border-radius: var(--radius-xl);
+  border: 1px solid var(--border);
+  background: color-mix(in oklch, var(--foreground) 2%, transparent);
+  padding: 2rem;
+  text-align: center;
+  font-size: 0.875rem;
+  color: var(--muted-foreground);
+}
+
+/* Compact icon/text action buttons -- episode/file row actions, small
+   inline controls that are too small for the standard Button component. */
+.action-btn {
+  display: inline-flex;
+  height: 24px;
+  min-width: 24px;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  background: color-mix(in oklch, var(--foreground) 4%, transparent);
+  padding: 0 10px;
+  font-size: 11px;
+  color: var(--muted-foreground);
+  cursor: pointer;
+  transition: color 0.15s, background-color 0.15s, border-color 0.15s;
+}
+.action-btn:hover {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: var(--primary-foreground);
+}
+.action-btn[aria-disabled='true'] { opacity: 0.5; pointer-events: none; }
+.action-btn-icon { width: 24px; padding: 0; }
+.action-btn-danger:hover {
+  border-color: var(--destructive);
+  background: var(--destructive);
+  color: white;
+}
+
+/* Hero backdrop image + gradient shade, for detail-page hero sections. */
+.hero-backdrop, .hero-shade { position: absolute; inset: 0; }
+.hero-backdrop { width: 100%; height: 100%; object-fit: cover; }
+.hero-shade { background: linear-gradient(180deg, hsl(0 0% 0% / 0.2), hsl(0 0% 0% / 0.86)); }
+
+/* Disclosure-triangle marker for any <details>/<summary> toggle. */
+.disclosure-caret > summary::-webkit-details-marker { display: none; }
+.disclosure-caret > summary::before {
+  content: '▶';
+  font-size: 9px;
+  margin-right: 2px;
+  display: inline-block;
+  transition: transform 0.15s;
+}
+.disclosure-caret[open] > summary::before { transform: rotate(90deg); }
+
+/* Shimmer progress bar, for indeterminate loading states. */
+.loading-shimmer-bar {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--primary) 40%,
+    color-mix(in oklch, var(--primary) 40%, transparent) 70%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: loading-shimmer 1.2s linear infinite;
+}
+@keyframes loading-shimmer {
+  0%   { background-position: 200% center; }
+  100% { background-position: -200% center; }
+}
+
+/* Settings list+editor layout -- used by Custom Formats, Quality Profiles,
+   Release Filtering, Indexer Policies, and Subtitle Profiles: a scrollable
+   list of selectable item cards on one side, an editor panel on the other. */
+.settings-list-layout { display: grid; grid-template-columns: 220px 1fr; gap: 16px; }
+.settings-list { display: grid; gap: 4px; align-content: start; min-width: 0; }
+.settings-list-scroll { max-height: 600px; overflow-y: auto; }
+.settings-list-header {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 12px; font-weight: 600; color: var(--muted-foreground);
+  padding: 0 4px 6px; text-transform: uppercase; letter-spacing: 0.06em;
+}
+.settings-list-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  padding: 8px 12px; border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  background: color-mix(in oklch, var(--foreground) 3%, transparent);
+  cursor: pointer; text-align: left; min-width: 0; transition: background-color 0.12s, border-color 0.12s;
+}
+.settings-list-item:hover,
+.settings-list-item.active {
+  background: color-mix(in oklch, var(--primary) 12%, transparent);
+  border-color: color-mix(in oklch, var(--primary) 30%, transparent);
+}
+.settings-list-item.disabled { opacity: 0.45; }
+.settings-list-item-name {
+  font-size: 13px; font-weight: 500; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+}
+.settings-list-item-name :global(svg) { color: var(--primary); }
+.settings-list-item-meta {
+  font-size: 11px; color: var(--muted-foreground); font-family: 'JetBrains Mono', monospace;
+}
+.settings-list-item-score {
+  font-size: 12px; font-family: 'JetBrains Mono', monospace; font-weight: 700; flex-shrink: 0;
+}
+.settings-list-item-score.positive { color: hsl(var(--status-available)); }
+.settings-list-item-score.negative { color: hsl(var(--status-failed)); }
+.settings-disabled-badge {
+  font-size: 10px; border-radius: var(--radius-sm); padding: 1px 5px;
+  color: var(--muted-foreground); background: color-mix(in oklch, var(--foreground) 8%, transparent);
+}
+.settings-editor { display: grid; gap: 14px; align-content: start; }
+.settings-import-box {
+  display: grid; gap: 10px; padding: 14px 16px; border-radius: var(--radius-lg);
+  border: 1px solid color-mix(in oklch, var(--primary) 30%, transparent);
+  background: color-mix(in oklch, var(--primary) 5%, transparent);
+  margin-bottom: 16px;
+}
+.settings-readonly-note {
+  font-size: 12px; color: var(--muted-foreground); margin: 0;
+  background: color-mix(in oklch, var(--foreground) 3%, transparent);
+  border: 1px solid var(--border); border-radius: var(--radius-md); padding: 10px 12px;
+}
+.settings-type-header {
+  font-size: 11px; font-weight: 600; color: var(--muted-foreground);
+  padding: 10px 4px 3px; text-transform: uppercase; letter-spacing: 0.06em;
+  display: flex; align-items: center; gap: 6px;
+}
+.settings-count-badge {
+  font-size: 10px; border-radius: var(--radius-sm); padding: 1px 5px;
+  background: color-mix(in oklch, var(--foreground) 8%, transparent);
+}
+.settings-badge-row { display: flex; gap: 3px; flex-shrink: 0; }
+.settings-badge { font-size: 10px; border-radius: var(--radius-sm); padding: 1px 5px; white-space: nowrap; }
+.settings-badge-block { background: hsl(var(--status-failed) / 0.2); color: hsl(var(--status-failed)); }
+.settings-badge-penalty { background: hsl(var(--status-warning) / 0.2); color: hsl(var(--status-warning)); }
+.settings-badge-info { background: color-mix(in oklch, var(--foreground) 8%, transparent); color: var(--muted-foreground); }
+.settings-badge-media { background: hsl(var(--status-partial) / 0.2); color: hsl(var(--status-partial)); }
+.settings-test-panel {
+  margin-top: 24px; padding: 14px; border-radius: var(--radius-lg);
+  border: 1px solid var(--border); background: color-mix(in oklch, var(--foreground) 2%, transparent);
+  display: grid; gap: 10px;
+}
+.settings-test-row { display: flex; gap: 8px; align-items: center; }
+.settings-test-result {
+  padding: 10px 12px; border-radius: var(--radius-md);
+  border: 1px solid var(--border); background: color-mix(in oklch, var(--foreground) 3%, transparent);
+  font-size: 13px;
+}
+.settings-test-result.blocked {
+  background: hsl(var(--status-failed) / 0.1); border-color: hsl(var(--status-failed) / 0.3); color: hsl(var(--status-failed));
+}
+.settings-test-result.allowed {
+  background: hsl(var(--status-available) / 0.1); border-color: hsl(var(--status-available) / 0.3); color: hsl(var(--status-available));
+}
+.settings-test-matches { margin: 6px 0 0; padding-left: 18px; display: grid; gap: 4px; list-style: disc; }
+@media (max-width: 900px) {
+  .settings-list-layout { grid-template-columns: 1fr; }
+}
+
+/* Settings vertical tab rail. */
+.tab-btn {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 12px; border-radius: var(--radius-md);
+  border: none; background: transparent; color: var(--muted-foreground);
+  cursor: pointer; text-align: left; font-size: 13px; font-weight: 500;
+  transition: background-color 0.12s, color 0.12s;
+}
+.tab-btn:hover { background: color-mix(in oklch, var(--foreground) 6%, transparent); color: var(--foreground); }
+.tab-btn.active { background: var(--primary); color: var(--primary-foreground); }
+
+/* Settings sub-tab pill switcher (e.g. Quality Profiles vs Quality Definitions). */
+.sub-tab-btn {
+  padding: 6px 18px; border-radius: var(--radius-md); border: none;
+  background: transparent; color: var(--muted-foreground);
+  font-size: 13px; font-weight: 500; cursor: pointer; transition: background-color 0.12s, color 0.12s;
+}
+.sub-tab-btn:hover { color: var(--foreground); background: color-mix(in oklch, var(--foreground) 6%, transparent); }
+.sub-tab-btn.active { background: var(--primary); color: var(--primary-foreground); }
+
+.tab-content { display: grid; gap: 16px; }
+.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+
+/* Settings form layout: a grid of labeled fields, 1/2/3 columns. */
+.form-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+.form-grid--3col { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.form-grid--2col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.form-grid--compact { gap: 10px; margin-top: 10px; }
+@media (max-width: 900px) {
+  .form-grid--3col, .form-grid--2col { grid-template-columns: 1fr; }
+}
+/* align-content: start (not the grid default of stretch) -- without it, a
+   field with an extra hint-text row grows taller than its siblings in the
+   same .form-grid row, and every field's auto rows stretch to fill that
+   extra height, shifting each sibling's <input> to a different vertical
+   position depending on how many rows ITS OWN field happens to have. */
+.form-field { display: grid; gap: 5px; align-content: start; }
+.form-field span { font-size: 12px; font-weight: 500; color: var(--muted-foreground); }
+.form-field input[type="text"],
+.form-field input[type="url"],
+.form-field input[type="password"],
+.form-field input[type="number"] { width: 100%; }
+.form-field--toggle { flex-direction: row; align-items: center; gap: 10px; }
+
+.field-hint { display: block; font-size: 11px; font-weight: 400; color: var(--muted-foreground); margin-top: 2px; }
+.field-hint-inline { font-size: 11px; font-weight: 400; color: var(--muted-foreground); }
+.field { margin-bottom: 20px; }
+.field-label { font-size: 13px; font-weight: 600; margin-bottom: 10px; display: flex; align-items: baseline; gap: 8px; }
+.field-input { width: 100%; }
+.divider { height: 1px; background: var(--border); margin: 6px 0 20px; }
+
+/* StatusPill — small rounded status chip, color-coded by tone. */
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--foreground);
+  white-space: nowrap;
+}
+.status-pill-ok {
+  background: hsl(var(--status-available) / 0.16);
+  color: hsl(var(--status-available));
+}
+.status-pill-warn {
+  background: hsl(var(--status-warning) / 0.16);
+  color: hsl(var(--status-warning));
+}
+.status-pill-danger {
+  background: hsl(var(--status-failed) / 0.16);
+  color: hsl(var(--status-failed));
+}
+.status-pill-neutral {
+  color: var(--muted-foreground);
+}
+
+/* PosterCard — poster-first card for a library item or discover result,
+   used on Dashboard/Library/Search/Discover/Details. */
+.poster-card {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  overflow: hidden;
+  border-radius: var(--radius-lg);
+  border: 1px solid hsl(0 0% 100% / 0.07);
+  background: color-mix(in oklch, var(--card) 90%, transparent);
+  transition: border-color 0.18s ease, box-shadow 0.18s ease;
+  text-decoration: none;
+  cursor: pointer;
+}
+.poster-card:hover {
+  border-color: color-mix(in oklch, var(--primary) 40%, transparent);
+  box-shadow: 0 8px 24px color-mix(in oklch, var(--background) 60%, transparent);
+}
+
+/* 2px status bar at top of the poster card */
+.poster-status-bar {
+  height: 2px;
+  flex-shrink: 0;
+  width: 100%;
+}
+.poster-status-bar-available   { background: hsl(var(--status-available)); }
+.poster-status-bar-partial     { background: hsl(var(--status-partial)); }
+.poster-status-bar-active      { background: hsl(var(--status-downloading)); }
+.poster-status-bar-unreleased  { background: hsl(var(--status-unreleased)); }
+.poster-status-bar-missing     { background: hsl(var(--status-missing)); }
+.poster-status-bar-failed      { background: hsl(var(--status-failed)); }
+
+/* Poster image frame + fallback icon */
+.poster-frame {
+  position: relative;
+  aspect-ratio: 2 / 3;
+  flex-shrink: 0;
+  background: var(--muted);
+  overflow: hidden;
+}
+.poster-frame img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.poster-fallback {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  color: var(--muted-foreground);
+}
+
+/* Status badge — bottom-left overlay on the poster */
+.poster-badge {
+  position: absolute;
+  bottom: 6px;
+  left: 6px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  font-family: 'JetBrains Mono', monospace;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  backdrop-filter: blur(8px);
+  border: 1px solid hsl(0 0% 0% / 0.2);
+  color: hsl(0 0% 100%);
+}
+.poster-badge-available   { background: hsl(var(--status-available) / 0.85); }
+.poster-badge-partial     { background: hsl(var(--status-partial) / 0.85); }
+.poster-badge-active      { background: hsl(var(--status-downloading) / 0.85); }
+.poster-badge-unreleased  { background: hsl(var(--status-unreleased) / 0.85); }
+.poster-badge-missing     { background: hsl(var(--status-missing) / 0.8); }
+.poster-badge-failed      { background: hsl(var(--status-failed) / 0.85); }
+
+/* Request button overlay — top-right corner of the poster */
+.poster-request-btn {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 26px;
+  height: 26px;
+  border-radius: 999px;
+  border: 1px solid hsl(0 0% 100% / 0.2);
+  background: color-mix(in oklch, var(--primary) 85%, transparent);
+  color: var(--primary-foreground);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: background 0.15s, transform 0.15s;
+}
+.poster-request-btn:hover {
+  background: var(--primary);
+  transform: scale(1.1);
+}
+
+/* Title + meta beneath the poster */
+.poster-copy {
+  padding: 8px 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+}
+.poster-copy-compact { padding: 6px 8px 8px; }
+
+.poster-title {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow: hidden;
+  display: -webkit-box;
+  line-clamp: 2;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  color: var(--foreground);
+}
+.poster-title-compact { font-size: 11px; }
+
+.poster-meta {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  font-weight: 500;
+  font-family: 'JetBrains Mono', monospace;
+  letter-spacing: 0.01em;
+}
+
+/* MediaRow — horizontally scrollable row of PosterCards (e.g. "Recently
+   Added", "Trending Movies"). */
+.media-row {
+  display: grid;
+  gap: 16px;
+}
+
+.media-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+@media (max-width: 700px) {
+  .media-row-head {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
+.media-row-title {
+  position: relative;
+  margin: 0;
+  padding-left: 14px;
+  font-size: 24px;
+  font-weight: 800;
+}
+.media-row-title::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 4px;
+  height: 22px;
+  transform: translateY(-50%);
+  border-radius: 999px;
+  background: var(--accent);
+}
+
+.media-row-link {
+  padding: 10px 14px;
+  border-radius: 999px;
+  border: 1px solid hsl(0 0% 100% / 0.08);
+  color: var(--muted-foreground);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.media-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.media-row-subtitle {
+  margin: 4px 0 0 14px;
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.media-row-nav-btn {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  border: 1px solid hsl(0 0% 100% / 0.08);
+  background: hsl(0 0% 100% / 0.04);
+  color: var(--foreground);
+  cursor: pointer;
+}
+
+.media-row-scroll {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding-bottom: 6px;
+  scroll-snap-type: x proximity;
+}
+.media-row-scroll.dragging {
+  cursor: grabbing;
+}
+
+.media-row-item {
+  flex: 0 0 auto;
+  scroll-snap-align: start;
+}
+
+.media-row-empty {
+  padding: 18px;
+  border-radius: 18px;
+  border: 1px solid hsl(0 0% 100% / 0.06);
+  background: hsl(0 0% 100% / 0.03);
+  color: var(--muted-foreground);
+}
+
+.dark {
+  --background: oklch(0.141 0.005 285.823);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.21 0.006 285.885);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.21 0.006 285.885);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.432 0.095 166.913);
+  --primary-foreground: oklch(0.979 0.021 166.113);
+  --secondary: oklch(0.274 0.006 286.033);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.274 0.006 286.033);
+  --muted-foreground: oklch(0.705 0.015 286.067);
+  --accent: oklch(0.274 0.006 286.033);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.552 0.016 285.938);
+  --chart-1: oklch(0.871 0.15 154.449);
+  --chart-2: oklch(0.723 0.219 149.579);
+  --chart-3: oklch(0.627 0.194 149.214);
+  --chart-4: oklch(0.527 0.154 150.069);
+  --chart-5: oklch(0.448 0.119 151.328);
+  --sidebar: oklch(0.21 0.006 285.885);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.696 0.17 162.48);
+  --sidebar-primary-foreground: oklch(0.262 0.051 172.552);
+  --sidebar-accent: oklch(0.274 0.006 286.033);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.552 0.016 285.938);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+}
+
+@layer base {
+	* {
+		@apply border-border outline-ring/50;
+  }
+	body {
+		@apply bg-background text-foreground;
+  }
 }

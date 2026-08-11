@@ -14,6 +14,7 @@
   import Panel from '$lib/components/Panel.svelte';
   import Button from '$lib/components/Button.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
+  import * as Table from '$lib/components/ui/table/index.js';
   import { api } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
   import { bytes } from '$lib/format';
@@ -60,10 +61,15 @@
   <StatusPill tone="neutral">{results.length} results</StatusPill>
 </PageHeader>
 
-<form class="sf" on:submit|preventDefault={doSearch}>
-  <div class="si-wrap">
-    <Search size={15} />
-    <input class="si" bind:this={queryInput} bind:value={query} placeholder="e.g. The Dark Knight 2008 1080p BluRay" />
+<form class="mb-5 flex items-center gap-2.5" on:submit|preventDefault={doSearch}>
+  <div class="relative flex-1">
+    <Search size={15} class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+    <input
+      bind:this={queryInput}
+      bind:value={query}
+      placeholder="e.g. The Dark Knight 2008 1080p BluRay"
+      class="!h-10 pl-9 text-sm"
+    />
   </div>
   <Button kind="primary" type="submit" disabled={loading || !query.trim()}>
     {loading ? 'Searching…' : 'Search Hydra'}
@@ -71,64 +77,43 @@
 </form>
 
 {#if searched && results.length === 0}
-  <div class="empty">No results for "{query}".</div>
+  <div class="rounded-xl border border-border bg-white/[0.02] p-8 text-center text-sm text-muted-foreground">No results for "{query}".</div>
 {:else if results.length > 0}
   <Panel title="Candidates" subtitle="Scored against default quality profile. Click NZB to download via NZBHydra.">
-    <div class="tw">
-      <table>
-        <thead><tr><th>Title</th><th>Indexer</th><th>Size</th><th>Score</th><th></th></tr></thead>
-        <tbody>
-          {#each results as item (item.externalUrl)}
-            <tr>
-              <td class="tc">
-                <div class="tl">{item.title}</div>
-                <div class="tags">
-                  {#each [item.resolution, item.source, item.codec].filter(Boolean) as t}
-                    <span class="tag">{t}</span>
-                  {/each}
-                  {#if item.audio}<span class="tag audio">{item.audio}</span>{/if}
-                  {#if item.hdr && item.hdr !== 'SDR'}<span class="tag hdr">{item.hdr}</span>{/if}
-                </div>
-              </td>
-              <td class="mono muted small">{item.indexer || '—'}</td>
-              <td class="mono muted small">{bytes(item.sizeBytes)}</td>
-              <td><StatusPill tone={scoreTone(item.score)}>{item.score}</StatusPill></td>
-              <td>
-                <a href={item.externalUrl} target="_blank" rel="noopener" class="nzb-btn">
-                  <ExternalLink size={13} /> NZB
-                </a>
-              </td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
+    <Table.Root>
+      <Table.Header>
+        <Table.Row>
+          <Table.Head class="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Title</Table.Head>
+          <Table.Head class="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Indexer</Table.Head>
+          <Table.Head class="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Size</Table.Head>
+          <Table.Head class="text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Score</Table.Head>
+          <Table.Head class="text-[11px] uppercase tracking-[0.18em] text-muted-foreground"></Table.Head>
+        </Table.Row>
+      </Table.Header>
+      <Table.Body>
+        {#each results as item (item.externalUrl)}
+          <Table.Row>
+            <Table.Cell class="max-w-[380px] whitespace-normal align-top">
+              <div class="mb-1 truncate font-medium">{item.title}</div>
+              <div class="flex flex-wrap gap-1">
+                {#each [item.resolution, item.source, item.codec].filter(Boolean) as t}
+                  <span class="rounded-md bg-white/[0.08] px-1.75 py-0.25 font-mono text-[11px] text-muted-foreground">{t}</span>
+                {/each}
+                {#if item.audio}<span class="rounded-md px-1.75 py-0.25 font-mono text-[11px]" style="background: hsl(271 75% 65% / 0.2); color: hsl(271 75% 82%)">{item.audio}</span>{/if}
+                {#if item.hdr && item.hdr !== 'SDR'}<span class="rounded-md px-1.75 py-0.25 font-mono text-[11px]" style="background: hsl(38 96% 55% / 0.2); color: hsl(38 100% 72%)">{item.hdr}</span>{/if}
+              </div>
+            </Table.Cell>
+            <Table.Cell class="font-mono text-xs text-muted-foreground">{item.indexer || '—'}</Table.Cell>
+            <Table.Cell class="font-mono text-xs text-muted-foreground">{bytes(item.sizeBytes)}</Table.Cell>
+            <Table.Cell><StatusPill tone={scoreTone(item.score)}>{item.score}</StatusPill></Table.Cell>
+            <Table.Cell>
+              <a href={item.externalUrl} target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border border-border bg-white/[0.05] px-3 py-1.25 text-xs text-foreground transition-colors hover:bg-white/[0.1]">
+                <ExternalLink size={13} /> NZB
+              </a>
+            </Table.Cell>
+          </Table.Row>
+        {/each}
+      </Table.Body>
+    </Table.Root>
   </Panel>
 {/if}
-
-<style>
-  .sf { display:flex; gap:10px; margin-bottom:20px; align-items:center; }
-  .si-wrap { flex:1; display:flex; align-items:center; gap:10px; height:46px; padding:0 14px;
-    border-radius:14px; border:1px solid hsl(0 0% 100%/.1); background:hsl(0 0% 100%/.04);
-    color:hsl(var(--muted-foreground)); }
-  .si { flex:1; background:transparent; border:none; outline:none; color:hsl(var(--foreground)); font-size:14px; }
-  .si::placeholder { color:hsl(var(--muted-foreground)); }
-  .tw { overflow-x:auto; }
-  table { width:100%; min-width:700px; border-collapse:collapse; }
-  th { padding:10px 12px; text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.12em; color:hsl(var(--muted-foreground)); border-bottom:1px solid hsl(0 0% 100%/.06); }
-  td { padding:11px 12px; border-bottom:1px solid hsl(0 0% 100%/.04); vertical-align:middle; font-size:13px; }
-  tr:last-child td { border-bottom:none; }
-  tr:hover td { background:hsl(0 0% 100%/.03); }
-  .tc { max-width:380px; }
-  .tl { font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-bottom:4px; }
-  .tags { display:flex; flex-wrap:wrap; gap:4px; }
-  .tag { padding:1px 7px; border-radius:6px; font-size:11px; font-family:'JetBrains Mono',monospace; background:hsl(0 0% 100%/.08); color:hsl(var(--muted-foreground)); }
-  .tag.audio { background:hsl(271 75% 65%/.2); color:hsl(271 75% 82%); }
-  .tag.hdr   { background:hsl(38 96% 55%/.2);  color:hsl(38 100% 72%); }
-  .mono { font-family:'JetBrains Mono',monospace; }
-  .muted { color:hsl(var(--muted-foreground)); }
-  .small { font-size:12px; }
-  .nzb-btn { display:inline-flex; align-items:center; gap:5px; padding:5px 12px; border-radius:10px; border:1px solid hsl(0 0% 100%/.1); background:hsl(0 0% 100%/.05); color:hsl(var(--foreground)); font-size:12px; text-decoration:none; white-space:nowrap; }
-  .nzb-btn:hover { background:hsl(0 0% 100%/.1); }
-  .empty { padding:32px; text-align:center; border-radius:18px; border:1px solid hsl(0 0% 100%/.06); color:hsl(var(--muted-foreground)); }
-</style>

@@ -30,9 +30,9 @@
   };
 
   const TYPE_STYLE: Record<string, string> = {
-    movie:   'entry-movie',
-    episode: 'entry-episode',
-    tv:      'entry-tv',
+    movie:   'border-cyan-400/35 bg-cyan-400/15 text-cyan-200',
+    episode: 'border-violet-400/35 bg-violet-400/15 text-violet-200',
+    tv:      'border-emerald-400/35 bg-emerald-400/15 text-emerald-200',
   };
 
   const STATE_LABEL: Record<string, string> = {
@@ -180,75 +180,86 @@
 <PageHeader title="Release Calendar" subtitle="Library movies and episodes by theatrical / air date." />
 
 <!-- Month navigation -->
-<div class="cal-header">
-  <div class="cal-nav">
-    <button class="icon-btn" on:click={prev} aria-label="Previous month"><ChevronLeft size={18} /></button>
-    <span class="cal-month-label">{label}</span>
-    <button class="icon-btn" on:click={next} aria-label="Next month"><ChevronRight size={18} /></button>
+<div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+  <div class="flex items-center gap-2.5">
+    <button class="grid size-9.5 place-items-center rounded-xl border border-border bg-white/[0.04] text-foreground transition-colors hover:bg-white/[0.1]" on:click={prev} aria-label="Previous month"><ChevronLeft size={18} /></button>
+    <span class="min-w-47.5 text-center text-[1.1rem] font-bold">{label}</span>
+    <button class="grid size-9.5 place-items-center rounded-xl border border-border bg-white/[0.04] text-foreground transition-colors hover:bg-white/[0.1]" on:click={next} aria-label="Next month"><ChevronRight size={18} /></button>
     <Button kind="secondary" on:click={today} disabled={loading}>Today</Button>
   </div>
-  <div class="cal-stats">
-    <button class="filter-pill" class:active={filters.movie} on:click={() => (filters = { ...filters, movie: !filters.movie })} type="button">
-      <span class="dot dot-movie" class:dim={!filters.movie}></span>
+  <div class="flex flex-wrap gap-2">
+    <button
+      class="inline-flex items-center gap-1.75 rounded-full border border-border px-3.5 py-1.75 text-sm font-semibold transition-colors {filters.movie ? 'bg-white/[0.08] text-foreground' : 'bg-white/[0.04] text-muted-foreground'}"
+      on:click={() => (filters = { ...filters, movie: !filters.movie })} type="button"
+    >
+      <span class="size-2.25 shrink-0 rounded-full bg-cyan-400 transition-opacity {filters.movie ? '' : 'opacity-30'}"></span>
       <span>{movieCount} Movie{movieCount !== 1 ? 's' : ''}</span>
     </button>
-    <button class="filter-pill" class:active={filters.episode} on:click={() => (filters = { ...filters, episode: !filters.episode })} type="button">
-      <span class="dot dot-episode" class:dim={!filters.episode}></span>
+    <button
+      class="inline-flex items-center gap-1.75 rounded-full border border-border px-3.5 py-1.75 text-sm font-semibold transition-colors {filters.episode ? 'bg-white/[0.08] text-foreground' : 'bg-white/[0.04] text-muted-foreground'}"
+      on:click={() => (filters = { ...filters, episode: !filters.episode })} type="button"
+    >
+      <span class="size-2.25 shrink-0 rounded-full bg-violet-400 transition-opacity {filters.episode ? '' : 'opacity-30'}"></span>
       <span>{episodeCount} Episode{episodeCount !== 1 ? 's' : ''}</span>
     </button>
   </div>
 </div>
 
 <!-- Calendar grid -->
-<div class="cal-wrap" class:loading>
-  <div class="cal-dow-row">
+<div class="overflow-hidden rounded-[22px] border border-border bg-card/60 transition-opacity {loading ? 'pointer-events-none opacity-65' : ''}">
+  <div class="grid grid-cols-7 border-b border-white/[0.06] bg-background/40">
     {#each ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'] as d}
-      <div class="cal-dow">{d}</div>
+      <div class="px-1 py-2.5 text-center text-[10px] font-bold uppercase tracking-[0.14em] text-muted-foreground">{d}</div>
     {/each}
   </div>
 
   {#if loading && entries.length === 0}
     <!-- Skeleton while first load -->
-    <div class="cal-cells">
+    <div class="grid grid-cols-7">
       {#each Array(42) as _, i}
-        <div class="cell" class:out={i < 2 || i > 30}>
-          <div class="cell-head"><span class="skel skel-day"></span></div>
+        <div class="flex min-h-27.5 flex-col gap-1 border-b border-r border-white/5 p-2 [&:nth-child(7n)]:border-r-0 {i < 2 || i > 30 ? 'bg-background/25' : ''}">
+          <div class="mb-0.5 flex items-center justify-between"><span class="animate-pulse block h-3 w-4.5 rounded-md bg-white/[0.06]"></span></div>
           {#if Math.random() > 0.72}
-            <div class="skel skel-entry"></div>
+            <div class="animate-pulse block h-6 w-full rounded-lg bg-white/[0.06]"></div>
           {/if}
         </div>
       {/each}
     </div>
   {:else}
-    <div class="cal-cells">
+    <div class="grid grid-cols-7">
       {#each grid as day (day.date)}
-        <div class="cell" class:out={!day.inMonth} class:today={day.isToday}>
-          <div class="cell-head">
-            <span class="cell-day" class:today-badge={day.isToday}>{day.day}</span>
+        <div
+          class="flex min-h-27.5 flex-col gap-1 border-b border-r border-white/5 p-2 [&:nth-child(7n)]:border-r-0 {day.inMonth ? '' : 'bg-background/25'}"
+          style={day.isToday ? 'background: color-mix(in oklch, var(--primary) 7%, transparent); box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--primary) 25%, transparent);' : undefined}
+        >
+          <div class="mb-0.5 flex items-center justify-between">
+            <span
+              class="text-xs font-bold leading-none {day.isToday ? 'rounded-full bg-primary px-1.5 py-0.5 text-[11px] text-primary-foreground' : 'text-muted-foreground'} {!day.inMonth && !day.isToday ? 'opacity-35' : ''}"
+            >{day.day}</span>
             {#if day.entries.length > 0}
-              <span class="cell-count">{day.entries.length}</span>
+              <span class="text-[10px] text-muted-foreground">{day.entries.length}</span>
             {/if}
           </div>
-          <div class="cell-entries">
+          <div class="flex min-w-0 flex-col gap-0.75">
             {#each day.entries.slice(0, 3) as entry (entry.id)}
-              <button class="entry {TYPE_STYLE[entry.type === 'tv' ? 'episode' : entry.type] ?? ''}"
-                class:entry-available={entry.available}
+              <button
+                class="flex min-w-0 items-center justify-between gap-1 rounded-lg border px-1.5 py-1 text-left transition-[filter] hover:brightness-[1.18] {TYPE_STYLE[entry.type === 'tv' ? 'episode' : entry.type] ?? ''}"
                 title={statusLabel(entry)}
                 on:click={() => (selected = entry)}>
-                <span class="entry-title">
-                  {entry.title}{#if episodeCode(entry)}<span class="entry-episode"> · {episodeCode(entry)}</span>{/if}
+                <span class="min-w-0 flex-1 truncate text-[11px] font-bold">
+                  {entry.title}{#if episodeCode(entry)}<span class="font-medium opacity-75"> · {episodeCode(entry)}</span>{/if}
                 </span>
                 {#if entry.available}
-                  <span class="entry-dot avail" aria-hidden="true"></span>
+                  <span class="size-1.5 shrink-0 rounded-full bg-emerald-400" aria-hidden="true"></span>
                 {:else if entry.queueState === 'failed'}
-                  <span class="entry-dot fail" aria-hidden="true"></span>
+                  <span class="size-1.5 shrink-0 rounded-full bg-red-400" aria-hidden="true"></span>
                 {:else if entry.queueState}
-                  <span class="entry-dot queued" aria-hidden="true"></span>
+                  <span class="size-1.5 shrink-0 rounded-full bg-amber-400" aria-hidden="true"></span>
                 {/if}
               </button>
             {/each}
             {#if day.entries.length > 3}
-              <button class="entry-more" on:click={() => (selected = day.entries[3])}>
+              <button class="rounded border-none bg-none px-1 py-0.5 text-left text-[11px] font-semibold text-muted-foreground hover:text-foreground" on:click={() => (selected = day.entries[3])}>
                 +{day.entries.length - 3} more
               </button>
             {/if}
@@ -260,42 +271,48 @@
 </div>
 
 {#if visible.length === 0 && !loading}
-  <div class="empty">No library items with release dates in {label}.</div>
+  <div class="p-12 text-center text-sm text-muted-foreground">No library items with release dates in {label}.</div>
 {/if}
 
 <!-- Detail modal -->
 {#if selected}
   {@const s = selected}
   <div
-    class="modal-backdrop"
+    class="fixed inset-0 z-50 grid place-items-center bg-black/72 p-4 backdrop-blur-[8px]"
     on:click={(e) => e.target === e.currentTarget && (selected = null)}
     on:keydown={(e) => e.key === 'Escape' && (selected = null)}
     role="button"
     tabindex="0"
     aria-label="Close details dialog"
   >
-    <div class="modal" role="dialog" aria-modal="true" tabindex="-1">
-      <div class="modal-inner">
+    <div class="w-full max-w-130 overflow-hidden rounded-[28px] border border-white/10 bg-card shadow-[0_40px_80px_hsl(0_0%_0%/0.5)]" role="dialog" aria-modal="true" tabindex="-1">
+      <div class="flex max-sm:flex-col">
         {#if s.posterUrl}
-          <img class="modal-poster" src={s.posterUrl} alt={s.title} loading="lazy" />
+          <img class="hidden w-35 shrink-0 border-r border-white/[0.08] object-cover object-top sm:block" src={s.posterUrl} alt={s.title} loading="lazy" />
         {/if}
-        <div class="modal-body">
-          <div class="modal-head">
-            <div class="modal-meta">
-              <span class="modal-badge {TYPE_STYLE[s.type === 'tv' ? 'episode' : s.type] ?? ''}">
+        <div class="flex min-w-0 flex-1 flex-col gap-4 p-5.5">
+          <div class="flex items-start justify-between gap-3">
+            <div class="min-w-0 flex-1">
+              <span class="mb-2 inline-block rounded-lg border px-2.5 py-0.75 text-[11px] font-bold {TYPE_STYLE[s.type === 'tv' ? 'episode' : s.type] ?? ''}">
                 {s.type === 'movie' ? 'Movie' : 'Episode'}
               </span>
-              <h2 class="modal-title">{s.title}</h2>
+              <h2 class="text-[1.25rem] font-bold leading-tight">{s.title}</h2>
               {#if episodeLabel(s)}
-                <p class="modal-episode">{episodeLabel(s)}</p>
+                <p class="mt-0.75 text-sm font-semibold text-muted-foreground">{episodeLabel(s)}</p>
               {/if}
-              <p class="modal-date">{longDate(s.releaseDate)}</p>
+              <p class="mt-1.25 text-sm text-muted-foreground">{longDate(s.releaseDate)}</p>
             </div>
-            <button class="icon-btn" on:click={() => (selected = null)} aria-label="Close"><X size={18} /></button>
+            <button class="grid size-9.5 shrink-0 place-items-center rounded-xl border border-border bg-white/[0.04] text-foreground transition-colors hover:bg-white/[0.1]" on:click={() => (selected = null)} aria-label="Close"><X size={18} /></button>
           </div>
 
-          <div class="modal-status-row">
-            <div class="status-chip tone-{statusTone(s)}">
+          <div class="flex flex-wrap gap-2">
+            <div
+              class="inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-sm font-semibold"
+              style={statusTone(s) === 'ok' ? 'background: hsl(142 60% 40% / 0.2); border-color: hsl(142 60% 40% / 0.3); color: hsl(142 70% 70%)'
+                : statusTone(s) === 'err' ? 'background: hsl(0 60% 45% / 0.2); border-color: hsl(0 60% 45% / 0.3); color: hsl(0 80% 75%)'
+                : statusTone(s) === 'pending' ? 'background: hsl(43 80% 50% / 0.15); border-color: hsl(43 80% 50% / 0.3); color: hsl(43 90% 75%)'
+                : 'background: hsl(0 0% 100% / 0.05); border-color: hsl(0 0% 100% / 0.08); color: var(--muted-foreground)'}
+            >
               {#if s.available}
                 <CheckCircle2 size={13} />
               {:else if s.queueState}
@@ -305,9 +322,9 @@
             </div>
           </div>
 
-          <div class="modal-actions">
+          <div class="mt-auto flex justify-end gap-2.5">
             <Button kind="secondary" on:click={() => (selected = null)}>Close</Button>
-            <a class="btn-primary" href="/library/{s.libraryItemId}">
+            <a class="inline-flex h-10 items-center gap-1.75 rounded-2xl bg-primary px-4 text-sm font-bold text-primary-foreground transition-opacity hover:opacity-88" href="/library/{s.libraryItemId}">
               <ExternalLink size={14} /> Open Details
             </a>
           </div>
@@ -316,179 +333,3 @@
     </div>
   </div>
 {/if}
-
-<style>
-  .cal-header {
-    display: flex; align-items: center; justify-content: space-between;
-    gap: 12px; margin-bottom: 16px; flex-wrap: wrap;
-  }
-  .cal-nav { display: flex; align-items: center; gap: 10px; }
-  .cal-month-label {
-    font-size: 1.1rem; font-weight: 700; min-width: 190px; text-align: center;
-  }
-  .icon-btn {
-    display: grid; place-items: center; width: 38px; height: 38px;
-    border-radius: 12px; border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04); color: hsl(var(--foreground));
-    cursor: pointer; transition: background .12s;
-  }
-  .icon-btn:hover { background: hsl(0 0% 100% / 0.1); }
-
-  /* Filter pills / stats */
-  .cal-stats { display: flex; gap: 8px; flex-wrap: wrap; }
-  .filter-pill {
-    display: inline-flex; align-items: center; gap: 7px;
-    padding: 7px 14px; border-radius: 22px;
-    border: 1px solid hsl(0 0% 100% / 0.1); background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--muted-foreground)); font-size: 13px; font-weight: 600;
-    cursor: pointer; transition: all .12s;
-  }
-  .filter-pill.active { color: hsl(var(--foreground)); background: hsl(0 0% 100% / 0.08); }
-  .dot {
-    width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0;
-    transition: opacity .12s;
-  }
-  .dot.dim { opacity: 0.3; }
-  .dot-movie   { background: hsl(186 95% 60%); }
-  .dot-episode { background: hsl(270 90% 70%); }
-
-  /* Grid */
-  .cal-wrap {
-    border-radius: 22px; border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(var(--card) / 0.6); overflow: hidden;
-    transition: opacity .2s;
-  }
-  .cal-wrap.loading { opacity: .65; pointer-events: none; }
-
-  .cal-dow-row {
-    display: grid; grid-template-columns: repeat(7, minmax(0, 1fr));
-    border-bottom: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(var(--background) / 0.4);
-  }
-  .cal-dow {
-    padding: 10px 4px; text-align: center;
-    font-size: 10px; font-weight: 700; text-transform: uppercase;
-    letter-spacing: .14em; color: hsl(var(--muted-foreground));
-  }
-
-  .cal-cells { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
-
-  .cell {
-    min-height: 110px; padding: 8px 6px;
-    border-right: 1px solid hsl(0 0% 100% / 0.05);
-    border-bottom: 1px solid hsl(0 0% 100% / 0.05);
-    display: flex; flex-direction: column; gap: 4px;
-  }
-  .cell:nth-child(7n) { border-right: none; }
-  .cell.out { background: hsl(var(--background) / 0.25); }
-  .cell.today {
-    background: hsl(var(--primary) / 0.07);
-    box-shadow: inset 0 0 0 1px hsl(var(--primary) / 0.25);
-  }
-
-  .cell-head {
-    display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px;
-  }
-  .cell-day {
-    font-size: 12px; font-weight: 700; color: hsl(var(--muted-foreground)); line-height: 1;
-  }
-  .cell.out .cell-day { opacity: 0.35; }
-  .today-badge {
-    background: hsl(var(--primary)); color: hsl(var(--primary-foreground));
-    padding: 1px 6px; border-radius: 99px; font-size: 11px;
-  }
-  .cell-count { font-size: 10px; color: hsl(var(--muted-foreground)); }
-  .cell-entries { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-
-  .entry {
-    display: flex; align-items: center; justify-content: space-between;
-    width: 100%; padding: 4px 6px; border-radius: 8px;
-    border: 1px solid transparent; text-align: left; cursor: pointer;
-    transition: filter .1s; min-width: 0; gap: 4px;
-  }
-  .entry:hover { filter: brightness(1.18); }
-  .entry-title {
-    font-size: 11px; font-weight: 700;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0;
-  }
-  .entry-episode { font-weight: 500; opacity: .75; }
-  .entry-dot {
-    width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
-  }
-  .entry-dot.avail  { background: hsl(142 70% 55%); }
-  .entry-dot.fail   { background: hsl(0 80% 60%); }
-  .entry-dot.queued { background: hsl(43 90% 60%); }
-
-  .entry-movie   { border-color: hsl(186 80% 50% / 0.35); background: hsl(186 80% 50% / 0.15); color: hsl(186 95% 85%); }
-  .entry-episode { border-color: hsl(270 75% 65% / 0.35); background: hsl(270 75% 65% / 0.15); color: hsl(270 90% 85%); }
-  .entry-tv      { border-color: hsl(142 70% 45% / 0.35); background: hsl(142 70% 45% / 0.15); color: hsl(142 80% 75%); }
-
-  .entry-more {
-    font-size: 11px; font-weight: 600; color: hsl(var(--muted-foreground));
-    padding: 2px 4px; text-align: left; cursor: pointer; background: none; border: none;
-  }
-  .entry-more:hover { color: hsl(var(--foreground)); }
-
-  /* Skeleton */
-  .skel { border-radius: 6px; background: hsl(0 0% 100% / 0.06); animation: pulse 1.6s ease-in-out infinite; }
-  .skel-day { display: block; width: 18px; height: 12px; }
-  .skel-entry { display: block; width: 100%; height: 24px; border-radius: 8px; }
-  @keyframes pulse { 0%,100% { opacity: .6; } 50% { opacity: 1; } }
-
-  /* Modal */
-  .modal-backdrop {
-    position: fixed; inset: 0; z-index: 50;
-    background: hsl(0 0% 0% / 0.72); backdrop-filter: blur(8px);
-    display: grid; place-items: center; padding: 16px;
-  }
-  .modal {
-    width: 100%; max-width: 520px; border-radius: 28px;
-    border: 1px solid hsl(0 0% 100% / 0.1); background: hsl(var(--card));
-    box-shadow: 0 40px 80px hsl(0 0% 0% / 0.5); overflow: hidden;
-  }
-  .modal-inner { display: flex; gap: 0; }
-  .modal-poster {
-    width: 140px; flex-shrink: 0; object-fit: cover; object-position: center top;
-    border-right: 1px solid hsl(0 0% 100% / 0.08);
-  }
-  .modal-body { flex: 1; min-width: 0; padding: 22px; display: flex; flex-direction: column; gap: 16px; }
-  .modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-  .modal-meta { flex: 1; min-width: 0; }
-  .modal-badge {
-    display: inline-block; padding: 3px 10px; border-radius: 8px;
-    font-size: 11px; font-weight: 700; margin-bottom: 8px;
-  }
-  .modal-title { font-size: 1.25rem; font-weight: 700; line-height: 1.25; }
-  .modal-episode { font-size: 13px; font-weight: 600; color: hsl(var(--muted-foreground)); margin-top: 3px; }
-  .modal-date { font-size: 13px; color: hsl(var(--muted-foreground)); margin-top: 5px; }
-
-  .modal-status-row { display: flex; gap: 8px; flex-wrap: wrap; }
-  .status-chip {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 6px 12px; border-radius: 12px; font-size: 13px; font-weight: 600;
-    border: 1px solid transparent;
-  }
-  .tone-ok     { background: hsl(142 60% 40% / 0.2); border-color: hsl(142 60% 40% / 0.3); color: hsl(142 70% 70%); }
-  .tone-err    { background: hsl(0 60% 45% / 0.2); border-color: hsl(0 60% 45% / 0.3); color: hsl(0 80% 75%); }
-  .tone-pending{ background: hsl(43 80% 50% / 0.15); border-color: hsl(43 80% 50% / 0.3); color: hsl(43 90% 75%); }
-  .tone-none   { background: hsl(0 0% 100% / 0.05); border-color: hsl(0 0% 100% / 0.08); color: hsl(var(--muted-foreground)); }
-
-  .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: auto; }
-  .btn-primary {
-    display: inline-flex; align-items: center; gap: 7px;
-    padding: 0 16px; height: 40px; border-radius: 14px;
-    background: hsl(var(--primary)); color: hsl(var(--primary-foreground));
-    font-size: 13px; font-weight: 700; text-decoration: none; transition: opacity .12s;
-  }
-  .btn-primary:hover { opacity: .88; }
-
-  .empty {
-    text-align: center; padding: 48px; color: hsl(var(--muted-foreground)); font-size: 14px;
-  }
-
-  @media (max-width: 640px) {
-    .modal-poster { display: none; }
-    .cal-month-label { min-width: 150px; font-size: 1rem; }
-    .cell { min-height: 80px; }
-  }
-</style>

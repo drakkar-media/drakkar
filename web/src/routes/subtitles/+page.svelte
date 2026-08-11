@@ -18,6 +18,7 @@
   import Panel from '$lib/components/Panel.svelte';
   import Button from '$lib/components/Button.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
+  import * as Select from '$lib/components/ui/select/index.js';
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
   import { runAction, confirmed } from '$lib/actions';
@@ -45,6 +46,7 @@
   let missingOnly = false;
   let selected = new Set<number>();
 
+  $: mediaTypeLabel = mediaType === 'movie' ? 'Movies' : mediaType === 'episode' ? 'TV episodes' : 'All media';
   $: selectedCount = selected.size;
   $: allVisibleSelected = items.length > 0 && items.every((item) => selected.has(item.libraryItemId));
 
@@ -145,20 +147,23 @@
   </Button>
 </PageHeader>
 
-<div class="filter-row">
+<div class="mb-4 flex flex-wrap items-center gap-2.5">
   <input
-    class="filter-input"
+    class="min-w-50 flex-1"
     type="search"
     placeholder="Search title…"
     bind:value={search}
     on:keydown={(e) => e.key === 'Enter' && applyFilters()}
   />
-  <select class="filter-select" bind:value={mediaType} on:change={applyFilters}>
-    <option value="all">All media</option>
-    <option value="movie">Movies</option>
-    <option value="episode">TV episodes</option>
-  </select>
-  <label class="filter-checkbox">
+  <Select.Root type="single" bind:value={mediaType} onValueChange={applyFilters}>
+    <Select.Trigger class="w-40">{mediaTypeLabel}</Select.Trigger>
+    <Select.Content>
+      <Select.Item value="all">All media</Select.Item>
+      <Select.Item value="movie">Movies</Select.Item>
+      <Select.Item value="episode">TV episodes</Select.Item>
+    </Select.Content>
+  </Select.Root>
+  <label class="flex items-center gap-2 text-sm text-muted-foreground">
     <input type="checkbox" bind:checked={missingOnly} on:change={applyFilters} />
     Missing subtitles only
   </label>
@@ -171,10 +176,10 @@
   </div>
 
   {#if items.length === 0 && !loading}
-    <div class="empty-state">No items match these filters.</div>
+    <div class="text-sm text-muted-foreground">No items match these filters.</div>
   {:else}
-    <div class="toolbar">
-      <label class="select-all">
+    <div class="mb-3.5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border bg-white/[0.03] px-3.5 py-3">
+      <label class="flex items-center gap-2.5 text-sm text-muted-foreground">
         <input
           type="checkbox"
           checked={allVisibleSelected}
@@ -183,7 +188,7 @@
         />
         <span>Select visible ({items.length})</span>
       </label>
-      <div class="toolbar-actions">
+      <div class="flex items-center gap-2.5">
         <StatusPill tone="neutral">{selectedCount} selected</StatusPill>
         <Button kind="secondary" on:click={() => bulkAction('search')} disabled={isBusy('bulk-search') || selectedCount === 0}>
           <SearchCheck size={14} />
@@ -196,10 +201,10 @@
       </div>
     </div>
 
-    <div class="row-list">
+    <div class="grid gap-2.5">
       {#each items as item (item.libraryItemId)}
-        <div class="row-card">
-          <label class="row-checkbox">
+        <div class="flex flex-wrap items-center gap-3.5 rounded-xl border border-border bg-card/80 px-4 py-3.5 max-sm:flex-col max-sm:items-start">
+          <label class="shrink-0">
             <input
               type="checkbox"
               checked={selected.has(item.libraryItemId)}
@@ -207,9 +212,9 @@
               on:change={(e) => toggleSelected(item.libraryItemId, (e.currentTarget as HTMLInputElement).checked)}
             />
           </label>
-          <div class="row-main">
-            <div class="row-title">{rowLabel(item)}</div>
-            <div class="row-sub">
+          <div class="min-w-0 flex-1">
+            <div class="font-semibold">{rowLabel(item)}</div>
+            <div class="mt-1 text-sm text-muted-foreground">
               {#if item.languages.length > 0}
                 {item.languages.join(', ')}
               {:else}
@@ -220,8 +225,8 @@
               {/if}
             </div>
           </div>
-          <div class="row-actions">
-            <a href={`/details/${item.mediaType === 'movie' ? 'movie' : 'tv'}/${item.libraryItemId}`} class="library-link">
+          <div class="flex shrink-0 items-center gap-2">
+            <a href={`/details/${item.mediaType === 'movie' ? 'movie' : 'tv'}/${item.libraryItemId}`} class="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-border bg-muted/40 px-3 text-sm">
               <Link size={14} />
               Open
             </a>
@@ -238,184 +243,12 @@
       {/each}
     </div>
 
-    <div class="pager">
-      <div class="pager-copy">Page {page} of {totalPages}</div>
-      <div class="pager-actions">
-        <button type="button" on:click={() => { page = Math.max(1, page - 1); void load(); }} disabled={page === 1 || loading}>Prev</button>
-        <button type="button" on:click={() => { page = Math.min(totalPages, page + 1); void load(); }} disabled={page === totalPages || loading}>Next</button>
+    <div class="mt-3.5 flex items-center justify-between gap-3 text-sm text-muted-foreground max-sm:flex-col max-sm:items-start">
+      <div>Page {page} of {totalPages}</div>
+      <div class="inline-flex items-center gap-2">
+        <Button kind="secondary" on:click={() => { page = Math.max(1, page - 1); void load(); }} disabled={page === 1 || loading}>Prev</Button>
+        <Button kind="secondary" on:click={() => { page = Math.min(totalPages, page + 1); void load(); }} disabled={page === totalPages || loading}>Next</Button>
       </div>
     </div>
   {/if}
 </Panel>
-
-<style>
-  .filter-row {
-    display: flex;
-    gap: 10px;
-    align-items: center;
-    margin-bottom: 16px;
-    flex-wrap: wrap;
-  }
-
-  .filter-input,
-  .filter-select {
-    height: 40px;
-    padding: 0 14px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 14px;
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--foreground));
-    font-size: 13px;
-  }
-
-  .filter-input {
-    flex: 1;
-    min-width: 200px;
-  }
-
-  .filter-checkbox {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .filter-checkbox input {
-    width: 16px;
-    height: 16px;
-  }
-
-  .empty-state {
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .toolbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 12px 14px;
-    margin-bottom: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 16px;
-    background: hsl(0 0% 100% / 0.03);
-  }
-
-  .select-all,
-  .toolbar-actions {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-
-  .select-all {
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .select-all input {
-    width: 16px;
-    height: 16px;
-  }
-
-  .row-list {
-    display: grid;
-    gap: 10px;
-  }
-
-  .row-card {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    padding: 14px 16px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 20px;
-    background: hsl(var(--card) / 0.82);
-  }
-
-  .row-checkbox {
-    flex: 0 0 auto;
-  }
-
-  .row-checkbox input {
-    width: 16px;
-    height: 16px;
-  }
-
-  .row-main {
-    flex: 1;
-    min-width: 0;
-  }
-
-  .row-title {
-    font-weight: 600;
-  }
-
-  .row-sub {
-    margin-top: 4px;
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .row-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    flex: 0 0 auto;
-  }
-
-  .library-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    min-height: 36px;
-    padding: 0 12px;
-    border-radius: 12px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--foreground));
-    font-size: 13px;
-  }
-
-  .pager {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    margin-top: 14px;
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .pager-actions {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .pager-actions button {
-    min-height: 32px;
-    padding: 0 10px;
-    border-radius: 10px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.03);
-    color: hsl(var(--foreground));
-    cursor: pointer;
-  }
-
-  .pager-actions button:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
-
-  @media (max-width: 700px) {
-    .toolbar,
-    .row-card,
-    .pager {
-      flex-direction: column;
-      align-items: flex-start;
-    }
-  }
-</style>

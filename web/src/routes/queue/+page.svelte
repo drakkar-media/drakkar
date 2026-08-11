@@ -13,4 +13,4 @@
 
 <svelte:head><title>Redirecting — Drakkar</title></svelte:head>
 
-<div style="padding:24px;color:hsl(var(--muted-foreground));">Redirecting to downloads…</div>
+<div style="padding:24px;color:var(--muted-foreground);">Redirecting to downloads…</div>

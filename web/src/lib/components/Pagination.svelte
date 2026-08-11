@@ -36,11 +36,11 @@
 <style>
   .pagination { display: flex; align-items: center; gap: 6px; }
   .pg-btn {
-    padding: 3px 10px; border-radius: 8px; font-size: 13px; cursor: pointer;
-    background: hsl(0 0% 100% / 0.06); border: 1px solid hsl(0 0% 100% / 0.1);
-    color: hsl(var(--foreground)); transition: background 0.15s;
+    padding: 3px 10px; border-radius: var(--radius-md, 8px); font-size: 13px; cursor: pointer;
+    background: var(--background); border: 1px solid var(--border);
+    color: var(--foreground); transition: background 0.15s;
   }
-  .pg-btn:hover:not(:disabled) { background: hsl(0 0% 100% / 0.12); }
+  .pg-btn:hover:not(:disabled) { background: var(--muted); }
   .pg-btn:disabled { opacity: 0.35; cursor: default; }
-  .pg-info { font-size: 13px; color: hsl(var(--muted-foreground)); padding: 0 4px; }
+  .pg-info { font-size: 13px; color: var(--muted-foreground); padding: 0 4px; }
 </style>

@@ -58,7 +58,7 @@
 
   .message {
     min-width: 0;
-    color: hsl(var(--foreground));
+    color: var(--foreground);
     font-size: 14px;
     line-height: 1.4;
   }
@@ -71,12 +71,12 @@
     border: 0;
     border-radius: 999px;
     background: transparent;
-    color: hsl(var(--muted-foreground));
+    color: var(--muted-foreground);
     cursor: pointer;
   }
 
   .close:hover {
     background: hsl(0 0% 100% / 0.08);
-    color: hsl(var(--foreground));
+    color: var(--foreground);
   }
 </style>

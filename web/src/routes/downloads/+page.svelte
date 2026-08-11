@@ -373,13 +373,16 @@
       Clear Failed
     </Button>
   {/if}
-  <label class="upload-btn" class:disabled={uploading} title="Upload NZB file">
+  <label
+    class="inline-flex min-h-9 cursor-pointer items-center gap-1.5 rounded-md border border-border bg-transparent px-3 text-sm font-medium text-foreground transition-colors hover:bg-muted {uploading ? 'cursor-default opacity-55' : ''}"
+    title="Upload NZB file"
+  >
     <Upload size={14} />
     {uploading ? 'Uploading…' : 'Upload NZB'}
     <input
       type="file"
       accept=".nzb,application/x-nzb,application/xml,text/xml"
-      class="upload-input"
+      class="hidden"
       disabled={uploading}
       on:change={async (e) => {
         const input = e.currentTarget as HTMLInputElement;
@@ -396,22 +399,22 @@
   </label>
 </PageHeader>
 
-<section class="summary-grid">
-  <div class="summary-card">
-    <div class="summary-value">{queueItems.length}</div>
-    <div class="summary-label">Active queue jobs</div>
+<section class="mb-5 grid grid-cols-2 gap-3.5 sm:grid-cols-3">
+  <div class="rounded-xl border border-border bg-card/80 px-4 py-3.5">
+    <div class="text-2xl font-bold leading-none">{queueItems.length}</div>
+    <div class="mt-2 text-sm text-muted-foreground">Active queue jobs</div>
   </div>
-  <div class="summary-card">
-    <div class="summary-value">{historyItems.length}</div>
-    <div class="summary-label">History rows</div>
+  <div class="rounded-xl border border-border bg-card/80 px-4 py-3.5">
+    <div class="text-2xl font-bold leading-none">{historyItems.length}</div>
+    <div class="mt-2 text-sm text-muted-foreground">History rows</div>
   </div>
-  <div class="summary-card">
-    <div class="summary-value">{failedItems.length}</div>
-    <div class="summary-label">Failed items</div>
+  <div class="rounded-xl border border-border bg-card/80 px-4 py-3.5">
+    <div class="text-2xl font-bold leading-none">{failedItems.length}</div>
+    <div class="mt-2 text-sm text-muted-foreground">Failed items</div>
   </div>
 </section>
 
-<form class="url-row" on:submit|preventDefault={async () => {
+<form class="mb-4 flex items-center gap-2.5" on:submit|preventDefault={async () => {
   const url = nzbUrl.trim();
   if (!url) return;
   await runAction(() => api.addNzbUrl(url), {
@@ -423,21 +426,30 @@
     }
   });
 }}>
-  <div class="url-input-wrap">
+  <div class="flex h-10 flex-1 items-center gap-2.5 rounded-xl border border-border bg-muted/40 px-3.5 text-muted-foreground">
     <Link size={14} />
-    <input bind:value={nzbUrl} type="url" placeholder="Paste NZB URL to import…" class="url-input" disabled={addingUrl} />
+    <input bind:value={nzbUrl} type="url" placeholder="Paste NZB URL to import…" class="!h-auto flex-1 !border-0 !bg-transparent p-0 text-sm text-foreground" disabled={addingUrl} />
   </div>
   <Button kind="secondary" disabled={!nzbUrl.trim() || addingUrl}>
     {addingUrl ? 'Adding…' : 'Add NZB URL'}
   </Button>
 </form>
 
-<div class="tab-row">
-  <button class:active={tab === 'queue'} on:click={() => (tab = 'queue')}>queue</button>
-  <button class:active={tab === 'backedoff'} on:click={() => (tab = 'backedoff')}>
+<div class="mb-3 mt-5 flex gap-1.5">
+  <button
+    class="min-h-9 rounded-md border border-border px-3.5 text-sm font-bold lowercase transition-colors {tab === 'queue' ? 'bg-primary border-primary text-primary-foreground' : 'bg-transparent text-muted-foreground hover:bg-muted'}"
+    on:click={() => (tab = 'queue')}
+  >queue</button>
+  <button
+    class="min-h-9 rounded-md border border-border px-3.5 text-sm font-bold lowercase transition-colors {tab === 'backedoff' ? 'bg-primary border-primary text-primary-foreground' : 'bg-transparent text-muted-foreground hover:bg-muted'}"
+    on:click={() => (tab = 'backedoff')}
+  >
     backed off{#if backedOffItems.length} ({backedOffItems.length}){/if}
   </button>
-  <button class:active={tab === 'history'} on:click={() => (tab = 'history')}>history</button>
+  <button
+    class="min-h-9 rounded-md border border-border px-3.5 text-sm font-bold lowercase transition-colors {tab === 'history' ? 'bg-primary border-primary text-primary-foreground' : 'bg-transparent text-muted-foreground hover:bg-muted'}"
+    on:click={() => (tab = 'history')}
+  >history</button>
 </div>
 
 <Panel
@@ -459,28 +471,28 @@
 
   {#if tab === 'queue'}
     {#if queueItems.length === 0 && !loading}
-      <div class="empty-state">Queue empty. Nothing currently processing.</div>
+      <div class="mt-2 text-sm text-muted-foreground">Queue empty. Nothing currently processing.</div>
     {:else}
-      <div class="pager">
-        <div class="pager-copy">Showing {queueRangeStart}-{queueRangeEnd} of {queueItems.length}</div>
-        <div class="pager-actions">
-                  <button type="button" on:click={() => (queuePage = Math.max(1, queuePage - 1))} disabled={queuePage === 1}>Prev</button>
-                  <span>{queuePage}/{queueTotalPages}</span>
-                  <button type="button" on:click={() => (queuePage = Math.min(queueTotalPages, queuePage + 1))} disabled={queuePage === queueTotalPages}>Next</button>
+      <div class="mb-3.5 flex items-center justify-between gap-3 text-sm text-muted-foreground max-sm:flex-col max-sm:items-start">
+        <div>Showing {queueRangeStart}-{queueRangeEnd} of {queueItems.length}</div>
+        <div class="inline-flex items-center gap-2">
+          <button type="button" class="min-h-8 rounded-[8px] border border-border bg-transparent px-2.5 text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 disabled:opacity-45" on:click={() => (queuePage = Math.max(1, queuePage - 1))} disabled={queuePage === 1}>Prev</button>
+          <span>{queuePage}/{queueTotalPages}</span>
+          <button type="button" class="min-h-8 rounded-[8px] border border-border bg-transparent px-2.5 text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 disabled:opacity-45" on:click={() => (queuePage = Math.min(queueTotalPages, queuePage + 1))} disabled={queuePage === queueTotalPages}>Next</button>
         </div>
       </div>
-      <div class="row-list">
+      <div class="grid gap-2.5">
         {#each pagedQueueItems as item (item.queueItemId)}
           {@const pct = stageProgress(item.state)}
-          <div class="row-card">
-            <div class="row-head">
-              <div class="row-text">
-                <div class="row-title">{item.libraryTitle}</div>
-                <div class="row-sub">
+          <div class="rounded-xl border border-border bg-card/80 px-4.5 py-4">
+            <div class="flex items-center justify-between gap-3 max-sm:flex-col max-sm:items-start">
+              <div class="min-w-0 overflow-hidden">
+                <div class="truncate font-semibold">{item.libraryTitle}</div>
+                <div class="mt-2 truncate text-sm text-muted-foreground">
                   {item.nzbFileName ? `${item.nzbFileName} · ` : ''}{item.nzbSegmentCount} segments
                 </div>
               </div>
-              <div class="row-actions">
+              <div class="flex shrink-0 items-center gap-2">
                 {#if item.onHold}
                   <Button kind="secondary" on:click={() => resumeItem(item.queueItemId)} disabled={isBusy(`pause-${item.queueItemId}`)}>
                     <Play size={14} />
@@ -502,10 +514,10 @@
                 </Button>
               </div>
             </div>
-            <div class="progress-track"><div class="progress-fill" style={`width:${item.onHold ? 0 : pct}%`}></div></div>
-            <div class="row-foot">
+            <div class="my-3.5 h-2 overflow-hidden rounded-full bg-muted"><div class="h-full rounded-full bg-primary transition-[width] duration-400" style={`width:${item.onHold ? 0 : pct}%`}></div></div>
+            <div class="flex items-center justify-between text-sm text-muted-foreground">
               <span>{item.onHold ? 'Paused' : stageLabel(item)}</span>
-              <span class="mono">{item.onHold ? '' : `${pct}%`}</span>
+              <span class="font-mono">{item.onHold ? '' : `${pct}%`}</span>
             </div>
           </div>
         {/each}
@@ -513,29 +525,29 @@
     {/if}
   {:else if tab === 'backedoff'}
     {#if backedOffItems.length === 0 && !loading}
-      <div class="empty-state">Nothing backed off right now.</div>
+      <div class="mt-2 text-sm text-muted-foreground">Nothing backed off right now.</div>
     {:else}
-      <div class="pager">
-        <div class="pager-copy">Showing {backedOffRangeStart}-{backedOffRangeEnd} of {backedOffItems.length}</div>
-        <div class="pager-actions">
-                  <button type="button" on:click={() => (backedOffPage = Math.max(1, backedOffPage - 1))} disabled={backedOffPage === 1}>Prev</button>
-                  <span>{backedOffPage}/{backedOffTotalPages}</span>
-                  <button type="button" on:click={() => (backedOffPage = Math.min(backedOffTotalPages, backedOffPage + 1))} disabled={backedOffPage === backedOffTotalPages}>Next</button>
+      <div class="mb-3.5 flex items-center justify-between gap-3 text-sm text-muted-foreground max-sm:flex-col max-sm:items-start">
+        <div>Showing {backedOffRangeStart}-{backedOffRangeEnd} of {backedOffItems.length}</div>
+        <div class="inline-flex items-center gap-2">
+          <button type="button" class="min-h-8 rounded-[8px] border border-border bg-transparent px-2.5 text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 disabled:opacity-45" on:click={() => (backedOffPage = Math.max(1, backedOffPage - 1))} disabled={backedOffPage === 1}>Prev</button>
+          <span>{backedOffPage}/{backedOffTotalPages}</span>
+          <button type="button" class="min-h-8 rounded-[8px] border border-border bg-transparent px-2.5 text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 disabled:opacity-45" on:click={() => (backedOffPage = Math.min(backedOffTotalPages, backedOffPage + 1))} disabled={backedOffPage === backedOffTotalPages}>Next</button>
         </div>
       </div>
-      <div class="row-list">
+      <div class="grid gap-2.5">
         {#each pagedBackedOffItems as item (item.queueItemId)}
-          <div class="row-card backed-off-card">
-            <div class="row-head">
-              <div class="row-text">
-                <div class="row-title">
-                  {item.libraryTitle}{#if episodeBadge(item)}<span class="ep-badge">{episodeBadge(item)}</span>{/if}
+          <div class="rounded-xl border px-4.5 py-4" style="border-color: hsl(var(--status-warning) / 0.28); background: hsl(var(--status-warning) / 0.05);">
+            <div class="flex items-center justify-between gap-3 max-sm:flex-col max-sm:items-start">
+              <div class="min-w-0 overflow-hidden">
+                <div class="truncate font-semibold">
+                  {item.libraryTitle}{#if episodeBadge(item)}<span class="ml-2 rounded-[4px] bg-muted-foreground/15 px-1.5 py-0.5 align-middle text-[0.7rem] font-semibold tracking-wide text-muted-foreground">{episodeBadge(item)}</span>{/if}
                 </div>
-                <div class="row-sub">
+                <div class="mt-2 truncate text-sm text-muted-foreground">
                   {item.dispatchAttemptCount ?? 0} candidate{(item.dispatchAttemptCount ?? 0) === 1 ? '' : 's'} tried · {formatBackoffRemaining(item)}
                 </div>
               </div>
-              <div class="row-actions">
+              <div class="flex shrink-0 items-center gap-2">
                 <Button kind="secondary" on:click={() => retryItem(item.queueItemId)} disabled={isBusy(`retry-${item.queueItemId}`)}>
                   <RotateCcw size={14} />
                   Retry now
@@ -552,11 +564,11 @@
     {/if}
   {:else}
     {#if historyItems.length === 0 && !loading}
-      <div class="empty-state">No history yet.</div>
+      <div class="mt-2 text-sm text-muted-foreground">No history yet.</div>
     {:else}
       {#if failedItems.length > 0}
-        <div class="history-toolbar">
-          <label class="history-select-all">
+        <div class="mb-3.5 flex items-center justify-between gap-3 rounded-2xl border border-border bg-muted/30 px-3.5 py-3 max-sm:flex-col max-sm:items-start">
+          <label class="flex items-center gap-2.5 text-sm text-muted-foreground">
             <input
               type="checkbox"
               checked={visibleFailedHistoryIds.length > 0 && visibleFailedSelectedCount === visibleFailedHistoryIds.length}
@@ -565,7 +577,7 @@
             />
             <span>Select visible failed ({visibleFailedHistoryIds.length})</span>
           </label>
-          <div class="history-toolbar-actions">
+          <div class="flex items-center gap-2.5">
             <StatusPill tone="neutral">{selectedFailedCount} selected</StatusPill>
             <Button kind="secondary" on:click={() => manageSelectedFailed('remove_and_blocklist')} disabled={isBusy('manage-selected-remove_and_blocklist') || selectedFailedCount === 0}>
               <Trash2 size={14} />
@@ -581,21 +593,21 @@
           </div>
         </div>
       {/if}
-      <div class="pager">
-        <div class="pager-copy">Showing {historyRangeStart}-{historyRangeEnd} of {historyItems.length}</div>
-        <div class="pager-actions">
-                  <button type="button" on:click={() => (historyPage = Math.max(1, historyPage - 1))} disabled={historyPage === 1}>Prev</button>
-                  <span>{historyPage}/{historyTotalPages}</span>
-                  <button type="button" on:click={() => (historyPage = Math.min(historyTotalPages, historyPage + 1))} disabled={historyPage === historyTotalPages}>Next</button>
+      <div class="mb-3.5 flex items-center justify-between gap-3 text-sm text-muted-foreground max-sm:flex-col max-sm:items-start">
+        <div>Showing {historyRangeStart}-{historyRangeEnd} of {historyItems.length}</div>
+        <div class="inline-flex items-center gap-2">
+          <button type="button" class="min-h-8 rounded-[8px] border border-border bg-transparent px-2.5 text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 disabled:opacity-45" on:click={() => (historyPage = Math.max(1, historyPage - 1))} disabled={historyPage === 1}>Prev</button>
+          <span>{historyPage}/{historyTotalPages}</span>
+          <button type="button" class="min-h-8 rounded-[8px] border border-border bg-transparent px-2.5 text-foreground outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 disabled:opacity-45" on:click={() => (historyPage = Math.min(historyTotalPages, historyPage + 1))} disabled={historyPage === historyTotalPages}>Next</button>
         </div>
       </div>
-      <div class="row-list">
+      <div class="grid gap-2.5">
         {#each pagedHistoryItems as item (item.queueItemId)}
-          <div class={`row-card ${item.state === 'failed' ? 'failed' : ''}`}>
-            <div class="row-head">
-              <div class="history-main">
+          <div class="rounded-xl border px-4.5 py-4 {item.state === 'failed' ? '' : 'border-border bg-card/80'}" style={item.state === 'failed' ? 'border-color: hsl(var(--danger) / 0.28); background: hsl(var(--danger) / 0.05);' : undefined}>
+            <div class="flex items-center justify-between gap-3 max-sm:flex-col max-sm:items-start">
+              <div class="flex min-w-0 flex-1 items-center gap-2.5">
                 {#if item.state === 'failed'}
-                  <label class="history-checkbox">
+                  <label class="flex shrink-0 items-center">
                     <input
                       type="checkbox"
                       checked={selectedHistoryIds.has(item.queueItemId)}
@@ -604,18 +616,18 @@
                     />
                   </label>
                 {/if}
-                <div class="row-text">
-                  <div class="row-title">
-                    {item.libraryTitle}{#if episodeBadge(item)}<span class="ep-badge">{episodeBadge(item)}</span>{/if}
+                <div class="min-w-0 overflow-hidden">
+                  <div class="truncate font-semibold">
+                    {item.libraryTitle}{#if episodeBadge(item)}<span class="ml-2 rounded-[4px] bg-muted-foreground/15 px-1.5 py-0.5 align-middle text-[0.7rem] font-semibold tracking-wide text-muted-foreground">{episodeBadge(item)}</span>{/if}
                   </div>
-                  <div class="row-sub">
+                  <div class="mt-2 truncate text-sm text-muted-foreground">
                     {item.nzbFileName ? `${item.nzbFileName} · ` : ''}{item.nzbSegmentCount} segments
                   </div>
                 </div>
               </div>
-              <div class="history-actions">
+              <div class="flex shrink-0 items-center justify-between gap-2">
                 {#if item.state === 'available' && item.libraryItemId}
-                  <a href={`/library/${item.libraryItemId}`} class="library-link">
+                  <a href={`/library/${item.libraryItemId}`} class="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-border bg-muted/40 px-3 text-sm">
                     <LinkIcon size={14} />
                     Open
                   </a>
@@ -636,7 +648,7 @@
                 {/if}
               </div>
             </div>
-            <div class="row-foot">
+            <div class="mt-3.5 text-sm text-muted-foreground">
               <StatusPill tone={item.state === 'available' ? 'ok' : 'danger'}>
                 {item.state === 'available' ? 'Available' : humanize(item.failureReason || 'failed')}
               </StatusPill>
@@ -648,303 +660,3 @@
   {/if}
 </Panel>
 
-<style>
-  .summary-grid {
-    display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
-    gap: 14px;
-    margin-bottom: 20px;
-  }
-
-  .summary-card,
-  .row-card {
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 20px;
-    background: hsl(var(--card) / 0.82);
-  }
-
-  .summary-card {
-    padding: 18px 20px;
-  }
-
-  .summary-value {
-    font-size: 2rem;
-    font-weight: 700;
-    line-height: 1;
-  }
-
-  .summary-label,
-  .row-sub,
-  .empty-state {
-    margin-top: 8px;
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .tab-row {
-    display: flex;
-    gap: 6px;
-    margin: 20px 0 12px;
-  }
-
-  .tab-row button {
-    min-height: 36px;
-    padding: 0 14px;
-    border-radius: 12px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: transparent;
-    color: hsl(var(--muted-foreground));
-    cursor: pointer;
-    text-transform: lowercase;
-    font-weight: 700;
-  }
-
-  .tab-row button.active {
-    background: hsl(var(--primary));
-    border-color: hsl(var(--primary));
-    color: hsl(var(--primary-foreground));
-  }
-
-  .row-list {
-    display: grid;
-    gap: 10px;
-  }
-
-  .pager {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    margin-bottom: 14px;
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .pager-actions {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .pager-actions button {
-    min-height: 32px;
-    padding: 0 10px;
-    border-radius: 10px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.03);
-    color: hsl(var(--foreground));
-    cursor: pointer;
-  }
-
-  .pager-actions button:disabled {
-    opacity: 0.45;
-    cursor: default;
-  }
-
-  .row-card {
-    padding: 16px 18px;
-  }
-
-  .row-card.failed {
-    border-color: hsl(var(--danger) / 0.28);
-    background: hsl(var(--danger) / 0.05);
-  }
-
-  .row-card.backed-off-card {
-    border-color: hsl(45 90% 55% / 0.28);
-    background: hsl(45 90% 55% / 0.05);
-  }
-
-  .row-head,
-  .row-foot,
-  .history-actions {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-  }
-
-  .row-text {
-    min-width: 0;
-    overflow: hidden;
-  }
-
-  .row-title,
-  .row-sub {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .row-title {
-    font-weight: 600;
-  }
-
-  .ep-badge {
-    margin-left: 0.5rem;
-    padding: 0.05rem 0.4rem;
-    border-radius: 4px;
-    font-size: 0.7rem;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    background: hsl(var(--muted-foreground) / 0.14);
-    color: hsl(var(--muted-foreground));
-    vertical-align: middle;
-  }
-
-  .row-head > :global(.button),
-  .row-actions,
-  .history-actions {
-    flex-shrink: 0;
-  }
-
-  .row-actions {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .history-main,
-  .history-toolbar,
-  .history-toolbar-actions,
-  .history-select-all,
-  .history-checkbox {
-    display: flex;
-    align-items: center;
-  }
-
-  .history-main {
-    gap: 10px;
-    min-width: 0;
-    flex: 1 1 auto;
-  }
-
-  .history-checkbox {
-    flex: 0 0 auto;
-  }
-
-  .history-checkbox input,
-  .history-select-all input {
-    width: 16px;
-    height: 16px;
-  }
-
-  .history-toolbar {
-    justify-content: space-between;
-    gap: 12px;
-    padding: 12px 14px;
-    margin-bottom: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 16px;
-    background: hsl(0 0% 100% / 0.03);
-  }
-
-  .history-toolbar-actions,
-  .history-select-all {
-    gap: 10px;
-  }
-
-  .history-select-all {
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .progress-track {
-    height: 8px;
-    border-radius: 999px;
-    background: hsl(0 0% 100% / 0.06);
-    overflow: hidden;
-    margin: 14px 0 10px;
-  }
-
-  .progress-fill {
-    height: 100%;
-    border-radius: 999px;
-    background: hsl(var(--primary));
-    transition: width 0.4s ease;
-  }
-
-  .row-foot {
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .library-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    min-height: 36px;
-    padding: 0 12px;
-    border-radius: 12px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04);
-  }
-
-  .url-row {
-    display: flex;
-    gap: 10px;
-    align-items: center;
-    margin-bottom: 16px;
-  }
-
-  .url-input-wrap {
-    flex: 1;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    height: 40px;
-    padding: 0 14px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 14px;
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--muted-foreground));
-  }
-
-  .url-input {
-    flex: 1;
-    background: transparent;
-    border: none;
-    outline: none;
-    color: hsl(var(--foreground));
-    font-size: 13px;
-  }
-
-  .url-input::placeholder { color: hsl(var(--muted-foreground)); }
-  .url-input:disabled { opacity: 0.6; }
-
-  .upload-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    min-height: 36px;
-    padding: 0 12px;
-    border-radius: 12px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--foreground));
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background .12s;
-  }
-
-  .upload-btn:hover:not(.disabled) { background: hsl(0 0% 100% / 0.08); }
-  .upload-btn.disabled { opacity: 0.55; cursor: default; }
-  .upload-input { display: none; }
-
-  @media (max-width: 900px) {
-    .summary-grid {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-  }
-
-  @media (max-width: 700px) {
-    .pager,
-    .row-head,
-    .row-foot,
-    .history-toolbar {
-      flex-direction: column;
-      align-items: flex-start;
-    }
-  }
-</style>

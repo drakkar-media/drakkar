@@ -22,6 +22,7 @@
   import Panel from '$lib/components/Panel.svelte';
   import Button from '$lib/components/Button.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
+  import * as Table from '$lib/components/ui/table/index.js';
   import { toastError, toastSuccess } from '$lib/toast';
   import { api, subscribeEvents } from '$lib/api';
   import type { TaskSchedule } from '$lib/types';
@@ -185,233 +186,103 @@
   <StatusPill tone={runningCount > 0 ? 'warn' : 'ok'}>{runningCount} running</StatusPill>
 </PageHeader>
 
-<section class="summary-grid">
-  <div class="summary-card">
-    <div class="summary-value">{automatedCount}</div>
-    <div class="summary-label">Automated schedules</div>
+<section class="mb-5 grid grid-cols-2 gap-3.5 md:grid-cols-4">
+  <div class="rounded-xl border border-border bg-card/80 px-4 py-3.5">
+    <div class="text-2xl font-bold leading-none">{automatedCount}</div>
+    <div class="mt-2 text-sm text-muted-foreground">Automated schedules</div>
   </div>
-  <div class="summary-card">
-    <div class="summary-value">{operationsCount}</div>
-    <div class="summary-label">Manual operations</div>
+  <div class="rounded-xl border border-border bg-card/80 px-4 py-3.5">
+    <div class="text-2xl font-bold leading-none">{operationsCount}</div>
+    <div class="mt-2 text-sm text-muted-foreground">Manual operations</div>
   </div>
-  <div class="summary-card">
-    <div class="summary-value {runningCount > 0 ? 'running' : ''}">{runningCount}</div>
-    <div class="summary-label">Currently running</div>
+  <div class="rounded-xl border border-border bg-card/80 px-4 py-3.5">
+    <div class="text-2xl font-bold leading-none" style={runningCount > 0 ? 'color: hsl(var(--status-warning))' : undefined}>{runningCount}</div>
+    <div class="mt-2 text-sm text-muted-foreground">Currently running</div>
   </div>
-  <div class="summary-card">
-    <div class="summary-value">{lastRunCount}</div>
-    <div class="summary-label">Executed this session</div>
+  <div class="rounded-xl border border-border bg-card/80 px-4 py-3.5">
+    <div class="text-2xl font-bold leading-none">{lastRunCount}</div>
+    <div class="mt-2 text-sm text-muted-foreground">Executed this session</div>
   </div>
 </section>
 
 <Panel title="Scheduled Tasks" subtitle="Automated tasks driven by the backend scheduler. IDs match live schedule state.">
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Name</th>
-          <th>Interval</th>
-          <th>Status</th>
-          <th>Last Run</th>
-          <th>Action</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each groups as group}
-          {@const groupTasks = tasks.filter((t) => t.group === group)}
-          {@const collapsed = collapsedGroups.has(group)}
-          <tr class="group-row" on:click={() => toggleGroup(group)}>
-            <td colspan="5">
-              <span class="group-toggle">
-                <svelte:component this={collapsed ? ChevronRight : ChevronDown} size={14} />
-                {group}
-                <span class="group-count">{groupTasks.length}</span>
-              </span>
-            </td>
-          </tr>
-          {#if !collapsed}
-          {#each groupTasks as task}
-            {@const busy = running[task.id]}
-            {@const result = results[task.id]}
-            {@const schedule = scheduleFor(task)}
-            <tr>
-              <td>
-                <div class="row-title">{task.label}</div>
-                <div class="row-sub">{task.description}</div>
-                {#if result}
-                  <div class={`result ${result.ok ? 'ok' : 'fail'}`}>
-                    <svelte:component this={result.ok ? CheckCircle2 : AlertTriangle} size={12} />
-                    <span>{result.detail}</span>
-                  </div>
-                {/if}
-              </td>
-              <td class="muted">{schedule?.interval ?? task.interval}</td>
-              <td>
+  <Table.Root class="min-w-[880px]">
+    <Table.Header>
+      <Table.Row>
+        <Table.Head class="align-top text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Name</Table.Head>
+        <Table.Head class="align-top text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Interval</Table.Head>
+        <Table.Head class="align-top text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Status</Table.Head>
+        <Table.Head class="align-top text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Last Run</Table.Head>
+        <Table.Head class="align-top text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Action</Table.Head>
+      </Table.Row>
+    </Table.Header>
+    <Table.Body>
+      {#each groups as group}
+        {@const groupTasks = tasks.filter((t) => t.group === group)}
+        {@const collapsed = collapsedGroups.has(group)}
+        <Table.Row class="cursor-pointer select-none" onclick={() => toggleGroup(group)}>
+          <Table.Cell colspan={5} class="bg-transparent pt-5 text-xs font-bold uppercase tracking-[0.12em] text-primary">
+            <span class="inline-flex items-center gap-1.5">
+              <svelte:component this={collapsed ? ChevronRight : ChevronDown} size={14} />
+              {group}
+              <span class="font-medium normal-case tracking-normal text-muted-foreground">{groupTasks.length}</span>
+            </span>
+          </Table.Cell>
+        </Table.Row>
+        {#if !collapsed}
+        {#each groupTasks as task}
+          {@const busy = running[task.id]}
+          {@const result = results[task.id]}
+          {@const schedule = scheduleFor(task)}
+          <Table.Row>
+            <Table.Cell class="whitespace-normal align-top">
+              <div class="font-semibold">{task.label}</div>
+              <div class="mt-2 text-sm text-muted-foreground">{task.description}</div>
+              {#if result}
+                <div class="mt-2.5 inline-flex items-center gap-1.5 font-mono text-xs" style={result.ok ? 'color: hsl(var(--status-available))' : 'color: hsl(var(--status-failed))'}>
+                  <svelte:component this={result.ok ? CheckCircle2 : AlertTriangle} size={12} />
+                  <span>{result.detail}</span>
+                </div>
+              {/if}
+            </Table.Cell>
+            <Table.Cell class="align-top text-sm text-muted-foreground">{schedule?.interval ?? task.interval}</Table.Cell>
+            <Table.Cell class="align-top">
+              {#if busy}
+                <StatusPill tone="warn">Running</StatusPill>
+              {:else if schedule?.automated}
+                <StatusPill tone="ok">Automated</StatusPill>
+              {:else if result?.ok}
+                <StatusPill tone="ok">Success</StatusPill>
+              {:else if result && !result.ok}
+                <StatusPill tone="danger">Failed</StatusPill>
+              {:else}
+                <StatusPill tone="neutral">Idle</StatusPill>
+              {/if}
+            </Table.Cell>
+            <Table.Cell class="whitespace-normal align-top text-sm text-muted-foreground">
+              {#if result}
+                <span class="inline-flex items-center gap-1.5 text-xs text-muted-foreground"><Clock3 size={12} /> {fmtTime(result.ranAt)}</span>
+              {:else if schedule?.lastRunAt}
+                <span class="inline-flex items-center gap-1.5 text-xs text-muted-foreground"><Clock3 size={12} /> {fmtTime(schedule.lastRunAt)}</span>
+              {:else}
+                <span class="inline-flex items-center gap-1.5 text-xs text-muted-foreground opacity-40">Never</span>
+              {/if}
+            </Table.Cell>
+            <Table.Cell class="align-top">
+              <Button kind="secondary" on:click={() => runTask(task)} disabled={busy || !task.manual}>
                 {#if busy}
-                  <StatusPill tone="warn">Running</StatusPill>
-                {:else if schedule?.automated}
-                  <StatusPill tone="ok">Automated</StatusPill>
-                {:else if result?.ok}
-                  <StatusPill tone="ok">Success</StatusPill>
-                {:else if result && !result.ok}
-                  <StatusPill tone="danger">Failed</StatusPill>
+                  <RefreshCw size={14} class="animate-spin" />
+                  Running…
                 {:else}
-                  <StatusPill tone="neutral">Idle</StatusPill>
+                  <Play size={14} />
+                  Run
                 {/if}
-              </td>
-              <td class="muted">
-                {#if result}
-                  <span class="time-cell"><Clock3 size={12} /> {fmtTime(result.ranAt)}</span>
-                {:else if schedule?.lastRunAt}
-                  <span class="time-cell"><Clock3 size={12} /> {fmtTime(schedule.lastRunAt)}</span>
-                {:else}
-                  <span class="time-cell dim">Never</span>
-                {/if}
-              </td>
-              <td>
-                <Button kind="secondary" on:click={() => runTask(task)} disabled={busy || !task.manual}>
-                  {#if busy}
-                    <RefreshCw size={14} class="spin" />
-                    Running…
-                  {:else}
-                    <Play size={14} />
-                    Run
-                  {/if}
-                </Button>
-              </td>
-            </tr>
-          {/each}
-          {/if}
+              </Button>
+            </Table.Cell>
+          </Table.Row>
         {/each}
-      </tbody>
-    </table>
-  </div>
+        {/if}
+      {/each}
+    </Table.Body>
+  </Table.Root>
 </Panel>
-
-<style>
-  .summary-grid {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 14px;
-    margin-bottom: 20px;
-  }
-
-  .summary-card {
-    padding: 18px 20px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 20px;
-    background: hsl(var(--card) / 0.82);
-  }
-
-  .summary-value {
-    font-size: 2rem;
-    font-weight: 700;
-    line-height: 1;
-  }
-
-  .summary-value.running {
-    color: hsl(47 100% 77%);
-  }
-
-  .summary-label,
-  .row-sub,
-  .muted {
-    margin-top: 8px;
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .table-wrap {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    min-width: 880px;
-    border-collapse: collapse;
-  }
-
-  th,
-  td {
-    padding: 14px 10px;
-    border-bottom: 1px solid hsl(0 0% 100% / 0.05);
-    text-align: left;
-    vertical-align: top;
-  }
-
-  th {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.18em;
-    color: hsl(var(--muted-foreground));
-  }
-
-  .group-row {
-    cursor: pointer;
-    user-select: none;
-  }
-
-  .group-row td {
-    padding-top: 20px;
-    font-size: 12px;
-    font-weight: 700;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: hsl(var(--primary));
-    background: transparent;
-  }
-
-  .group-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .group-count {
-    font-weight: 500;
-    color: hsl(var(--muted-foreground));
-    letter-spacing: normal;
-    text-transform: none;
-  }
-
-  .row-title {
-    font-weight: 600;
-  }
-
-  .result,
-  .time-cell {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .time-cell.dim { opacity: 0.4; }
-
-  .result {
-    margin-top: 10px;
-    font-size: 12px;
-    font-family: 'JetBrains Mono', monospace;
-  }
-
-  .result.ok   { color: hsl(141 80% 68%); }
-  .result.fail { color: hsl(0 96% 82%); }
-
-  .time-cell {
-    color: hsl(var(--muted-foreground));
-    font-size: 12px;
-  }
-
-  :global(.spin) {
-    animation: spin 1s linear infinite;
-  }
-
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
-
-  @media (max-width: 900px) {
-    .summary-grid {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-  }
-</style>

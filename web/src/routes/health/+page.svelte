@@ -21,6 +21,7 @@
   import Panel from '$lib/components/Panel.svelte';
   import Button from '$lib/components/Button.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
+  import * as Table from '$lib/components/ui/table/index.js';
   import { api, subscribeEvents } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
   import { debounce } from '$lib/debounce';
@@ -195,40 +196,40 @@
 </PageHeader>
 
 {#if summary}
-  <section class="stats-grid">
-    <div class="stat-card">
-      <div class="stat-value">{summary.total}</div>
-      <div class="stat-label">Total published symlinks</div>
+  <section class="mb-4.5 grid grid-cols-2 gap-3.5 sm:grid-cols-3 xl:grid-cols-6">
+    <div class="rounded-xl border border-border bg-card/80 p-4">
+      <div class="text-2xl font-bold leading-none">{summary.total}</div>
+      <div class="mt-2 text-sm text-muted-foreground">Total published symlinks</div>
     </div>
-    <div class="stat-card">
-      <div class="stat-value ok">{healthy}</div>
-      <div class="stat-label">Healthy symlinks ({healthyPct}%)</div>
-      <div class="bar"><div class="fill ok" style={`width:${healthyPct}%`}></div></div>
+    <div class="rounded-xl border border-border bg-card/80 p-4">
+      <div class="text-2xl font-bold leading-none" style="color: hsl(var(--status-available))">{healthy}</div>
+      <div class="mt-2 text-sm text-muted-foreground">Healthy symlinks ({healthyPct}%)</div>
+      <div class="mt-3 h-2 overflow-hidden rounded-full bg-muted"><div class="h-full rounded-full" style={`width:${healthyPct}%; background: hsl(var(--status-available))`}></div></div>
     </div>
-    <div class="stat-card">
-      <div class="stat-value warn">{summary.neverChecked}</div>
-      <div class="stat-label">Never checked</div>
+    <div class="rounded-xl border border-border bg-card/80 p-4">
+      <div class="text-2xl font-bold leading-none" style="color: hsl(var(--status-warning))">{summary.neverChecked}</div>
+      <div class="mt-2 text-sm text-muted-foreground">Never checked</div>
     </div>
-    <div class="stat-card">
-      <div class="stat-value danger">{broken}</div>
-      <div class="stat-label">Broken symlinks</div>
+    <div class="rounded-xl border border-border bg-card/80 p-4">
+      <div class="text-2xl font-bold leading-none" style="color: hsl(var(--status-failed))">{broken}</div>
+      <div class="mt-2 text-sm text-muted-foreground">Broken symlinks</div>
     </div>
-    <div class="stat-card {consistencyIssues > 0 ? 'has-issue' : ''}">
-      <div class="stat-value {consistencyIssues > 0 ? 'danger' : 'ok'}">{consistencyIssues}</div>
-      <div class="stat-label">Consistency issues</div>
-      <div class="stat-hint">Available items with no symlink</div>
+    <div class="rounded-xl border p-4 {consistencyIssues > 0 ? '' : 'border-border bg-card/80'}" style={consistencyIssues > 0 ? 'border-color: hsl(var(--status-failed) / 0.28); background: color-mix(in oklch, var(--card) 82%, transparent);' : undefined}>
+      <div class="text-2xl font-bold leading-none" style={consistencyIssues > 0 ? 'color: hsl(var(--status-failed))' : 'color: hsl(var(--status-available))'}>{consistencyIssues}</div>
+      <div class="mt-2 text-sm text-muted-foreground">Consistency issues</div>
+      <div class="mt-1 text-[11px] text-muted-foreground/70">Available items with no symlink</div>
     </div>
-    <div class="stat-card">
-      <div class="stat-value {uncalibrated > 0 ? 'warn' : 'ok'}">{uncalibrated}</div>
-      <div class="stat-label">Uncalibrated NZB files</div>
-      <div class="stat-hint">Pending yEnc offset correction</div>
+    <div class="rounded-xl border border-border bg-card/80 p-4">
+      <div class="text-2xl font-bold leading-none" style={uncalibrated > 0 ? 'color: hsl(var(--status-warning))' : 'color: hsl(var(--status-available))'}>{uncalibrated}</div>
+      <div class="mt-2 text-sm text-muted-foreground">Uncalibrated NZB files</div>
+      <div class="mt-1 text-[11px] text-muted-foreground/70">Pending yEnc offset correction</div>
     </div>
   </section>
 
   {#if summary.neverChecked > 0}
-    <div class="attention">
-      <div class="attention-title"><HeartPulse size={16} /> Attention</div>
-      <ul>
+    <div class="mb-4.5 rounded-xl border px-4.5 py-4" style="border-color: hsl(var(--status-warning) / 0.28); background: hsl(var(--status-warning) / 0.08);">
+      <div class="mb-2 flex items-center gap-2 font-bold" style="color: hsl(var(--status-warning))"><HeartPulse size={16} /> Attention</div>
+      <ul class="m-0 list-disc pl-4.5 text-foreground">
         <li>{summary.neverChecked} item(s) have never been health-checked.</li>
         <li>Run a check now for immediate verification, or wait for the hourly background task.</li>
       </ul>
@@ -236,15 +237,15 @@
   {/if}
 
   {#if consistencyIssues > 0}
-    <div class="attention attention-danger">
-      <div class="attention-title"><AlertTriangle size={16} /> Consistency Issues</div>
-      <p>
+    <div class="mb-4.5 rounded-xl border px-4.5 py-4" style="border-color: hsl(var(--status-failed) / 0.28); background: hsl(var(--status-failed) / 0.06);">
+      <div class="mb-2 flex items-center gap-2 font-bold" style="color: hsl(var(--status-failed))"><AlertTriangle size={16} /> Consistency Issues</div>
+      <p class="m-0 text-foreground">
         {consistencyIssues} library item(s) are marked <strong>available</strong> but have no published symlink.
         These items may show as available in the library but will not stream.
         Use <strong>Republish Pending</strong> when the selected release is still recoverable. Use
         <strong> Reset Orphaned Available</strong> when the item needs to be re-queued for a fresh search and download.
       </p>
-      <div class="attention-actions">
+      <div class="mt-3.5 flex flex-wrap gap-2.5">
         <Button kind="secondary" on:click={republishPending} disabled={loading || republishing}>
           <RefreshCw size={14} />
           {republishing ? 'Republishing…' : 'Republish Pending'}
@@ -262,94 +263,94 @@
       <div slot="actions">
         <StatusPill tone="danger">{consistency.length} item(s)</StatusPill>
       </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Title</th>
-              <th>Type</th>
-              <th>Queue State</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each consistency as issue}
-              <tr>
-                <td>
-                  <div class="row-title">{issue.title}</div>
-                  <div class="row-sub">ID {issue.libraryItemId}</div>
-                </td>
-                <td><StatusPill tone="neutral">{issue.mediaType}</StatusPill></td>
-                <td><StatusPill tone={issue.queueState === 'available' ? 'ok' : 'warn'}>{issue.queueState || 'unknown'}</StatusPill></td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
+      <Table.Root>
+        <Table.Header>
+          <Table.Row>
+            <Table.Head class="align-top text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Title</Table.Head>
+            <Table.Head class="align-top text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Type</Table.Head>
+            <Table.Head class="align-top text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Queue State</Table.Head>
+          </Table.Row>
+        </Table.Header>
+        <Table.Body>
+          {#each consistency as issue}
+            <Table.Row>
+              <Table.Cell class="whitespace-normal align-top">
+                <div class="font-semibold">{issue.title}</div>
+                <div class="mt-2 text-sm text-muted-foreground">ID {issue.libraryItemId}</div>
+              </Table.Cell>
+              <Table.Cell class="align-top"><StatusPill tone="neutral">{issue.mediaType}</StatusPill></Table.Cell>
+              <Table.Cell class="align-top"><StatusPill tone={issue.queueState === 'available' ? 'ok' : 'warn'}>{issue.queueState || 'unknown'}</StatusPill></Table.Cell>
+            </Table.Row>
+          {/each}
+        </Table.Body>
+      </Table.Root>
     </Panel>
   {/if}
 
   <Panel title="Symlink Health" subtitle="Broken and unchecked entries float to top.">
-    <div slot="actions" class="panel-actions">
-      <div class="filter-tabs">
-        <button class="filter-tab {filter === 'all' ? 'active' : ''}" on:click={() => setFilter('all')}>All</button>
-        <button class="filter-tab {filter === 'broken' ? 'active broken' : ''}" on:click={() => setFilter('broken')}>Broken</button>
-        <button class="filter-tab {filter === 'unchecked' ? 'active' : ''}" on:click={() => setFilter('unchecked')}>Unchecked</button>
+    <div slot="actions" class="flex items-center gap-2.5">
+      <div class="flex gap-0.5 rounded-lg bg-muted p-0.75">
+        <button class="rounded-md px-3 py-1 text-xs font-medium transition-colors {filter === 'all' ? 'bg-white/10 text-foreground' : 'text-muted-foreground hover:text-foreground'}" on:click={() => setFilter('all')}>All</button>
+        <button
+          class="rounded-md px-3 py-1 text-xs font-medium transition-colors {filter === 'broken' ? 'text-foreground' : 'text-muted-foreground hover:text-foreground'}"
+          style={filter === 'broken' ? 'background: hsl(var(--status-failed) / 0.15); color: hsl(var(--status-failed))' : undefined}
+          on:click={() => setFilter('broken')}
+        >Broken</button>
+        <button class="rounded-md px-3 py-1 text-xs font-medium transition-colors {filter === 'unchecked' ? 'bg-white/10 text-foreground' : 'text-muted-foreground hover:text-foreground'}" on:click={() => setFilter('unchecked')}>Unchecked</button>
       </div>
       <StatusPill tone={broken > 0 ? 'warn' : 'ok'}>{entriesPage.total} item(s)</StatusPill>
     </div>
     {#if entriesPage.items.length > 0}
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Created</th>
-              <th>Last Check</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each entriesPage.items as entry}
-              <tr>
-                <td>
-                  <div class="row-title">{shortName(entry.libraryPath)}</div>
-                  <div class="row-sub">{entry.libraryPath}</div>
-                </td>
-                <td>{fmtDate(entry.createdAt, 'Unknown')}</td>
-                <td>{fmtDate(entry.lastCheckedAt)}</td>
-                <td>
-                  {#if entry.healthOk === true}
-                    <StatusPill tone="ok">Healthy</StatusPill>
-                  {:else if entry.healthOk === false}
-                    <StatusPill tone="danger">Broken</StatusPill>
-                  {:else}
-                    <StatusPill tone="warn">Unchecked</StatusPill>
-                  {/if}
-                </td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
+      <Table.Root>
+        <Table.Header>
+          <Table.Row>
+            <Table.Head class="align-top text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Name</Table.Head>
+            <Table.Head class="align-top text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Created</Table.Head>
+            <Table.Head class="align-top text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Last Check</Table.Head>
+            <Table.Head class="align-top text-[11px] uppercase tracking-[0.18em] text-muted-foreground">Status</Table.Head>
+          </Table.Row>
+        </Table.Header>
+        <Table.Body>
+          {#each entriesPage.items as entry}
+            <Table.Row>
+              <Table.Cell class="whitespace-normal align-top">
+                <div class="font-semibold">{shortName(entry.libraryPath)}</div>
+                <div class="mt-2 text-sm text-muted-foreground">{entry.libraryPath}</div>
+              </Table.Cell>
+              <Table.Cell class="align-top">{fmtDate(entry.createdAt, 'Unknown')}</Table.Cell>
+              <Table.Cell class="align-top">{fmtDate(entry.lastCheckedAt)}</Table.Cell>
+              <Table.Cell class="align-top">
+                {#if entry.healthOk === true}
+                  <StatusPill tone="ok">Healthy</StatusPill>
+                {:else if entry.healthOk === false}
+                  <StatusPill tone="danger">Broken</StatusPill>
+                {:else}
+                  <StatusPill tone="warn">Unchecked</StatusPill>
+                {/if}
+              </Table.Cell>
+            </Table.Row>
+          {/each}
+        </Table.Body>
+      </Table.Root>
       {#if entriesPage.total > PAGE_SIZE}
-        <div class="pagination">
-          <button class="page-btn" on:click={() => goPage(-1)} disabled={page === 0} aria-label="Previous page">
+        <div class="flex items-center justify-center gap-3.5 pb-1 pt-3.5">
+          <button class="flex size-7.5 items-center justify-center rounded-lg border border-border bg-transparent text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 disabled:opacity-30" on:click={() => goPage(-1)} disabled={page === 0} aria-label="Previous page">
             <ChevronLeft size={14} />
           </button>
-          <span class="page-info">{pageStart}–{pageEnd} of {entriesPage.total}</span>
-          <button class="page-btn" on:click={() => goPage(1)} disabled={page >= lastPage} aria-label="Next page">
+          <span class="min-w-30 text-center text-sm text-muted-foreground">{pageStart}–{pageEnd} of {entriesPage.total}</span>
+          <button class="flex size-7.5 items-center justify-center rounded-lg border border-border bg-transparent text-foreground outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 disabled:opacity-30" on:click={() => goPage(1)} disabled={page >= lastPage} aria-label="Next page">
             <ChevronRight size={14} />
           </button>
         </div>
       {/if}
     {:else}
-      <div class="empty-state">{loading ? 'Loading…' : filter === 'broken' ? 'No broken symlinks.' : filter === 'unchecked' ? 'No unchecked symlinks.' : 'No published media yet.'}</div>
+      <div class="p-6 text-center text-sm text-muted-foreground">{loading ? 'Loading…' : filter === 'broken' ? 'No broken symlinks.' : filter === 'unchecked' ? 'No unchecked symlinks.' : 'No published media yet.'}</div>
     {/if}
   </Panel>
 
-  <div class="info-card">
-    <div class="info-title">Deep NZB Article Check</div>
-    <p>
+  <div class="mt-4.5 rounded-xl border border-border bg-card/80 p-5">
+    <div class="mb-2 text-sm font-bold">Deep NZB Article Check</div>
+    <p class="m-0 text-sm leading-relaxed text-muted-foreground">
       In addition to symlink verification, Drakkar probes NNTP providers weekly to confirm that
       the actual NNTP articles behind each published item are still available. Items whose articles
       have expired are automatically reset to <em>requested</em> so a fresh release can be selected.
@@ -358,254 +359,3 @@
     </p>
   </div>
 {/if}
-
-<style>
-  .stats-grid {
-    display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
-    gap: 14px;
-    margin-bottom: 18px;
-  }
-
-  .stat-card,
-  .attention,
-  .info-card {
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 20px;
-    background: hsl(var(--card) / 0.82);
-  }
-
-  .stat-card {
-    padding: 22px;
-  }
-
-  .stat-card.has-issue {
-    border-color: hsl(0 96% 82% / 0.28);
-  }
-
-  .stat-value {
-    font-size: 2rem;
-    font-weight: 700;
-    line-height: 1;
-  }
-
-  .stat-value.ok { color: hsl(141 80% 68%); }
-  .stat-value.warn { color: hsl(47 100% 77%); }
-  .stat-value.danger { color: hsl(0 96% 82%); }
-
-  .stat-label,
-  .row-sub,
-  .empty-state {
-    margin-top: 8px;
-    font-size: 13px;
-    color: hsl(var(--muted-foreground));
-  }
-
-  .stat-hint {
-    margin-top: 4px;
-    font-size: 11px;
-    color: hsl(var(--muted-foreground));
-    opacity: 0.7;
-  }
-
-  .bar {
-    margin-top: 12px;
-    height: 8px;
-    border-radius: 999px;
-    background: hsl(0 0% 100% / 0.06);
-    overflow: hidden;
-  }
-
-  .fill {
-    height: 100%;
-    border-radius: 999px;
-    background: hsl(var(--primary));
-  }
-
-  .fill.ok { background: hsl(141 80% 68%); }
-
-  .attention {
-    padding: 16px 18px;
-    margin-bottom: 18px;
-    border-color: hsl(43 96% 44% / 0.28);
-    background: hsl(43 96% 44% / 0.08);
-  }
-
-  .attention-danger {
-    border-color: hsl(0 96% 82% / 0.28);
-    background: hsl(0 96% 82% / 0.06);
-  }
-
-  .attention-title {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-weight: 700;
-    color: hsl(47 100% 77%);
-    margin-bottom: 8px;
-  }
-
-  .attention-danger .attention-title {
-    color: hsl(0 96% 82%);
-  }
-
-  .attention ul {
-    margin: 0;
-    padding-left: 18px;
-    color: hsl(var(--foreground));
-  }
-
-  .attention p {
-    margin: 0;
-    color: hsl(var(--foreground));
-  }
-
-  .attention-actions {
-    display: flex;
-    gap: 10px;
-    flex-wrap: wrap;
-    margin-top: 14px;
-  }
-
-  .info-card {
-    padding: 20px 22px;
-    margin-top: 18px;
-  }
-
-  .info-title {
-    font-weight: 700;
-    font-size: 14px;
-    margin-bottom: 8px;
-    color: hsl(var(--foreground));
-  }
-
-  .info-card p {
-    margin: 0;
-    font-size: 13px;
-    color: hsl(var(--muted-foreground));
-    line-height: 1.6;
-  }
-
-  .table-wrap {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-  }
-
-  th,
-  td {
-    text-align: left;
-    padding: 14px 10px;
-    border-bottom: 1px solid hsl(0 0% 100% / 0.05);
-    vertical-align: top;
-  }
-
-  th {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.18em;
-    color: hsl(var(--muted-foreground));
-  }
-
-  .row-title {
-    font-weight: 600;
-  }
-
-  .panel-actions {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-
-  .filter-tabs {
-    display: flex;
-    gap: 2px;
-    background: hsl(0 0% 100% / 0.05);
-    border-radius: 8px;
-    padding: 3px;
-  }
-
-  .filter-tab {
-    padding: 4px 12px;
-    border-radius: 6px;
-    font-size: 12px;
-    font-weight: 500;
-    border: none;
-    background: transparent;
-    color: hsl(var(--muted-foreground));
-    cursor: pointer;
-    transition: background 0.15s, color 0.15s;
-  }
-
-  .filter-tab:hover {
-    color: hsl(var(--foreground));
-  }
-
-  .filter-tab.active {
-    background: hsl(0 0% 100% / 0.1);
-    color: hsl(var(--foreground));
-  }
-
-  .filter-tab.active.broken {
-    background: hsl(0 96% 82% / 0.15);
-    color: hsl(0 96% 82%);
-  }
-
-  .pagination {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 14px;
-    padding: 14px 0 4px;
-  }
-
-  .page-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 30px;
-    height: 30px;
-    border-radius: 8px;
-    border: 1px solid hsl(0 0% 100% / 0.1);
-    background: transparent;
-    color: hsl(var(--foreground));
-    cursor: pointer;
-    transition: background 0.15s;
-  }
-
-  .page-btn:hover:not(:disabled) {
-    background: hsl(0 0% 100% / 0.08);
-  }
-
-  .page-btn:disabled {
-    opacity: 0.3;
-    cursor: default;
-  }
-
-  .page-info {
-    font-size: 13px;
-    color: hsl(var(--muted-foreground));
-    min-width: 120px;
-    text-align: center;
-  }
-
-  .empty-state {
-    padding: 24px;
-    text-align: center;
-  }
-
-  @media (max-width: 1200px) {
-    .stats-grid {
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-  }
-
-  @media (max-width: 700px) {
-    .stats-grid {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-  }
-</style>

@@ -11,7 +11,7 @@
    * (nav/chrome) alongside the global `ToastViewport`.
    */
   import { onMount } from 'svelte';
-  import { goto } from '$app/navigation';
+  import { afterNavigate, goto } from '$app/navigation';
   import { page } from '$app/state';
   import '../app.css';
   import AppShell from '$lib/components/AppShell.svelte';
@@ -21,7 +21,19 @@
 
   let ready = false;
 
-  $: isPublic = PUBLIC_PATHS.some((p) => page.url.pathname.startsWith(p));
+  // Reading page.url.pathname from a $: block does not reliably re-run on
+  // client-side navigation in this app (confirmed: after logging in, this
+  // stayed stuck on "true" for /login forever, so the app silently rendered
+  // bare page content with no AppShell/sidebar at all -- never a visible
+  // error, just missing chrome). afterNavigate + a plain `let`, plus an
+  // eager synchronous read for the very first load (afterNavigate does not
+  // fire for that one), is the reliable alternative used here and in
+  // AppShell.
+  let isPublic = PUBLIC_PATHS.some((p) => page.url.pathname.startsWith(p));
+  afterNavigate((nav) => {
+    const pathname = nav.to?.url.pathname ?? window.location.pathname;
+    isPublic = PUBLIC_PATHS.some((p) => pathname.startsWith(p));
+  });
 
   onMount(async () => {
     if (isPublic) {

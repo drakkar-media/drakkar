@@ -1,28 +1,35 @@
 <script lang="ts">
   /**
-   * Persistent app chrome: desktop sidebar nav, topbar with global
-   * type-ahead search and the user menu, and a mobile drawer + bottom nav.
+   * Persistent app chrome: desktop sidebar nav (shadcn-svelte Sidebar,
+   * icon-collapsible), topbar with global type-ahead search and the user
+   * menu, and a mobile bottom nav whose "More" button opens the SAME
+   * sidebar as a full-screen sheet (Sidebar's built-in mobile behavior).
    * Mounted once by the root layout; page content renders into the default
    * slot.
    */
   import { onDestroy, onMount } from 'svelte';
-  import { goto } from '$app/navigation';
+  import { afterNavigate, goto } from '$app/navigation';
   import { page } from '$app/state';
   import Bell from '@lucide/svelte/icons/bell';
-  import BookOpen from '@lucide/svelte/icons/book-open';
+  import ChevronsUpDown from '@lucide/svelte/icons/chevrons-up-down';
   import FileText from '@lucide/svelte/icons/file-text';
   import LogOut from '@lucide/svelte/icons/log-out';
-  import Menu from '@lucide/svelte/icons/menu';
   import Search from '@lucide/svelte/icons/search';
-  import X from '@lucide/svelte/icons/x';
+  import UserRound from '@lucide/svelte/icons/user-round';
+  import Users from '@lucide/svelte/icons/users';
   import { api } from '$lib/api';
   import { detailsHref } from '$lib/detailsHref';
   import { navItems, mobilePrimaryItems } from '$lib/nav';
   import DrakkarLogo from '$lib/components/DrakkarLogo.svelte';
   import { clearToastHistory, toastHistory } from '$lib/toast';
   import type { DiscoverMediaItem, DiscoverSearchResult, User } from '$lib/types';
+  import * as Sidebar from '$lib/components/ui/sidebar/index.js';
+  import * as Popover from '$lib/components/ui/popover/index.js';
+  import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
+  import * as Avatar from '$lib/components/ui/avatar/index.js';
+  import { Button } from '$lib/components/ui/button/index.js';
+  import MobileMoreButton from '$lib/components/ui/sidebar/mobile-more-button.svelte';
 
-  let mobileOpen = false;
   let globalSearch = '';
   let suggestions: DiscoverSearchResult | null = null;
   let searchOpen = false;
@@ -45,10 +52,25 @@
     return `${Math.round(hours / 24)}d ago`;
   }
 
-  function isActive(href: string) {
-    if (href === '/dashboard' && page.url.pathname === '/') return true;
-    return page.url.pathname === href || page.url.pathname.startsWith(`${href}/`);
+  // Reading page.url.pathname from a $: block does not reliably re-run on
+  // client-side navigation in this app -- confirmed the same root cause as
+  // +layout.svelte's isPublic bug. afterNavigate + a plain `let`, plus an
+  // eager synchronous read for the very first load (afterNavigate does not
+  // fire for that one), is the reliable alternative.
+  let currentPath: string = page.url.pathname;
+  let activeHrefs = new Set<string>();
+  function recomputeActiveHrefs() {
+    activeHrefs = new Set(
+      navItems
+        .filter((item) => (item.href === '/dashboard' && currentPath === '/') || currentPath === item.href || currentPath.startsWith(`${item.href}/`))
+        .map((item) => item.href)
+    );
   }
+  recomputeActiveHrefs();
+  afterNavigate((nav) => {
+    currentPath = nav.to?.url.pathname ?? window.location.pathname;
+    recomputeActiveHrefs();
+  });
 
   function submitSearch() {
     const q = globalSearch.trim();
@@ -109,7 +131,7 @@
     void goto('/login', { replaceState: true });
   }
 
-  $: if (page.url.pathname !== '/search' && !globalSearch) suggestions = null;
+  $: if (currentPath !== '/search' && !globalSearch) suggestions = null;
 
   onMount(() => {
     void loadMe();
@@ -118,409 +140,189 @@
   onDestroy(() => window.clearTimeout(debounceTimer));
 </script>
 
-<div class="shell">
-  <!-- Desktop sidebar -->
-  <aside class="sidebar">
-    <a href="/dashboard" class="brandmark" aria-label="Dashboard">
-      <DrakkarLogo size={22} />
-    </a>
-    <nav class="side-nav">
-      {#each navItems as item}
-        <a href={item.href} class:active={isActive(item.href)} title={item.label} aria-label={item.label}>
-          <svelte:component this={item.icon} size={18} />
-        </a>
-      {/each}
-    </nav>
-  </aside>
+<Sidebar.Provider>
+  <Sidebar.Root collapsible="icon">
+    <Sidebar.Header>
+      <a href="/dashboard" class="flex items-center gap-2" aria-label="Dashboard">
+        <span class="grid size-8 shrink-0 place-items-center rounded-lg bg-primary text-primary-foreground">
+          <DrakkarLogo size={18} />
+        </span>
+        <span class="text-sm font-semibold group-data-[collapsible=icon]:hidden">Drakkar</span>
+      </a>
+    </Sidebar.Header>
+    <Sidebar.Content>
+      <Sidebar.Group>
+        <Sidebar.GroupContent>
+          <Sidebar.Menu class="gap-1">
+            {#each navItems as item}
+              <Sidebar.MenuItem>
+                <Sidebar.MenuButton isActive={activeHrefs.has(item.href)} tooltipContent={item.label}>
+                  {#snippet child({ props })}
+                    <a href={item.href} aria-label={item.label} {...props} data-active={activeHrefs.has(item.href) ? 'true' : undefined}>
+                      <svelte:component this={item.icon} />
+                      <span class="truncate group-data-[collapsible=icon]:hidden">{item.label}</span>
+                    </a>
+                  {/snippet}
+                </Sidebar.MenuButton>
+              </Sidebar.MenuItem>
+            {/each}
+          </Sidebar.Menu>
+        </Sidebar.GroupContent>
+      </Sidebar.Group>
+    </Sidebar.Content>
+    <Sidebar.Footer>
+      {#if appVersion}
+        <div class="px-2 pb-1 text-xs text-muted-foreground group-data-[collapsible=icon]:hidden">Drakkar v{appVersion}</div>
+      {/if}
+      <Sidebar.Menu>
+        <Sidebar.MenuItem>
+          <DropdownMenu.Root>
+            <DropdownMenu.Trigger>
+              {#snippet child({ props })}
+                <Sidebar.MenuButton size="lg" class="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground" {...props}>
+                  <Avatar.Root class="size-8 rounded-lg">
+                    <Avatar.Fallback class="rounded-lg bg-primary text-primary-foreground">
+                      <UserRound size={16} />
+                    </Avatar.Fallback>
+                  </Avatar.Root>
+                  <div class="grid flex-1 text-left text-sm leading-tight group-data-[collapsible=icon]:hidden">
+                    <span class="truncate font-medium">{currentUser?.username ?? 'Account'}</span>
+                    <span class="truncate text-xs text-muted-foreground">{currentUser?.role ?? 'guest'}</span>
+                  </div>
+                  <ChevronsUpDown class="ms-auto size-4 group-data-[collapsible=icon]:hidden" />
+                </Sidebar.MenuButton>
+              {/snippet}
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Content align="end" side="top" class="w-56">
+              {#if currentUser}
+                <div class="px-2 py-1.5 text-sm">
+                  <div class="font-medium">{currentUser.username}</div>
+                  <div class="text-xs text-muted-foreground">{currentUser.role}</div>
+                </div>
+                <DropdownMenu.Separator />
+              {/if}
+              <DropdownMenu.Item onclick={() => goto('/users')}>
+                <Users class="size-4" />
+                Users
+              </DropdownMenu.Item>
+              <DropdownMenu.Item onclick={logout}>
+                <LogOut class="size-4" />
+                Log out
+              </DropdownMenu.Item>
+            </DropdownMenu.Content>
+          </DropdownMenu.Root>
+        </Sidebar.MenuItem>
+      </Sidebar.Menu>
+    </Sidebar.Footer>
+  </Sidebar.Root>
 
-  <!-- Content -->
-  <div class="content-wrap">
-    <header class="topbar">
-      <button class="hamburger" type="button" aria-label="Open navigation" on:click={() => (mobileOpen = true)}>
-        <Menu size={20} />
-      </button>
+  <Sidebar.Inset>
+    <header class="sticky top-0 z-20 grid grid-cols-[auto_1fr_auto] items-center gap-3 border-b bg-background/90 px-4 py-2.5 backdrop-blur-md">
+      <Sidebar.Trigger />
 
-      <form class="searchbar" on:submit|preventDefault={submitSearch}>
-        <Search size={15} />
-        <input bind:value={globalSearch} type="search" placeholder="Search movies, shows..."
-          aria-label="Global search" on:input={onInput}
-          on:focus={() => { if (suggestions) searchOpen = true; }} on:blur={onBlur} />
+      <div class="relative mx-auto w-full max-w-[520px]">
+        <form on:submit|preventDefault={submitSearch} class="relative flex items-center">
+          <Search class="pointer-events-none absolute left-3 size-4 text-muted-foreground" />
+          <input
+            bind:value={globalSearch}
+            type="search"
+            placeholder="Search movies, shows..."
+            aria-label="Global search"
+            on:input={onInput}
+            on:focus={() => { if (suggestions) searchOpen = true; }}
+            on:blur={onBlur}
+            class="h-9 w-full rounded-full border bg-muted/40 pl-9 pr-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+          />
+        </form>
         {#if searchOpen && (searchBusy || suggestions)}
-          <div class="search-popover">
+          <div class="absolute left-0 top-[calc(100%+8px)] z-30 w-full overflow-hidden rounded-lg bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10">
             {#if searchBusy && !suggestions}
-              <div class="search-state">Searching…</div>
+              <div class="p-4 text-sm text-muted-foreground">Searching…</div>
             {:else if suggestions && !(suggestions.movies.length || suggestions.tv.length)}
-              <div class="search-state">No results.</div>
+              <div class="p-4 text-sm text-muted-foreground">No results.</div>
             {:else if suggestions}
               {#if suggestions.movies.length}
-                <div class="search-group">
-                  <div class="search-label">Movies</div>
+                <div class="p-1">
+                  <div class="px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">Movies</div>
                   {#each suggestions.movies.slice(0, 5) as item (suggestionKey(item))}
-                    <button class="search-item" type="button" on:mousedown|preventDefault={() => openSuggestion(item)}>
-                      <span class="search-name">{item.title}</span>
-                      <span class="search-meta">{item.year || '—'}</span>
+                    <button type="button" class="flex w-full items-center justify-between rounded-md px-3 py-2 text-sm outline-none hover:bg-muted focus-visible:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50" on:mousedown|preventDefault={() => openSuggestion(item)}>
+                      <span class="truncate">{item.title}</span>
+                      <span class="text-xs text-muted-foreground">{item.year || '—'}</span>
                     </button>
                   {/each}
                 </div>
               {/if}
               {#if suggestions.tv.length}
-                <div class="search-group">
-                  <div class="search-label">TV Shows</div>
+                <div class="p-1">
+                  <div class="px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">TV Shows</div>
                   {#each suggestions.tv.slice(0, 5) as item (suggestionKey(item))}
-                    <button class="search-item" type="button" on:mousedown|preventDefault={() => openSuggestion(item)}>
-                      <span class="search-name">{item.title}</span>
-                      <span class="search-meta">{item.year || '—'}</span>
+                    <button type="button" class="flex w-full items-center justify-between rounded-md px-3 py-2 text-sm outline-none hover:bg-muted focus-visible:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50" on:mousedown|preventDefault={() => openSuggestion(item)}>
+                      <span class="truncate">{item.title}</span>
+                      <span class="text-xs text-muted-foreground">{item.year || '—'}</span>
                     </button>
                   {/each}
                 </div>
               {/if}
-              <button class="search-all" type="submit">Open full search</button>
+              <button type="submit" on:click={submitSearch} class="block w-full border-t px-3 py-2 text-center text-sm font-medium text-primary outline-none hover:bg-muted focus-visible:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50">Open full search</button>
             {/if}
           </div>
         {/if}
-      </form>
+      </div>
 
-      <div class="topbar-right">
-        <a class="icon-btn" href="/docs" target="_blank" rel="noreferrer" title="API docs" aria-label="API docs"><FileText size={15} /></a>
-        <div class="notif-wrap">
-          <button
-            class="icon-btn notif-btn"
-            class:active={notifOpen}
-            type="button"
-            title="Notifications"
-            aria-label="Notifications"
-            on:click={() => (notifOpen = !notifOpen)}
-          ><Bell size={15} /></button>
-          {#if notifOpen}
-            <button class="notif-backdrop" type="button" aria-label="Close notifications" on:click={() => (notifOpen = false)}></button>
-            <div class="notif-popover" role="dialog" aria-label="Notifications">
-              <div class="notif-head">
-                <span>Notifications</span>
-                {#if $toastHistory.length}
-                  <button class="notif-clear" type="button" on:click={clearToastHistory}>Clear</button>
-                {/if}
-              </div>
-              <div class="notif-list">
-                {#if $toastHistory.length === 0}
-                  <div class="notif-empty">No notifications yet.</div>
-                {:else}
-                  {#each $toastHistory as item (item.id)}
-                    <div class={`notif-item ${item.tone}`}>
-                      <div class="notif-message">{item.message}</div>
-                      <div class="notif-time">{relativeTime(item.at)}</div>
-                    </div>
-                  {/each}
-                {/if}
-              </div>
+      <div class="flex items-center gap-1.5">
+        <Button variant="ghost" size="icon" href="/docs" target="_blank" rel="noreferrer" title="API docs" aria-label="API docs">
+          <FileText class="size-4" />
+        </Button>
+
+        <Popover.Root bind:open={notifOpen}>
+          <Popover.Trigger>
+            {#snippet child({ props })}
+              <Button variant="ghost" size="icon" title="Notifications" aria-label="Notifications" {...props}>
+                <Bell class="size-4" />
+              </Button>
+            {/snippet}
+          </Popover.Trigger>
+          <Popover.Content align="end" class="w-80 p-0">
+            <div class="flex items-center justify-between border-b px-3.5 py-3 text-sm font-semibold">
+              <span>Notifications</span>
+              {#if $toastHistory.length}
+                <button type="button" class="rounded-sm text-xs font-normal text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50" on:click={clearToastHistory}>Clear</button>
+              {/if}
             </div>
-          {/if}
-        </div>
-        <a class="icon-btn" href="/settings?tab=logs" aria-label="Logs"><BookOpen size={15} /></a>
-        {#if currentUser}
-          <a class="user-chip" href="/users" aria-label="Open users">
-            <span class="user-name">{currentUser.username}</span>
-            <span class="user-role">{currentUser.role}</span>
-          </a>
-        {/if}
-        <button class="icon-btn" type="button" aria-label="Log out" on:click={logout}>
-          <LogOut size={15} />
-        </button>
-        <div class="avatar" title={appVersion ? `Drakkar v${appVersion}` : 'Drakkar'}><DrakkarLogo size={18} /></div>
+            <div class="max-h-[360px] overflow-y-auto">
+              {#if $toastHistory.length === 0}
+                <div class="p-6 text-center text-sm text-muted-foreground">No notifications yet.</div>
+              {:else}
+                {#each $toastHistory as item (item.id)}
+                  <div
+                    class="border-b border-l-[3px] px-3.5 py-2.5"
+                    class:border-l-primary={item.tone === 'info'}
+                    style={item.tone === 'success' ? 'border-left-color: hsl(var(--status-available))' : item.tone === 'error' ? 'border-left-color: hsl(var(--status-failed))' : undefined}
+                  >
+                    <div class="text-sm leading-snug">{item.message}</div>
+                    <div class="mt-0.5 text-xs text-muted-foreground">{relativeTime(item.at)}</div>
+                  </div>
+                {/each}
+              {/if}
+            </div>
+          </Popover.Content>
+        </Popover.Root>
       </div>
     </header>
 
-    <main class="main"><slot /></main>
-  </div>
+    <main class="mx-auto w-full max-w-[1760px] flex-1 px-4 py-2 pb-24 md:pb-8">
+      <slot />
+    </main>
 
-  <!-- Mobile overlay + drawer -->
-  <div class:open={mobileOpen} class="mobile-overlay">
-    <button class="mobile-backdrop" type="button" aria-label="Close" on:click={() => (mobileOpen = false)}></button>
-    <div class="mobile-drawer" role="dialog" aria-modal="true" tabindex="-1">
-      <div class="drawer-head">
-        <div class="drawer-brand-wrap">
-          <div class="drawer-brand-icon"><DrakkarLogo size={20} /></div>
-          <div>
-            <div class="drawer-brand">Drakkar</div>
-            <div class="drawer-sub">control plane</div>
-          </div>
-        </div>
-        <button class="icon-btn" type="button" aria-label="Close" on:click={() => (mobileOpen = false)}>
-          <X size={18} />
-        </button>
-      </div>
-      <nav class="drawer-nav">
-        {#each navItems as item}
-          <a href={item.href} class:active={isActive(item.href)} on:click={() => (mobileOpen = false)}>
-            <svelte:component this={item.icon} size={18} />
-            <span>{item.label}</span>
-          </a>
-        {/each}
-      </nav>
-    </div>
-  </div>
-
-  <!-- Mobile bottom nav: 5 primary + More -->
-  <nav class="bottom-nav" aria-label="Primary navigation">
-    {#each mobilePrimaryItems as item}
-      <a href={item.href} class:active={isActive(item.href)} aria-label={item.label} title={item.label}>
-        <svelte:component this={item.icon} size={20} />
-        {#if isActive(item.href)}<span class="active-dot"></span>{/if}
-      </a>
-    {/each}
-    <button class="bottom-more" type="button" on:click={() => (mobileOpen = true)} aria-label="More">
-      <Menu size={20} />
-    </button>
-  </nav>
-</div>
-
-<style>
-  .shell { min-height: 100vh; }
-
-  /* ── Sidebar ─────────────────────────────────── */
-  .sidebar {
-    position: fixed; inset: 0 auto 0 0; z-index: 30;
-    width: 56px; display: none; flex-direction: column;
-    align-items: center; gap: 4px; padding: 14px 0;
-    border-right: 1px solid hsl(171 80% 56% / 0.1);
-    background: hsl(215 36% 4% / 0.78); backdrop-filter: blur(20px);
-  }
-
-  .brandmark {
-    display: grid; place-items: center; width: 36px; height: 36px;
-    border-radius: 12px; background: hsl(var(--primary));
-    color: hsl(var(--primary-foreground));
-    text-decoration: none; margin-bottom: 8px;
-  }
-
-  .side-nav { display: flex; flex-direction: column; gap: 2px; flex: 1; padding-top: 4px; }
-
-  /* notif-wrap/notif-btn live in .topbar-right now (always visible, mobile
-     included) rather than the desktop-only sidebar -- previously the bell,
-     the docs link, and the version tag were reachable ONLY inside
-     `.sidebar`, which is display:none below 768px, making all three
-     completely unreachable on mobile, not just poorly laid out. */
-  .notif-wrap { position: relative; }
-  .notif-btn.active { color: hsl(var(--foreground)); background: hsl(0 0% 100% / 0.1); }
-  .notif-backdrop {
-    position: fixed; inset: 0; z-index: 89; border: 0; background: transparent; cursor: default;
-  }
-  .notif-popover {
-    position: absolute; top: calc(100% + 10px); right: 0; z-index: 90;
-    width: min(320px, 90vw); max-height: 420px; display: flex; flex-direction: column;
-    border-radius: 16px; border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(212 27% 10% / 0.98); box-shadow: 0 18px 40px hsl(0 0% 0% / 0.35);
-    overflow: hidden;
-  }
-  .notif-head {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 12px 14px; border-bottom: 1px solid hsl(0 0% 100% / 0.06);
-    font-size: 13px; font-weight: 600; color: hsl(var(--foreground));
-  }
-  .notif-clear {
-    border: 0; background: transparent; color: hsl(var(--muted-foreground));
-    font-size: 12px; cursor: pointer;
-  }
-  .notif-clear:hover { color: hsl(var(--foreground)); }
-  .notif-list { overflow-y: auto; }
-  .notif-empty {
-    padding: 24px 14px; text-align: center; color: hsl(var(--muted-foreground)); font-size: 13px;
-  }
-  .notif-item {
-    padding: 10px 14px; border-bottom: 1px solid hsl(0 0% 100% / 0.05);
-    border-left: 3px solid transparent;
-  }
-  .notif-item.success { border-left-color: hsl(140 65% 45% / 0.6); }
-  .notif-item.error { border-left-color: hsl(0 72% 51% / 0.6); }
-  .notif-item.info { border-left-color: hsl(171 82% 55% / 0.6); }
-  .notif-message { font-size: 13px; color: hsl(var(--foreground)); line-height: 1.4; }
-  .notif-time { margin-top: 2px; font-size: 11px; color: hsl(var(--muted-foreground)); }
-
-  .side-nav a {
-    display: grid; place-items: center; width: 40px; height: 40px;
-    border-radius: 14px; border: 1px solid transparent;
-    color: hsl(var(--muted-foreground)); background: transparent; text-decoration: none;
-    transition: background .12s, color .12s;
-  }
-  .side-nav a:hover {
-    color: hsl(var(--foreground)); background: hsl(0 0% 100% / 0.08);
-  }
-  .side-nav a.active {
-    color: hsl(var(--foreground)); background: hsl(0 0% 100% / 0.12);
-    border-color: hsl(0 0% 100% / 0.06);
-  }
-
-  /* ── Content wrap ────────────────────────────── */
-  .content-wrap { min-width: 0; }
-
-  .topbar {
-    position: sticky; top: 0; z-index: 20; display: flex;
-    align-items: center; gap: 12px; padding: 12px 16px;
-    background: linear-gradient(180deg, hsl(var(--background) / 0.96), hsl(var(--background) / 0.4));
-    backdrop-filter: blur(18px);
-  }
-
-  .hamburger {
-    display: grid; place-items: center; width: 44px; height: 44px;
-    border-radius: 16px; border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.05); color: hsl(var(--foreground));
-    cursor: pointer; flex-shrink: 0;
-  }
-
-  /* ── Search ──────────────────────────────────── */
-  .searchbar {
-    position: relative; flex: 1; display: flex; align-items: center;
-    gap: 10px; height: 44px; padding: 0 16px;
-    border: 1px solid hsl(171 80% 56% / 0.12); border-radius: 18px;
-    background: hsl(171 30% 40% / 0.05); color: hsl(var(--muted-foreground));
-  }
-  .searchbar input {
-    flex: 1; border: none; outline: none; background: transparent;
-    color: hsl(var(--foreground)); font-size: 14px; font-weight: 600; min-width: 0;
-  }
-  .searchbar input::placeholder { color: hsl(var(--muted-foreground)); }
-
-  .search-popover {
-    position: absolute; top: calc(100% + 10px); left: 0; right: 0; z-index: 100;
-    display: grid; gap: 12px; padding: 14px;
-    border-radius: 18px; border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(221 39% 7% / 0.98); box-shadow: 0 20px 50px hsl(0 0% 0% / 0.4);
-  }
-  .search-group { display: grid; gap: 6px; }
-  .search-label, .search-meta, .search-state { color: hsl(var(--muted-foreground)); font-size: 12px; }
-  .search-item, .search-all {
-    display: flex; align-items: center; justify-content: space-between; gap: 12px;
-    width: 100%; min-height: 40px; padding: 0 12px;
-    border-radius: 12px; border: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(0 0% 100% / 0.04); color: hsl(var(--foreground)); text-align: left; cursor: pointer;
-  }
-  .search-item:hover, .search-all:hover { background: hsl(0 0% 100% / 0.08); }
-  .search-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 700; }
-  .search-all { justify-content: center; font-weight: 700; }
-
-  /* ── Topbar right ────────────────────────────── */
-  .topbar-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
-
-  .user-chip {
-    display: none;
-    align-items: center;
-    gap: 8px;
-    min-height: 40px;
-    padding: 0 12px;
-    border-radius: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--foreground));
-    text-decoration: none;
-  }
-
-  .user-name {
-    font-size: 13px;
-    font-weight: 700;
-  }
-
-  .user-role {
-    color: hsl(var(--muted-foreground));
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-  }
-
-  .icon-btn {
-    display: grid; place-items: center; width: 40px; height: 40px;
-    border-radius: 14px; border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04); color: hsl(var(--muted-foreground));
-    text-decoration: none; cursor: pointer; transition: background .12s;
-  }
-  .icon-btn:hover { background: hsl(0 0% 100% / 0.1); color: hsl(var(--foreground)); }
-
-  .avatar {
-    width: 34px; height: 34px; border-radius: 50%;
-    background: hsl(var(--primary)); color: hsl(var(--primary-foreground));
-    display: grid; place-items: center; font-size: 12px; font-weight: 800;
-  }
-
-  .main { max-width: 1760px; padding: 8px 16px 100px; margin: 0 auto; }
-  @media (max-width: 767px) {
-    .main { padding-bottom: 80px; }
-  }
-
-  /* ── Mobile overlay / drawer ─────────────────── */
-  .mobile-overlay {
-    position: fixed; inset: 0; z-index: 50;
-    background: hsl(0 0% 0% / 0.72); backdrop-filter: blur(8px);
-    opacity: 0; pointer-events: none; transition: opacity .18s;
-  }
-  .mobile-overlay.open { opacity: 1; pointer-events: auto; }
-
-  .mobile-backdrop {
-    position: absolute; inset: 0; border: 0; background: transparent; cursor: default;
-  }
-
-  .mobile-drawer {
-    position: relative; z-index: 1; width: min(22rem, 86vw); height: 100%;
-    padding: 16px; border-right: 1px solid hsl(var(--border) / 0.7);
-    background: hsl(var(--background)); display: flex; flex-direction: column;
-    transform: translateX(-100%); transition: transform .18s;
-  }
-  .mobile-overlay.open .mobile-drawer { transform: translateX(0); }
-
-  .drawer-head {
-    display: flex; justify-content: space-between; align-items: center;
-    gap: 12px; margin-bottom: 18px;
-  }
-  .drawer-brand-wrap { display: flex; align-items: center; gap: 10px; }
-  .drawer-brand-icon {
-    display: grid; place-items: center; width: 36px; height: 36px; flex-shrink: 0;
-    border-radius: 10px; background: hsl(var(--primary)); color: hsl(var(--primary-foreground));
-  }
-  .drawer-brand { font-size: 18px; font-weight: 700; }
-  .drawer-sub { color: hsl(var(--muted-foreground)); font-size: 12px; }
-
-  .drawer-nav { display: grid; gap: 3px; flex: 1; overflow-y: auto; }
-  .drawer-nav a {
-    display: flex; align-items: center; gap: 12px; padding: 11px 14px;
-    border-radius: 16px; border: 1px solid transparent;
-    color: hsl(var(--muted-foreground)); text-decoration: none;
-    font-size: 14px; font-weight: 600; transition: background .12s, color .12s;
-  }
-  .drawer-nav a:hover { background: hsl(0 0% 100% / 0.06); color: hsl(var(--foreground)); }
-  .drawer-nav a.active {
-    background: hsl(0 0% 100% / 0.1); color: hsl(var(--foreground));
-    border-color: hsl(0 0% 100% / 0.06);
-  }
-
-  /* ── Mobile bottom nav ───────────────────────── */
-  .bottom-nav {
-    position: fixed; left: 12px; right: 12px; bottom: 12px; z-index: 40;
-    display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; padding: 8px;
-    border: 1px solid hsl(0 0% 100% / 0.08); border-radius: 22px;
-    background: hsl(0 0% 0% / 0.82); backdrop-filter: blur(18px);
-  }
-
-  .bottom-nav a, .bottom-more {
-    position: relative; display: flex; align-items: center; justify-content: center;
-    height: 46px; border-radius: 18px;
-    color: hsl(var(--muted-foreground)); text-decoration: none;
-    transition: background .12s, color .12s; background: none; border: none; cursor: pointer;
-  }
-  .bottom-nav a:hover, .bottom-more:hover {
-    background: hsl(0 0% 100% / 0.08); color: hsl(var(--foreground));
-  }
-  .bottom-nav a.active { background: hsl(0 0% 100% / 0.12); color: hsl(var(--foreground)); }
-
-  .active-dot {
-    position: absolute; bottom: 5px; left: 50%; transform: translateX(-50%);
-    width: 4px; height: 4px; border-radius: 50%; background: hsl(var(--primary));
-  }
-
-  /* ── Desktop overrides ───────────────────────── */
-  @media (min-width: 768px) {
-    .sidebar { display: flex; }
-    .content-wrap { padding-left: 56px; }
-    .topbar { padding: 12px 32px; justify-content: center; }
-    .searchbar { max-width: 520px; }
-    .user-chip { display: inline-flex; }
-    .main { padding: 8px 32px 32px; }
-    .hamburger, .mobile-overlay, .bottom-nav { display: none !important; }
-  }
-</style>
+    <!-- Mobile bottom nav: 5 primary + More (opens the full sidebar sheet) -->
+    <nav class="fixed inset-x-0 bottom-0 z-20 flex h-16 items-center justify-around border-t bg-background/95 backdrop-blur-md md:hidden" aria-label="Primary navigation">
+      {#each mobilePrimaryItems as item}
+        <a href={item.href} class="relative flex min-h-11 min-w-11 flex-col items-center justify-center gap-0.5 rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring/50" class:text-primary={activeHrefs.has(item.href)} class:text-muted-foreground={!activeHrefs.has(item.href)} aria-label={item.label} title={item.label}>
+          <svelte:component this={item.icon} size={20} />
+          {#if activeHrefs.has(item.href)}<span class="absolute -bottom-0.5 size-1 rounded-full bg-primary"></span>{/if}
+        </a>
+      {/each}
+      <MobileMoreButton />
+    </nav>
+  </Sidebar.Inset>
+</Sidebar.Provider>

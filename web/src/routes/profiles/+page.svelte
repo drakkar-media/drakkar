@@ -130,244 +130,242 @@
   </Button>
 </PageHeader>
 
-<div class="profiles-shell">
+<div class="grid grid-cols-1 items-start gap-4 lg:grid-cols-[240px_minmax(0,1fr)]">
   <!-- Sidebar list -->
-  <aside class="profile-list">
+  <aside class="grid gap-2 lg:sticky lg:top-22">
     {#each profiles as p (p.id ?? p.name)}
       <button
-        class="profile-item"
-        class:selected={selected?.id === p.id}
+        class="grid gap-0.75 rounded-2xl border px-3.5 py-3 text-left transition-colors {selected?.id === p.id ? 'border-primary/28 bg-primary/12' : 'border-white/[0.06] bg-white/[0.03] hover:border-primary/28 hover:bg-primary/12'}"
         on:click={() => selectProfile(p)}
         type="button"
       >
-        <div class="profile-item-name">
-          {#if p.isDefault}<Star size={12} class="star" />{/if}
+        <div class="flex items-center gap-1.5 text-sm font-semibold">
+          {#if p.isDefault}<Star size={12} class="text-primary" />{/if}
           {p.name}
         </div>
-        <div class="profile-item-meta">{p.resolutions.slice(0, 2).join(', ')}</div>
+        <div class="font-mono text-[11px] text-muted-foreground">{p.resolutions.slice(0, 2).join(', ')}</div>
       </button>
     {/each}
     {#if profiles.length === 0 && !loading}
-      <div class="empty">No profiles yet.</div>
+      <div class="px-3.5 py-2 text-sm text-muted-foreground">No profiles yet.</div>
     {/if}
   </aside>
 
   <!-- Editor panel -->
   {#if selected}
-    <div class="editor">
+    <div class="grid">
       <Panel title={selected.id ? `Edit: ${selected.name}` : 'New Profile'} subtitle="Settings control how releases are ranked and filtered.">
         <div slot="actions">
           {#if selected.isDefault}<StatusPill tone="ok">Default</StatusPill>{/if}
         </div>
 
         <!-- Name -->
-        <div class="field">
-          <label class="field-label" for="pname">Profile Name</label>
-          <input id="pname" class="field-input" bind:value={selected.name} placeholder="e.g. Movie HD" />
+        <div class="mb-5">
+          <label class="mb-2.5 block text-sm font-semibold" for="pname">Profile Name</label>
+          <input id="pname" class="w-full" bind:value={selected.name} placeholder="e.g. Movie HD" />
         </div>
 
-        <div class="divider"></div>
+        <div class="my-5 h-px bg-white/[0.06]"></div>
 
         <!-- Resolutions (ordered) -->
-        <div class="field">
-          <div class="field-label">Resolutions <span class="field-hint">drag to re-rank</span></div>
-          <div class="ordered-list">
+        <div class="mb-5">
+          <div class="mb-2.5 flex items-baseline gap-2 text-sm font-semibold">Resolutions <span class="text-[11px] font-normal text-muted-foreground">drag to re-rank</span></div>
+          <div class="grid gap-1.5">
             {#each selected.resolutions as res, i}
-              <div class="ordered-row">
-                <span class="rank">{i + 1}</span>
-                <span class="ordered-value">{res}</span>
-                <button type="button" class="rank-btn" aria-label={`Move ${res} up`} on:click={() => { selected = { ...selected!, resolutions: moveUp(selected!.resolutions, i) }; }} disabled={i === 0}>
+              <div class="flex items-center gap-2 rounded-[10px] border border-white/[0.06] bg-white/[0.03] px-2.5 py-2">
+                <span class="min-w-5.5 font-mono text-[11px] font-bold text-primary">{i + 1}</span>
+                <span class="flex-1 font-mono text-sm">{res}</span>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-muted-foreground hover:bg-white/[0.08] hover:text-foreground disabled:opacity-30" aria-label={`Move ${res} up`} on:click={() => { selected = { ...selected!, resolutions: moveUp(selected!.resolutions, i) }; }} disabled={i === 0}>
                   <ChevronUp size={13} />
                 </button>
-                <button type="button" class="rank-btn" aria-label={`Move ${res} down`} on:click={() => { selected = { ...selected!, resolutions: moveDown(selected!.resolutions, i) }; }} disabled={i === selected.resolutions.length - 1}>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-muted-foreground hover:bg-white/[0.08] hover:text-foreground disabled:opacity-30" aria-label={`Move ${res} down`} on:click={() => { selected = { ...selected!, resolutions: moveDown(selected!.resolutions, i) }; }} disabled={i === selected.resolutions.length - 1}>
                   <ChevronDown size={13} />
                 </button>
-                <button type="button" class="rank-btn remove" aria-label={`Remove ${res}`} on:click={() => { selected = { ...selected!, resolutions: selected!.resolutions.filter(v => v !== res) }; }}>✕</button>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-xs text-muted-foreground transition-colors hover:bg-[hsl(var(--status-failed)/0.15)] hover:text-[hsl(var(--status-failed))]" aria-label={`Remove ${res}`} on:click={() => { selected = { ...selected!, resolutions: selected!.resolutions.filter(v => v !== res) }; }}>✕</button>
               </div>
             {/each}
-            <div class="chip-row">
+            <div class="mt-2 flex flex-wrap gap-1.5">
               {#each ALL_RESOLUTIONS.filter(r => !selected!.resolutions.includes(r)) as r}
-                <button type="button" class="chip add" on:click={() => { selected = { ...selected!, resolutions: [...selected!.resolutions, r] }; }}>{r} +</button>
+                <button type="button" class="rounded-[10px] border border-dashed border-white/[0.08] bg-white/[0.04] px-3 py-1.25 font-mono text-[11px] text-muted-foreground transition-colors hover:bg-white/[0.08] hover:text-foreground" on:click={() => { selected = { ...selected!, resolutions: [...selected!.resolutions, r] }; }}>{r} +</button>
               {/each}
             </div>
           </div>
         </div>
 
         <!-- Sources (ordered) -->
-        <div class="field">
-          <div class="field-label">Sources <span class="field-hint">rank by priority</span></div>
-          <div class="ordered-list">
+        <div class="mb-5">
+          <div class="mb-2.5 flex items-baseline gap-2 text-sm font-semibold">Sources <span class="text-[11px] font-normal text-muted-foreground">rank by priority</span></div>
+          <div class="grid gap-1.5">
             {#each selected.sources as src, i}
-              <div class="ordered-row">
-                <span class="rank">{i + 1}</span>
-                <span class="ordered-value">{src}</span>
-                <button type="button" class="rank-btn" aria-label={`Move ${src} up`} on:click={() => { selected = { ...selected!, sources: moveUp(selected!.sources, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
-                <button type="button" class="rank-btn" aria-label={`Move ${src} down`} on:click={() => { selected = { ...selected!, sources: moveDown(selected!.sources, i) }; }} disabled={i === selected.sources.length - 1}><ChevronDown size={13} /></button>
-                <button type="button" class="rank-btn remove" aria-label={`Remove ${src}`} on:click={() => { selected = { ...selected!, sources: selected!.sources.filter(v => v !== src) }; }}>✕</button>
+              <div class="flex items-center gap-2 rounded-[10px] border border-white/[0.06] bg-white/[0.03] px-2.5 py-2">
+                <span class="min-w-5.5 font-mono text-[11px] font-bold text-primary">{i + 1}</span>
+                <span class="flex-1 font-mono text-sm">{src}</span>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-muted-foreground hover:bg-white/[0.08] hover:text-foreground disabled:opacity-30" aria-label={`Move ${src} up`} on:click={() => { selected = { ...selected!, sources: moveUp(selected!.sources, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-muted-foreground hover:bg-white/[0.08] hover:text-foreground disabled:opacity-30" aria-label={`Move ${src} down`} on:click={() => { selected = { ...selected!, sources: moveDown(selected!.sources, i) }; }} disabled={i === selected.sources.length - 1}><ChevronDown size={13} /></button>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-xs text-muted-foreground transition-colors hover:bg-[hsl(var(--status-failed)/0.15)] hover:text-[hsl(var(--status-failed))]" aria-label={`Remove ${src}`} on:click={() => { selected = { ...selected!, sources: selected!.sources.filter(v => v !== src) }; }}>✕</button>
               </div>
             {/each}
-            <div class="chip-row">
+            <div class="mt-2 flex flex-wrap gap-1.5">
               {#each ALL_SOURCES.filter(s => !selected!.sources.includes(s)) as s}
-                <button type="button" class="chip add" on:click={() => { selected = { ...selected!, sources: [...selected!.sources, s] }; }}>{s} +</button>
+                <button type="button" class="rounded-[10px] border border-dashed border-white/[0.08] bg-white/[0.04] px-3 py-1.25 font-mono text-[11px] text-muted-foreground transition-colors hover:bg-white/[0.08] hover:text-foreground" on:click={() => { selected = { ...selected!, sources: [...selected!.sources, s] }; }}>{s} +</button>
               {/each}
             </div>
           </div>
         </div>
 
         <!-- Codecs (ordered) -->
-        <div class="field">
-          <div class="field-label">Codecs <span class="field-hint">rank by priority</span></div>
-          <div class="ordered-list">
+        <div class="mb-5">
+          <div class="mb-2.5 flex items-baseline gap-2 text-sm font-semibold">Codecs <span class="text-[11px] font-normal text-muted-foreground">rank by priority</span></div>
+          <div class="grid gap-1.5">
             {#each selected.codecs as c, i}
-              <div class="ordered-row">
-                <span class="rank">{i + 1}</span>
-                <span class="ordered-value">{c}</span>
-                <button type="button" class="rank-btn" aria-label={`Move ${c} up`} on:click={() => { selected = { ...selected!, codecs: moveUp(selected!.codecs, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
-                <button type="button" class="rank-btn" aria-label={`Move ${c} down`} on:click={() => { selected = { ...selected!, codecs: moveDown(selected!.codecs, i) }; }} disabled={i === selected.codecs.length - 1}><ChevronDown size={13} /></button>
-                <button type="button" class="rank-btn remove" aria-label={`Remove ${c}`} on:click={() => { selected = { ...selected!, codecs: selected!.codecs.filter(v => v !== c) }; }}>✕</button>
+              <div class="flex items-center gap-2 rounded-[10px] border border-white/[0.06] bg-white/[0.03] px-2.5 py-2">
+                <span class="min-w-5.5 font-mono text-[11px] font-bold text-primary">{i + 1}</span>
+                <span class="flex-1 font-mono text-sm">{c}</span>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-muted-foreground hover:bg-white/[0.08] hover:text-foreground disabled:opacity-30" aria-label={`Move ${c} up`} on:click={() => { selected = { ...selected!, codecs: moveUp(selected!.codecs, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-muted-foreground hover:bg-white/[0.08] hover:text-foreground disabled:opacity-30" aria-label={`Move ${c} down`} on:click={() => { selected = { ...selected!, codecs: moveDown(selected!.codecs, i) }; }} disabled={i === selected.codecs.length - 1}><ChevronDown size={13} /></button>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-xs text-muted-foreground transition-colors hover:bg-[hsl(var(--status-failed)/0.15)] hover:text-[hsl(var(--status-failed))]" aria-label={`Remove ${c}`} on:click={() => { selected = { ...selected!, codecs: selected!.codecs.filter(v => v !== c) }; }}>✕</button>
               </div>
             {/each}
-            <div class="chip-row">
+            <div class="mt-2 flex flex-wrap gap-1.5">
               {#each ALL_CODECS.filter(c => !selected!.codecs.includes(c)) as c}
-                <button type="button" class="chip add" on:click={() => { selected = { ...selected!, codecs: [...selected!.codecs, c] }; }}>{c} +</button>
+                <button type="button" class="rounded-[10px] border border-dashed border-white/[0.08] bg-white/[0.04] px-3 py-1.25 font-mono text-[11px] text-muted-foreground transition-colors hover:bg-white/[0.08] hover:text-foreground" on:click={() => { selected = { ...selected!, codecs: [...selected!.codecs, c] }; }}>{c} +</button>
               {/each}
             </div>
           </div>
         </div>
 
-        <div class="divider"></div>
+        <div class="my-5 h-px bg-white/[0.06]"></div>
 
         <!-- Audio formats (ordered — new) -->
-        <div class="field">
-          <div class="field-label">Audio Formats <span class="field-hint">rank by priority — top scores highest</span></div>
-          <div class="ordered-list">
+        <div class="mb-5">
+          <div class="mb-2.5 flex items-baseline gap-2 text-sm font-semibold">Audio Formats <span class="text-[11px] font-normal text-muted-foreground">rank by priority — top scores highest</span></div>
+          <div class="grid gap-1.5">
             {#each selected.audioFormats as a, i}
-              <div class="ordered-row">
-                <span class="rank">{i + 1}</span>
-                <span class="ordered-value">{a}</span>
-                <button type="button" class="rank-btn" aria-label={`Move ${a} up`} on:click={() => { selected = { ...selected!, audioFormats: moveUp(selected!.audioFormats, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
-                <button type="button" class="rank-btn" aria-label={`Move ${a} down`} on:click={() => { selected = { ...selected!, audioFormats: moveDown(selected!.audioFormats, i) }; }} disabled={i === selected.audioFormats.length - 1}><ChevronDown size={13} /></button>
-                <button type="button" class="rank-btn remove" aria-label={`Remove ${a}`} on:click={() => { selected = { ...selected!, audioFormats: selected!.audioFormats.filter(v => v !== a) }; }}>✕</button>
+              <div class="flex items-center gap-2 rounded-[10px] border border-white/[0.06] bg-white/[0.03] px-2.5 py-2">
+                <span class="min-w-5.5 font-mono text-[11px] font-bold text-primary">{i + 1}</span>
+                <span class="flex-1 font-mono text-sm">{a}</span>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-muted-foreground hover:bg-white/[0.08] hover:text-foreground disabled:opacity-30" aria-label={`Move ${a} up`} on:click={() => { selected = { ...selected!, audioFormats: moveUp(selected!.audioFormats, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-muted-foreground hover:bg-white/[0.08] hover:text-foreground disabled:opacity-30" aria-label={`Move ${a} down`} on:click={() => { selected = { ...selected!, audioFormats: moveDown(selected!.audioFormats, i) }; }} disabled={i === selected.audioFormats.length - 1}><ChevronDown size={13} /></button>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-xs text-muted-foreground transition-colors hover:bg-[hsl(var(--status-failed)/0.15)] hover:text-[hsl(var(--status-failed))]" aria-label={`Remove ${a}`} on:click={() => { selected = { ...selected!, audioFormats: selected!.audioFormats.filter(v => v !== a) }; }}>✕</button>
               </div>
             {/each}
-            <div class="chip-row">
+            <div class="mt-2 flex flex-wrap gap-1.5">
               {#each ALL_AUDIO.filter(a => !selected!.audioFormats.includes(a)) as a}
-                <button type="button" class="chip add" on:click={() => { selected = { ...selected!, audioFormats: [...selected!.audioFormats, a] }; }}>{a} +</button>
+                <button type="button" class="rounded-[10px] border border-dashed border-white/[0.08] bg-white/[0.04] px-3 py-1.25 font-mono text-[11px] text-muted-foreground transition-colors hover:bg-white/[0.08] hover:text-foreground" on:click={() => { selected = { ...selected!, audioFormats: [...selected!.audioFormats, a] }; }}>{a} +</button>
               {/each}
             </div>
           </div>
         </div>
 
         <!-- HDR formats (ordered — new) -->
-        <div class="field">
-          <div class="field-label">HDR Formats <span class="field-hint">rank by priority</span></div>
-          <div class="ordered-list">
+        <div class="mb-5">
+          <div class="mb-2.5 flex items-baseline gap-2 text-sm font-semibold">HDR Formats <span class="text-[11px] font-normal text-muted-foreground">rank by priority</span></div>
+          <div class="grid gap-1.5">
             {#each selected.hdrFormats as h, i}
-              <div class="ordered-row">
-                <span class="rank">{i + 1}</span>
-                <span class="ordered-value">{h}</span>
-                <button type="button" class="rank-btn" aria-label={`Move ${h} up`} on:click={() => { selected = { ...selected!, hdrFormats: moveUp(selected!.hdrFormats, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
-                <button type="button" class="rank-btn" aria-label={`Move ${h} down`} on:click={() => { selected = { ...selected!, hdrFormats: moveDown(selected!.hdrFormats, i) }; }} disabled={i === selected.hdrFormats.length - 1}><ChevronDown size={13} /></button>
-                <button type="button" class="rank-btn remove" aria-label={`Remove ${h}`} on:click={() => { selected = { ...selected!, hdrFormats: selected!.hdrFormats.filter(v => v !== h) }; }}>✕</button>
+              <div class="flex items-center gap-2 rounded-[10px] border border-white/[0.06] bg-white/[0.03] px-2.5 py-2">
+                <span class="min-w-5.5 font-mono text-[11px] font-bold text-primary">{i + 1}</span>
+                <span class="flex-1 font-mono text-sm">{h}</span>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-muted-foreground hover:bg-white/[0.08] hover:text-foreground disabled:opacity-30" aria-label={`Move ${h} up`} on:click={() => { selected = { ...selected!, hdrFormats: moveUp(selected!.hdrFormats, i) }; }} disabled={i === 0}><ChevronUp size={13} /></button>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-muted-foreground hover:bg-white/[0.08] hover:text-foreground disabled:opacity-30" aria-label={`Move ${h} down`} on:click={() => { selected = { ...selected!, hdrFormats: moveDown(selected!.hdrFormats, i) }; }} disabled={i === selected.hdrFormats.length - 1}><ChevronDown size={13} /></button>
+                <button type="button" class="grid size-6.5 place-items-center rounded-md border border-white/[0.06] bg-transparent text-xs text-muted-foreground transition-colors hover:bg-[hsl(var(--status-failed)/0.15)] hover:text-[hsl(var(--status-failed))]" aria-label={`Remove ${h}`} on:click={() => { selected = { ...selected!, hdrFormats: selected!.hdrFormats.filter(v => v !== h) }; }}>✕</button>
               </div>
             {/each}
-            <div class="chip-row">
+            <div class="mt-2 flex flex-wrap gap-1.5">
               {#each ALL_HDR.filter(h => !selected!.hdrFormats.includes(h)) as h}
-                <button type="button" class="chip add" on:click={() => { selected = { ...selected!, hdrFormats: [...selected!.hdrFormats, h] }; }}>{h} +</button>
+                <button type="button" class="rounded-[10px] border border-dashed border-white/[0.08] bg-white/[0.04] px-3 py-1.25 font-mono text-[11px] text-muted-foreground transition-colors hover:bg-white/[0.08] hover:text-foreground" on:click={() => { selected = { ...selected!, hdrFormats: [...selected!.hdrFormats, h] }; }}>{h} +</button>
               {/each}
             </div>
           </div>
         </div>
 
-        <div class="divider"></div>
+        <div class="my-5 h-px bg-white/[0.06]"></div>
 
         <!-- Languages (chips) -->
-        <div class="field">
-          <div class="field-label">Languages</div>
-          <div class="chip-row">
+        <div class="mb-5">
+          <div class="mb-2.5 text-sm font-semibold">Languages</div>
+          <div class="flex flex-wrap gap-1.5">
             {#each ALL_LANGUAGES as lang}
               <button
                 type="button"
-                class="chip"
-                class:on={selected.languages.includes(lang)}
+                class="rounded-[10px] border px-3 py-1.25 font-mono text-xs transition-colors {selected.languages.includes(lang) ? 'border-primary bg-primary text-primary-foreground' : 'border-white/[0.08] bg-white/[0.04] text-muted-foreground hover:bg-white/[0.08] hover:text-foreground'}"
                 on:click={() => { selected = { ...selected!, languages: toggleOrdered(selected!.languages, lang) }; }}
               >{lang}</button>
             {/each}
           </div>
         </div>
 
-        <div class="divider"></div>
+        <div class="my-5 h-px bg-white/[0.06]"></div>
 
         <!-- Flags — Radarr/Sonarr style -->
-        <div class="field">
-          <div class="field-label">Release Flags</div>
-          <div class="flags-grid">
-            <label class="flag-row">
-              <input type="checkbox" bind:checked={selected.preferProper} />
+        <div class="mb-5">
+          <div class="mb-2.5 text-sm font-semibold">Release Flags</div>
+          <div class="grid gap-2.5">
+            <label class="flex items-start gap-3 rounded-xl border border-white/[0.06] bg-white/[0.03] px-3.5 py-3 cursor-pointer">
+              <input type="checkbox" class="mt-0.5 shrink-0" bind:checked={selected.preferProper} />
               <div>
-                <strong>Prefer Proper</strong>
-                <span>Boost score when release is marked PROPER</span>
+                <strong class="block text-sm mb-0.5">Prefer Proper</strong>
+                <span class="block text-xs text-muted-foreground">Boost score when release is marked PROPER</span>
               </div>
             </label>
-            <label class="flag-row">
-              <input type="checkbox" bind:checked={selected.preferRepack} />
+            <label class="flex items-start gap-3 rounded-xl border border-white/[0.06] bg-white/[0.03] px-3.5 py-3 cursor-pointer">
+              <input type="checkbox" class="mt-0.5 shrink-0" bind:checked={selected.preferRepack} />
               <div>
-                <strong>Prefer Repack</strong>
-                <span>Boost score when release is marked REPACK</span>
+                <strong class="block text-sm mb-0.5">Prefer Repack</strong>
+                <span class="block text-xs text-muted-foreground">Boost score when release is marked REPACK</span>
               </div>
             </label>
-            <label class="flag-row">
-              <input type="checkbox" bind:checked={selected.rejectCam} />
+            <label class="flex items-start gap-3 rounded-xl border border-white/[0.06] bg-white/[0.03] px-3.5 py-3 cursor-pointer">
+              <input type="checkbox" class="mt-0.5 shrink-0" bind:checked={selected.rejectCam} />
               <div>
-                <strong>Reject CAM / TS / Telecine</strong>
-                <span>Hard-reject low-quality cam captures and telesyncs</span>
+                <strong class="block text-sm mb-0.5">Reject CAM / TS / Telecine</strong>
+                <span class="block text-xs text-muted-foreground">Hard-reject low-quality cam captures and telesyncs</span>
               </div>
             </label>
-            <label class="flag-row">
-              <input type="checkbox" bind:checked={selected.allowUpgrade} />
+            <label class="flex items-start gap-3 rounded-xl border border-white/[0.06] bg-white/[0.03] px-3.5 py-3 cursor-pointer">
+              <input type="checkbox" class="mt-0.5 shrink-0" bind:checked={selected.allowUpgrade} />
               <div>
-                <strong>Allow Quality Upgrade</strong>
-                <span>Periodically re-search available items for better releases</span>
+                <strong class="block text-sm mb-0.5">Allow Quality Upgrade</strong>
+                <span class="block text-xs text-muted-foreground">Periodically re-search available items for better releases</span>
               </div>
             </label>
           </div>
         </div>
 
-        <div class="divider"></div>
+        <div class="my-5 h-px bg-white/[0.06]"></div>
 
-        <div class="field">
-          <div class="field-label">Upgrade Rules</div>
-          <div class="size-row">
-            <label>
-              <span>Minimum CF Upgrade</span>
-              <input type="number" min="0" bind:value={selected.minimumUpgradeCustomFormatScore} class="size-input" placeholder="0 = no minimum" />
+        <div class="mb-5">
+          <div class="mb-2.5 text-sm font-semibold">Upgrade Rules</div>
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <label class="grid gap-1.5">
+              <span class="text-xs text-muted-foreground">Minimum CF Upgrade</span>
+              <input type="number" min="0" bind:value={selected.minimumUpgradeCustomFormatScore} class="font-mono" placeholder="0 = no minimum" />
             </label>
           </div>
-          <div class="field-hint" style="margin-top:8px">When upgrades are enabled, the new release must improve the custom-format subtotal by at least this amount.</div>
+          <div class="mt-2 text-[11px] text-muted-foreground">When upgrades are enabled, the new release must improve the custom-format subtotal by at least this amount.</div>
         </div>
 
-        <div class="divider"></div>
+        <div class="my-5 h-px bg-white/[0.06]"></div>
 
         <!-- Size limits -->
-        <div class="field">
-          <div class="field-label">Size Limits</div>
-          <div class="size-row">
-            <label>
-              <span>Min (MB/min)</span>
-              <input type="number" min="0" bind:value={selected.minMbPerMinute} class="size-input" placeholder="0 = no limit" />
+        <div class="mb-5">
+          <div class="mb-2.5 text-sm font-semibold">Size Limits</div>
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <label class="grid gap-1.5">
+              <span class="text-xs text-muted-foreground">Min (MB/min)</span>
+              <input type="number" min="0" bind:value={selected.minMbPerMinute} class="font-mono" placeholder="0 = no limit" />
             </label>
-            <label>
-              <span>Max (MB/min)</span>
-              <input type="number" min="0" bind:value={selected.maxMbPerMinute} class="size-input" placeholder="0 = no limit" />
+            <label class="grid gap-1.5">
+              <span class="text-xs text-muted-foreground">Max (MB/min)</span>
+              <input type="number" min="0" bind:value={selected.maxMbPerMinute} class="font-mono" placeholder="0 = no limit" />
             </label>
           </div>
-          <div class="field-hint" style="margin-top:8px">Applied per runtime minute. Releases without runtime metadata skip these limits.</div>
+          <div class="mt-2 text-[11px] text-muted-foreground">Applied per runtime minute. Releases without runtime metadata skip these limits.</div>
         </div>
 
-        <div class="divider"></div>
+        <div class="my-5 h-px bg-white/[0.06]"></div>
 
         <!-- Actions -->
-        <div class="editor-actions">
+        <div class="mt-1.5 flex justify-end gap-2.5">
           {#if selected.id && !selected.isDefault}
             <Button kind="danger" on:click={() => selected && deleteProfile(selected)} disabled={saving || deleting}>
               <Trash2 size={15} />
@@ -382,245 +380,8 @@
       </Panel>
     </div>
   {:else}
-    <div class="no-selection">
+    <div class="rounded-2xl border border-white/[0.06] bg-white/[0.02] p-8 text-center text-sm text-muted-foreground">
       Select a profile to edit, or create a new one.
     </div>
   {/if}
 </div>
-
-<style>
-  .profiles-shell {
-    display: grid;
-    grid-template-columns: 240px minmax(0, 1fr);
-    gap: 16px;
-    align-items: start;
-  }
-
-  /* Sidebar */
-  .profile-list {
-    display: grid;
-    gap: 8px;
-    position: sticky;
-    top: 88px;
-  }
-
-  .profile-item {
-    display: grid;
-    gap: 3px;
-    padding: 12px 14px;
-    border-radius: 14px;
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(0 0% 100% / 0.03);
-    text-align: left;
-    cursor: pointer;
-    transition: background 0.12s;
-  }
-
-  .profile-item:hover, .profile-item.selected {
-    background: hsl(var(--primary) / 0.12);
-    border-color: hsl(var(--primary) / 0.28);
-  }
-
-  .profile-item-name {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 13px;
-    font-weight: 600;
-  }
-
-  .profile-item-name :global(.star) { color: hsl(var(--primary)); }
-
-  .profile-item-meta {
-    font-size: 11px;
-    color: hsl(var(--muted-foreground));
-    font-family: 'JetBrains Mono', monospace;
-  }
-
-  /* Editor */
-  .editor { display: grid; gap: 0; }
-
-  .no-selection {
-    padding: 32px;
-    border-radius: 18px;
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(0 0% 100% / 0.02);
-    color: hsl(var(--muted-foreground));
-    text-align: center;
-  }
-
-  .field {
-    margin-bottom: 20px;
-  }
-
-  .field-label {
-    font-size: 13px;
-    font-weight: 600;
-    margin-bottom: 10px;
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-  }
-
-  .field-hint {
-    font-size: 11px;
-    font-weight: 400;
-    color: hsl(var(--muted-foreground));
-  }
-
-  .field-input {
-    width: 100%;
-    padding: 10px 12px;
-    border-radius: 12px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--foreground));
-    font-size: 13px;
-  }
-
-  .divider {
-    height: 1px;
-    background: hsl(0 0% 100% / 0.06);
-    margin: 6px 0 20px;
-  }
-
-  /* Ordered list */
-  .ordered-list { display: grid; gap: 6px; }
-
-  .ordered-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 10px;
-    border-radius: 10px;
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(0 0% 100% / 0.03);
-  }
-
-  .rank {
-    min-width: 22px;
-    font-size: 11px;
-    font-weight: 700;
-    font-family: 'JetBrains Mono', monospace;
-    color: hsl(var(--primary));
-  }
-
-  .ordered-value {
-    flex: 1;
-    font-size: 13px;
-    font-family: 'JetBrains Mono', monospace;
-  }
-
-  .rank-btn {
-    display: grid;
-    place-items: center;
-    width: 26px;
-    height: 26px;
-    border-radius: 7px;
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    background: transparent;
-    color: hsl(var(--muted-foreground));
-    cursor: pointer;
-    font-size: 12px;
-  }
-
-  .rank-btn:hover { background: hsl(0 0% 100% / 0.08); color: hsl(var(--foreground)); }
-  .rank-btn:disabled { opacity: 0.3; cursor: default; }
-  .rank-btn.remove:hover { background: hsl(0 72% 51% / 0.15); color: hsl(0 96% 82%); }
-
-  /* Chips */
-  .chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-
-  .chip {
-    padding: 5px 12px;
-    border-radius: 10px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--muted-foreground));
-    font-size: 12px;
-    font-family: 'JetBrains Mono', monospace;
-    cursor: pointer;
-    transition: all 0.12s;
-  }
-
-  .chip.on {
-    background: hsl(var(--primary) / 0.18);
-    border-color: hsl(var(--primary) / 0.4);
-    color: hsl(var(--primary));
-  }
-
-  .chip.add {
-    border-style: dashed;
-    font-size: 11px;
-  }
-
-  .chip.add:hover, .chip:not(.on):hover {
-    background: hsl(0 0% 100% / 0.08);
-    color: hsl(var(--foreground));
-  }
-
-  /* Flags (Radarr/Sonarr style) */
-  .flags-grid { display: grid; gap: 10px; }
-
-  .flag-row {
-    display: flex;
-    align-items: flex-start;
-    gap: 12px;
-    padding: 12px 14px;
-    border-radius: 12px;
-    border: 1px solid hsl(0 0% 100% / 0.06);
-    background: hsl(0 0% 100% / 0.03);
-    cursor: pointer;
-  }
-
-  .flag-row input[type=checkbox] {
-    width: 16px;
-    height: 16px;
-    flex-shrink: 0;
-    margin-top: 2px;
-    accent-color: hsl(var(--primary));
-    cursor: pointer;
-  }
-
-  .flag-row strong { display: block; font-size: 13px; margin-bottom: 2px; }
-  .flag-row span   { display: block; font-size: 12px; color: hsl(var(--muted-foreground)); }
-
-  /* Size limits */
-  .size-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-
-  .size-row label { display: grid; gap: 6px; }
-  .size-row span  { font-size: 12px; color: hsl(var(--muted-foreground)); }
-  .size-input {
-    width: 100%;
-    padding: 10px 12px;
-    border-radius: 12px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--foreground));
-    font-size: 13px;
-    font-family: 'JetBrains Mono', monospace;
-  }
-
-  /* Actions */
-  .editor-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 10px;
-    margin-top: 6px;
-  }
-
-  .empty {
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-    padding: 8px 14px;
-  }
-
-  @media (max-width: 1100px) {
-    .profiles-shell { grid-template-columns: 1fr; }
-    .profile-list { position: static; }
-  }
-
-  @media (max-width: 700px) {
-    .size-row { grid-template-columns: 1fr; }
-  }
-</style>

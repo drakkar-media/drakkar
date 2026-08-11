@@ -16,6 +16,7 @@
   import Panel from '$lib/components/Panel.svelte';
   import Button from '$lib/components/Button.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
+  import * as Select from '$lib/components/ui/select/index.js';
   import { api } from '$lib/api';
   import { toastError, toastSuccess } from '$lib/toast';
   import { runAction, confirmed } from '$lib/actions';
@@ -137,39 +138,42 @@
   </Button>
 </PageHeader>
 
-<section class="summary-grid">
-  <div class="summary-card">
-    <div class="summary-value">{users.length}</div>
-    <div class="summary-label">Total users</div>
+<section class="mb-5 grid grid-cols-1 gap-3.5 sm:grid-cols-3">
+  <div class="rounded-xl border border-border bg-card/80 px-4 py-3.5">
+    <div class="text-xl font-bold leading-none">{users.length}</div>
+    <div class="mt-2 text-sm text-muted-foreground">Total users</div>
   </div>
-  <div class="summary-card">
-    <div class="summary-value">{users.filter((user) => user.role === 'admin').length}</div>
-    <div class="summary-label">Admins</div>
+  <div class="rounded-xl border border-border bg-card/80 px-4 py-3.5">
+    <div class="text-xl font-bold leading-none">{users.filter((user) => user.role === 'admin').length}</div>
+    <div class="mt-2 text-sm text-muted-foreground">Admins</div>
   </div>
-  <div class="summary-card">
-    <div class="summary-value">{me?.username ?? '—'}</div>
-    <div class="summary-label">Current session</div>
+  <div class="rounded-xl border border-border bg-card/80 px-4 py-3.5">
+    <div class="text-xl font-bold leading-none">{me?.username ?? '—'}</div>
+    <div class="mt-2 text-sm text-muted-foreground">Current session</div>
   </div>
 </section>
 
-<div class="grid">
-  <div class="sidebar-stack">
+<div class="grid grid-cols-1 gap-4 md:grid-cols-[minmax(320px,420px)_minmax(0,1fr)]">
+  <div class="grid gap-4">
     <Panel title="Create User" subtitle="Adds a new local account and immediately makes it available for login.">
-      <form class="create-form" on:submit|preventDefault={createUser}>
-        <label>
-          <span>Username</span>
+      <form class="grid gap-3" on:submit|preventDefault={createUser}>
+        <label class="grid gap-1.5">
+          <span class="text-sm font-semibold">Username</span>
           <input bind:value={username} type="text" autocomplete="off" placeholder="operator" />
         </label>
-        <label>
-          <span>Password</span>
+        <label class="grid gap-1.5">
+          <span class="text-sm font-semibold">Password</span>
           <input bind:value={password} type="password" autocomplete="new-password" placeholder="minimum 8 characters" />
         </label>
-        <label>
-          <span>Role</span>
-          <select bind:value={role}>
-            <option value="admin">Admin</option>
-            <option value="user">User</option>
-          </select>
+        <label class="grid gap-1.5">
+          <span class="text-sm font-semibold">Role</span>
+          <Select.Root type="single" bind:value={role}>
+            <Select.Trigger class="w-full">{role === 'admin' ? 'Admin' : 'User'}</Select.Trigger>
+            <Select.Content>
+              <Select.Item value="admin">Admin</Select.Item>
+              <Select.Item value="user">User</Select.Item>
+            </Select.Content>
+          </Select.Root>
         </label>
         <Button kind="primary" disabled={isBusy('create-user') || !username.trim() || password.length < 8}>
           <UserPlus size={14} />
@@ -179,13 +183,13 @@
     </Panel>
 
     <Panel title="API Tokens" subtitle="Personal access tokens for scripts and automation. The raw token is shown only once after creation.">
-      <form class="create-form" on:submit|preventDefault={createToken}>
-        <label>
-          <span>Name</span>
+      <form class="grid gap-3" on:submit|preventDefault={createToken}>
+        <label class="grid gap-1.5">
+          <span class="text-sm font-semibold">Name</span>
           <input bind:value={tokenName} type="text" autocomplete="off" placeholder="home-lab-sync" />
         </label>
-        <label>
-          <span>Expires At</span>
+        <label class="grid gap-1.5">
+          <span class="text-sm font-semibold">Expires At</span>
           <input bind:value={tokenExpiresAt} type="datetime-local" />
         </label>
         <Button kind="primary" disabled={isBusy('create-token') || !tokenName.trim()}>
@@ -195,19 +199,19 @@
       </form>
 
       {#if createdToken}
-        <div class="token-reveal" role="status" aria-live="polite">
-          <div class="token-reveal-title">Copy this token now</div>
-          <code>{createdToken}</code>
+        <div class="mt-3 rounded-2xl border border-border bg-muted/30 p-3.5" role="status" aria-live="polite">
+          <div class="mb-2 text-sm font-bold">Copy this token now</div>
+          <code class="block break-all">{createdToken}</code>
         </div>
       {/if}
 
       {#if tokens.length > 0}
-        <div class="token-list">
+        <div class="mt-3 grid gap-3">
           {#each tokens as token}
-            <div class="token-card">
+            <div class="flex items-center justify-between gap-3 rounded-2xl border border-border bg-muted/30 p-3.5">
               <div>
-                <div class="user-name">{token.name}</div>
-                <div class="user-meta">
+                <div class="text-[15px] font-bold">{token.name}</div>
+                <div class="mt-2 text-sm text-muted-foreground">
                   Created {new Date(token.createdAt).toLocaleString('en-GB')}
                   {#if token.lastUsedAt}
                     · Last used {new Date(token.lastUsedAt).toLocaleString('en-GB')}
@@ -225,22 +229,22 @@
           {/each}
         </div>
       {:else if !loading}
-        <div class="empty">No API tokens created yet.</div>
+        <div class="mt-3 text-sm text-muted-foreground">No API tokens created yet.</div>
       {/if}
     </Panel>
   </div>
 
   <Panel title="Accounts" subtitle="Current users with password rotation and delete controls.">
     {#if users.length > 0}
-      <div class="user-list">
+      <div class="grid gap-3">
         {#each users as user}
-          <div class="user-card">
-            <div class="user-head">
+          <div class="rounded-xl border border-border bg-card/80 px-4.5 py-4">
+            <div class="mb-3.5 flex items-center justify-between gap-3">
               <div>
-                <div class="user-name">{user.username}</div>
-                <div class="user-meta">Created {new Date(user.createdAt).toLocaleString('en-GB')}</div>
+                <div class="text-[15px] font-bold">{user.username}</div>
+                <div class="mt-2 text-sm text-muted-foreground">Created {new Date(user.createdAt).toLocaleString('en-GB')}</div>
               </div>
-              <div class="user-badges">
+              <div class="flex flex-wrap items-center justify-end gap-3">
                 <StatusPill tone={user.role === 'admin' ? 'ok' : 'neutral'}>{user.role}</StatusPill>
                 {#if me?.id === user.id}
                   <StatusPill tone="neutral">current</StatusPill>
@@ -248,9 +252,9 @@
               </div>
             </div>
 
-            <div class="password-row">
-              <label class="password-field">
-                <span>New password</span>
+            <div class="flex flex-wrap items-center gap-3">
+              <label class="grid flex-1 basis-64 gap-1.5">
+                <span class="text-sm font-semibold">New password</span>
                 <input
                   bind:value={passwordDrafts[user.id]}
                   type="password"
@@ -271,152 +275,9 @@
         {/each}
       </div>
     {:else if loading}
-      <div class="empty">Loading users…</div>
+      <div class="text-sm text-muted-foreground">Loading users…</div>
     {:else}
-      <div class="empty">No users found.</div>
+      <div class="text-sm text-muted-foreground">No users found.</div>
     {/if}
   </Panel>
 </div>
-
-<style>
-  .summary-grid {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 14px;
-    margin-bottom: 20px;
-  }
-
-  .summary-card,
-  .user-card {
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 20px;
-    background: hsl(var(--card) / 0.82);
-  }
-
-  .summary-card {
-    padding: 18px 20px;
-  }
-
-  .summary-value {
-    font-size: 1.8rem;
-    font-weight: 700;
-    line-height: 1;
-  }
-
-  .summary-label,
-  .user-meta,
-  .empty {
-    margin-top: 8px;
-    color: hsl(var(--muted-foreground));
-    font-size: 13px;
-  }
-
-  .grid {
-    display: grid;
-    grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
-    gap: 16px;
-  }
-
-  .sidebar-stack {
-    display: grid;
-    gap: 16px;
-  }
-
-  .create-form,
-  .user-list,
-  .token-list {
-    display: grid;
-    gap: 12px;
-  }
-
-  label,
-  .password-field {
-    display: grid;
-    gap: 6px;
-  }
-
-  label span,
-  .password-field span {
-    font-size: 13px;
-    font-weight: 600;
-  }
-
-  input,
-  select {
-    min-height: 40px;
-    border-radius: 12px;
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    background: hsl(0 0% 100% / 0.04);
-    color: hsl(var(--foreground));
-    padding: 0 12px;
-    font-size: 13px;
-  }
-
-  .user-card {
-    padding: 16px 18px;
-  }
-
-  .user-head,
-  .user-badges,
-  .password-row {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
-
-  .user-head {
-    justify-content: space-between;
-    margin-bottom: 14px;
-  }
-
-  .user-name {
-    font-weight: 700;
-    font-size: 15px;
-  }
-
-  .user-badges {
-    flex-wrap: wrap;
-    justify-content: flex-end;
-  }
-
-  .password-row {
-    flex-wrap: wrap;
-  }
-
-  .password-field {
-    flex: 1 1 260px;
-  }
-
-  .token-card,
-  .token-reveal {
-    border: 1px solid hsl(0 0% 100% / 0.08);
-    border-radius: 16px;
-    background: hsl(0 0% 100% / 0.03);
-    padding: 14px;
-  }
-
-  .token-card {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-  }
-
-  .token-reveal-title {
-    margin-bottom: 8px;
-    font-size: 13px;
-    font-weight: 700;
-  }
-
-  .token-reveal code {
-    display: block;
-    overflow-wrap: anywhere;
-  }
-
-  @media (max-width: 900px) {
-    .summary-grid,
-    .grid {
-      grid-template-columns: 1fr;
-    }
-  }
-</style>
