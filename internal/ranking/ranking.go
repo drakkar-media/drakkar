@@ -304,7 +304,7 @@ type Result struct {
 // (built-in scoring tiers only, no profile-specific allow-lists, custom
 // formats, or block rules). Most callers should use ScoreWithPreferences.
 func Score(candidate Candidate, required Requirements) Result {
-	return ScoreWithPreferences(candidate, required, Preferences{})
+	return ScoreWithPreferences(candidate, required, Preferences{RejectCam: true})
 }
 
 // ScoreWithPreferences evaluates a single release candidate against the
@@ -365,8 +365,14 @@ func ScoreWithPreferences(candidate Candidate, required Requirements, prefs Pref
 
 	// ── Hard rejections ──────────────────────────────────────────────────────
 
-	// CAM/TS/Screener — Radarr QualityParser extended set
-	if hasRejectedSource(titleLower) {
+	// CAM/TS/Screener — Radarr QualityParser extended set. Gated on
+	// prefs.RejectCam: the field has existed on Preferences/QualityProfile
+	// (and a real UI checkbox, default true) since profile_repository.go's
+	// reject_cam column, but this rejection previously fired unconditionally
+	// regardless of its value -- so unchecking it in Settings had zero
+	// effect. Defaulting true everywhere it's constructed preserves prior
+	// behavior for every profile that never touched the checkbox.
+	if prefs.RejectCam && hasRejectedSource(titleLower) {
 		return Result{Rejected: true, RejectReason: "bad_source", Explanations: []string{"Rejected: low-quality source such as CAM/TS/Screener was detected."}}
 	}
 	// Unencoded Blu-ray disc (BD-ISO, BDMV, COMPLETE.BLURAY) — always reject
@@ -861,7 +867,22 @@ func rejectBySize(candidate Candidate, prefs Preferences, runtimeMinutes int) st
 			return "too_large"
 		}
 		if len(prefs.TierMBPerMinuteLimits) > 0 && candidate.Resolution != "" {
-			if lim, ok := prefs.TierMBPerMinuteLimits[candidate.Resolution]; ok {
+			// Remux gets its own, much larger size bucket (quality_definitions
+			// stores e.g. 1080p Remux's max as ~1000 MB/min vs ~130-155 for
+			// WEB-DL/BluRay at the same resolution -- a lossless remux is
+			// legitimately many times bigger for the same runtime). Without
+			// this, a real 1080p/2160p remux was checked against the plain
+			// resolution bucket's much tighter max and hard-rejected as
+			// too_large. Falls back to the plain resolution key when no
+			// remux-specific tier exists (e.g. an older DB before this key was
+			// added), preserving prior behavior exactly.
+			key := candidate.Resolution
+			if reRemux.MatchString(candidate.Title) {
+				if _, ok := prefs.TierMBPerMinuteLimits[candidate.Resolution+"-remux"]; ok {
+					key = candidate.Resolution + "-remux"
+				}
+			}
+			if lim, ok := prefs.TierMBPerMinuteLimits[key]; ok {
 				if lim[0] > 0 && sizeMB < lim[0]*runtimeMinutes {
 					return "too_small"
 				}
@@ -925,6 +946,13 @@ func scoreCodec(codec string, prefs Preferences) int {
 	switch strings.ToLower(codec) {
 	case "h265", "x265":
 		return 150
+	case "av1":
+		// Below x265: efficient and improving fast, but as of this writing
+		// encoder maturity/hardware playback support lag x265's, matching
+		// current community (TRaSH Guides) consensus. Previously fell to the
+		// same 0 as a fully unrecognized codec, scoring identically to a
+		// release with no codec information at all.
+		return 130
 	case "h264", "x264":
 		return 120
 	default:

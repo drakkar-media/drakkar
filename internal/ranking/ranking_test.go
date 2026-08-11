@@ -87,6 +87,44 @@ func TestScoreRejectsBadSource(t *testing.T) {
 	}
 }
 
+// TestScoreRejectCamHonorsProfileSetting guards a real dead-toggle bug: the
+// RejectCam profile field (a real UI checkbox in Settings, default true)
+// was persisted and threaded through to Preferences but ScoreWithPreferences
+// never read it -- CAM/TS rejection fired unconditionally regardless of the
+// setting's value, so unchecking it in Settings had zero effect.
+// TestScoreCodecFallbackRecognizesAV1 guards a real gap: AV1 fell through
+// scoreCodec's built-in fallback tier to the same 0 as a fully unrecognized
+// codec, scoring identically to a release with no codec information at all
+// despite being a real, increasingly common, deliberately-chosen encode.
+func TestScoreCodecFallbackRecognizesAV1(t *testing.T) {
+	prefs := Preferences{}
+	if got := scoreCodec("av1", prefs); got <= 0 {
+		t.Fatalf("expected AV1 to score above 0 in the fallback tier, got %d", got)
+	}
+	if got := scoreCodec("av1", prefs); got >= scoreCodec("x265", prefs) {
+		t.Fatalf("expected AV1 to score below x265 (current community consensus), got av1=%d x265=%d", got, scoreCodec("x265", prefs))
+	}
+}
+
+func TestScoreRejectCamHonorsProfileSetting(t *testing.T) {
+	candidate := Candidate{
+		Title:      "Dune.2021.1080p.CAM",
+		Resolution: "1080p",
+		Source:     "cam",
+	}
+	req := Requirements{Title: "Dune", MediaType: "movie", Year: 2021}
+
+	rejected := ScoreWithPreferences(candidate, req, Preferences{RejectCam: true})
+	if !rejected.Rejected || rejected.RejectReason != "bad_source" {
+		t.Fatalf("expected RejectCam=true to reject CAM, got %+v", rejected)
+	}
+
+	allowed := ScoreWithPreferences(candidate, req, Preferences{RejectCam: false})
+	if allowed.Rejected {
+		t.Fatalf("expected RejectCam=false to allow a CAM release through, got %+v", allowed)
+	}
+}
+
 func TestScoreRejectsForeignLanguageOutsideProfilePreferences(t *testing.T) {
 	result := ScoreWithPreferences(Candidate{
 		Title:      "Yellowstone.S01E01.Spanish.1080p.WEB-DL",
@@ -295,6 +333,41 @@ func TestScoreWithPreferencesRejectsTooLarge(t *testing.T) {
 		Preferences{MaxMBPerMinute: 34})
 	if !result.Rejected || result.RejectReason != "too_large" {
 		t.Fatalf("unexpected result %+v", result)
+	}
+}
+
+// TestScoreWithPreferencesRemuxUsesItsOwnSizeTier guards a real bug: a 1080p
+// remux is legitimately many times bigger than a WEB-DL/BluRay release at
+// the same resolution and runtime (lossless audio, no re-encode) --
+// quality_definitions stores a correspondingly much looser max for it
+// (~1000 MB/min vs ~130-155), but that tier was never mapped at all, so a
+// real remux candidate was checked against the plain "1080p" bucket's tight
+// max and hard-rejected as too_large. The "-remux" tier key must be used
+// instead when TierMBPerMinuteLimits has one and the title says Remux.
+func TestScoreWithPreferencesRemuxUsesItsOwnSizeTier(t *testing.T) {
+	// 30 GB / 120 min ≈ 256 MB/min -- comfortably over a WEB-DL/BluRay 1080p
+	// max (~155) but well under a real remux max (1000).
+	candidate := Candidate{
+		Title:      "Dune.2021.1080p.BluRay.REMUX.AVC.DTS-HD.MA",
+		SizeBytes:  30 * 1024 * 1024 * 1024,
+		Resolution: "1080p",
+		Source:     "remux",
+		Language:   "en",
+	}
+	req := Requirements{Title: "Dune", MediaType: "movie", Year: 2021, RuntimeMinutes: 120}
+
+	rejected := ScoreWithPreferences(candidate, req, Preferences{
+		TierMBPerMinuteLimits: map[string][2]int{"1080p": {4, 155}},
+	})
+	if !rejected.Rejected || rejected.RejectReason != "too_large" {
+		t.Fatalf("expected the plain 1080p tier (no remux entry) to still reject an oversized remux, got %+v", rejected)
+	}
+
+	allowed := ScoreWithPreferences(candidate, req, Preferences{
+		TierMBPerMinuteLimits: map[string][2]int{"1080p": {4, 155}, "1080p-remux": {35, 1000}},
+	})
+	if allowed.Rejected {
+		t.Fatalf("expected the remux-specific tier to allow a real remux size through, got %+v", allowed)
 	}
 }
 

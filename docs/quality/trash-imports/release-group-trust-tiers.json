@@ -1,0 +1,86 @@
+[
+  {
+    "name": "TRaSH HD BluRay Tier 1 (trusted groups)",
+    "pattern": "(?i)-(?:BBQ|BMF|CRiSC|Chotab|CtrlHD|D\\-Z0N3|DON|Dariush|EDPH|EbP|Geek|LolHD|NCmt|NTb|PTer|TDD|TayTO|TnP|VietHD|ZQ|ZoroSenpai|c0kE|decibeL)(?:\\[[^\\]]*\\])?$",
+    "score": 75,
+    "enabled": true,
+    "source": "trash"
+  },
+  {
+    "name": "TRaSH HD BluRay Tier 2 (trusted groups)",
+    "pattern": "(?i)-(?:ATELiER|EA|HiDt|HiSD|NTb|QOQ|SA89|iFT|sbR)(?:\\[[^\\]]*\\])?$",
+    "score": 60,
+    "enabled": true,
+    "source": "trash"
+  },
+  {
+    "name": "TRaSH HD BluRay Tier 3 (trusted groups)",
+    "pattern": "(?i)-(?:BHDStudio|HONE|HiFi|LoRD|SPHD|W4NK3R|hallowed|playHD)(?:\\[[^\\]]*\\])?$",
+    "score": 45,
+    "enabled": true,
+    "source": "trash"
+  },
+  {
+    "name": "TRaSH UHD BluRay Tier 1 (trusted groups)",
+    "pattern": "(?i)-(?:CtrlHD|DON|MainFrame|W4NK3R)(?:\\[[^\\]]*\\])?$",
+    "score": 75,
+    "enabled": true,
+    "source": "trash"
+  },
+  {
+    "name": "TRaSH UHD BluRay Tier 2 (trusted groups)",
+    "pattern": "(?i)-(?:HQMUX|HiDt|RandomBytes)(?:\\[[^\\]]*\\])?$",
+    "score": 60,
+    "enabled": true,
+    "source": "trash"
+  },
+  {
+    "name": "TRaSH UHD BluRay Tier 3 (trusted groups)",
+    "pattern": "(?i)-(?:BHDStudio|HONE|PTer|SPHD|WEBDV|hallowed)(?:\\[[^\\]]*\\])?$",
+    "score": 45,
+    "enabled": true,
+    "source": "trash"
+  },
+  {
+    "name": "TRaSH Remux Tier 1 (trusted groups)",
+    "pattern": "(?i)-(?:3L|ATELiER|BLURANiUM|BMF|BiZKiT|CiNEPHiLES|FraMeSToR|PiRAMiDHEAD|PmP|WiLDCAT|ZQ)(?:\\[[^\\]]*\\])?$",
+    "score": 85,
+    "enabled": true,
+    "source": "trash"
+  },
+  {
+    "name": "TRaSH Remux Tier 2 (trusted groups)",
+    "pattern": "(?i)-(?:12GaugeShotgun|EPSiLON|HiFi|KRaLiMaRKo|NCmt|PTer|SURFINBIRD|SiCFoI|TEPES|TRiToN|decibeL|playBD)(?:\\[[^\\]]*\\])?$",
+    "score": 70,
+    "enabled": true,
+    "source": "trash"
+  },
+  {
+    "name": "TRaSH Remux Tier 3 (trusted groups)",
+    "pattern": "(?i)-(?:12GaugeShotgun|EPSiLON|HiFi|KRaLiMaRKo|NTb|PTP|SumVision|TOA|TRiToN|decibeL|iFT)(?:\\[[^\\]]*\\])?$",
+    "score": 55,
+    "enabled": true,
+    "source": "trash"
+  },
+  {
+    "name": "TRaSH WEB Tier 1 (trusted groups)",
+    "pattern": "(?i)-(?:ABBIE|ABBiE|AJP69|APEX|PAXA|PEXA|XEPA|BLUTONiUM|BYNDR|CMRG|CRFW|CRUD|CasStudio|CtrlHD|FLUX|GNOME|HONE|KiNGS|Kitsune|MADSKY|NOSiViD|NTG|NTb|QOQ|RAWR|RTN|SiC|T6D|TEPES|TOMMY|TheFarm|ViSUM|ZoroSenpai|monkee)(?:\\[[^\\]]*\\])?$",
+    "score": 70,
+    "enabled": true,
+    "source": "trash"
+  },
+  {
+    "name": "TRaSH WEB Tier 2 (trusted groups)",
+    "pattern": "(?i)-(?:3cTWeB|BLUTONiUM|BTW|BYNDR|CMRG|Chotab|CiT|Cinefeel|Coo7|DEEP|END|ETHiCS|FC|Flights|GNOME|JETIX|KHN|KiMCHI|LAZY|MZABI|MiU|NPMS|NYH|PHOENiX|PSiG|ROCCaT|RTFM|SA89|SDCC|SIGMA|SMURF|SPiRiT|SbR|TEPES|TOMMY|TVSmash|WELP|XEBEC|4KBEC|CEBEX|dB|iJP|iKA|iT00NZ|monkee|orbitron|playWEB)(?:\\[[^\\]]*\\])?$",
+    "score": 55,
+    "enabled": true,
+    "source": "trash"
+  },
+  {
+    "name": "TRaSH WEB Tier 3 (trusted groups)",
+    "pattern": "(?i)-(?:BLOOM|DRACULA|Dooky|GNOMiSSiON|HHWEB|NINJACENTRAL|NPMS|ROCCaT|SLiGNOME|SiGMA|SwAgLaNdEr|T4H|ViSiON)(?:\\[[^\\]]*\\])?$",
+    "score": 45,
+    "enabled": true,
+    "source": "trash"
+  }
+]

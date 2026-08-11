@@ -4615,7 +4615,7 @@ func (s *Service) profilePreferencesForItem(ctx context.Context, libraryItemID i
 // media type ("movie" or "episode"). Results are cached for 5 minutes.
 func (s *Service) defaultProfilePreferences(ctx context.Context, mediaType string) ranking.Preferences {
 	if s == nil || s.repo == nil {
-		return ranking.Preferences{}
+		return ranking.Preferences{RejectCam: true}
 	}
 	const cacheTTL = 5 * time.Minute
 
@@ -4646,7 +4646,7 @@ func (s *Service) defaultProfilePreferences(ctx context.Context, mediaType strin
 		profile, err = s.repo.GetDefaultQualityProfile(ctx)
 	}
 	if err != nil {
-		return ranking.Preferences{}
+		return ranking.Preferences{RejectCam: true}
 	}
 
 	prefs := ranking.Preferences{
@@ -4697,10 +4697,18 @@ func (s *Service) loadTierSizeLimits(ctx context.Context, mediaType string) map[
 	}
 	// Map DB quality keys (no dashes) to resolution strings used in ranking.
 	keyToResolution := map[string]string{
-		"bluray2160p": "2160p", "webdl2160p": "2160p", "webrip2160p": "2160p",
+		"bluray2160p": "2160p", "webdl2160p": "2160p", "webrip2160p": "2160p", "hdtv2160p": "2160p",
 		"bluray1080p": "1080p", "webdl1080p": "1080p", "webrip1080p": "1080p", "hdtv1080p": "1080p",
 		"bluray720p": "720p", "webdl720p": "720p", "webrip720p": "720p", "hdtv720p": "720p",
 		"dvd": "576p", "sdtv": "480p",
+		// Remux gets its own "<resolution>-remux" bucket, not merged into the
+		// plain resolution bucket above -- see rejectBySize's comment. A
+		// remux's real max (~1000 MB/min) is many times looser than
+		// WEB-DL/BluRay's (~130-155) at the same resolution; merging them
+		// would either wrongly reject real remuxes (tight bucket wins) or
+		// silently let oversized non-remux releases through (loose bucket
+		// wins), depending on which happened to be inserted/compared last.
+		"remux1080p": "1080p-remux", "remux2160p": "2160p-remux",
 	}
 	out := make(map[string][2]int)
 	for _, d := range defs {
@@ -5558,6 +5566,7 @@ func (s *Service) ManualSearch(ctx context.Context, query string) ([]ManualSearc
 			UploadedAt: r.PublishedAt,
 		}
 		result := ranking.ScoreWithPreferences(candidate, ranking.Requirements{}, ranking.Preferences{
+			RejectCam:     true,
 			CustomFormats: s.loadCustomFormats(ctx),
 			BlockRules:    s.loadBlockRules(ctx),
 		})
