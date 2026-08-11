@@ -4,12 +4,14 @@
 package observability
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -54,7 +56,7 @@ func NewWithFile(w io.Writer, level Level, logsDir string) zerolog.Logger {
 	if logsDir != "" {
 		if err := os.MkdirAll(logsDir, 0o755); err == nil {
 			logPath := filepath.Join(logsDir, "drakkar.log")
-			if f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
+			if f, err := newRotatingFile(logPath, defaultLogMaxSize, defaultLogMaxBackups); err == nil {
 				// stdoutWriter transforms bytes (ConsoleWriter or plain).
 				// f receives the original JSON bytes — MultiWriter delivers both.
 				out = io.MultiWriter(stdoutWriter, f)
@@ -101,6 +103,79 @@ func RecoverWithCleanup(name string, cleanup func(recovered any)) {
 		slog.Error("goroutine panic recovered", "goroutine", name, "panic", r, "stack", string(debug.Stack()))
 		cleanup(r)
 	}
+}
+
+// defaultLogMaxSize/defaultLogMaxBackups bound drakkar.log's on-disk footprint
+// (previously unbounded — a single deployment ran the file up to 978MB).
+// Vars, not consts, so tests can shrink them.
+var (
+	defaultLogMaxSize    int64 = 100 * 1024 * 1024
+	defaultLogMaxBackups       = 3
+)
+
+// rotatingFile is an io.Writer over a single log file that renames the
+// current file to a numbered backup and reopens a fresh one once it would
+// exceed maxSize, keeping at most maxBackups old files (oldest discarded).
+// Safe for concurrent Write calls.
+type rotatingFile struct {
+	mu         sync.Mutex
+	path       string
+	maxSize    int64
+	maxBackups int
+	f          *os.File
+	size       int64
+}
+
+func newRotatingFile(path string, maxSize int64, maxBackups int) (*rotatingFile, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	var size int64
+	if info, err := f.Stat(); err == nil {
+		size = info.Size()
+	}
+	return &rotatingFile{path: path, maxSize: maxSize, maxBackups: maxBackups, f: f, size: size}, nil
+}
+
+func (r *rotatingFile) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.size+int64(len(p)) > r.maxSize {
+		// Rotation failure is non-fatal: keep writing to the current file
+		// (unbounded growth) rather than silently dropping log lines.
+		_ = r.rotate()
+	}
+	n, err := r.f.Write(p)
+	r.size += int64(n)
+	return n, err
+}
+
+func (r *rotatingFile) rotate() error {
+	if err := r.f.Close(); err != nil {
+		return err
+	}
+	for i := r.maxBackups; i >= 1; i-- {
+		if i == r.maxBackups {
+			_ = os.Remove(backupPath(r.path, i))
+			continue
+		}
+		_ = os.Rename(backupPath(r.path, i), backupPath(r.path, i+1))
+	}
+	if err := os.Rename(r.path, backupPath(r.path, 1)); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	r.f = f
+	r.size = 0
+	return nil
+}
+
+func backupPath(path string, n int) string {
+	return fmt.Sprintf("%s.%d", path, n)
 }
 
 func parseLevel(level Level) zerolog.Level {
