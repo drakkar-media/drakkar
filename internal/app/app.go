@@ -587,6 +587,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			subtitleSvc.TriggerAutomaticSearch(libraryItemID)
 			notifyMediaServers(libraryItemID)
 		}()
+		// Own goroutine/timeout, deliberately not chained into the one
+		// above: this can involve a real (background-priority) NNTP read
+		// of several MB, and must never delay the subtitle search or media
+		// server notification sitting in the same hook.
+		probeEmbeddedSubtitleLanguagesAsync(db, libraryItemID)
 		return nil
 	})
 	// Unlike SetPostPublishHook, this fires on repair/republish passes too
@@ -599,6 +604,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			defer observability.Recover("media-server-notify-hook")
 			notifyMediaServers(libraryItemID)
 		}()
+		// Covers season-pack sibling fulfillment and repair/republish
+		// passes, which never run SetPostPublishHook above --
+		// probeEmbeddedSubtitleLanguagesAsync's own "already probed" check
+		// makes this a cheap no-op on repeat calls for the same file.
+		probeEmbeddedSubtitleLanguagesAsync(db, libraryItemID)
 		return nil
 	})
 	notifier := notifications.New(notifications.Config{

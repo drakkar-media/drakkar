@@ -308,21 +308,29 @@ func (db *DB) BlocklistStats(ctx context.Context) (BlocklistStats, error) {
 		select norm_reason, sum(cnt)::int as cnt
 		from (
 			select
-				case
-					when reason ~ '^preflight: (first|last) segment \S+ unavailable: '
-					then regexp_replace(
-						regexp_replace(reason,
+				-- Strip any embedded NNTP message-id (word@word, wherever it
+				-- appears, not just trailing) after the segment-position
+				-- normalization below. Message-ids are unique per article, so
+				-- leaving them in the grouping key turned what should be a
+				-- handful of meaningful buckets (e.g. "fetch decoded article
+				-- <id>: yenc crc mismatch") into one near-unique bucket per
+				-- affected article -- 1000+ singleton reasons observed live,
+				-- burying the real signal in the Settings > Blocklist page's
+				-- reason breakdown.
+				regexp_replace(
+					case
+						when reason ~ '^preflight: (first|last) segment \S+ unavailable: '
+						then regexp_replace(reason,
 							'^preflight: (first|last) segment \S+ unavailable: ',
-							'preflight: '),
-						': [^: @]+@\S+$', '')
-					when reason ~ '^strict health: (first|last) segment \S+ unavailable: '
-					then regexp_replace(
-						regexp_replace(reason,
+							'preflight: ')
+						when reason ~ '^strict health: (first|last) segment \S+ unavailable: '
+						then regexp_replace(reason,
 							'^strict health: (first|last) segment \S+ unavailable: ',
-							'strict health: '),
-						': [^: @]+@\S+$', '')
-					else reason
-				end as norm_reason,
+							'strict health: ')
+						else reason
+					end,
+					'[^\s@:]+@[^\s@:]+', '<msgid>', 'g'
+				) as norm_reason,
 				count(*) as cnt
 			from blocklist_items
 			where expires_at is null or expires_at > now()

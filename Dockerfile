@@ -30,8 +30,16 @@ FROM debian:bookworm-slim
 # base image included it implicitly (busybox), debian-slim does not, so the
 # healthcheck silently failed every 15s ("wget: not found", exit 1) from the
 # moment this image switched to Debian, unrelated to actual app health.
+# ffmpeg is only needed for its ffprobe binary (internal/mediaprobe --
+# detects subtitle languages already embedded in a published file's own
+# container, so internal/subtitles can skip a redundant download). Debian
+# doesn't ship ffprobe as a separate, smaller package -- it's bundled with
+# the full ffmpeg package and its libavcodec/libavformat/etc dependency
+# tree, a real image-size tradeoff accepted deliberately here since it's
+# the only realistic way to get a robust, well-tested container-probing
+# tool without hand-rolling MKV/EBML parsing.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates fuse3 par2 p7zip-full tzdata libstdc++6 wget \
+    ca-certificates fuse3 par2 p7zip-full tzdata libstdc++6 wget ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /out/drakkar /app/drakkar

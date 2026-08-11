@@ -363,3 +363,144 @@ func TestGetCurrentFileDetailResolvesSeasonPackEpisodeViaSymlinkPublication(t *t
 		t.Fatalf("expected season-pack episode's real file via symlink_publications, got %+v", detail)
 	}
 }
+
+// TestGetEmbeddedSubtitleLanguagesForLibraryItemResolvesSeasonPackEpisode
+// mirrors TestGetCurrentFileDetailResolvesSeasonPackEpisodeViaSymlinkPublication:
+// a season-pack episode's virtual_files row lives under the pack's own
+// selected_release_id, not the per-episode one FulfillEpisodeLibraryItem
+// creates, so symlink_publications must be consulted first here too, or
+// every season-pack episode would silently report "nothing embedded" and
+// download subtitles the file already has.
+func TestGetEmbeddedSubtitleLanguagesForLibraryItemResolvesSeasonPackEpisode(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	var packLibID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('episode', 'embedded-subs-pack-triggering', true)
+		returning id`).Scan(&packLibID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, packLibID)
+
+	var episodeLibID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('episode', 'embedded-subs-pack-episode', true)
+		returning id`).Scan(&episodeLibID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, episodeLibID)
+
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, selected)
+		values ($1, 'embedded-subs-pack release', true)
+		returning id`, packLibID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+
+	var packSrID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, packLibID, rcID).Scan(&packSrID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Per-episode selected_releases row -- deliberately has no virtual_files
+	// of its own, matching FulfillEpisodeLibraryItem's real behavior.
+	var episodeSrID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, episodeLibID, rcID).Scan(&episodeSrID); err != nil {
+		t.Fatal(err)
+	}
+
+	var vfID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, size_bytes, reader_kind, inline_bytes, embedded_subtitle_languages)
+		values ($1, 'Episode.mkv', 'Episode.mkv', 3, 'inline', $2, $3)
+		returning id`, packSrID, []byte("abc"), pgTextArray([]string{"en", "nl"})).Scan(&vfID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.UpsertSymlinkPublication(ctx, episodeLibID, vfID, "/library/Episode.mkv", "/downloads/Episode.mkv"); err != nil {
+		t.Fatal(err)
+	}
+
+	languages, err := db.GetEmbeddedSubtitleLanguagesForLibraryItem(ctx, episodeLibID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(languages) != 2 || languages[0] != "en" || languages[1] != "nl" {
+		t.Fatalf("expected [en nl] resolved via symlink_publications, got %v", languages)
+	}
+}
+
+// TestGetEmbeddedSubtitleLanguagesForLibraryItemDefaultsToEmpty covers the
+// "never probed yet" case: a fresh virtual_files row (NULL column) must
+// resolve to an empty slice, not an error or nil that callers would have to
+// special-case.
+func TestGetEmbeddedSubtitleLanguagesForLibraryItemDefaultsToEmpty(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	var libID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('movie', 'embedded-subs-never-probed', true)
+		returning id`).Scan(&libID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, selected)
+		values ($1, 'embedded-subs-never-probed release', true)
+		returning id`, libID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+	var srID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2) returning id`, libID, rcID).Scan(&srID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, size_bytes, reader_kind, inline_bytes)
+		values ($1, 'never-probed.mkv', 'never-probed.mkv', 3, 'inline', $2)`,
+		srID, []byte("abc"),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	languages, err := db.GetEmbeddedSubtitleLanguagesForLibraryItem(ctx, libID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(languages) != 0 {
+		t.Fatalf("expected empty slice for a never-probed file, got %v", languages)
+	}
+}

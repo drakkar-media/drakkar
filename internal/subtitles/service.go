@@ -53,6 +53,14 @@ type Repository interface {
 	ReplaceSubtitleCandidates(ctx context.Context, libraryItemID int64, provider string, candidates []database.SubtitleCandidateRecord) error
 	DeleteSubtitleFile(ctx context.Context, subtitleID int64) (database.SubtitleDeleteGroup, error)
 	ListSubtitleLibrary(ctx context.Context, filter database.SubtitleLibraryFilter) (database.SubtitleLibraryPage, error)
+	// GetEmbeddedSubtitleLanguagesForLibraryItem returns languages already
+	// muxed into libraryItemID's own media file (per the best-effort
+	// ffprobe-based probe in internal/app), so SearchCandidates/
+	// SearchAndDownloadBest can skip downloading a language the release
+	// already shipped with. Always returns a slice (possibly empty), never
+	// an error a caller needs to special-case -- see its implementation's
+	// doc comment for why "unknown" degrades to "assume nothing embedded".
+	GetEmbeddedSubtitleLanguagesForLibraryItem(ctx context.Context, libraryItemID int64) ([]string, error)
 	// GetAppSetting/PutAppSetting back the per-provider daily call budget
 	// (see providerUsage) -- reusing the existing generic settings store
 	// rather than adding a dedicated table for what's just a small persisted
@@ -232,7 +240,7 @@ func (s *Service) SearchCandidates(ctx context.Context, libraryItemID int64, lan
 	if err != nil {
 		return SearchResult{}, err
 	}
-	missing := subtractLanguages(s.requestedLanguages(languages), languagesWithFiles(existing))
+	missing := subtractLanguages(s.requestedLanguages(languages), s.alreadyHaveLanguages(ctx, libraryItemID, existing))
 	if len(missing) == 0 {
 		return SearchResult{LibraryItemID: libraryItemID}, nil
 	}
@@ -318,7 +326,7 @@ func (s *Service) SearchAndDownloadBest(ctx context.Context, libraryItemID int64
 	if err != nil {
 		return nil, err
 	}
-	missing := subtractLanguages(s.requestedLanguages(languages), languagesWithFiles(existing))
+	missing := subtractLanguages(s.requestedLanguages(languages), s.alreadyHaveLanguages(ctx, libraryItemID, existing))
 	if len(missing) == 0 {
 		return nil, nil
 	}
@@ -715,6 +723,35 @@ func assignedProviderOrder(names []string, libraryItemID int64) []string {
 	out := make([]string, len(names))
 	for i := range names {
 		out[i] = names[(start+i)%len(names)]
+	}
+	return out
+}
+
+// alreadyHaveLanguages returns the distinct, normalized set of languages
+// libraryItemID doesn't need a subtitle download for: languagesWithFiles'
+// downloaded-subtitle_files set, merged with any languages the media file
+// itself already has embedded (per the best-effort ffprobe-based probe --
+// see internal/app/subtitle_embedded_probe.go). A repo error or empty
+// result from the embedded-languages lookup just means "none known" and is
+// silently ignored -- this is purely an optimization to avoid redundant
+// downloads, never a correctness requirement, so it must never fail or
+// change behavior beyond skipping languages that are genuinely covered.
+func (s *Service) alreadyHaveLanguages(ctx context.Context, libraryItemID int64, files []database.SubtitleFileSummary) []string {
+	have := languagesWithFiles(files)
+	embedded, err := s.repo.GetEmbeddedSubtitleLanguagesForLibraryItem(ctx, libraryItemID)
+	if err != nil || len(embedded) == 0 {
+		return have
+	}
+	seen := make(map[string]struct{}, len(have)+len(embedded))
+	for _, l := range have {
+		seen[normalizeLanguage(l)] = struct{}{}
+	}
+	for _, l := range embedded {
+		seen[normalizeLanguage(l)] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for l := range seen {
+		out = append(out, l)
 	}
 	return out
 }

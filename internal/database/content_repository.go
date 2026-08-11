@@ -439,6 +439,165 @@ func (db *DB) OpenVirtualMediaFile(ctx context.Context, virtualFileID int64) (st
 	}
 }
 
+// GetMainVirtualFileForLibraryItem returns the id and reader_kind of the
+// virtual file actually backing libraryItemID's current selection --
+// mirroring GetCurrentFileDetail's own "prefer the published symlink's
+// file, else the largest virtual_files row for the current selected
+// release" logic, since callers of this (the embedded-subtitle-language
+// probe) need the same file identity the player itself would stream.
+func (db *DB) GetMainVirtualFileForLibraryItem(ctx context.Context, libraryItemID int64) (virtualFileID int64, readerKind string, found bool, err error) {
+	var vfID sql.NullInt64
+	var kind sql.NullString
+	err = db.SQL.QueryRowContext(ctx, `
+		with sp_file as (
+			select vf.id, vf.size_bytes, vf.reader_kind
+			from symlink_publications sp
+			join virtual_files vf on vf.id = sp.virtual_file_id
+			where sp.library_item_id = $1
+			order by vf.size_bytes desc nulls last
+			limit 1
+		)
+		select coalesce(spf.id, vf.id), coalesce(spf.reader_kind, vf.reader_kind)
+		from selected_releases sr
+		left join virtual_files vf on vf.selected_release_id = sr.id
+		left join sp_file spf on true
+		where sr.library_item_id = $1
+		order by sr.id desc, coalesce(spf.size_bytes, vf.size_bytes) desc nulls last
+		limit 1`, libraryItemID,
+	).Scan(&vfID, &kind)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return 0, "", false, nil
+		}
+		return 0, "", false, err
+	}
+	if !vfID.Valid {
+		return 0, "", false, nil
+	}
+	return vfID.Int64, kind.String, true, nil
+}
+
+// PrefixBytesBackground reads up to limit decoded bytes from the start of
+// virtualFileID at background scheduler priority, bypassing FUSE entirely
+// (like readContainerHeaderDirect) so a bulk read for a best-effort
+// optimization -- currently the embedded-subtitle-language probe -- can
+// never compete with or dilute the concurrency accounting of a real
+// player's interactive/read-ahead reads.
+//
+// Only reader_kind "direct_nzb" is supported (ok=false for anything else):
+// its spans map 1:1 to decoded file bytes, so a bounded prefix read is
+// exactly the file's own first N bytes. "stored_rar" would need the same
+// on-the-fly decompression stream_.StoredRarReader performs, which isn't
+// safe to reimplement here without duplicating that reader's logic; a
+// RAR-wrapped release simply won't get embedded-subtitle detection for now.
+// "inline" files are tiny non-video companions (e.g. .nfo), never the main
+// video file, so they're excluded too.
+func (db *DB) PrefixBytesBackground(ctx context.Context, virtualFileID int64, limit int64) (data []byte, ok bool, err error) {
+	entry, err := db.loadVFCache(ctx, virtualFileID)
+	if err != nil {
+		return nil, false, err
+	}
+	if entry.readerKind != "direct_nzb" {
+		return nil, false, nil
+	}
+	fetcher := db.SegmentFetcher
+	if fetcher == nil {
+		return nil, false, errors.New("no segment fetcher configured")
+	}
+	readLimit := limit
+	if entry.size < readLimit {
+		readLimit = entry.size
+	}
+	ranges, err := stream.ResolveRange(entry.spans, 0, readLimit)
+	if err != nil {
+		return nil, false, err
+	}
+	out := make([]byte, 0, readLimit)
+	for _, r := range ranges {
+		block, err := fetchRangeBackground(ctx, fetcher, r)
+		if err != nil {
+			return nil, false, err
+		}
+		out = append(out, block...)
+	}
+	return out, true, nil
+}
+
+// SetEmbeddedSubtitleLanguages records the subtitle languages detected
+// embedded in virtualFileID's own container (an empty, non-nil slice means
+// "probed, found none" -- distinct from never having probed at all, which
+// leaves the column NULL).
+func (db *DB) SetEmbeddedSubtitleLanguages(ctx context.Context, virtualFileID int64, languages []string) error {
+	if languages == nil {
+		languages = []string{}
+	}
+	_, err := db.SQL.ExecContext(ctx, `
+		update virtual_files set embedded_subtitle_languages = $2 where id = $1`,
+		virtualFileID, pgTextArray(languages),
+	)
+	return err
+}
+
+// EmbeddedSubtitleLanguagesProbed reports whether virtualFileID's
+// embedded_subtitle_languages column has already been set (by a prior
+// SetEmbeddedSubtitleLanguages call) -- callers use this to avoid
+// re-running the ffprobe-based probe on every publish/republish event for
+// the same file, since the result never changes for a given virtual file.
+func (db *DB) EmbeddedSubtitleLanguagesProbed(ctx context.Context, virtualFileID int64) (bool, error) {
+	var probed bool
+	err := db.SQL.QueryRowContext(ctx, `
+		select embedded_subtitle_languages is not null
+		from virtual_files where id = $1`, virtualFileID,
+	).Scan(&probed)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	return probed, nil
+}
+
+// GetEmbeddedSubtitleLanguagesForLibraryItem returns the subtitle languages
+// already embedded in libraryItemID's current main video file, as last
+// recorded by SetEmbeddedSubtitleLanguages. Returns an empty (non-nil) slice
+// -- never an error -- when the item has no resolvable file yet or the file
+// hasn't been probed: this is a best-effort optimization, so "unknown"
+// degrades to "assume nothing is embedded" rather than surfacing an error a
+// caller would have to handle specially.
+func (db *DB) GetEmbeddedSubtitleLanguagesForLibraryItem(ctx context.Context, libraryItemID int64) ([]string, error) {
+	var languages []string
+	err := db.SQL.QueryRowContext(ctx, `
+		with sp_file as (
+			select vf.embedded_subtitle_languages
+			from symlink_publications sp
+			join virtual_files vf on vf.id = sp.virtual_file_id
+			where sp.library_item_id = $1
+			order by vf.size_bytes desc nulls last
+			limit 1
+		),
+		sr_file as (
+			select vf.embedded_subtitle_languages
+			from selected_releases sr
+			join virtual_files vf on vf.selected_release_id = sr.id
+			where sr.library_item_id = $1
+			order by sr.id desc, vf.size_bytes desc nulls last
+			limit 1
+		)
+		select coalesce(
+			(select embedded_subtitle_languages from sp_file),
+			(select embedded_subtitle_languages from sr_file),
+			'{}')`, libraryItemID,
+	).Scan(pgTextArrayScan(&languages))
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return []string{}, nil
+		}
+		return nil, err
+	}
+	return languages, nil
+}
+
 // loadVFCache returns the cached virtual-file metadata, querying the DB on
 // the first call for each virtualFileID and serving from memory thereafter.
 // Spans are recomputed from inline nzb_files data, so calibration must call

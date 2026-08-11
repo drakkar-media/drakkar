@@ -410,6 +410,37 @@ func TestBlocklistStatsCountsAndGroupsByNormalizedReason(t *testing.T) {
 	}
 }
 
+func TestBlocklistStatsCollapsesEmbeddedMessageIDsAnywhereInReason(t *testing.T) {
+	db, sqlDB, ctx := openBlocklistTestDB(t)
+
+	msgA, err := db.CreateBlocklistItem(ctx, BlocklistMutation{
+		Key: "external_url:http://example/msgid-a.nzb",
+		Reason: "fetch decoded article aaaa1111@news.example.com: yenc crc mismatch",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from blocklist_items where id = $1`, msgA.ID)
+
+	msgB, err := db.CreateBlocklistItem(ctx, BlocklistMutation{
+		Key: "external_url:http://example/msgid-b.nzb",
+		Reason: "fetch decoded article bbbb2222@reader.example.net: yenc crc mismatch",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from blocklist_items where id = $1`, msgB.ID)
+
+	stats, err := db.BlocklistStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "fetch decoded article <msgid>: yenc crc mismatch"
+	if stats.ByReason[want] != 2 {
+		t.Errorf("ByReason[%q] = %d, want 2 (msgA + msgB collapsed despite different message-ids)", want, stats.ByReason[want])
+	}
+}
+
 func TestDeleteAllBlocklistItemsOnlyRemovesActiveEntries(t *testing.T) {
 	db, sqlDB, ctx := openBlocklistTestDB(t)
 

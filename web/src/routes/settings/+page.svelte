@@ -72,7 +72,7 @@
     { id: 'indexers',      label: 'Indexers',      short: 'Indexers', icon: Search },
     { id: 'queue',         label: 'Queue',         short: 'Queue',    icon: Settings2 },
     { id: 'library',       label: 'Library',       short: 'Names',    icon: Library },
-    { id: 'rules',         label: 'Rules',         short: 'Rules',    icon: ShieldAlert },
+    { id: 'rules',         label: 'Blocklist',     short: 'Blocklist', icon: ShieldAlert },
     { id: 'quality',       label: 'Quality',       short: 'Quality',  icon: SlidersHorizontal },
     { id: 'formats',       label: 'Custom Formats',    short: 'Formats',   icon: Star },
     { id: 'filtering',        label: 'Release Filtering', short: 'Filtering', icon: Ban },

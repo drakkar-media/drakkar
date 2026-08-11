@@ -16,6 +16,7 @@ require (
 	golang.org/x/net v0.55.0
 	golang.org/x/sys v0.45.0
 	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
+	gopkg.in/vansante/go-ffprobe.v2 v2.3.0
 )
 
 require (

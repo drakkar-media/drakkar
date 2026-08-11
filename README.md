@@ -55,7 +55,7 @@ docker compose up -d
 ```
 
 > [!TIP]
-> The web UI is available at `http://localhost:8080` once the stack is healthy.
+> The web UI is available at `http://[IP-ADDRESS]:8080` once the stack is healthy.
 
 To upgrade later:
 
@@ -130,6 +130,7 @@ Key sections:
 - **Subtitle integration** — automatic search and download via SubDL and OpenSubtitles
 - **Notifications** — Discord webhook and generic HTTP webhook on grab/import/failure events
 - **WebDAV server** — built-in WebDAV for rclone to serve as the FUSE backing store
+- **Privacy routing** — route Usenet/indexer traffic direct, through SOCKS5, or through a userspace WireGuard tunnel, per-provider or per-indexer
 
 ## 🐳 Docker
 
@@ -184,10 +185,10 @@ docker compose -f docker-compose.dev.yml up -d --build
 ### Releasing
 
 ```bash
-./release.sh v0.2.0
+./release.sh next "short summary of what changed"
 ```
 
-Bumps the version, commits, tags, and pushes. GitHub Actions then builds and publishes the image to `ghcr.io/drakkar-media/drakkar`.
+Auto-computes the next patch version, bumps version files, commits, tags, and pushes (pass an explicit version like `v0.2.0` instead of `next` if you need to override it). GitHub Actions then builds and publishes the image to `ghcr.io/drakkar-media/drakkar`.
 
 ## 🤝 Contributing
 

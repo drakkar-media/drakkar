@@ -26,6 +26,11 @@ type repoStub struct {
 	downloadCandidate database.SubtitleCandidateSummary
 	storedCandidates  []database.SubtitleCandidateRecord
 	appSettings       map[string]string
+	embeddedLanguages []string
+}
+
+func (r *repoStub) GetEmbeddedSubtitleLanguagesForLibraryItem(ctx context.Context, libraryItemID int64) ([]string, error) {
+	return r.embeddedLanguages, nil
 }
 
 // GetAppSetting/PutAppSetting back the per-provider daily call budget with a
@@ -412,6 +417,38 @@ func TestSearchCandidatesSkipsLanguagesAlreadyDownloaded(t *testing.T) {
 	}
 	if len(calls) != 1 || len(calls[0].languages) != 1 || calls[0].languages[0] != "nl" {
 		t.Fatalf("expected exactly one call requesting only 'nl', got %+v", calls)
+	}
+	if result.CandidateCount != 1 {
+		t.Fatalf("expected only the nl candidate to be stored, got %+v", result)
+	}
+}
+
+// TestSearchCandidatesSkipsLanguagesAlreadyEmbedded mirrors
+// TestSearchCandidatesSkipsLanguagesAlreadyDownloaded but for a language the
+// media file already has embedded (per the ffprobe-based probe) rather
+// than one with an existing downloaded subtitle_files row -- both must
+// behave identically from SearchCandidates' point of view.
+func TestSearchCandidatesSkipsLanguagesAlreadyEmbedded(t *testing.T) {
+	var calls []searchCall
+	repo := &repoStub{
+		embeddedLanguages: []string{"en"},
+		searchInput:       database.SubtitleSearchInput{LibraryItemID: 42, MediaType: "movie", Title: "Dune", MovieYear: 2021},
+	}
+	service := NewService(repo, nil, countingProviderStub{
+		name: "subdl",
+		candidates: map[string][]ProviderCandidate{
+			"en": {{Language: "en", Title: "en", ExternalID: "en-1", DownloadURL: "en-1"}},
+			"nl": {{Language: "nl", Title: "nl", ExternalID: "nl-1", DownloadURL: "nl-1"}},
+		},
+		calls: &calls,
+	})
+
+	result, err := service.SearchCandidates(context.Background(), 42, []string{"en", "nl"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || len(calls[0].languages) != 1 || calls[0].languages[0] != "nl" {
+		t.Fatalf("expected exactly one call requesting only 'nl' (en already embedded), got %+v", calls)
 	}
 	if result.CandidateCount != 1 {
 		t.Fatalf("expected only the nl candidate to be stored, got %+v", result)
