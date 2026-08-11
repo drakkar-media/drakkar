@@ -160,6 +160,8 @@ export type QueueItem = {
   seasonNumber?: number;
   episodeNumber?: number;
   onHold: boolean;
+  dispatchAttemptCount?: number;
+  dispatchBackoffUntil?: string;
   createdAt?: string;
   updatedAt?: string;
 };

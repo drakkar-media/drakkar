@@ -38,8 +38,15 @@ type QueueSnapshot struct {
 	SeasonNumber    *int       `json:"seasonNumber,omitempty"`
 	EpisodeNumber   *int       `json:"episodeNumber,omitempty"`
 	OnHold          bool       `json:"onHold"`
-	CreatedAt       time.Time  `json:"createdAt"`
-	UpdatedAt       time.Time  `json:"updatedAt"`
+	// DispatchAttemptCount/DispatchBackoffUntil reflect the passive-resume
+	// dispatch sweep's escalating per-item backoff (see
+	// workflow.RecordDispatchAttempt) -- a non-nil, future
+	// DispatchBackoffUntil means this item won't be automatically
+	// re-dispatched until then, distinct from every other active state.
+	DispatchAttemptCount int        `json:"dispatchAttemptCount"`
+	DispatchBackoffUntil *time.Time `json:"dispatchBackoffUntil,omitempty"`
+	CreatedAt            time.Time  `json:"createdAt"`
+	UpdatedAt            time.Time  `json:"updatedAt"`
 }
 
 // ImportedNZB holds the fully parsed contents of a manually-imported NZB --

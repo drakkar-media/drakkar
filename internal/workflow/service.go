@@ -1315,6 +1315,10 @@ func (s *Service) SearchPendingLibrary(ctx context.Context) (BulkSearchResult, e
 					resultCh:          resultCh,
 				}) {
 					go func() { <-resultCh }()
+					newCount := target.DispatchAttemptCount + 1
+					if err := s.repo.RecordDispatchAttempt(ctx, target.LibraryItemID, newCount, now.Add(dispatchBackoff(newCount))); err != nil {
+						s.logger.Warn().Err(err).Int64("libraryItemId", target.LibraryItemID).Msg("search: failed to persist dispatch backoff state")
+					}
 				}
 				result.Searched++
 				continue

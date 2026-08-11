@@ -46,8 +46,9 @@
   function anyBusy(): boolean {
     return Object.values(busy).some(Boolean);
   }
-  let tab: 'queue' | 'history' = 'queue';
+  let tab: 'queue' | 'backedoff' | 'history' = 'queue';
   let queuePage = 1;
+  let backedOffPage = 1;
   let historyPage = 1;
   let selectedHistoryIds = new Set<number>();
 
@@ -57,6 +58,7 @@
   // internal/database/queue_repository.go), so it's kept as a local literal.
   const doneStates = ['available', 'failed'];
   const queuePageSize = 8;
+  const backedOffPageSize = 8;
   const historyPageSize = 12;
   // Matches ListQueue's recent_history CTE limit (internal/database/queue_repository.go)
   // -- the backend deliberately caps history to the most recent 200 rows for
@@ -80,7 +82,28 @@
     return item.libraryTitle.includes(tag) ? null : tag;
   }
 
-  $: queueItems = items.filter((item) => ACTIVE_STATES.includes(item.state));
+  // isBackedOff: an active item the passive-resume dispatch sweep has given
+  // up on for now (see workflow.dispatchBackoff) after repeated candidate
+  // failures -- it won't be automatically re-dispatched until
+  // dispatchBackoffUntil passes, possibly up to 24h out. These used to sit
+  // mixed into the main Queue tab looking identical to genuinely
+  // in-progress items ("why does this never move?"), so they get their own
+  // tab instead of cluttering the active view.
+  function isBackedOff(item: QueueItem): boolean {
+    return !!item.dispatchBackoffUntil && Date.parse(item.dispatchBackoffUntil) > Date.now();
+  }
+
+  function formatBackoffRemaining(item: QueueItem): string {
+    if (!item.dispatchBackoffUntil) return '';
+    const ms = Date.parse(item.dispatchBackoffUntil) - Date.now();
+    if (ms <= 0) return 'retrying soon';
+    const hours = Math.floor(ms / 3_600_000);
+    const minutes = Math.floor((ms % 3_600_000) / 60_000);
+    if (hours >= 1) return `retrying in ${hours}h ${minutes}m`;
+    return `retrying in ${Math.max(1, minutes)}m`;
+  }
+  $: backedOffItems = items.filter((item) => ACTIVE_STATES.includes(item.state) && isBackedOff(item));
+  $: queueItems = items.filter((item) => ACTIVE_STATES.includes(item.state) && !isBackedOff(item));
   // The backend's /api/queue ordering groups rows by state first (so every
   // 'available' row sorts before every 'failed' row) and only sorts by
   // updatedAt WITHIN each state bucket -- correct for the Queue tab's
@@ -99,15 +122,20 @@
   $: selectedFailedCount = selectedFailedIds.length;
   $: totalSegments = queueItems.reduce((sum, item) => sum + (item.nzbSegmentCount || 0), 0);
   $: queueTotalPages = Math.max(1, Math.ceil(queueItems.length / queuePageSize));
+  $: backedOffTotalPages = Math.max(1, Math.ceil(backedOffItems.length / backedOffPageSize));
   $: historyTotalPages = Math.max(1, Math.ceil(historyItems.length / historyPageSize));
   // Clamp back to the last valid page if the list shrinks out from under the
   // current page (e.g. failed items cleared/retried while on a later page).
   $: if (queuePage > queueTotalPages) queuePage = queueTotalPages;
+  $: if (backedOffPage > backedOffTotalPages) backedOffPage = backedOffTotalPages;
   $: if (historyPage > historyTotalPages) historyPage = historyTotalPages;
   $: pagedQueueItems = queueItems.slice((queuePage - 1) * queuePageSize, queuePage * queuePageSize);
+  $: pagedBackedOffItems = backedOffItems.slice((backedOffPage - 1) * backedOffPageSize, backedOffPage * backedOffPageSize);
   $: pagedHistoryItems = historyItems.slice((historyPage - 1) * historyPageSize, historyPage * historyPageSize);
   $: queueRangeStart = queueItems.length ? (queuePage - 1) * queuePageSize + 1 : 0;
   $: queueRangeEnd = Math.min(queuePage * queuePageSize, queueItems.length);
+  $: backedOffRangeStart = backedOffItems.length ? (backedOffPage - 1) * backedOffPageSize + 1 : 0;
+  $: backedOffRangeEnd = Math.min(backedOffPage * backedOffPageSize, backedOffItems.length);
   $: historyRangeStart = historyItems.length ? (historyPage - 1) * historyPageSize + 1 : 0;
   $: historyRangeEnd = Math.min(historyPage * historyPageSize, historyItems.length);
   $: visibleFailedHistoryIds = pagedHistoryItems.filter((item) => item.state === 'failed').map((item) => item.queueItemId);
@@ -406,19 +434,26 @@
 
 <div class="tab-row">
   <button class:active={tab === 'queue'} on:click={() => (tab = 'queue')}>queue</button>
+  <button class:active={tab === 'backedoff'} on:click={() => (tab = 'backedoff')}>
+    backed off{#if backedOffItems.length} ({backedOffItems.length}){/if}
+  </button>
   <button class:active={tab === 'history'} on:click={() => (tab = 'history')}>history</button>
 </div>
 
 <Panel
-  title={tab === 'queue' ? 'Queue' : 'History'}
+  title={tab === 'queue' ? 'Queue' : tab === 'backedoff' ? 'Backed Off' : 'History'}
   subtitle={tab === 'queue'
     ? 'Active lifecycle rows from request to publication.'
-    : historyItems.length >= historyBackendCap
-      ? `Completed and failed rows — showing the most recent ${historyBackendCap}, older rows are trimmed.`
-      : 'Completed and failed rows.'}
+    : tab === 'backedoff'
+      ? 'Items the automatic search gave up on for now after many failed candidates — not stuck, just parked until the backoff below expires (or Retry them now).'
+      : historyItems.length >= historyBackendCap
+        ? `Completed and failed rows — showing the most recent ${historyBackendCap}, older rows are trimmed.`
+        : 'Completed and failed rows.'}
 >
   <div slot="actions">
-    <StatusPill tone="neutral">{tab === 'queue' ? `${queueItems.length} active` : `${historyItems.length} rows`}</StatusPill>
+    <StatusPill tone="neutral">
+      {tab === 'queue' ? `${queueItems.length} active` : tab === 'backedoff' ? `${backedOffItems.length} rows` : `${historyItems.length} rows`}
+    </StatusPill>
     <StatusPill tone={workQueue.paused ? 'warn' : 'ok'}>{workQueue.paused ? 'Dispatch paused' : 'Dispatch running'}</StatusPill>
   </div>
 
@@ -471,6 +506,45 @@
             <div class="row-foot">
               <span>{item.onHold ? 'Paused' : stageLabel(item)}</span>
               <span class="mono">{item.onHold ? '' : `${pct}%`}</span>
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  {:else if tab === 'backedoff'}
+    {#if backedOffItems.length === 0 && !loading}
+      <div class="empty-state">Nothing backed off right now.</div>
+    {:else}
+      <div class="pager">
+        <div class="pager-copy">Showing {backedOffRangeStart}-{backedOffRangeEnd} of {backedOffItems.length}</div>
+        <div class="pager-actions">
+                  <button type="button" on:click={() => (backedOffPage = Math.max(1, backedOffPage - 1))} disabled={backedOffPage === 1}>Prev</button>
+                  <span>{backedOffPage}/{backedOffTotalPages}</span>
+                  <button type="button" on:click={() => (backedOffPage = Math.min(backedOffTotalPages, backedOffPage + 1))} disabled={backedOffPage === backedOffTotalPages}>Next</button>
+        </div>
+      </div>
+      <div class="row-list">
+        {#each pagedBackedOffItems as item (item.queueItemId)}
+          <div class="row-card backed-off-card">
+            <div class="row-head">
+              <div class="row-text">
+                <div class="row-title">
+                  {item.libraryTitle}{#if episodeBadge(item)}<span class="ep-badge">{episodeBadge(item)}</span>{/if}
+                </div>
+                <div class="row-sub">
+                  {item.dispatchAttemptCount ?? 0} candidate{(item.dispatchAttemptCount ?? 0) === 1 ? '' : 's'} tried · {formatBackoffRemaining(item)}
+                </div>
+              </div>
+              <div class="row-actions">
+                <Button kind="secondary" on:click={() => retryItem(item.queueItemId)} disabled={isBusy(`retry-${item.queueItemId}`)}>
+                  <RotateCcw size={14} />
+                  Retry now
+                </Button>
+                <Button kind="secondary" on:click={() => removeItem(item.queueItemId)} disabled={isBusy(`remove-${item.queueItemId}`)}>
+                  <Trash2 size={14} />
+                  Remove
+                </Button>
+              </div>
             </div>
           </div>
         {/each}
@@ -674,6 +748,11 @@
   .row-card.failed {
     border-color: hsl(var(--danger) / 0.28);
     background: hsl(var(--danger) / 0.05);
+  }
+
+  .row-card.backed-off-card {
+    border-color: hsl(45 90% 55% / 0.28);
+    background: hsl(45 90% 55% / 0.05);
   }
 
   .row-head,

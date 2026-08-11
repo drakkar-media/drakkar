@@ -4,7 +4,7 @@ import HardDriveDownload from '@lucide/svelte/icons/hard-drive-download';
 import HeartPulse from '@lucide/svelte/icons/heart-pulse';
 import Server from '@lucide/svelte/icons/server';
 import FolderTree from '@lucide/svelte/icons/folder-tree';
-import Settings2 from '@lucide/svelte/icons/settings-2';
+import Settings from '@lucide/svelte/icons/settings';
 import CalendarDays from '@lucide/svelte/icons/calendar-days';
 import Users from '@lucide/svelte/icons/users';
 import Captions from '@lucide/svelte/icons/captions';
@@ -24,7 +24,7 @@ export const navItems = [
   { href: '/services',   label: 'Services',   icon: Server },
   { href: '/vfs',        label: 'Files',      icon: FolderTree },
   { href: '/users',      label: 'Users',      icon: Users },
-  { href: '/settings',   label: 'Settings',   icon: Settings2 },
+  { href: '/settings',   label: 'Settings',   icon: Settings },
 ] as const;
 
 /**

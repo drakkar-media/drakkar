@@ -105,6 +105,8 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 			ep.season_number,
 			ep.episode_number,
 			q.on_hold,
+			q.dispatch_attempt_count,
+			q.dispatch_backoff_until,
 			q.created_at,
 			q.updated_at
 		from queue_items q
@@ -145,6 +147,7 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 		var selectedRelease sql.NullInt64
 		var nzbDocument sql.NullInt64
 		var seasonNumber, episodeNumber sql.NullInt64
+		var backoffUntil sql.NullTime
 		if err := rows.Scan(
 			&item.QueueItemID,
 			&item.LibraryItemID,
@@ -160,10 +163,15 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 			&seasonNumber,
 			&episodeNumber,
 			&item.OnHold,
+			&item.DispatchAttemptCount,
+			&backoffUntil,
 			&item.CreatedAt,
 			&item.UpdatedAt,
 		); err != nil {
 			return nil, err
+		}
+		if backoffUntil.Valid {
+			item.DispatchBackoffUntil = &backoffUntil.Time
 		}
 		if selectedRelease.Valid {
 			value := selectedRelease.Int64
