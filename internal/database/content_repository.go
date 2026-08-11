@@ -4,12 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/drakkar-media/drakkar/internal/rarcrypto"
 	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
@@ -431,7 +433,26 @@ func (db *DB) OpenVirtualMediaFile(ctx context.Context, virtualFileID int64) (st
 		spans := make([]stream.SegmentSpan, len(entry.spans))
 		copy(spans, entry.spans)
 		if entry.readerKind == "stored_rar" {
-			return stream.NewStoredRarReader(entry.name, entry.size, spans, fetcher, db.ReadAhead), nil
+			rarReader := stream.NewStoredRarReader(entry.name, entry.size, spans, fetcher, db.ReadAhead)
+			if entry.rarEncryption == nil {
+				return rarReader, nil
+			}
+			// Password-protected release: re-derive the AES key from the
+			// release's own stored password (never persisted as a raw key)
+			// -- inspectRAR5 already verified at import time that this
+			// exact password correctly derives this exact file's key, so
+			// this should always succeed; a failure here means something
+			// changed since import (e.g. the password was edited), and
+			// must fail loudly rather than silently serve ciphertext as if
+			// it were a normal, unencrypted read.
+			key, keyErr := rarcrypto.DeriveKey(entry.rarEncryption.password, rarcrypto.EncryptionParams{
+				Lg2Count: entry.rarEncryption.lg2Count,
+				Salt:     entry.rarEncryption.salt,
+			})
+			if keyErr != nil {
+				return nil, fmt.Errorf("encrypted RAR virtual file %d: %w", virtualFileID, keyErr)
+			}
+			return stream.NewEncryptedRarReader(rarReader, key, entry.rarEncryption.iv), nil
 		}
 		return stream.NewDirectNzbReader(entry.name, entry.size, spans, fetcher, db.ReadAhead), nil
 	default:
@@ -523,17 +544,28 @@ func (db *DB) PrefixBytesBackground(ctx context.Context, virtualFileID int64, li
 	return out, true, nil
 }
 
-// SetEmbeddedSubtitleLanguages records the subtitle languages detected
-// embedded in virtualFileID's own container (an empty, non-nil slice means
-// "probed, found none" -- distinct from never having probed at all, which
-// leaves the column NULL).
-func (db *DB) SetEmbeddedSubtitleLanguages(ctx context.Context, virtualFileID int64, languages []string) error {
+// SetContainerProbeResult records everything the embedded-subtitle probe
+// (internal/app/subtitle_embedded_probe.go) extracted from virtualFileID's
+// container in its single ffprobe run: which subtitle languages are
+// embedded (an empty, non-nil slice means "probed, found none" -- distinct
+// from never having probed at all, which leaves the column NULL) and the
+// container's own declared duration (0 if ffprobe couldn't determine it
+// from the probed prefix -- see mediaprobe.ContainerProbe). durationSeconds
+// backs the subtitle-sync framerate-mismatch check in
+// internal/subtitles/subtitle_sync.go.
+func (db *DB) SetContainerProbeResult(ctx context.Context, virtualFileID int64, languages []string, durationSeconds float64) error {
 	if languages == nil {
 		languages = []string{}
 	}
+	var duration sql.NullFloat64
+	if durationSeconds > 0 {
+		duration = sql.NullFloat64{Float64: durationSeconds, Valid: true}
+	}
 	_, err := db.SQL.ExecContext(ctx, `
-		update virtual_files set embedded_subtitle_languages = $2 where id = $1`,
-		virtualFileID, pgTextArray(languages),
+		update virtual_files
+		set embedded_subtitle_languages = $2, container_duration_seconds = $3
+		where id = $1`,
+		virtualFileID, pgTextArray(languages), duration,
 	)
 	return err
 }
@@ -556,6 +588,48 @@ func (db *DB) EmbeddedSubtitleLanguagesProbed(ctx context.Context, virtualFileID
 		return false, err
 	}
 	return probed, nil
+}
+
+// GetContainerDurationForLibraryItem returns the container-declared
+// duration (seconds) of libraryItemID's current main video file, as last
+// recorded by SetContainerProbeResult. ok is false when the item has no
+// resolvable file, the file hasn't been probed, or the probe couldn't
+// determine a duration -- callers must treat all three identically ("don't
+// know", not an error), since this backs a best-effort subtitle-sync check,
+// never a correctness requirement.
+func (db *DB) GetContainerDurationForLibraryItem(ctx context.Context, libraryItemID int64) (durationSeconds float64, ok bool, err error) {
+	var duration sql.NullFloat64
+	scanErr := db.SQL.QueryRowContext(ctx, `
+		with sp_file as (
+			select vf.container_duration_seconds
+			from symlink_publications sp
+			join virtual_files vf on vf.id = sp.virtual_file_id
+			where sp.library_item_id = $1
+			order by vf.size_bytes desc nulls last
+			limit 1
+		),
+		sr_file as (
+			select vf.container_duration_seconds
+			from selected_releases sr
+			join virtual_files vf on vf.selected_release_id = sr.id
+			where sr.library_item_id = $1
+			order by sr.id desc, vf.size_bytes desc nulls last
+			limit 1
+		)
+		select coalesce(
+			(select container_duration_seconds from sp_file),
+			(select container_duration_seconds from sr_file))`, libraryItemID,
+	).Scan(&duration)
+	if scanErr != nil {
+		if scanErr == sql.ErrNoRows {
+			return 0, false, nil
+		}
+		return 0, false, scanErr
+	}
+	if !duration.Valid || duration.Float64 <= 0 {
+		return 0, false, nil
+	}
+	return duration.Float64, true, nil
 }
 
 // GetEmbeddedSubtitleLanguagesForLibraryItem returns the subtitle languages
@@ -614,20 +688,33 @@ func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, 
 	var nzbFileID sql.NullInt64
 	var segByteOffset, decodedSegSize, lastDecSize int64
 	var messageIDsRaw *string // scan as nullable string then parse
+	var rarSalt, rarIV []byte
+	var rarLg2Count sql.NullInt32
+	var archivePassword sql.NullString
 
 	err := db.SQL.QueryRowContext(ctx, `
 		SELECT vf.file_name, vf.reader_kind, vf.inline_bytes, vf.size_bytes,
 		       vf.nzb_file_id, vf.segment_byte_offset,
 		       COALESCE(nf.message_ids::text, '{}'),
 		       COALESCE(nf.decoded_segment_size, 0),
-		       COALESCE(nf.last_decoded_size, 0)
+		       COALESCE(nf.last_decoded_size, 0),
+		       vf.rar_encryption_salt, vf.rar_encryption_iv, vf.rar_encryption_lg2_count,
+		       nd.archive_password
 		FROM virtual_files vf
 		LEFT JOIN nzb_files nf ON nf.id = vf.nzb_file_id
+		LEFT JOIN nzb_documents nd ON nd.id = nf.nzb_document_id
 		WHERE vf.id = $1`, virtualFileID,
 	).Scan(&entry.name, &entry.readerKind, &entry.inlineData, &entry.size,
-		&nzbFileID, &segByteOffset, &messageIDsRaw, &decodedSegSize, &lastDecSize)
+		&nzbFileID, &segByteOffset, &messageIDsRaw, &decodedSegSize, &lastDecSize,
+		&rarSalt, &rarIV, &rarLg2Count, &archivePassword)
 	if err != nil {
 		return nil, err
+	}
+	if entry.readerKind == "stored_rar" && len(rarSalt) == 16 && len(rarIV) == 16 && rarLg2Count.Valid && archivePassword.Valid {
+		enc := &rarFileEncryption{lg2Count: uint8(rarLg2Count.Int32), password: archivePassword.String}
+		copy(enc.salt[:], rarSalt)
+		copy(enc.iv[:], rarIV)
+		entry.rarEncryption = enc
 	}
 
 	if entry.readerKind == "stored_rar" {

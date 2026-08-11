@@ -17,16 +17,19 @@ import (
 // budget, so reading further would only add NNTP load for no extra signal.
 const embeddedSubtitleProbeBytes = 32 * 1024 * 1024
 
-// probeEmbeddedSubtitleLanguagesAsync best-effort-detects which subtitle
-// languages are already embedded in libraryItemID's current main video
-// file, so internal/subtitles can skip downloading a language the release
-// already shipped with. Fully async and non-blocking by design (own
-// goroutine, own timeout, panic-recovered) -- see the resource-safety
-// requirements captured in SESSION_TASKS.md: this must never compete with
-// real playback for provider connections, so every read it does goes
-// through database.DB.PrefixBytesBackground (background scheduler
-// priority, bypasses FUSE) rather than anything resembling a normal
-// streaming read.
+// probeEmbeddedSubtitleLanguagesAsync best-effort-probes libraryItemID's
+// current main video file's own container for two things in a single
+// ffprobe run: which subtitle languages are already embedded (so
+// internal/subtitles can skip downloading a language the release already
+// shipped with) and the container's declared duration (so
+// internal/subtitles can detect a framerate-mismatch scaling error in a
+// freshly-downloaded external subtitle -- see subtitle_sync.go). Fully
+// async and non-blocking by design (own goroutine, own timeout,
+// panic-recovered) -- see the resource-safety requirements captured in
+// SESSION_TASKS.md: this must never compete with real playback for
+// provider connections, so every read it does goes through
+// database.DB.PrefixBytesBackground (background scheduler priority,
+// bypasses FUSE) rather than anything resembling a normal streaming read.
 func probeEmbeddedSubtitleLanguagesAsync(db *database.DB, libraryItemID int64) {
 	go func() {
 		defer observability.Recover("embedded-subtitle-probe")
@@ -57,13 +60,13 @@ func probeEmbeddedSubtitleLanguages(ctx context.Context, db *database.DB, librar
 	if err != nil || !ok || len(data) == 0 {
 		return
 	}
-	languages, err := mediaprobe.DetectSubtitleLanguages(ctx, data)
+	probe, err := mediaprobe.ProbeContainer(ctx, data)
 	if err != nil {
 		// Couldn't determine (missing ffprobe binary, truncated prefix
 		// ffprobe couldn't parse, etc.) -- still record an empty result so
 		// this file isn't re-probed (and re-fetched over NNTP) on every
 		// future publish/republish event for it.
-		languages = nil
+		probe = mediaprobe.ContainerProbe{}
 	}
-	_ = db.SetEmbeddedSubtitleLanguages(ctx, virtualFileID, languages)
+	_ = db.SetContainerProbeResult(ctx, virtualFileID, probe.SubtitleLanguages, probe.DurationSeconds)
 }

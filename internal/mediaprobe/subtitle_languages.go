@@ -38,17 +38,51 @@ var probeTimeout = 20 * time.Second
 // optimization to avoid redundant subtitle downloads, never a correctness
 // requirement, so a failure here must never block or fail anything else.
 func DetectSubtitleLanguages(ctx context.Context, data []byte) ([]string, error) {
+	result, err := ProbeContainer(ctx, data)
+	if err != nil {
+		return nil, err
+	}
+	return result.SubtitleLanguages, nil
+}
+
+// ContainerProbe is everything Drakkar's best-effort container inspection
+// currently extracts from a single ffprobe run over a media prefix.
+type ContainerProbe struct {
+	// SubtitleLanguages are the distinct ISO 639-1 codes of embedded
+	// subtitle streams -- see DetectSubtitleLanguages's doc comment.
+	SubtitleLanguages []string
+	// DurationSeconds is the container's own declared duration, or 0 if
+	// ffprobe couldn't determine it from the (possibly truncated) prefix.
+	// For MKV this is normally available even from a prefix, since it
+	// lives in the Segment Info element alongside Tracks near the front of
+	// the file -- unlike Cues, which are commonly near the end. Used by
+	// internal/subtitles to detect a framerate-mismatch scaling error in a
+	// freshly-downloaded external subtitle (see subtitle_sync.go).
+	DurationSeconds float64
+}
+
+// ProbeContainer runs a single ffprobe invocation against data -- a
+// (possibly truncated) prefix of a media container's decoded bytes -- and
+// returns everything Drakkar currently extracts from it. See
+// DetectSubtitleLanguages for the truncated-input caveats; the same
+// fail-safe contract applies here (a non-nil error, or zero-value fields on
+// a nil error, both just mean "couldn't determine", never a fatal
+// condition).
+func ProbeContainer(ctx context.Context, data []byte) (ContainerProbe, error) {
 	if len(data) == 0 {
-		return nil, nil
+		return ContainerProbe{}, nil
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	result, err := ffprobe.ProbeReader(probeCtx, bytes.NewReader(data))
 	if err != nil {
-		return nil, err
+		return ContainerProbe{}, err
+	}
+	var out ContainerProbe
+	if result.Format != nil {
+		out.DurationSeconds = result.Format.DurationSeconds
 	}
 	seen := make(map[string]struct{}, len(result.Streams))
-	var out []string
 	for _, s := range result.Streams {
 		if s == nil || s.CodecType != "subtitle" {
 			continue
@@ -61,7 +95,7 @@ func DetectSubtitleLanguages(ctx context.Context, data []byte) ([]string, error)
 			continue
 		}
 		seen[code] = struct{}{}
-		out = append(out, code)
+		out.SubtitleLanguages = append(out.SubtitleLanguages, code)
 	}
 	return out, nil
 }

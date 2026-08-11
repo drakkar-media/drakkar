@@ -1,12 +1,17 @@
 package database
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"database/sql"
+	"io"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/drakkar-media/drakkar/internal/rarcrypto"
 	"github.com/drakkar-media/drakkar/internal/stream"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -502,5 +507,333 @@ func TestGetEmbeddedSubtitleLanguagesForLibraryItemDefaultsToEmpty(t *testing.T)
 	}
 	if len(languages) != 0 {
 		t.Fatalf("expected empty slice for a never-probed file, got %v", languages)
+	}
+}
+
+// TestSetContainerProbeResultAndGetContainerDurationForLibraryItem covers
+// the write/read round trip the subtitle-sync framerate-mismatch check
+// depends on: SetContainerProbeResult (written once by the embedded-
+// subtitle probe) must be readable back via
+// GetContainerDurationForLibraryItem, resolving the same
+// symlink_publications-first / selected_releases-fallback file as
+// GetEmbeddedSubtitleLanguagesForLibraryItem.
+func TestSetContainerProbeResultAndGetContainerDurationForLibraryItem(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	var libID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('movie', 'container-duration-check', true)
+		returning id`).Scan(&libID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, selected)
+		values ($1, 'container-duration-check release', true)
+		returning id`, libID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+	var srID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2) returning id`, libID, rcID).Scan(&srID); err != nil {
+		t.Fatal(err)
+	}
+	var vfID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, size_bytes, reader_kind, inline_bytes)
+		values ($1, 'container-duration.mkv', 'container-duration.mkv', 3, 'inline', $2)
+		returning id`, srID, []byte("abc")).Scan(&vfID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before any probe: duration unknown.
+	if _, ok, err := db.GetContainerDurationForLibraryItem(ctx, libID); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("expected ok=false before any probe result is recorded")
+	}
+
+	if err := db.SetContainerProbeResult(ctx, vfID, []string{"en"}, 7230.5); err != nil {
+		t.Fatal(err)
+	}
+
+	duration, ok, err := db.GetContainerDurationForLibraryItem(ctx, libID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected ok=true after recording a probe result")
+	}
+	if duration != 7230.5 {
+		t.Fatalf("duration = %v, want 7230.5", duration)
+	}
+
+	languages, err := db.GetEmbeddedSubtitleLanguagesForLibraryItem(ctx, libID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(languages) != 1 || languages[0] != "en" {
+		t.Fatalf("expected SetContainerProbeResult to also record languages, got %v", languages)
+	}
+}
+
+// TestSetContainerProbeResultZeroDurationStaysUnknown covers the "ffprobe
+// ran but couldn't determine duration from the truncated prefix" case: 0
+// must be stored as NULL/unknown, not as a literal 0-second duration a
+// caller might otherwise divide by.
+func TestSetContainerProbeResultZeroDurationStaysUnknown(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	var libID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('movie', 'container-duration-zero-check', true)
+		returning id`).Scan(&libID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, selected)
+		values ($1, 'container-duration-zero-check release', true)
+		returning id`, libID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+	var srID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2) returning id`, libID, rcID).Scan(&srID); err != nil {
+		t.Fatal(err)
+	}
+	var vfID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, size_bytes, reader_kind, inline_bytes)
+		values ($1, 'container-duration-zero.mkv', 'container-duration-zero.mkv', 3, 'inline', $2)
+		returning id`, srID, []byte("abc")).Scan(&vfID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.SetContainerProbeResult(ctx, vfID, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := db.GetContainerDurationForLibraryItem(ctx, libID); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("expected ok=false when the probe recorded a 0 duration")
+	}
+}
+
+// TestImportSelectedReleaseNZBPersistsArchivePassword guards the end-to-end
+// wiring for the archive-password extraction feature: an ImportedNZB
+// carrying ArchivePassword (from the NZB's <meta type="password">, see
+// internal/nzb.Document.Password) must land in nzb_documents.archive_password,
+// not be silently dropped -- the historical behavior before this session's
+// fix (the password was never even parsed out of the NZB XML).
+func TestImportSelectedReleaseNZBPersistsArchivePassword(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	var libID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('movie', 'archive-password-check', false)
+		returning id`).Scan(&libID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, external_url, selected)
+		values ($1, 'archive-password-check release', 'http://example/archive-password-check', true)
+		returning id`, libID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+	var srID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2) returning id`, libID, rcID).Scan(&srID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into queue_items (library_item_id, state, idempotency_key, selected_release_id)
+		values ($1, 'fetching_nzb', $2, $3)`, libID, "archive-password-check-key", srID); err != nil {
+		t.Fatal(err)
+	}
+
+	imported := ImportedNZB{
+		FileName:        "archive-password-check.nzb",
+		ExternalURL:     "http://example/archive-password-check",
+		ArchivePassword: "s3cr3t-from-nzb",
+		Files: []ImportedNZBFile{
+			{
+				FileName:      "movie.mkv",
+				FileSizeBytes: 1000,
+				Segments: []ImportedNZBSegment{
+					{Number: 1, MessageID: "<archive-password-check-1>", EncodedSizeBytes: 1030, DecodedStartOffset: 0, DecodedEndOffset: 1000},
+				},
+			},
+		},
+	}
+
+	if _, err := db.ImportSelectedReleaseNZB(ctx, srID, imported); err != nil {
+		t.Fatal(err)
+	}
+
+	var password sql.NullString
+	if err := sqlDB.QueryRowContext(ctx, `
+		select archive_password from nzb_documents where selected_release_id = $1`, srID,
+	).Scan(&password); err != nil {
+		t.Fatal(err)
+	}
+	if !password.Valid || password.String != "s3cr3t-from-nzb" {
+		t.Fatalf("archive_password = %+v, want valid %q", password, "s3cr3t-from-nzb")
+	}
+}
+
+// TestOpenVirtualMediaFileDecryptsPasswordProtectedRAR is the full
+// end-to-end integration test for password-protected RAR streaming: a
+// virtual_files row carrying real salt/IV/lg2Count (as insertArchiveVirtualFile
+// would persist after inspectRAR5 verified the password) plus the release's
+// stored nzb_documents.archive_password must make OpenVirtualMediaFile
+// return a reader whose ReadAt transparently decrypts -- exactly like an
+// unencrypted stored_rar file, with zero special-casing needed by any
+// caller (health checks, FUSE reads, everything goes through this same
+// OpenVirtualMediaFile choke point).
+func TestOpenVirtualMediaFileDecryptsPasswordProtectedRAR(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+
+	const password = "correct-password"
+	var salt, iv [16]byte
+	for i := range salt {
+		salt[i] = byte(0x20 + i)
+	}
+	for i := range iv {
+		iv[i] = byte(0x90 + i)
+	}
+	const lg2Count = 4
+
+	plaintext := bytes.Repeat([]byte("ENCRYPTED-VIDEO!"), 4) // 64 bytes, block-aligned
+	// EncryptedRarReader mandatorily verifies the decrypted output against
+	// a real video container's magic number before trusting it (see its
+	// doc comment) -- give it real MKV/EBML magic at the start so this
+	// test exercises that check succeeding, not failing on unrelated
+	// fixture data that was never meant to look like video.
+	copy(plaintext, []byte{0x1a, 0x45, 0xdf, 0xa3})
+	key, err := rarcrypto.DeriveKey(password, rarcrypto.EncryptionParams{Lg2Count: lg2Count, Salt: salt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext := make([]byte, len(plaintext))
+	cipher.NewCBCEncrypter(block, iv[:]).CryptBlocks(ciphertext, plaintext)
+
+	db := &DB{SQL: sqlDB, SegmentFetcher: fetcherStub{data: ciphertext}}
+
+	var libID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('movie', 'encrypted-rar-e2e-check', true)
+		returning id`).Scan(&libID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, selected)
+		values ($1, 'encrypted-rar-e2e-check release', true)
+		returning id`, libID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+	var srID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2) returning id`, libID, rcID).Scan(&srID); err != nil {
+		t.Fatal(err)
+	}
+	var nzbDocID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into nzb_documents (selected_release_id, file_name, archive_password)
+		values ($1, 'encrypted-rar-e2e-check.nzb', $2) returning id`, srID, password).Scan(&nzbDocID); err != nil {
+		t.Fatal(err)
+	}
+	var nzbFileID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into nzb_files (nzb_document_id, subject, message_ids, decoded_segment_size)
+		values ($1, 'encrypted-part', $2, $3)
+		returning id`, nzbDocID, "{<msg1>}", len(ciphertext)).Scan(&nzbFileID); err != nil {
+		t.Fatal(err)
+	}
+	var vfID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into virtual_files (
+			selected_release_id, path, file_name, size_bytes, reader_kind,
+			nzb_file_id, segment_byte_offset,
+			rar_encryption_salt, rar_encryption_iv, rar_encryption_lg2_count
+		) values ($1, 'Movie.mkv', 'Movie.mkv', $2, 'stored_rar', $3, 0, $4, $5, $6)
+		returning id`,
+		srID, len(plaintext), nzbFileID, salt[:], iv[:], lg2Count,
+	).Scan(&vfID); err != nil {
+		t.Fatal(err)
+	}
+
+	vf, err := db.OpenVirtualMediaFile(ctx, vfID)
+	if err != nil {
+		t.Fatalf("OpenVirtualMediaFile: %v", err)
+	}
+	got := make([]byte, len(plaintext))
+	n, err := vf.ReadAt(ctx, got, 0)
+	if err != nil && err != io.EOF {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if n != len(plaintext) || !bytes.Equal(got, plaintext) {
+		t.Fatalf("ReadAt returned %q, want %q", got[:n], plaintext)
 	}
 }

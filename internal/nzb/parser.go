@@ -14,7 +14,48 @@ import (
 // Document is the parsed representation of an NZB XML file's root <nzb> element.
 type Document struct {
 	XMLName xml.Name  `xml:"nzb"`
+	Head    NZBHead   `xml:"head"`
 	Files   []NZBFile `xml:"file"`
+}
+
+// NZBHead is the NZB's optional <head> element -- free-form <meta type="...">
+// key/value pairs some posters/indexers attach (category, name, and,
+// notably, "password" -- a de facto convention several indexers use for
+// releases whose archive requires one, confirmed live: NZBFinder's own
+// site documents it as "Password is inside NZB and is auto-detected by
+// most downloaders").
+type NZBHead struct {
+	Meta []NZBMeta `xml:"meta"`
+}
+
+// NZBMeta is a single <meta type="..."> value="..." OR the newer
+// <meta type="...">value</meta> element form -- both appear in the wild, so
+// this reads both the attribute and the character data and Password()
+// prefers whichever is non-empty.
+type NZBMeta struct {
+	Type       string `xml:"type,attr"`
+	ValueAttr  string `xml:"value,attr"`
+	ValueChars string `xml:",chardata"`
+}
+
+func (m NZBMeta) value() string {
+	if v := strings.TrimSpace(m.ValueChars); v != "" {
+		return v
+	}
+	return strings.TrimSpace(m.ValueAttr)
+}
+
+// Password returns the NZB's embedded archive password, if its <head> has
+// a <meta type="password"> entry -- "" if there isn't one. Matching is
+// case-insensitive on the type attribute since posters/indexers aren't
+// perfectly consistent about it.
+func (d *Document) Password() string {
+	for _, m := range d.Head.Meta {
+		if strings.EqualFold(strings.TrimSpace(m.Type), "password") {
+			return m.value()
+		}
+	}
+	return ""
 }
 
 // NZBFile is a single <file> entry in an NZB document: one posted file

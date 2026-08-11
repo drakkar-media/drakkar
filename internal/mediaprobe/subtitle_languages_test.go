@@ -57,6 +57,28 @@ func TestDetectSubtitleLanguagesRealMKV(t *testing.T) {
 	}
 }
 
+func TestProbeContainerReturnsDurationAlongsideLanguages(t *testing.T) {
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		t.Skip("ffprobe not installed in this environment -- this is a production-image-only dependency, not a CI/test-runner one")
+	}
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not installed -- needed to build the test fixture, not part of ProbeContainer itself")
+	}
+	data := buildFixtureMKV(t)
+	probe, err := ProbeContainer(context.Background(), data)
+	if err != nil {
+		t.Fatalf("ProbeContainer: %v", err)
+	}
+	if len(probe.SubtitleLanguages) != 1 || probe.SubtitleLanguages[0] != "en" {
+		t.Fatalf("SubtitleLanguages = %v, want [en]", probe.SubtitleLanguages)
+	}
+	// buildFixtureMKV encodes a 1-second clip -- allow slack for
+	// container/muxing rounding rather than asserting an exact value.
+	if probe.DurationSeconds < 0.5 || probe.DurationSeconds > 1.5 {
+		t.Fatalf("DurationSeconds = %v, want ~1.0", probe.DurationSeconds)
+	}
+}
+
 // buildFixtureMKV shells out to ffmpeg (only called when both ffmpeg and
 // ffprobe are confirmed present, see the Skip guards above) to synthesize a
 // tiny MKV with one English subtitle track, so the real ffprobe round-trip

@@ -14,6 +14,7 @@ import (
 
 	"github.com/drakkar-media/drakkar/internal/observability"
 	"github.com/drakkar-media/drakkar/internal/par2"
+	"github.com/drakkar-media/drakkar/internal/rarcrypto"
 	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
@@ -62,7 +63,7 @@ func fetchRangeBackground(ctx context.Context, fetcher stream.SegmentFetcher, se
 // index files are fetched and parsed once up front (enrichFileByNameFromPar2)
 // so all archive inspections benefit from the authoritative sizes/aliases
 // without redoing that work per archive.
-func inspectImportedArchives(ctx context.Context, archives []ImportedArchive, files []ImportedNZBFile, fetcher stream.SegmentFetcher) []ImportedArchive {
+func inspectImportedArchives(ctx context.Context, archives []ImportedArchive, files []ImportedNZBFile, fetcher stream.SegmentFetcher, archivePassword string) []ImportedArchive {
 	if len(archives) == 0 {
 		return nil
 	}
@@ -95,7 +96,7 @@ func inspectImportedArchives(ctx context.Context, archives []ImportedArchive, fi
 			defer func() { <-sem }()
 			inspected := item
 			inspectCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
-			err := inspectArchive(inspectCtx, &inspected, fileByName, fetcher)
+			err := inspectArchive(inspectCtx, &inspected, fileByName, fetcher, archivePassword)
 			cancel()
 			if err != nil {
 				inspected.Status = "rejected"
@@ -113,7 +114,7 @@ func inspectImportedArchives(ctx context.Context, archives []ImportedArchive, fi
 // (inspectRARArchive or inspect7zArchive). A gap in the volume sequence means
 // the NZB is missing a part, so inspection fails fast with
 // errArchiveHeadersInvalid rather than attempting a doomed header parse.
-func inspectArchive(ctx context.Context, archive *ImportedArchive, fileByName map[string]ImportedNZBFile, fetcher stream.SegmentFetcher) error {
+func inspectArchive(ctx context.Context, archive *ImportedArchive, fileByName map[string]ImportedNZBFile, fetcher stream.SegmentFetcher, archivePassword string) error {
 	if archive == nil {
 		return nil
 	}
@@ -125,7 +126,7 @@ func inspectArchive(ctx context.Context, archive *ImportedArchive, fileByName ma
 	}
 	switch archive.Kind {
 	case "rar":
-		return inspectRARArchive(ctx, archive, fileByName, fetcher)
+		return inspectRARArchive(ctx, archive, fileByName, fetcher, archivePassword)
 	case "7z":
 		return inspect7zArchive(ctx, archive, fileByName, fetcher)
 	default:
@@ -184,7 +185,7 @@ func reconcileStoreMethodSize(e *ImportedArchiveEntry, totalVolumeBytes int64) {
 // (errArchiveHeadersInvalid/errArchiveVideoNotFound) is tolerated and that
 // volume is simply skipped from the per-volume flow, since the legacy flow
 // can still cover it.
-func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName map[string]ImportedNZBFile, fetcher stream.SegmentFetcher) error {
+func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName map[string]ImportedNZBFile, fetcher stream.SegmentFetcher, archivePassword string) error {
 	first, ok := fileByName[archive.Volumes[0].Path]
 	if !ok {
 		return errArchiveHeadersInvalid
@@ -198,7 +199,7 @@ func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName
 		volumeSizes[volume.VolumeIndex] = importedFileEffectiveSize(ctx, file, fetcher)
 	}
 
-	entries, err := inspectRARWithRetries(ctx, first, fetcher)
+	entries, err := inspectRARWithRetries(ctx, first, fetcher, archivePassword)
 	if err != nil {
 		return err
 	}
@@ -230,7 +231,7 @@ func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName
 			continue
 		}
 		file := fileByName[volume.Path]
-		partEntries, partErr := inspectRARWithRetries(ctx, file, fetcher)
+		partEntries, partErr := inspectRARWithRetries(ctx, file, fetcher, archivePassword)
 		if partErr != nil {
 			if errors.Is(partErr, errArchiveHeadersInvalid) || errors.Is(partErr, errArchiveVideoNotFound) {
 				continue
@@ -266,7 +267,7 @@ func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName
 // (small headers) cheap; retrying larger only kicks in for
 // errArchiveHeadersInvalid/errArchiveVideoNotFound, which can mean the
 // initial prefix simply didn't reach every file header yet.
-func inspectRARWithRetries(ctx context.Context, file ImportedNZBFile, fetcher stream.SegmentFetcher) ([]ImportedArchiveEntry, error) {
+func inspectRARWithRetries(ctx context.Context, file ImportedNZBFile, fetcher stream.SegmentFetcher, archivePassword string) ([]ImportedArchiveEntry, error) {
 	available := importedFileEffectiveSize(ctx, file, fetcher)
 	if available <= 0 {
 		return nil, errArchiveHeadersInvalid
@@ -292,7 +293,7 @@ func inspectRARWithRetries(ctx context.Context, file ImportedNZBFile, fetcher st
 		if err != nil {
 			return nil, normalizeArchiveFetchError(err)
 		}
-		entries, err := inspectRARPrefix(prefix)
+		entries, err := inspectRARPrefix(prefix, archivePassword)
 		slog.Debug("archive inspect: header prefix attempt", "file", file.FileName, "limit", limit, "err", err)
 		if err == nil || !shouldRetryRARInspect(err) || limit == available {
 			return entries, err
@@ -323,9 +324,9 @@ func normalizeArchiveFetchError(err error) error {
 	return err
 }
 
-func inspectRARPrefix(prefix []byte) ([]ImportedArchiveEntry, error) {
+func inspectRARPrefix(prefix []byte, archivePassword string) ([]ImportedArchiveEntry, error) {
 	if len(prefix) >= 8 && string(prefix[:8]) == "Rar!\x1a\x07\x01\x00" {
-		return inspectRAR5(prefix)
+		return inspectRAR5(prefix, archivePassword)
 	}
 	return inspectRAR4(prefix)
 }
@@ -771,23 +772,75 @@ func rar5ReadVint(data []byte, pos int) (int64, int) {
 	return 0, 0
 }
 
+// parseRAR5EncryptionHeaderBody decodes a RAR5 encryption header's (type 4)
+// body: version (vint, ignored), flags (vint, bit 0 = has password check),
+// KDF iteration count as log2 (1 byte), a 16-byte salt, and -- when the
+// password-check flag is set -- an 8-byte check value + 4-byte checksum
+// (12 bytes total). Confirmed byte-for-byte against a real production
+// archive's encryption header.
+func parseRAR5EncryptionHeaderBody(body []byte) (rarcrypto.EncryptionParams, error) {
+	pos := 0
+	if _, n := rar5ReadVint(body, pos); n > 0 { // version
+		pos += n
+	} else {
+		return rarcrypto.EncryptionParams{}, errArchiveHeadersInvalid
+	}
+	flags, n := rar5ReadVint(body, pos)
+	if n == 0 {
+		return rarcrypto.EncryptionParams{}, errArchiveHeadersInvalid
+	}
+	pos += n
+	if pos+1+16 > len(body) {
+		return rarcrypto.EncryptionParams{}, errArchiveHeadersInvalid
+	}
+	lg2 := body[pos]
+	pos++
+	var salt [16]byte
+	copy(salt[:], body[pos:pos+16])
+	pos += 16
+	params := rarcrypto.EncryptionParams{Lg2Count: lg2, Salt: salt}
+	if flags&0x0001 != 0 {
+		if pos+8 > len(body) {
+			return rarcrypto.EncryptionParams{}, errArchiveHeadersInvalid
+		}
+		var check [8]byte
+		copy(check[:], body[pos:pos+8])
+		params.HasPasswordCheck = true
+		params.PasswordCheck = check
+	}
+	return params, nil
+}
+
 // inspectRAR5 walks a RAR5 volume's header blocks (as parsed from a decoded
 // byte prefix) and collects one ImportedArchiveEntry per file header found.
-// Any encryption header (type 4) rejects the whole archive immediately
-// (errArchiveEncrypted). Once a playable entry (video extension) is seen, it
-// must be uncompressed, non-solid, and unencrypted, or inspection fails with
-// the specific unsupported-feature error -- non-playable entries (nfo, sfv,
-// etc.) are collected but never fail inspection on their own. Returns
+// An encryption header (type 4) rejects the whole archive UNLESS
+// archivePassword successfully derives and verifies a key against it, in
+// which case decryption continues transparently and header parsing carries
+// on against the decrypted bytes. Once a playable entry (video extension)
+// is seen, it must be uncompressed and non-solid, and -- if encrypted --
+// have a verified per-file encryption record, or inspection fails with the
+// specific unsupported-feature error; non-playable entries (nfo, sfv, etc.)
+// are collected but never fail inspection on their own. Returns
 // errArchiveVideoNotFound if headers parsed cleanly but no playable entry
 // was found, distinguishing "not a video release" from a corrupt/truncated
 // parse (errArchiveHeadersInvalid).
-func inspectRAR5(raw []byte) ([]ImportedArchiveEntry, error) {
+func inspectRAR5(raw []byte, archivePassword string) ([]ImportedArchiveEntry, error) {
 	if len(raw) < 8 || string(raw[:8]) != "Rar!\x1a\x07\x01\x00" {
 		return nil, errArchiveHeadersInvalid
 	}
 	pos := 8
 	var entries []ImportedArchiveEntry
 	playableFound := false
+	// headerCipherStart tracks where the encrypted-headers ciphertext
+	// region began (see case 4), so a file entry's real content start can
+	// be rounded up to the next AES block boundary relative to it. RAR5
+	// pads the header-encryption ciphertext to a whole number of blocks,
+	// so a file's own dataAreaStart -- computed from the DECRYPTED
+	// header's own declared size, which knows nothing about that padding
+	// -- would otherwise land a few bytes before where the file's
+	// separately-keyed content actually starts. -1 means headers were
+	// never encrypted, so no adjustment applies.
+	headerCipherStart := -1
 
 	for pos+5 <= len(raw) {
 		pos += 4 // skip CRC32
@@ -842,16 +895,66 @@ func inspectRAR5(raw []byte) ([]ImportedArchiveEntry, error) {
 		typeEnd := bodyEnd - int(extraAreaSize)
 
 		switch headType {
-		case 4: // encryption header → whole archive is encrypted
-			return nil, errArchiveEncrypted
+		case 4: // encryption header -- headers from here on are encrypted
+			encParams, perr := parseRAR5EncryptionHeaderBody(raw[pos:bodyEnd])
+			if perr != nil || archivePassword == "" {
+				return nil, errArchiveEncrypted
+			}
+			key, derr := rarcrypto.DeriveKey(archivePassword, encParams)
+			if derr != nil {
+				// Definite wrong password (or, if this header carried no
+				// password-check value, DeriveKey never fails here --
+				// see its doc comment).
+				return nil, errArchiveEncrypted
+			}
+			// Per RAR5's own encrypted-header scheme: the 16 bytes right
+			// after this header's body are the IV for the ciphertext that
+			// follows (not a stored/derived value -- IVs don't need to be
+			// secret). Confirmed byte-for-byte against a real production
+			// archive: decrypting with this exact scheme recovered the
+			// archive's real embedded filename.
+			if bodyEnd+rarcrypto.BlockSize > len(raw) {
+				return nil, errArchiveHeadersInvalid
+			}
+			var iv [rarcrypto.BlockSize]byte
+			copy(iv[:], raw[bodyEnd:bodyEnd+rarcrypto.BlockSize])
+			cipherStart := bodyEnd + rarcrypto.BlockSize
+			cipherLen := len(raw) - cipherStart
+			cipherLen -= cipherLen % rarcrypto.BlockSize
+			if cipherLen <= 0 {
+				return nil, errArchiveHeadersInvalid
+			}
+			plaintext, decErr := rarcrypto.DecryptBlockAligned(raw[cipherStart:cipherStart+cipherLen], key, iv)
+			if decErr != nil {
+				return nil, errArchiveHeadersInvalid
+			}
+			// Splice the decrypted headers in place of their ciphertext so
+			// the rest of this same walk continues unmodified -- lengths
+			// match exactly (AES-CBC doesn't expand data), so pos stays
+			// numerically valid across the swap.
+			raw = append(append([]byte{}, raw[:cipherStart]...), plaintext...)
+			pos = cipherStart
+			headerCipherStart = cipherStart
+			continue
 		case 2: // file header
-			entry, isDir, err := parseRAR5FileHeader(raw, pos, typeEnd, dataAreaStart, dataAreaSize)
+			if headerCipherStart >= 0 {
+				if rem := (dataAreaStart - int64(headerCipherStart)) % rarcrypto.BlockSize; rem != 0 {
+					dataAreaStart += rarcrypto.BlockSize - rem
+				}
+			}
+			entry, isDir, err := parseRAR5FileHeader(raw, pos, typeEnd, bodyEnd, dataAreaStart, dataAreaSize, archivePassword)
 			if err == nil && !isDir {
 				entries = append(entries, entry)
 				if isPlayableArchiveEntry(entry.Path) {
 					playableFound = true
 					if entry.Encrypted {
-						return nil, errArchiveEncrypted
+						if !entry.EncryptionVerified {
+							return nil, errArchiveEncrypted
+						}
+						// Content decryption (see stream.EncryptedRarReader)
+						// only handles a continuous, uncompressed data area
+						// -- the same constraint unencrypted stored_rar
+						// entries already have, just also required here.
 					}
 					if entry.Solid {
 						return nil, errArchiveSolidUnsupported
@@ -881,7 +984,7 @@ done:
 // (size, name, compression method, solid flag) into an ImportedArchiveEntry.
 // isDir reports whether the header describes a directory rather than a file,
 // so the caller can skip it.
-func parseRAR5FileHeader(raw []byte, pos, end int, dataStart, dataAreaSize int64) (ImportedArchiveEntry, bool, error) {
+func parseRAR5FileHeader(raw []byte, pos, end, bodyEnd int, dataStart, dataAreaSize int64, archivePassword string) (ImportedArchiveEntry, bool, error) {
 	fileFlags, n := rar5ReadVint(raw, pos)
 	if n == 0 || pos+n > end {
 		return ImportedArchiveEntry{}, false, errArchiveHeadersInvalid
@@ -950,15 +1053,75 @@ func parseRAR5FileHeader(raw []byte, pos, end int, dataStart, dataAreaSize int64
 	}
 	isDir := fileFlags&0x0001 != 0
 
+	// Walk the extra area (fields the caller already excluded from [pos,
+	// end) via typeEnd) looking for an encryption record (extra type 1) --
+	// RAR5 gives each encrypted file its OWN salt/IV/KDF-iteration-count
+	// here, independent of any archive-wide header-encryption key (see
+	// case 4's handling in inspectRAR5). Confirmed byte-for-byte against a
+	// real production archive: this exact layout, with the SAME
+	// password, derives the SAME key its own stored password-check value
+	// expects.
+	encrypted := false
+	encVerified := false
+	var encSalt, encIV [16]byte
+	var encLg2 uint8
+	for extraPos := end; extraPos < bodyEnd; {
+		esize, n := rar5ReadVint(raw, extraPos)
+		if n == 0 || extraPos+n > bodyEnd {
+			break
+		}
+		fieldStart := extraPos + n
+		etype, n2 := rar5ReadVint(raw, fieldStart)
+		if n2 == 0 {
+			break
+		}
+		if etype == 1 {
+			encrypted = true
+			p := fieldStart + n2
+			if _, vn := rar5ReadVint(raw, p); vn > 0 { // version
+				p += vn
+			}
+			encFlags, fn := rar5ReadVint(raw, p)
+			if fn > 0 && p+fn+1+16+16 <= bodyEnd {
+				p += fn
+				lg2 := raw[p]
+				p++
+				var salt, iv [16]byte
+				copy(salt[:], raw[p:p+16])
+				p += 16
+				copy(iv[:], raw[p:p+16])
+				p += 16
+				params := rarcrypto.EncryptionParams{Lg2Count: lg2, Salt: salt, IV: iv}
+				if encFlags&0x0001 != 0 && p+8 <= bodyEnd {
+					var check [8]byte
+					copy(check[:], raw[p:p+8])
+					params.HasPasswordCheck = true
+					params.PasswordCheck = check
+				}
+				encLg2, encSalt, encIV = lg2, salt, iv
+				if archivePassword != "" {
+					if _, derr := rarcrypto.DeriveKey(archivePassword, params); derr == nil {
+						encVerified = true
+					}
+				}
+			}
+		}
+		extraPos = fieldStart + int(esize)
+	}
+
 	return ImportedArchiveEntry{
-		Path:              filepath.Base(strings.ReplaceAll(name, `\`, "/")),
-		SizeBytes:         unpackedSize,
-		PackedSizeBytes:   dataAreaSize,
-		CompressionMethod: methodName,
-		Encrypted:         false, // archive-level encryption caught by type-4 block
-		Solid:             solid,
-		VolumeIndex:       0,
-		ArchiveOffset:     dataStart,
+		Path:               filepath.Base(strings.ReplaceAll(name, `\`, "/")),
+		SizeBytes:          unpackedSize,
+		PackedSizeBytes:    dataAreaSize,
+		CompressionMethod:  methodName,
+		Encrypted:          encrypted,
+		EncryptionVerified: encVerified,
+		EncryptionSalt:     encSalt,
+		EncryptionIV:       encIV,
+		EncryptionLg2Count: encLg2,
+		Solid:              solid,
+		VolumeIndex:        0,
+		ArchiveOffset:      dataStart,
 	}, isDir, nil
 }
 

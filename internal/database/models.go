@@ -62,6 +62,12 @@ type ImportedNZB struct {
 	Files          []ImportedNZBFile
 	Archives       []ImportedArchive
 	MediaType      string // overrides default "manual_nzb" when set
+	// ArchivePassword is the NZB's embedded <meta type="password"> value,
+	// if the poster/indexer included one -- "" when absent. Confirmed live
+	// (2026-08-11) via a sample of real archive_encrypted-blocklisted NZBs:
+	// most (10/11 resolvable in the sample) actually carry a real password
+	// here, which today is silently discarded -- see SESSION_TASKS.md.
+	ArchivePassword string
 }
 
 // SabQueueItem models one row of the SABnzbd-compatible queue API response.
@@ -134,6 +140,20 @@ type ImportedArchiveEntry struct {
 	VolumeIndex       int
 	ArchiveOffset     int64
 	Ranges            []ImportedArchiveRange
+	// EncryptionVerified is true only when Encrypted is true AND the
+	// archive's own <meta type="password"> (see internal/nzb.Document)
+	// successfully derived and verified an AES key for this entry's own
+	// RAR5 encryption extra-area record -- see
+	// internal/rarcrypto/rar5.go's package doc for what "verified" means
+	// here. EncryptionSalt/EncryptionIV/EncryptionLg2Count are only
+	// meaningful when this is true; they're what
+	// stream.NewEncryptedRarReader needs to re-derive the same key at
+	// read time (from the same password, stored separately on
+	// nzb_documents.archive_password -- never the raw key itself).
+	EncryptionVerified bool
+	EncryptionSalt     [16]byte
+	EncryptionIV       [16]byte
+	EncryptionLg2Count uint8
 }
 
 // ImportedArchiveRange is one contiguous slice of an archive entry's data as

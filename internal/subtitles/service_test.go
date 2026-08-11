@@ -16,21 +16,29 @@ import (
 )
 
 type repoStub struct {
-	publicationPaths  []string
-	items             []database.SubtitleFileSummary
-	candidates        []database.SubtitleCandidateSummary
-	replaced          []string
-	deletedID         int64
-	deletedGroup      database.SubtitleDeleteGroup
-	searchInput       database.SubtitleSearchInput
-	downloadCandidate database.SubtitleCandidateSummary
-	storedCandidates  []database.SubtitleCandidateRecord
-	appSettings       map[string]string
-	embeddedLanguages []string
+	publicationPaths         []string
+	items                    []database.SubtitleFileSummary
+	candidates               []database.SubtitleCandidateSummary
+	replaced                 []string
+	deletedID                int64
+	deletedGroup             database.SubtitleDeleteGroup
+	searchInput              database.SubtitleSearchInput
+	downloadCandidate        database.SubtitleCandidateSummary
+	storedCandidates         []database.SubtitleCandidateRecord
+	appSettings              map[string]string
+	embeddedLanguages        []string
+	containerDurationSeconds float64
 }
 
 func (r *repoStub) GetEmbeddedSubtitleLanguagesForLibraryItem(ctx context.Context, libraryItemID int64) ([]string, error) {
 	return r.embeddedLanguages, nil
+}
+
+func (r *repoStub) GetContainerDurationForLibraryItem(ctx context.Context, libraryItemID int64) (float64, bool, error) {
+	if r.containerDurationSeconds <= 0 {
+		return 0, false, nil
+	}
+	return r.containerDurationSeconds, true, nil
 }
 
 // GetAppSetting/PutAppSetting back the per-provider daily call budget with a
@@ -812,6 +820,57 @@ func TestDownloadCandidatePublishesSubtitle(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "Hello") {
 		t.Fatalf("unexpected subtitle body %q", string(body))
+	}
+}
+
+// TestDownloadCandidateCorrectsFramerateMismatch guards the actual wiring:
+// DownloadCandidate must run the freshly-downloaded body through the
+// framerate-mismatch sync correction before publishing it, when the repo
+// reports a known container duration that implies a real framerate
+// mismatch against the subtitle's own timestamps.
+func TestDownloadCandidateCorrectsFramerateMismatch(t *testing.T) {
+	root := t.TempDir()
+	publicationPath := filepath.Join(root, "movies", "Dune (2021).mkv")
+	if err := os.MkdirAll(filepath.Dir(publicationPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(publicationPath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Subtitle's own last cue implies a 12s runtime; the "real" video is
+	// reported as 12 * (23.976/25) -- the classic PAL/film framerate
+	// mismatch, which correctFramerateMismatch must recognize and correct.
+	videoDuration := 12.0 * (23.976 / 25.0)
+	repo := &repoStub{
+		publicationPaths:         []string{publicationPath},
+		containerDurationSeconds: videoDuration,
+		downloadCandidate: database.SubtitleCandidateSummary{
+			ID:            7,
+			LibraryItemID: 42,
+			Provider:      "subdl",
+			Language:      "en",
+			Format:        "srt",
+			DownloadURL:   "http://example/file123.srt",
+		},
+	}
+	service := NewService(repo, []string{"en"}, providerStub{
+		fileName: "file123.srt",
+		body:     []byte(sampleSRT),
+	})
+	if _, err := service.DownloadCandidate(context.Background(), 7); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(root, "movies", "Dune (2021).en.srt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) == sampleSRT {
+		t.Fatal("expected the published subtitle to have corrected timestamps, got the original unmodified body")
+	}
+	lastMs := maxSubtitleTimestampMs(body)
+	wantMs := int64(videoDuration * 1000)
+	if diff := lastMs - wantMs; diff < -50 || diff > 50 {
+		t.Fatalf("published subtitle's last cue = %dms, want within 50ms of %dms", lastMs, wantMs)
 	}
 }
 

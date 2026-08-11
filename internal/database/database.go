@@ -28,6 +28,23 @@ type cachedVF struct {
 	inlineData []byte
 	size       int64                // virtual file size in bytes
 	spans      []stream.SegmentSpan // canonical spans — callers receive a copy
+	// rarEncryption is non-nil only for a "stored_rar" entry whose content
+	// is AES-256-CBC encrypted (a password-protected RAR5 release) and
+	// whose password was already verified at import time -- see
+	// ImportedArchiveEntry.EncryptionVerified. OpenVirtualMediaFile wraps
+	// the reader with stream.NewEncryptedRarReader when this is set.
+	rarEncryption *rarFileEncryption
+}
+
+// rarFileEncryption is everything OpenVirtualMediaFile needs to construct a
+// decrypting reader for a "stored_rar" virtual file: the salt/lg2Count to
+// re-derive the AES key from the release's own stored password
+// (nzb_documents.archive_password), and the file's own IV.
+type rarFileEncryption struct {
+	salt     [16]byte
+	iv       [16]byte
+	lg2Count uint8
+	password string
 }
 
 // DB wraps the application's Postgres connection pool (via pgx/stdlib)

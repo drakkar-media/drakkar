@@ -98,7 +98,7 @@ func TestInspectImportedArchivesStoredRAR(t *testing.T) {
 		Volumes: []ImportedArchiveVolume{
 			{Path: "Movie.part01.rar", VolumeIndex: 0},
 		},
-	}}, files, fetcherStub{data: raw})
+	}}, files, fetcherStub{data: raw}, "")
 	if len(archives) != 1 {
 		t.Fatalf("unexpected archives %+v", archives)
 	}
@@ -138,7 +138,7 @@ func TestInspectImportedArchivesRejectsCompressedRAR(t *testing.T) {
 		Volumes: []ImportedArchiveVolume{
 			{Path: "Movie.part01.rar", VolumeIndex: 0},
 		},
-	}}, files, fetcherStub{data: raw})
+	}}, files, fetcherStub{data: raw}, "")
 	if archives[0].Status != "rejected" || archives[0].RejectReason != "archive_compression_unsupported" {
 		t.Fatalf("unexpected archive %+v", archives[0])
 	}
@@ -158,7 +158,7 @@ func TestInspectImportedArchivesRejectsInvalidHeaders(t *testing.T) {
 			DecodedStartOffset: 0,
 			DecodedEndOffset:   16,
 		}},
-	}}, fetcherStub{data: []byte("not-rar-header!!")})
+	}}, fetcherStub{data: []byte("not-rar-header!!")}, "")
 	if archives[0].Status != "rejected" || archives[0].RejectReason != "archive_headers_invalid" {
 		t.Fatalf("unexpected archive %+v", archives[0])
 	}
@@ -178,7 +178,7 @@ func TestInspectImportedArchivesPropagatesMissingArticleFailure(t *testing.T) {
 			DecodedStartOffset: 0,
 			DecodedEndOffset:   1024,
 		}},
-	}}, fetcherStub{err: errors.New("fetch decoded article <one@test>: Newshosting attempt 1: unexpected BODY status 430")})
+	}}, fetcherStub{err: errors.New("fetch decoded article <one@test>: Newshosting attempt 1: unexpected BODY status 430")}, "")
 	if archives[0].Status != "rejected" {
 		t.Fatalf("expected rejected archive, got %+v", archives[0])
 	}
@@ -202,7 +202,7 @@ func TestInspectImportedArchivesUsesSegmentSizeWhenNZBFileSizeMetadataIsTooSmall
 			DecodedStartOffset: 0,
 			DecodedEndOffset:   int64(len(raw)),
 		}},
-	}}, fetcherStub{data: raw})
+	}}, fetcherStub{data: raw}, "")
 	if archives[0].Status != "supported" || archives[0].RejectReason != "" {
 		t.Fatalf("unexpected archive %+v", archives[0])
 	}
@@ -226,7 +226,7 @@ func TestInspectImportedArchivesRetriesLargerRARPrefix(t *testing.T) {
 			DecodedStartOffset: 0,
 			DecodedEndOffset:   int64(len(raw)),
 		}},
-	}}, fetcherStub{data: raw})
+	}}, fetcherStub{data: raw}, "")
 	if archives[0].Status != "supported" || archives[0].RejectReason != "" {
 		t.Fatalf("unexpected archive %+v", archives[0])
 	}
@@ -241,7 +241,7 @@ func TestInspectImportedArchivesLeavesPendingWithoutFetcher(t *testing.T) {
 		Volumes: []ImportedArchiveVolume{
 			{Path: "Movie.part01.rar", VolumeIndex: 0},
 		},
-	}}, nil, nil)
+	}}, nil, nil, "")
 	if archives[0].Status != "pending" {
 		t.Fatalf("unexpected archive %+v", archives[0])
 	}

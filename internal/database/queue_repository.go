@@ -201,7 +201,7 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 // instead of creating a duplicate.
 func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (QueueSnapshot, error) {
 	imported = db.applyImportPolicies(ctx, imported)
-	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher)
+	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher, imported.ArchivePassword)
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
 		return QueueSnapshot{}, err
@@ -271,9 +271,11 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 
 	var nzbDocumentID int64
 	if err = tx.QueryRowContext(ctx, `
-		insert into nzb_documents (selected_release_id, file_name, xml)
-		values ($1, $2, $3)
-		returning id`, selectedReleaseID, imported.FileName, compressNZBXML(imported.XML)).Scan(&nzbDocumentID); err != nil {
+		insert into nzb_documents (selected_release_id, file_name, xml, archive_password)
+		values ($1, $2, $3, $4)
+		returning id`, selectedReleaseID, imported.FileName, compressNZBXML(imported.XML),
+		sql.NullString{String: imported.ArchivePassword, Valid: imported.ArchivePassword != ""},
+	).Scan(&nzbDocumentID); err != nil {
 		return QueueSnapshot{}, err
 	}
 
@@ -317,7 +319,7 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 // its queue_items row instead of inserting a fresh one.
 func (db *DB) AttachImportedNZBToLibraryItem(ctx context.Context, libraryItemID int64, imported ImportedNZB) (QueueSnapshot, error) {
 	imported = db.applyImportPolicies(ctx, imported)
-	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher)
+	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher, imported.ArchivePassword)
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
 		return QueueSnapshot{}, err
@@ -381,9 +383,11 @@ func (db *DB) AttachImportedNZBToLibraryItem(ctx context.Context, libraryItemID 
 
 	var nzbDocumentID int64
 	if err = tx.QueryRowContext(ctx, `
-		insert into nzb_documents (selected_release_id, file_name, xml)
-		values ($1, $2, $3)
-		returning id`, selectedReleaseID, imported.FileName, compressNZBXML(imported.XML)).Scan(&nzbDocumentID); err != nil {
+		insert into nzb_documents (selected_release_id, file_name, xml, archive_password)
+		values ($1, $2, $3, $4)
+		returning id`, selectedReleaseID, imported.FileName, compressNZBXML(imported.XML),
+		sql.NullString{String: imported.ArchivePassword, Valid: imported.ArchivePassword != ""},
+	).Scan(&nzbDocumentID); err != nil {
 		return QueueSnapshot{}, err
 	}
 
@@ -446,7 +450,7 @@ func (db *DB) AttachImportedNZBToLibraryItem(ctx context.Context, libraryItemID 
 // back to the indexing state.
 func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID int64, imported ImportedNZB) (QueueSnapshot, error) {
 	imported = db.applyImportPolicies(ctx, imported)
-	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher)
+	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher, imported.ArchivePassword)
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	tx, err := db.SQL.BeginTx(ctx, nil)
@@ -490,9 +494,11 @@ func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID in
 
 	var nzbDocumentID int64
 	if err = tx.QueryRowContext(ctx, `
-		insert into nzb_documents (selected_release_id, external_url, file_name, xml)
-		values ($1, $2, $3, $4)
-		returning id`, selectedReleaseID, imported.ExternalURL, imported.FileName, compressNZBXML(imported.XML)).Scan(&nzbDocumentID); err != nil {
+		insert into nzb_documents (selected_release_id, external_url, file_name, xml, archive_password)
+		values ($1, $2, $3, $4, $5)
+		returning id`, selectedReleaseID, imported.ExternalURL, imported.FileName, compressNZBXML(imported.XML),
+		sql.NullString{String: imported.ArchivePassword, Valid: imported.ArchivePassword != ""},
+	).Scan(&nzbDocumentID); err != nil {
 		return QueueSnapshot{}, err
 	}
 
@@ -715,16 +721,30 @@ func insertArchiveVirtualFile(ctx context.Context, tx *sql.Tx, selectedReleaseID
 		break
 	}
 
+	// EncryptionVerified means inspectRAR5 already confirmed archivePassword
+	// derives this entry's real key (see its own password-check value) --
+	// only then is it safe to record the salt/IV that lets
+	// OpenVirtualMediaFile re-derive the same key at read time and stream
+	// the content decrypted, exactly like an unencrypted release.
+	var salt, iv []byte
+	var lg2Count sql.NullInt32
+	if entry.Encrypted && entry.EncryptionVerified {
+		salt = append([]byte{}, entry.EncryptionSalt[:]...)
+		iv = append([]byte{}, entry.EncryptionIV[:]...)
+		lg2Count = sql.NullInt32{Int32: int32(entry.EncryptionLg2Count), Valid: true}
+	}
+
 	virtualPath := "releases/" + fmt.Sprintf("%d", selectedReleaseID) + "/" + entry.Path
 	var virtualFileID int64
 	if err := tx.QueryRowContext(ctx, `
 		insert into virtual_files (
 			selected_release_id, path, file_name, size_bytes, reader_kind,
-			nzb_file_id, segment_byte_offset
-		) values ($1, $2, $3, $4, 'stored_rar', $5, $6)
+			nzb_file_id, segment_byte_offset,
+			rar_encryption_salt, rar_encryption_iv, rar_encryption_lg2_count
+		) values ($1, $2, $3, $4, 'stored_rar', $5, $6, $7, $8, $9)
 		returning id`,
 		selectedReleaseID, virtualPath, entry.Path, entry.SizeBytes,
-		nzbFileID, archiveByteOffset,
+		nzbFileID, archiveByteOffset, salt, iv, lg2Count,
 	).Scan(&virtualFileID); err != nil {
 		return 0, err
 	}

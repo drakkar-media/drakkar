@@ -61,6 +61,12 @@ type Repository interface {
 	// an error a caller needs to special-case -- see its implementation's
 	// doc comment for why "unknown" degrades to "assume nothing embedded".
 	GetEmbeddedSubtitleLanguagesForLibraryItem(ctx context.Context, libraryItemID int64) ([]string, error)
+	// GetContainerDurationForLibraryItem returns libraryItemID's real video
+	// container duration (seconds), if known -- backs the framerate-mismatch
+	// subtitle-sync check in subtitle_sync.go. ok is false whenever it can't
+	// be determined; callers must treat that identically to "don't attempt
+	// sync correction", never as an error.
+	GetContainerDurationForLibraryItem(ctx context.Context, libraryItemID int64) (durationSeconds float64, ok bool, err error)
 	// GetAppSetting/PutAppSetting back the per-provider daily call budget
 	// (see providerUsage) -- reusing the existing generic settings store
 	// rather than adding a dedicated table for what's just a small persisted
@@ -449,6 +455,7 @@ func (s *Service) DownloadCandidate(ctx context.Context, candidateID int64) (Upl
 		metrics.M.SubtitleFailures.Add(1)
 		return UploadResult{}, err
 	}
+	body = s.correctExternalSubtitleSync(ctx, candidate.LibraryItemID, body)
 	result, err := s.publishSubtitleBody(ctx, candidate.LibraryItemID, candidate.Provider, candidate.Language, ext, body)
 	if err != nil {
 		metrics.M.SubtitleFailures.Add(1)

@@ -131,3 +131,37 @@ func TestBuildImportedNZBComputesDecodedRanges(t *testing.T) {
 		t.Fatalf("expected contiguous decoded ranges, got first=%+v second=%+v", file.Segments[0], file.Segments[1])
 	}
 }
+
+// TestBuildImportedNZBExtractsArchivePassword guards the wiring: an NZB
+// carrying a <meta type="password"> must surface it on the resulting
+// database.ImportedNZB, not silently discard it (the historical behavior
+// before this was added -- Document had no <head> field at all).
+func TestBuildImportedNZBExtractsArchivePassword(t *testing.T) {
+	const nzbWithPassword = `<?xml version="1.0" encoding="UTF-8"?>
+<nzb>
+  <head>
+    <meta type="password">s3cr3t-pw</meta>
+  </head>
+  <file subject="&quot;Dune (2021).mkv&quot;" poster="poster" date="1710000000">
+    <groups><group>alt.binaries.movies</group></groups>
+    <segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments>
+  </file>
+</nzb>`
+	imported, err := BuildImportedNZB("Dune.nzb", []byte(nzbWithPassword), "test-key", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.ArchivePassword != "s3cr3t-pw" {
+		t.Fatalf("ArchivePassword = %q, want %q", imported.ArchivePassword, "s3cr3t-pw")
+	}
+}
+
+func TestBuildImportedNZBArchivePasswordEmptyWhenAbsent(t *testing.T) {
+	imported, err := BuildImportedNZB("Dune.nzb", []byte(sampleNZB), "test-key", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.ArchivePassword != "" {
+		t.Fatalf("ArchivePassword = %q, want empty for an NZB with no password meta", imported.ArchivePassword)
+	}
+}

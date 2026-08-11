@@ -177,14 +177,15 @@ func BuildImportedNZB(fileName string, raw []byte, idempotencyKey string, extern
 	}
 	files := importedFiles(document)
 	return database.ImportedNZB{
-		FileName:       sanitizeFileName(fileName),
-		XML:            raw,
-		ExternalURL:    externalURL,
-		IdempotencyKey: idempotencyKey,
-		FileCount:      len(document.Files),
-		SegmentCount:   countSegments(document),
-		Files:          files,
-		Archives:       archive.DetectImportedArchives(files),
+		FileName:        sanitizeFileName(fileName),
+		XML:             raw,
+		ExternalURL:     externalURL,
+		IdempotencyKey:  idempotencyKey,
+		FileCount:       len(document.Files),
+		SegmentCount:    countSegments(document),
+		Files:           files,
+		Archives:        archive.DetectImportedArchives(files),
+		ArchivePassword: document.Password(),
 	}, nil
 }
 
