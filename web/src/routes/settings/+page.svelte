@@ -4084,11 +4084,18 @@
 
   /* ── Custom Formats ─────────────────────────────────────────── */
   .cf-layout { display: grid; grid-template-columns: 200px 1fr; gap: 16px; }
-  .cf-list { display: grid; gap: 4px; align-content: start; }
+  /* min-width: 0 on every level here: a grid/flex item's default min-width is
+     "auto", i.e. its content's min-content size -- for a button containing a
+     white-space:nowrap name span, that's the FULL unwrapped text width, not
+     0. Without overriding it, a long format name (e.g. "TRaSH HD BluRay Tier
+     1 (trusted groups)") forced .cf-layout's 200px first track to grow to fit
+     it instead of the name ellipsis-truncating, visually pushing/overlapping
+     the editor column that was supposed to occupy the remaining 1fr space. */
+  .cf-list { display: grid; gap: 4px; align-content: start; min-width: 0; }
   .cf-list-header { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 600; color: hsl(var(--muted-foreground)); padding: 0 4px 6px; text-transform: uppercase; letter-spacing: 0.06em; }
-  .cf-item { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 8px 12px; border-radius: 10px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.03); cursor: pointer; text-align: left; }
+  .cf-item { display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 8px 12px; border-radius: 10px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.03); cursor: pointer; text-align: left; min-width: 0; }
   .cf-item:hover, .cf-item.cf-active { background: hsl(var(--primary) / 0.12); border-color: hsl(var(--primary) / 0.3); }
-  .cf-item-name { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cf-item-name { font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .cf-item-score { font-size: 12px; font-family: 'JetBrains Mono', monospace; font-weight: 700; flex-shrink: 0; }
   .cf-item-score.cf-pos { color: hsl(140 60% 50%); }
   .cf-item-score.cf-neg { color: hsl(0 70% 60%); }
@@ -4104,14 +4111,18 @@
 
   /* ── Release Filtering ─────────────────────────────────────────────────── */
   .rf-layout { display: grid; grid-template-columns: 240px 1fr; gap: 16px; }
-  .rf-list { display: grid; gap: 3px; align-content: start; max-height: 600px; overflow-y: auto; }
+  /* min-width: 0 throughout: same fix as .cf-list/.cf-item above -- a long
+     regex pattern in .rf-pattern would otherwise force this column wider
+     than 240px instead of ellipsis-truncating, overlapping the editor
+     column meant to occupy the remaining 1fr space. */
+  .rf-list { display: grid; gap: 3px; align-content: start; max-height: 600px; overflow-y: auto; min-width: 0; }
   .rf-list-header { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 600; color: hsl(var(--muted-foreground)); padding: 0 4px 6px; text-transform: uppercase; letter-spacing: 0.06em; }
   .rf-type-header { font-size: 11px; font-weight: 600; color: hsl(var(--muted-foreground)); padding: 10px 4px 3px; text-transform: uppercase; letter-spacing: 0.06em; display: flex; align-items: center; gap: 6px; }
   .rf-count { font-size: 10px; background: hsl(0 0% 100% / 0.08); border-radius: 4px; padding: 1px 5px; }
-  .rf-item { display: flex; align-items: center; justify-content: space-between; gap: 4px; padding: 6px 10px; border-radius: 9px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.03); cursor: pointer; text-align: left; transition: background 0.1s; }
+  .rf-item { display: flex; align-items: center; justify-content: space-between; gap: 4px; padding: 6px 10px; border-radius: 9px; border: 1px solid hsl(0 0% 100% / 0.06); background: hsl(0 0% 100% / 0.03); cursor: pointer; text-align: left; transition: background 0.1s; min-width: 0; }
   .rf-item:hover, .rf-item.rf-active { background: hsl(var(--primary) / 0.12); border-color: hsl(var(--primary) / 0.3); }
   .rf-item.rf-disabled { opacity: 0.45; }
-  .rf-pattern { font-size: 12px; font-family: 'JetBrains Mono', monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+  .rf-pattern { font-size: 12px; font-family: 'JetBrains Mono', monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
   .rf-badges { display: flex; gap: 3px; flex-shrink: 0; }
   .rf-badge { font-size: 10px; border-radius: 4px; padding: 1px 5px; white-space: nowrap; }
   .rf-badge-block { background: hsl(0 70% 50% / 0.2); color: hsl(0 70% 65%); }
