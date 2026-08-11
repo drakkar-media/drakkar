@@ -2024,95 +2024,130 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 	const maxHydraCalls = 100
 	hydraCallCount := 0
 
+	// perItemRetryBudget bounds a single target's worth of work inside the
+	// loop below (DB updates plus, for Hydra-eligible actions, a real
+	// SearchLibrary call: indexer round-trip + ranking against however many
+	// candidates come back -- one item in production carried 2,759). Each
+	// target gets its OWN timeout, detached from ctx (see the loop comment
+	// for why), rather than sharing one deadline across the whole batch.
+	const perItemRetryBudget = 2 * time.Minute
+
 	result := BulkQueueRetryResult{Processed: len(targets)}
 	for _, target := range targets {
+		// Once the batch-level ctx (runQueueHousekeeping's shared 10-minute
+		// budget) is used up, stop STARTING new work -- remaining targets
+		// are simply picked up on the next housekeeping pass 10 minutes
+		// later, same as before this fix.
+		if ctx.Err() != nil {
+			break
+		}
 		result.ProcessedQueues = append(result.ProcessedQueues, target.QueueItemID)
 
-		switch decideRetryQueueAction(settings, target) {
-		case retryPolicyRemoveBlocklistAndSearch:
-			if hydraCallCount >= maxHydraCalls {
-				continue // skip Hydra-dependent items when cap is reached
-			}
-			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, ttl); err != nil {
-				s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: blocklist failed")
-			}
-			if err := s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID); err != nil {
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-				continue
-			}
-			hydraCallCount++
-			_, err := s.SearchLibrary(ctx, target.LibraryItemID)
-			_ = s.repo.TouchQueueItemSearched(ctx, target.LibraryItemID)
-			if err == nil {
+		// Real production incident (2026-08-12): every DB/search call below
+		// used to share ctx -- the SAME context across every target in this
+		// loop, all the way down through SearchLibrary's synchronous
+		// select-then-fetch. Once that shared deadline lapsed mid-fetch for
+		// one slow item (a season pack with a huge candidate pool is slow
+		// to rank and fetch), every OTHER target still left in this loop
+		// failed instantly afterward with "context canceled" -- and since
+		// that's a soft/transient failure reason, it's never blocklisted,
+		// so the exact same candidate got reselected and re-cancelled every
+		// single housekeeping cycle, forever. Confirmed live: dozens of The
+		// Big Bang Theory episodes stuck in this exact loop, missing count
+		// climbing (411 -> 508) instead of shrinking. Giving each target
+		// its own context, detached from ctx, means a slow/cancelled item
+		// can only ever fail on its own terms -- it can no longer take any
+		// sibling down with it.
+		func() {
+			itemCtx, cancel := context.WithTimeout(context.Background(), perItemRetryBudget)
+			defer cancel()
+
+			switch decideRetryQueueAction(settings, target) {
+			case retryPolicyRemoveBlocklistAndSearch:
+				if hydraCallCount >= maxHydraCalls {
+					return // skip Hydra-dependent items when cap is reached
+				}
+				if err := s.repo.BlocklistQueueSelectedRelease(itemCtx, target.QueueItemID, target.FailureReason, ttl); err != nil {
+					s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: blocklist failed")
+				}
+				if err := s.repo.ClearQueueSelectedRelease(itemCtx, target.QueueItemID); err != nil {
+					result.Failed++
+					result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+					return
+				}
+				hydraCallCount++
+				_, err := s.SearchLibrary(itemCtx, target.LibraryItemID)
+				_ = s.repo.TouchQueueItemSearched(itemCtx, target.LibraryItemID)
+				if err == nil {
+					result.Retried++
+				} else {
+					result.Failed++
+					result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+				}
+			case retryPolicyRemoveAndBlocklist:
+				if err := s.repo.BlocklistQueueSelectedRelease(itemCtx, target.QueueItemID, target.FailureReason, ttl); err != nil {
+					s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: blocklist failed")
+				}
+				if err := s.repo.ClearQueueSelectedRelease(itemCtx, target.QueueItemID); err != nil {
+					result.Failed++
+					result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+				}
+			case retryPolicySearchAgain:
+				if hydraCallCount >= maxHydraCalls {
+					return
+				}
+				hydraCallCount++
+				_, err := s.SearchLibrary(itemCtx, target.LibraryItemID)
+				_ = s.repo.TouchQueueItemSearched(itemCtx, target.LibraryItemID)
+				if err == nil {
+					result.Retried++
+				} else {
+					result.Failed++
+					result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+				}
+			case retryPolicyRemove:
+				if err := s.repo.ClearQueueSelectedRelease(itemCtx, target.QueueItemID); err != nil {
+					result.Failed++
+					result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+				}
+			case retryPolicyDoNothing:
+				// no-op: policy explicitly says leave this item alone.
+			case retryMatrixBlocklistAndSearch:
+				if hydraCallCount >= maxHydraCalls {
+					return
+				}
+				hydraCallCount++
+				if err := s.repo.BlocklistQueueSelectedRelease(itemCtx, target.QueueItemID, target.FailureReason, ttl); err != nil {
+					s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("bulk retry: blocklist failed")
+				}
+				sr, err := s.SearchLibrary(itemCtx, target.LibraryItemID)
+				_ = s.repo.TouchQueueItemSearched(itemCtx, target.LibraryItemID)
+				if err == nil && sr.SelectedReleaseID != nil {
+					result.Retried++
+				} else {
+					result.Failed++
+					result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+				}
+			case retryMatrixDoNothing:
+				// no-op: hardcoded matrix says leave this item alone.
+			case retryMatrixRestartRequeue:
+				if err := s.repo.RequeueSelectedRelease(itemCtx, target.QueueItemID); err != nil {
+					s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: RequeueSelectedRelease failed")
+					result.Failed++
+					result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+					return
+				}
 				result.Retried++
-			} else {
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-			}
-		case retryPolicyRemoveAndBlocklist:
-			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, ttl); err != nil {
-				s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: blocklist failed")
-			}
-			if err := s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID); err != nil {
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-			}
-		case retryPolicySearchAgain:
-			if hydraCallCount >= maxHydraCalls {
-				continue
-			}
-			hydraCallCount++
-			_, err := s.SearchLibrary(ctx, target.LibraryItemID)
-			_ = s.repo.TouchQueueItemSearched(ctx, target.LibraryItemID)
-			if err == nil {
+			case retryMatrixRetryQueueItem:
+				if _, err := s.RetryQueueItem(itemCtx, target.QueueItemID); err != nil {
+					s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: RetryQueueItem failed")
+					result.Failed++
+					result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
+					return
+				}
 				result.Retried++
-			} else {
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
 			}
-		case retryPolicyRemove:
-			if err := s.repo.ClearQueueSelectedRelease(ctx, target.QueueItemID); err != nil {
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-			}
-		case retryPolicyDoNothing:
-			// no-op: policy explicitly says leave this item alone.
-		case retryMatrixBlocklistAndSearch:
-			if hydraCallCount >= maxHydraCalls {
-				continue
-			}
-			hydraCallCount++
-			if err := s.repo.BlocklistQueueSelectedRelease(ctx, target.QueueItemID, target.FailureReason, ttl); err != nil {
-				s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("bulk retry: blocklist failed")
-			}
-			sr, err := s.SearchLibrary(ctx, target.LibraryItemID)
-			_ = s.repo.TouchQueueItemSearched(ctx, target.LibraryItemID)
-			if err == nil && sr.SelectedReleaseID != nil {
-				result.Retried++
-			} else {
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-			}
-		case retryMatrixDoNothing:
-			// no-op: hardcoded matrix says leave this item alone.
-		case retryMatrixRestartRequeue:
-			if err := s.repo.RequeueSelectedRelease(ctx, target.QueueItemID); err != nil {
-				s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: RequeueSelectedRelease failed")
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-				continue
-			}
-			result.Retried++
-		case retryMatrixRetryQueueItem:
-			if _, err := s.RetryQueueItem(ctx, target.QueueItemID); err != nil {
-				s.logger.Warn().Err(err).Int64("queueItemId", target.QueueItemID).Msg("retry: RetryQueueItem failed")
-				result.Failed++
-				result.FailedQueues = append(result.FailedQueues, target.QueueItemID)
-				continue
-			}
-			result.Retried++
-		}
+		}()
 	}
 	return result, nil
 }

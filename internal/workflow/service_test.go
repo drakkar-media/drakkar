@@ -2611,6 +2611,50 @@ func TestRetryFailedQueue(t *testing.T) {
 	}
 }
 
+// TestRetryFailedQueueStopsCleanlyOnceBatchContextExpires guards the
+// 2026-08-12 production incident: every target in RetryFailedQueue's loop
+// used to share ONE context across the whole batch, all the way down
+// through SearchLibrary's synchronous select-then-fetch. Once that shared
+// deadline lapsed mid-fetch for one slow item (a season pack with a huge
+// candidate pool is slow to rank and fetch), every remaining target in the
+// loop failed instantly afterward with the transient reason "context
+// canceled" -- which is never blocklisted, so the exact same candidate got
+// reselected and re-cancelled on every subsequent housekeeping cycle,
+// forever (confirmed live: dozens of The Big Bang Theory episodes stuck
+// this way, the library's missing count climbing instead of shrinking).
+// The fix gives each target its own context, detached from the batch-level
+// one, and stops STARTING new work once the batch-level context is already
+// done rather than plowing on and recording a wave of bogus per-item
+// failures. This test passes an already-canceled context and confirms
+// RetryFailedQueue stops before processing anything, instead of marking
+// every target Failed.
+func TestRetryFailedQueueStopsCleanlyOnceBatchContextExpires(t *testing.T) {
+	repo := &repoStub{
+		failedQueues: []database.FailedQueueRetryTarget{
+			{QueueItemID: 55, LibraryItemID: 42, FailureReason: "interrupted_by_restart", HasSelectedRelease: true, CandidateFailureCount: 0},
+			{QueueItemID: 56, LibraryItemID: 43, FailureReason: "stale_worker", HasSelectedRelease: true, CandidateFailureCount: 0},
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate the batch-level deadline already having lapsed
+
+	result, err := service.RetryFailedQueue(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Failed != 0 {
+		t.Fatalf("expected zero bogus per-item failures once the batch context is already done, got %+v", result)
+	}
+	if len(result.ProcessedQueues) != 0 {
+		t.Fatalf("expected no targets to be started once the batch context is already done, got %+v", result.ProcessedQueues)
+	}
+	if len(repo.requeued) != 0 {
+		t.Fatalf("expected no requeue calls once the batch context is already done, got %+v", repo.requeued)
+	}
+}
+
 // TestPromoteNextAfterFailureDepthNoOpsWhenNextAlreadyInFlight guards the
 // secondary gap found in the same 2026-07-18 audit as the atomic URL claim:
 // promoteNextAfterFailureDepth's recursive fallback-chain continuation used
