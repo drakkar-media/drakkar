@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/drakkar-media/drakkar/internal/stream"
 )
 
 // statOnlySource implements StatSource (and the bare ArticleSource interface,
@@ -101,6 +103,84 @@ func TestCachedFallbackSourceStatCachesArticleMissingFromStatPath(t *testing.T) 
 	}
 	if got := stub.statCalls; got != 1 {
 		t.Fatalf("expected the cache to short-circuit the second Stat call (still 1 live call), got %d", got)
+	}
+}
+
+// TestConfirmedTTLRequiresAgreementAtBackgroundPriority guards the 2026-08-11
+// fix: a single 430/423 sample was trusted enough on its own to cache an
+// article as missing for a full day (missingArticleTTL), which then feeds
+// straight into blocklisting a release forever via every downstream caller
+// (preflight, calibration, health checks). This provider has already had
+// its 430 handling reversed once (see classifyCacheableError's own doc
+// comment) and is independently documented (see nntp.ErrArticleMissing's
+// doc comment) to sometimes return 430 for a transient throttle, not just a
+// genuinely absent article -- exactly the class of false positive
+// confirmed live for the CRC-mismatch case (confirmPermanentCRCMismatch).
+// A second, independent, delayed sample must agree before the long TTL is
+// used; a disagreeing (or erroring differently) confirmation must fall back
+// to the short throttleTTL instead.
+func TestConfirmedTTLRequiresAgreementAtBackgroundPriority(t *testing.T) {
+	original := confirmMissingDelay
+	confirmMissingDelay = time.Millisecond
+	t.Cleanup(func() { confirmMissingDelay = original })
+
+	t.Run("confirmation agrees -> long TTL", func(t *testing.T) {
+		stub := &statOnlySource{statErr: ErrArticleMissing}
+		fallback := NewFallbackSource([]NamedArticleSource{{Name: "provider1", Source: stub}}, 1)
+		cached := NewCachedFallbackSource(fallback)
+
+		got := cached.confirmedTTL(context.Background(), "msg1", stream.PriorityBackground, false, missingArticleTTL)
+		if got != missingArticleTTL {
+			t.Fatalf("expected agreement to produce missingArticleTTL, got %v", got)
+		}
+		if stub.statCalls != 1 {
+			t.Fatalf("expected exactly 1 confirmation call to the stub, got %d", stub.statCalls)
+		}
+	})
+
+	t.Run("confirmation disagrees -> short throttleTTL", func(t *testing.T) {
+		stub := &statOnlySource{statErr: nil} // confirmation succeeds -- article is actually there
+		fallback := NewFallbackSource([]NamedArticleSource{{Name: "provider1", Source: stub}}, 1)
+		cached := NewCachedFallbackSource(fallback)
+
+		got := cached.confirmedTTL(context.Background(), "msg1", stream.PriorityBackground, false, missingArticleTTL)
+		if got != throttleTTL {
+			t.Fatalf("expected disagreement to fall back to throttleTTL, got %v", got)
+		}
+	})
+
+	t.Run("interactive priority skips confirmation entirely", func(t *testing.T) {
+		stub := &statOnlySource{statErr: ErrArticleMissing}
+		fallback := NewFallbackSource([]NamedArticleSource{{Name: "provider1", Source: stub}}, 1)
+		cached := NewCachedFallbackSource(fallback)
+
+		got := cached.confirmedTTL(context.Background(), "msg1", stream.PriorityInteractive, false, missingArticleTTL)
+		if got != missingArticleTTL {
+			t.Fatalf("expected interactive priority to pass the TTL through unchanged, got %v", got)
+		}
+		if stub.statCalls != 0 {
+			t.Fatalf("expected zero confirmation calls at interactive priority (must not add latency to a live playback read), got %d", stub.statCalls)
+		}
+	})
+}
+
+// TestCachedFallbackSourceStatConfirmsBeforeLongCacheAtBackgroundPriority is
+// the end-to-end counterpart: StatPriority at background priority must issue
+// a second live call before caching a miss for the full day.
+func TestCachedFallbackSourceStatConfirmsBeforeLongCacheAtBackgroundPriority(t *testing.T) {
+	original := confirmMissingDelay
+	confirmMissingDelay = time.Millisecond
+	t.Cleanup(func() { confirmMissingDelay = original })
+
+	stub := &statOnlySource{statErr: ErrArticleMissing}
+	fallback := NewFallbackSource([]NamedArticleSource{{Name: "provider1", Source: stub}}, 1)
+	cached := NewCachedFallbackSource(fallback)
+
+	if err := cached.StatPriority(context.Background(), "msg1", stream.PriorityBackground); err == nil {
+		t.Fatal("expected an error for a missing article")
+	}
+	if stub.statCalls != 2 {
+		t.Fatalf("expected 1 live call + 1 confirmation call at background priority, got %d", stub.statCalls)
 	}
 }
 

@@ -3465,16 +3465,22 @@ func (db *DB) flushBlocklistKeys(keys []string, reason string, ttlDays int) {
 	if len(keys) == 0 {
 		return
 	}
+	// reason may carry a withMessageIDSuffix annotation (from a "confirmed
+	// gone article" check in calibrate.go) recording exactly which NNTP
+	// article failed. Split it out before storing: the human-readable
+	// reason column stays clean, and the article can be independently
+	// re-verified later instead of a wrong verdict being unrecoverable.
+	cleanReason, messageID := splitMessageIDSuffix(reason)
 	flushCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	// One multi-row insert instead of one round trip per key.
 	_, _ = db.SQL.ExecContext(flushCtx, `
-		insert into blocklist_items (key, reason, expires_at)
-		select k, $2, case when $3 > 0 then now() + ($3 * interval '1 day') else null end
+		insert into blocklist_items (key, reason, expires_at, message_id)
+		select k, $2, case when $3 > 0 then now() + ($3 * interval '1 day') else null end, $4
 		from unnest($1::text[]) as k
 		on conflict (key)
-		do update set reason = excluded.reason, expires_at = excluded.expires_at`,
-		pgTextArray(keys), reason, ttlDays)
+		do update set reason = excluded.reason, expires_at = excluded.expires_at, message_id = excluded.message_id`,
+		pgTextArray(keys), cleanReason, ttlDays, sql.NullString{String: messageID, Valid: messageID != ""})
 	invalidateBlocklistCache()
 }
 

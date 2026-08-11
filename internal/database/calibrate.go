@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -174,7 +175,7 @@ func (db *DB) PreflightCheckFirstSegments(ctx context.Context, nzbDocumentID int
 		defer func() { <-sem }()
 		if err := checker.Exists(checkCtx, messageID); err != nil {
 			errOnce.Do(func() {
-				firstErr = sanitizedSegmentErr("preflight", pos, err)
+				firstErr = sanitizedSegmentErr("preflight", pos, err, messageID)
 				cancel()
 			})
 			return
@@ -267,21 +268,70 @@ func (db *DB) StrictCheckFirstSegments(ctx context.Context, nzbDocumentID int64)
 	}
 	for _, p := range pairs {
 		if _, err := sizer.DecodedSize(ctx, p.first); err != nil {
-			return sanitizedSegmentErr("strict health", "first", err)
+			if errors.Is(err, yenc.ErrCRCMismatch) && !db.confirmPermanentCRCMismatch(ctx, p.first) {
+				// Not confirmed on independent, delayed re-fetch -- treat as
+				// the same transient glitch class confirmPermanentCRCMismatch
+				// already guards calibration against, not permanent
+				// corruption. Without this, the deep health check hard-failed
+				// (and blocklisted) on a single unconfirmed CRC mismatch,
+				// while the calibration path right above required two
+				// independent, delayed, agreeing samples for the identical
+				// failure class -- confirmed live, two false positives, on
+				// this same provider.
+				continue
+			}
+			return sanitizedSegmentErr("strict health", "first", err, p.first)
 		}
 		if p.last != p.first {
 			if _, err := sizer.DecodedSize(ctx, p.last); err != nil {
-				return sanitizedSegmentErr("strict health", "last", err)
+				if errors.Is(err, yenc.ErrCRCMismatch) && !db.confirmPermanentCRCMismatch(ctx, p.last) {
+					continue
+				}
+				return sanitizedSegmentErr("strict health", "last", err, p.last)
 			}
 		}
 	}
 	return nil
 }
 
-// sanitizedSegmentErr builds a blocklist-safe error for a failed segment check.
-// It omits the raw message ID (which would create one unique reason per segment)
-// and strips trailing message IDs from the wrapped error text.
-func sanitizedSegmentErr(kind, pos string, err error) error {
+// messageIDSuffixPattern matches the trailing " [msgid:<...>]" annotation
+// withMessageIDSuffix appends and splitMessageIDSuffix later strips off.
+var messageIDSuffixPattern = regexp.MustCompile(`\s*\[msgid:([^\]]*)\]$`)
+
+// withMessageIDSuffix annotates reason with messageID in a form that
+// splitMessageIDSuffix can later recover, without changing anything that
+// pattern-matches on the reason text itself (isConfirmedGoneArticleReason
+// etc. all match substrings earlier in the string, unaffected by a trailing
+// suffix). Returns reason unchanged if messageID is empty.
+func withMessageIDSuffix(reason, messageID string) string {
+	if messageID == "" {
+		return reason
+	}
+	return reason + " [msgid:" + messageID + "]"
+}
+
+// splitMessageIDSuffix reverses withMessageIDSuffix: returns the reason text
+// with any trailing message-id annotation removed, plus the annotated
+// message-id (empty if none was present). Blocklist entries previously
+// discarded which specific NNTP article failed a "confirmed gone" check, so
+// a wrong verdict (e.g. a throttle-induced false 430) could never be
+// re-checked or corrected later -- it was blocklisted forever on an
+// unverifiable snapshot with nothing left to re-verify against.
+func splitMessageIDSuffix(reason string) (cleanReason, messageID string) {
+	m := messageIDSuffixPattern.FindStringSubmatch(reason)
+	if m == nil {
+		return reason, ""
+	}
+	return messageIDSuffixPattern.ReplaceAllString(reason, ""), m[1]
+}
+
+// sanitizedSegmentErr builds a blocklist-safe error for a failed segment
+// check. The human-readable message omits the raw message ID (which would
+// create one unique reason per segment) and strips trailing message IDs
+// from the wrapped error text, but messageID itself travels alongside via
+// withMessageIDSuffix so the eventual blocklist_items row can still record
+// exactly which article failed (see splitMessageIDSuffix).
+func sanitizedSegmentErr(kind, pos string, err error, messageID string) error {
 	msg := err.Error()
 	// Strip trailing bare message ID: "... (cached): msgid@host" → "... (cached)"
 	if i := strings.LastIndex(msg, ": "); i > 0 {
@@ -290,7 +340,7 @@ func sanitizedSegmentErr(kind, pos string, err error) error {
 			msg = msg[:i]
 		}
 	}
-	return fmt.Errorf("%s: %s segment unavailable: %s", kind, pos, msg)
+	return errors.New(withMessageIDSuffix(fmt.Sprintf("%s: %s segment unavailable: %s", kind, pos, msg), messageID))
 }
 
 // CalibrateAllNZBOffsets runs CalibrateNZBOffsets for every NZB document in the

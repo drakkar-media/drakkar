@@ -724,7 +724,10 @@ func (s *Service) ValidatePublishedArticles(ctx context.Context) (int, error) {
 			continue
 		}
 		s.logger.Warn().Int64("libraryItemId", seg.LibraryItemID).Str("msgID", seg.FirstMsgID).Err(checkErr).Msg("article health check: first segment unavailable — blocklisting release")
-		reason := "article health check: " + checkErr.Error()
+		// Suffix carries msgID through to the eventual blocklist_items row
+		// (see database.splitMessageIDSuffix) so a wrong verdict can be
+		// independently re-checked later instead of being unrecoverable.
+		reason := fmt.Sprintf("article health check: %s [msgid:%s]", checkErr, seg.FirstMsgID)
 		if seg.SelectedReleaseID > 0 {
 			if blockErr := s.FailAndBlocklistRelease(ctx, seg.SelectedReleaseID, reason); blockErr != nil {
 				s.logger.Warn().Int64("libraryItemId", seg.LibraryItemID).Err(blockErr).Msg("article health check: blocklist failed")
@@ -2947,7 +2950,11 @@ func (s *Service) fetchAndBuildImportedNZB(ctx context.Context, current database
 				if shouldIgnoreEarlyPreflightFailure(err) {
 					s.logger.Info().Err(err).Int64("srId", current.SelectedReleaseID).Msg("early preflight advisory only; continuing import")
 				} else {
-					result, err := s.promoteNextAfterFailureDepth(ctx, current, fmt.Sprintf("early preflight: %s", err), depth)
+					// Suffix carries msgID through to the eventual blocklist_items
+					// row (see database.splitMessageIDSuffix) so a wrong verdict
+					// can be independently re-checked later instead of being
+					// unrecoverable.
+					result, err := s.promoteNextAfterFailureDepth(ctx, current, fmt.Sprintf("early preflight: %s [msgid:%s]", err, msgID), depth)
 					return result, nil, err
 				}
 			}

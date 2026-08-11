@@ -24,6 +24,19 @@ const missingArticleTTL = 24 * time.Hour
 // soon instead of being blacklisted from streaming for a full day.
 const throttleTTL = 30 * time.Second
 
+// confirmMissingDelay spaces the single extra confirmation check
+// confirmMissing performs before a 430/423 response is trusted enough to
+// cache for missingArticleTTL (24h) and, via classifyCacheableError's
+// callers (preflight, calibration, health checks), before it's treated as
+// grounds to blocklist a release forever. Mirrors calibrate.go's
+// confirmPermanentCRCMismatch, which needed the identical treatment after
+// two confirmed live false positives for CRC on this same provider — this
+// file's own classifyCacheableError doc comment records that 430's meaning
+// has already been reversed once (ambiguous -> always-definitive) based on
+// a misread pattern, so a second, independent, delayed sample is cheap
+// insurance against the same class of mistake recurring here.
+var confirmMissingDelay = 10 * time.Second
+
 // CachedFallbackSource wraps FallbackSource and caches message IDs that
 // recently failed, so repeated fetches for the same dead/throttled article
 // are short-circuited without hitting NNTP every time.
@@ -78,7 +91,7 @@ func (s *CachedFallbackSource) BodyPriority(ctx context.Context, messageID strin
 		body, err := s.inner.BodyPriority(ctx, messageID, priority)
 		if err != nil {
 			if ttl, ok := classifyCacheableError(err); ok {
-				s.markMissing(messageID, ttl)
+				s.markMissing(messageID, s.confirmedTTL(ctx, messageID, priority, true, ttl))
 			}
 		}
 		return body, err
@@ -101,12 +114,51 @@ func (s *CachedFallbackSource) StatPriority(ctx context.Context, messageID strin
 		err := s.inner.StatPriority(ctx, messageID, priority)
 		if err != nil {
 			if ttl, ok := classifyCacheableError(err); ok {
-				s.markMissing(messageID, ttl)
+				s.markMissing(messageID, s.confirmedTTL(ctx, messageID, priority, false, ttl))
 			}
 		}
 		return nil, err
 	})
 	return err
+}
+
+// confirmedTTL returns ttl unchanged, EXCEPT for the missingArticleTTL
+// (24h, "confirmed gone") case at background priority: there, a single
+// 430/423 sample is not trusted enough on its own to cache for a full day
+// (and, via every caller downstream, to justify blocklisting a release
+// forever) -- see confirmMissingDelay's doc comment. One extra, independent,
+// delayed re-check via s.inner directly (bypassing this cache) must agree
+// before the long TTL is used; if it doesn't, a short throttleTTL is used
+// instead so the next real request gets a fresh look soon rather than being
+// stuck on an unconfirmed verdict for a day.
+//
+// Deliberately NOT applied at interactive/read-ahead priority: a real-time
+// playback read that hits a genuinely missing segment must fail fast, not
+// wait an extra confirmMissingDelay before the error even surfaces --
+// confirmation only gates how long the NEGATIVE result is cached, not
+// whether this one caller's own failure is reported, so skipping it here
+// costs nothing but latency for the (much rarer) interactive path.
+func (s *CachedFallbackSource) confirmedTTL(ctx context.Context, messageID string, priority stream.FetchPriority, isBody bool, ttl time.Duration) time.Duration {
+	if ttl != missingArticleTTL || priority >= stream.PriorityInteractive {
+		return ttl
+	}
+	timer := time.NewTimer(confirmMissingDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return throttleTTL // Couldn't confirm -- don't commit to a day-long verdict.
+	case <-timer.C:
+	}
+	var confirmErr error
+	if isBody {
+		_, confirmErr = s.inner.BodyPriority(ctx, messageID, priority)
+	} else {
+		confirmErr = s.inner.StatPriority(ctx, messageID, priority)
+	}
+	if confirmTTL, ok := classifyCacheableError(confirmErr); ok && confirmTTL == missingArticleTTL {
+		return missingArticleTTL // Independently confirmed -- trust it for the full day.
+	}
+	return throttleTTL
 }
 
 // isMissing reports whether messageID is currently cached as missing,

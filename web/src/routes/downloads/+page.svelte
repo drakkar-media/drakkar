@@ -186,6 +186,15 @@
     });
   }
 
+  async function removeItem(id: number) {
+    if (!confirmed('Remove this item from the queue? It will stop being searched/downloaded until requested again.')) return;
+    await runAction(() => api.queueAction(id, 'remove'), {
+      setWorking: (v) => setBusy(`remove-${id}`, v),
+      successMessage: () => 'Removed from queue',
+      afterSuccess: load
+    });
+  }
+
   async function clearFailed() {
     if (!confirmed('Clear all failed queue items? This removes their retry history.')) return;
     await runAction(() => api.clearFailedQueue(), {
@@ -451,6 +460,10 @@
                 <Button kind="secondary" on:click={() => retryItem(item.queueItemId)} disabled={isBusy(`retry-${item.queueItemId}`)}>
                   <RotateCcw size={14} />
                   Retry
+                </Button>
+                <Button kind="secondary" on:click={() => removeItem(item.queueItemId)} disabled={isBusy(`remove-${item.queueItemId}`)}>
+                  <Trash2 size={14} />
+                  Remove
                 </Button>
               </div>
             </div>

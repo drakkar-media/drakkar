@@ -285,7 +285,17 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 				}
 			}
 		}
-		blocklistErr := workflowSvc.FailAndBlocklistRelease(ctx, c.SelectedReleaseID, "strict health: "+err.Error())
+		// StrictCheckFirstSegments's own error already carries a "strict
+		// health: " prefix (via sanitizedSegmentErr); only the
+		// "invalid video container" variant built just above doesn't.
+		// Unconditionally prepending here produced a doubled
+		// "strict health: strict health: ..." reason for every segment
+		// failure.
+		reason := err.Error()
+		if !strings.HasPrefix(strings.ToLower(reason), "strict health:") {
+			reason = "strict health: " + reason
+		}
+		blocklistErr := workflowSvc.FailAndBlocklistRelease(ctx, c.SelectedReleaseID, reason)
 		if blocklistErr != nil {
 			logger.Error().Err(blocklistErr).Int64("libraryItemId", c.LibraryItemID).Msg("health check: blocklist failed")
 		} else if _, exists := resetSeen[c.LibraryItemID]; !exists {

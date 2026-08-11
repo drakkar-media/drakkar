@@ -11,6 +11,7 @@ import (
 
 	"github.com/drakkar-media/drakkar/internal/nntp"
 	"github.com/drakkar-media/drakkar/internal/stream"
+	"github.com/drakkar-media/drakkar/internal/yenc"
 )
 
 // mapSegmentChecker reports nntp.ErrArticleMissing for exactly the message
@@ -131,6 +132,54 @@ func TestPreflightCheckFirstSegmentsPassesWhenInteriorSegmentsPresent(t *testing
 	if err := db.PreflightCheckFirstSegments(ctx, nzbDocID); err != nil {
 		t.Fatalf("expected preflight to pass when every segment is reachable, got: %v", err)
 	}
+}
+
+// TestStrictCheckFirstSegmentsRequiresConfirmedCRCMismatch guards a real gap
+// found 2026-08-11 while auditing why the blocklist held so many "yenc crc
+// mismatch" entries: the deep health check's StrictCheckFirstSegments
+// hard-failed (and blocklisted the release) on a SINGLE unconfirmed CRC
+// mismatch, while the sibling calibration path (isArticlePermanentlyMissing)
+// right in the same file already required confirmPermanentCRCMismatch's two
+// independent, delayed, agreeing samples for the identical failure class --
+// added after two confirmed live false positives on this provider. A CRC
+// mismatch that doesn't reproduce on the confirmation re-fetch must not fail
+// the check.
+func TestStrictCheckFirstSegmentsRequiresConfirmedCRCMismatch(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	withFastCRCConfirmation(t)
+
+	t.Run("confirmed on every re-fetch -> fails", func(t *testing.T) {
+		ids := makeMessageIDs(3, "strict-crc-confirmed")
+		nzbDocID, cleanup := insertPreflightFixture(t, sqlDB, ctx, "strict-crc-confirmed", [][]string{ids})
+		defer cleanup()
+
+		sizer := &fakeSegmentSizer{sizeErr: yenc.ErrCRCMismatch}
+		db := &DB{SQL: sqlDB, SegmentFetcher: sizer}
+		if err := db.StrictCheckFirstSegments(ctx, nzbDocID); err == nil {
+			t.Fatal("expected a confirmed CRC mismatch to fail the check")
+		}
+	})
+
+	t.Run("not reproduced on re-fetch -> passes", func(t *testing.T) {
+		ids := makeMessageIDs(3, "strict-crc-unconfirmed")
+		nzbDocID, cleanup := insertPreflightFixture(t, sqlDB, ctx, "strict-crc-unconfirmed", [][]string{ids})
+		defer cleanup()
+
+		sizer := &fakeSegmentSizer{errsBySequence: []error{yenc.ErrCRCMismatch, nil}}
+		db := &DB{SQL: sqlDB, SegmentFetcher: sizer}
+		if err := db.StrictCheckFirstSegments(ctx, nzbDocID); err != nil {
+			t.Fatalf("expected an unconfirmed CRC mismatch to pass, got: %v", err)
+		}
+	})
 }
 
 // TestPreflightCheckFirstSegmentsSkipsInteriorSamplingForMultiFileReleases
