@@ -485,6 +485,14 @@
     {
       "name": "Webhooks",
       "description": "Inbound webhooks from Seerr"
+    },
+    {
+      "name": "Dashboard",
+      "description": "Home screen aggregation (hero pick, recently added, trending)"
+    },
+    {
+      "name": "Setup",
+      "description": "First-run initial admin account creation"
     }
   ],
   "paths": {
@@ -3053,6 +3061,1245 @@
         "responses": {
           "200": {
             "description": "Log lines array"
+          }
+        }
+      }
+    },
+    "/api/dashboard/home": {
+      "get": {
+        "tags": [
+          "Dashboard"
+        ],
+        "summary": "Home screen data: hero pick, recently added, TMDB trending",
+        "responses": {
+          "200": {
+            "description": "Hero pick, recently-added items, trending movies/TV"
+          }
+        }
+      }
+    },
+    "/api/queue/{id}/pause": {
+      "post": {
+        "tags": [
+          "Queue"
+        ],
+        "summary": "Pause a single queue item",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true,
+            "description": "queueItemId"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Paused"
+          }
+        }
+      }
+    },
+    "/api/queue/{id}/resume": {
+      "post": {
+        "tags": [
+          "Queue"
+        ],
+        "summary": "Resume a paused queue item",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true,
+            "description": "queueItemId"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Resumed"
+          }
+        }
+      }
+    },
+    "/api/queue/failed/action": {
+      "post": {
+        "tags": [
+          "Queue"
+        ],
+        "summary": "Bulk-process every failed queue row in the background",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "action": {
+                    "type": "string",
+                    "description": "e.g. remove_blocklist_and_search"
+                  }
+                },
+                "required": [
+                  "action"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Queued; result reported later via the queue.failed_action SSE event"
+          }
+        }
+      }
+    },
+    "/api/library/{id}/current-file": {
+      "get": {
+        "tags": [
+          "Library"
+        ],
+        "summary": "Currently-downloaded/active file for a library item",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true,
+            "description": "libraryItemId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current file details, or null"
+          }
+        }
+      }
+    },
+    "/api/library/{id}/manual-import": {
+      "post": {
+        "tags": [
+          "Library"
+        ],
+        "summary": "Manually attach a specific external release to a library item",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true,
+            "description": "libraryItemId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  },
+                  "externalUrl": {
+                    "type": "string"
+                  },
+                  "indexerName": {
+                    "type": "string"
+                  },
+                  "resolution": {
+                    "type": "string"
+                  },
+                  "sizeBytes": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "score": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Imported"
+          },
+          "410": {
+            "description": "Candidate no longer available"
+          },
+          "400": {
+            "description": "Import failed"
+          }
+        }
+      }
+    },
+    "/api/library/{id}/manual-import/upload": {
+      "post": {
+        "tags": [
+          "Library"
+        ],
+        "summary": "Manually import a directly-uploaded .nzb file for a library item",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true,
+            "description": "libraryItemId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "The .nzb file, max 64MB"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Imported queue item"
+          }
+        }
+      }
+    },
+    "/api/subtitles": {
+      "get": {
+        "tags": [
+          "Subtitles"
+        ],
+        "summary": "Paginated subtitle-coverage listing across the whole library",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "pageSize",
+            "in": "query",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "mediaType",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "search"
+          },
+          {
+            "name": "missingOnly",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "description": "\"true\" to only show items missing subtitles"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SubtitleLibraryPage {items, page, pageSize, total, totalPages}"
+          }
+        }
+      }
+    },
+    "/api/subtitles/bulk": {
+      "post": {
+        "tags": [
+          "Subtitles"
+        ],
+        "summary": "Bulk background subtitle search or delete across many items",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "action": {
+                    "type": "string",
+                    "enum": [
+                      "search",
+                      "delete"
+                    ]
+                  },
+                  "libraryItemIds": {
+                    "type": "array",
+                    "items": {
+                      "type": "integer",
+                      "format": "int64"
+                    }
+                  },
+                  "languages": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Used only for action=search"
+                  }
+                },
+                "required": [
+                  "action",
+                  "libraryItemIds"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Queued; result reported via subtitle.search/subtitle.delete SSE events"
+          },
+          "400": {
+            "description": "Empty libraryItemIds or unknown action"
+          }
+        }
+      }
+    },
+    "/api/subtitles/{libraryItemId}/upload": {
+      "post": {
+        "tags": [
+          "Subtitles"
+        ],
+        "summary": "Manually upload a subtitle file for a library item",
+        "parameters": [
+          {
+            "name": "libraryItemId",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created subtitle record"
+          }
+        }
+      }
+    },
+    "/api/custom-formats": {
+      "get": {
+        "tags": [
+          "Quality"
+        ],
+        "summary": "List custom formats",
+        "responses": {
+          "200": {
+            "description": "{items: CustomFormat[]}"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Quality"
+        ],
+        "summary": "Create or upsert a custom format",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "score": {
+                    "type": "integer"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "source": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved custom format"
+          }
+        }
+      }
+    },
+    "/api/custom-formats/{id}": {
+      "put": {
+        "tags": [
+          "Quality"
+        ],
+        "summary": "Update a custom format",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "score": {
+                    "type": "integer"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "source": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated custom format"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Quality"
+        ],
+        "summary": "Delete a custom format",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{deleted: id}"
+          }
+        }
+      }
+    },
+    "/api/custom-formats/import": {
+      "post": {
+        "tags": [
+          "Quality"
+        ],
+        "summary": "Bulk import custom formats (e.g. from TRaSH Guides)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "type": "string"
+                    },
+                    "score": {
+                      "type": "integer"
+                    },
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "source": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{imported: n, total: n}"
+          }
+        }
+      }
+    },
+    "/api/release-block-rules": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "List release block rules",
+        "responses": {
+          "200": {
+            "description": "{items: ReleaseBlockRule[]}"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Create or upsert a release block rule",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "type": {
+                    "type": "string"
+                  },
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "mediaType": {
+                    "type": "string"
+                  },
+                  "action": {
+                    "type": "string"
+                  },
+                  "scorePenalty": {
+                    "type": "integer"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "source": {
+                    "type": "string"
+                  },
+                  "note": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved rule"
+          },
+          "400": {
+            "description": "Invalid rule"
+          }
+        }
+      }
+    },
+    "/api/release-block-rules/{id}": {
+      "put": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Update a release block rule",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "type": {
+                    "type": "string"
+                  },
+                  "pattern": {
+                    "type": "string"
+                  },
+                  "mediaType": {
+                    "type": "string"
+                  },
+                  "action": {
+                    "type": "string"
+                  },
+                  "scorePenalty": {
+                    "type": "integer"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "source": {
+                    "type": "string"
+                  },
+                  "note": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated rule"
+          },
+          "400": {
+            "description": "Invalid rule"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Delete a release block rule",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{deleted: id}"
+          }
+        }
+      }
+    },
+    "/api/release-block-rules/import": {
+      "post": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Bulk import release block rules (all-or-nothing; first invalid rule aborts)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "integer",
+                      "format": "int64"
+                    },
+                    "type": {
+                      "type": "string"
+                    },
+                    "pattern": {
+                      "type": "string"
+                    },
+                    "mediaType": {
+                      "type": "string"
+                    },
+                    "action": {
+                      "type": "string"
+                    },
+                    "scorePenalty": {
+                      "type": "integer"
+                    },
+                    "enabled": {
+                      "type": "boolean"
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "note": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{imported: n, total: n}"
+          },
+          "400": {
+            "description": "Invalid rule at index N"
+          }
+        }
+      }
+    },
+    "/api/release-block-rules/test": {
+      "post": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Dry-run a hypothetical release title against all current block rules",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "type": "string"
+                  },
+                  "mediaType": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "title"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Matched rule(s)/outcome"
+          }
+        }
+      }
+    },
+    "/api/indexer-policies": {
+      "get": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "List per-indexer score/enable overrides",
+        "responses": {
+          "200": {
+            "description": "{items: IndexerPolicy[]}"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Create or upsert an indexer policy",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "indexerName": {
+                    "type": "string"
+                  },
+                  "scoreModifier": {
+                    "type": "integer"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "note": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved policy"
+          },
+          "400": {
+            "description": "Missing indexerName"
+          }
+        }
+      }
+    },
+    "/api/indexer-policies/{id}": {
+      "put": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Update an indexer policy",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "indexerName": {
+                    "type": "string"
+                  },
+                  "scoreModifier": {
+                    "type": "integer"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "note": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated policy"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Policies"
+        ],
+        "summary": "Delete an indexer policy",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{deleted: id}"
+          }
+        }
+      }
+    },
+    "/api/subtitle-profiles": {
+      "get": {
+        "tags": [
+          "Subtitles"
+        ],
+        "summary": "List named subtitle-search preference sets",
+        "responses": {
+          "200": {
+            "description": "{items: SubtitleProfile[]}"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Subtitles"
+        ],
+        "summary": "Create a subtitle profile",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "languages": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "preferHearingImpaired": {
+                    "type": "boolean"
+                  },
+                  "requireExactLanguage": {
+                    "type": "boolean"
+                  },
+                  "isDefault": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved profile"
+          },
+          "400": {
+            "description": "Missing name"
+          }
+        }
+      }
+    },
+    "/api/subtitle-profiles/{id}": {
+      "put": {
+        "tags": [
+          "Subtitles"
+        ],
+        "summary": "Update a subtitle profile",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "integer",
+                    "format": "int64"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "languages": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "preferHearingImpaired": {
+                    "type": "boolean"
+                  },
+                  "requireExactLanguage": {
+                    "type": "boolean"
+                  },
+                  "isDefault": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated profile"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Subtitles"
+        ],
+        "summary": "Delete a subtitle profile",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "{deleted: id}"
+          }
+        }
+      }
+    },
+    "/api/settings/privacy/status": {
+      "get": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Current privacy-routing (SOCKS5/WireGuard) manager status",
+        "responses": {
+          "200": {
+            "description": "Privacy manager status (mode, connection state)"
+          }
+        }
+      }
+    },
+    "/api/settings/privacy/test": {
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Probe connectivity through a candidate or the active privacy config without persisting it",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "direct",
+                      "socks5",
+                      "wireguard"
+                    ]
+                  },
+                  "socks5": {
+                    "type": "object",
+                    "properties": {
+                      "host": {
+                        "type": "string"
+                      },
+                      "port": {
+                        "type": "integer"
+                      },
+                      "username": {
+                        "type": "string"
+                      },
+                      "password": {
+                        "type": "string"
+                      },
+                      "timeoutSeconds": {
+                        "type": "integer"
+                      }
+                    }
+                  },
+                  "wireguard": {
+                    "type": "object",
+                    "properties": {
+                      "configText": {
+                        "type": "string"
+                      },
+                      "timeoutSeconds": {
+                        "type": "integer"
+                      }
+                    }
+                  },
+                  "targetAddr": {
+                    "type": "string",
+                    "description": "Defaults to 1.1.1.1:443"
+                  }
+                },
+                "required": [
+                  "mode"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "{ok: bool, error?: string}"
+          }
+        }
+      }
+    },
+    "/api/indexers/names": {
+      "get": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "List configured indexer names from NZBHydra2 (for policy dropdowns)",
+        "responses": {
+          "200": {
+            "description": "{names: string[]} (or {names: [], error} if unreachable)"
+          }
+        }
+      }
+    },
+    "/api/speedtest": {
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Synchronous throughput/CPU test streaming an already-downloaded file through the real playback path",
+        "responses": {
+          "200": {
+            "description": "Speed-test result"
+          }
+        }
+      }
+    },
+    "/api/setup/status": {
+      "get": {
+        "tags": [
+          "Setup"
+        ],
+        "summary": "Whether first-run setup is required",
+        "responses": {
+          "200": {
+            "description": "{required: bool}"
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/setup/complete": {
+      "post": {
+        "tags": [
+          "Setup"
+        ],
+        "summary": "Create the first admin account and log in",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "username": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "username",
+                  "password"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "{username, role}; also sets the session cookie"
+          },
+          "400": {
+            "description": "Missing username/password"
+          },
+          "409": {
+            "description": "A user already exists"
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/users/{id}": {
+      "delete": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Delete a user account (admin-only; cannot delete your own account)",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "schema": {
+              "type": "integer"
+            },
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          },
+          "400": {
+            "description": "Cannot delete your own account"
           }
         }
       }
