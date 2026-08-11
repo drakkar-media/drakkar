@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -593,6 +594,40 @@ func (db *DB) rescaleFileSegments(ctx context.Context, nzbFileID, actualFirstSiz
 		return err
 	}
 	defer tx.Rollback()
+
+	// Lock the owning library item's queue_items row FIRST, in the same
+	// order every function that deletes/inserts selected_releases rows
+	// already uses (see lockLibraryItemQueueRow's own doc comment).
+	// Without this, this transaction's UPDATEs on nzb_files/virtual_files
+	// below can deadlock against FailSelectedReleaseAndPromoteNext's
+	// cascading DELETE FROM selected_releases, which locks those exact
+	// same nzb_files/virtual_files rows (via ON DELETE CASCADE through
+	// nzb_documents) in whatever order Postgres's cascade happens to visit
+	// them -- confirmed live (2026-08-11): "rescale nzb_file N: ERROR:
+	// deadlock detected (SQLSTATE 40P01)" firing repeatedly in production,
+	// roughly every 15-30 minutes, and at least once hitting the promote
+	// side too ("workqueue: promote retry failed"). Acquiring the same
+	// queue_items lock first establishes a single consistent lock order
+	// between the two paths instead of leaving Postgres's cascade order
+	// (which application code doesn't control) to decide it. A missing
+	// owning library item (concurrent delete raced this calibration pass)
+	// isn't an error here -- there's nothing left to conflict with.
+	var libraryItemID int64
+	lockErr := tx.QueryRowContext(ctx, `
+		select sr.library_item_id
+		from nzb_files nf
+		join nzb_documents nd on nd.id = nf.nzb_document_id
+		join selected_releases sr on sr.id = nd.selected_release_id
+		where nf.id = $1`, nzbFileID,
+	).Scan(&libraryItemID)
+	if lockErr != nil && !errors.Is(lockErr, sql.ErrNoRows) {
+		return lockErr
+	}
+	if lockErr == nil {
+		if lockErr = lockLibraryItemQueueRow(ctx, tx, libraryItemID); lockErr != nil {
+			return lockErr
+		}
+	}
 
 	// Update the inline segment sizes stored in nzb_files.
 	// COALESCE guards against array_length returning NULL for an empty array.

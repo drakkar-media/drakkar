@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -123,6 +125,116 @@ func setupRaceTestLibraryItem(t *testing.T, ctx context.Context, sqlDB *sql.DB, 
 // producing a second selected_releases row for it, the same defect class
 // fixed for activateReleaseCandidate in c4ead9f, via a call-site pair that
 // fix's lock ordering alone didn't cover.
+// TestRescaleFileSegmentsDoesNotDeadlockWithFailSelectedReleaseAndPromoteNext
+// guards a real production bug (2026-08-11): rescaleFileSegments (the
+// calibration background-repair path) updated nzb_files/virtual_files rows
+// without ever locking the owning library item's queue_items row first,
+// while FailSelectedReleaseAndPromoteNext's cascading DELETE FROM
+// selected_releases locks those exact same nzb_files/virtual_files rows (via
+// ON DELETE CASCADE through nzb_documents) AFTER already locking
+// queue_items -- two different lock orders on overlapping rows, the classic
+// deadlock shape. Confirmed live: "rescale nzb_file N: ERROR: deadlock
+// detected (SQLSTATE 40P01)" firing repeatedly, and at least once hitting
+// the promote side too. Races both functions against many independent
+// fixtures concurrently to reproduce the timing window; asserts none of
+// them ever surface a deadlock error.
+func TestRescaleFileSegmentsDoesNotDeadlockWithFailSelectedReleaseAndPromoteNext(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	const fixtures = 30
+	type fixture struct {
+		libID, srID, nzbFileID int64
+	}
+	all := make([]fixture, fixtures)
+	for i := 0; i < fixtures; i++ {
+		var libID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into library_items (media_type, title, available)
+			values ('tv', 'rescale-deadlock-check', false)
+			returning id`).Scan(&libID); err != nil {
+			t.Fatal(err)
+		}
+		defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+		if _, err := sqlDB.ExecContext(ctx, `
+			insert into queue_items (library_item_id, state, idempotency_key)
+			values ($1, 'selected', $2)`, libID, "rescale-deadlock-check-"+strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+		var rcID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into release_candidates (library_item_id, title, external_url, indexer_name, selected)
+			values ($1, 'Rescale Deadlock Test Release', $2, 'test-indexer', true)
+			returning id`, libID, "http://example/rescale-deadlock-"+strconv.Itoa(i)).Scan(&rcID); err != nil {
+			t.Fatal(err)
+		}
+		var srID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into selected_releases (library_item_id, release_candidate_id)
+			values ($1, $2) returning id`, libID, rcID).Scan(&srID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqlDB.ExecContext(ctx, `
+			update queue_items set selected_release_id = $2 where library_item_id = $1`, libID, srID); err != nil {
+			t.Fatal(err)
+		}
+		var nzbDocID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into nzb_documents (selected_release_id, file_name)
+			values ($1, 'rescale-deadlock-check.nzb') returning id`, srID).Scan(&nzbDocID); err != nil {
+			t.Fatal(err)
+		}
+		var nzbFileID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into nzb_files (nzb_document_id, subject, message_ids, decoded_segment_size)
+			values ($1, 'rescale-deadlock-part', $2, 700000)
+			returning id`, nzbDocID, pgTextArray([]string{"<msg1>", "<msg2>", "<msg3>"})).Scan(&nzbFileID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqlDB.ExecContext(ctx, `
+			insert into virtual_files (selected_release_id, path, file_name, reader_kind, nzb_file_id)
+			values ($1, 'rescale-deadlock.mkv', 'rescale-deadlock.mkv', 'direct_nzb', $2)`,
+			srID, nzbFileID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		all[i] = fixture{libID: libID, srID: srID, nzbFileID: nzbFileID}
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, fixtures*2)
+	for i, f := range all {
+		wg.Add(2)
+		go func(i int, f fixture) {
+			defer wg.Done()
+			errs[i*2] = db.rescaleFileSegments(ctx, f.nzbFileID, 716800, 500000)
+		}(i, f)
+		go func(i int, f fixture) {
+			defer wg.Done()
+			_, errs[i*2+1] = db.FailSelectedReleaseAndPromoteNext(ctx, f.srID, "test_transient_failure")
+		}(i, f)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err == nil {
+			continue
+		}
+		if strings.Contains(err.Error(), "40P01") || strings.Contains(strings.ToLower(err.Error()), "deadlock") {
+			t.Fatalf("goroutine %d hit a deadlock: %v", i, err)
+		}
+	}
+}
+
 func TestFailSelectedReleaseAndPromoteNextSerializesConcurrentFailure(t *testing.T) {
 	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
 	if dsn == "" {
