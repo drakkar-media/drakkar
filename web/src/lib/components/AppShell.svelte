@@ -131,45 +131,6 @@
         </a>
       {/each}
     </nav>
-    <div class="sidebar-tail">
-      <a href="/docs" target="_blank" rel="noreferrer" title="API docs" aria-label="API docs"><FileText size={18} /></a>
-      <div class="notif-wrap">
-        <button
-          class="notif-btn"
-          class:active={notifOpen}
-          type="button"
-          title="Notifications"
-          aria-label="Notifications"
-          on:click={() => (notifOpen = !notifOpen)}
-        ><Bell size={18} /></button>
-        {#if notifOpen}
-          <button class="notif-backdrop" type="button" aria-label="Close notifications" on:click={() => (notifOpen = false)}></button>
-          <div class="notif-popover" role="dialog" aria-label="Notifications">
-            <div class="notif-head">
-              <span>Notifications</span>
-              {#if $toastHistory.length}
-                <button class="notif-clear" type="button" on:click={clearToastHistory}>Clear</button>
-              {/if}
-            </div>
-            <div class="notif-list">
-              {#if $toastHistory.length === 0}
-                <div class="notif-empty">No notifications yet.</div>
-              {:else}
-                {#each $toastHistory as item (item.id)}
-                  <div class={`notif-item ${item.tone}`}>
-                    <div class="notif-message">{item.message}</div>
-                    <div class="notif-time">{relativeTime(item.at)}</div>
-                  </div>
-                {/each}
-              {/if}
-            </div>
-          </div>
-        {/if}
-      </div>
-      {#if appVersion}
-        <span class="app-version" title="Drakkar version">v{appVersion}</span>
-      {/if}
-    </div>
   </aside>
 
   <!-- Content -->
@@ -220,6 +181,40 @@
       </form>
 
       <div class="topbar-right">
+        <a class="icon-btn" href="/docs" target="_blank" rel="noreferrer" title="API docs" aria-label="API docs"><FileText size={15} /></a>
+        <div class="notif-wrap">
+          <button
+            class="icon-btn notif-btn"
+            class:active={notifOpen}
+            type="button"
+            title="Notifications"
+            aria-label="Notifications"
+            on:click={() => (notifOpen = !notifOpen)}
+          ><Bell size={15} /></button>
+          {#if notifOpen}
+            <button class="notif-backdrop" type="button" aria-label="Close notifications" on:click={() => (notifOpen = false)}></button>
+            <div class="notif-popover" role="dialog" aria-label="Notifications">
+              <div class="notif-head">
+                <span>Notifications</span>
+                {#if $toastHistory.length}
+                  <button class="notif-clear" type="button" on:click={clearToastHistory}>Clear</button>
+                {/if}
+              </div>
+              <div class="notif-list">
+                {#if $toastHistory.length === 0}
+                  <div class="notif-empty">No notifications yet.</div>
+                {:else}
+                  {#each $toastHistory as item (item.id)}
+                    <div class={`notif-item ${item.tone}`}>
+                      <div class="notif-message">{item.message}</div>
+                      <div class="notif-time">{relativeTime(item.at)}</div>
+                    </div>
+                  {/each}
+                {/if}
+              </div>
+            </div>
+          {/if}
+        </div>
         <a class="icon-btn" href="/settings?tab=logs" aria-label="Logs"><BookOpen size={15} /></a>
         {#if currentUser}
           <a class="user-chip" href="/users" aria-label="Open users">
@@ -230,7 +225,7 @@
         <button class="icon-btn" type="button" aria-label="Log out" on:click={logout}>
           <LogOut size={15} />
         </button>
-        <div class="avatar"><DrakkarLogo size={18} /></div>
+        <div class="avatar" title={appVersion ? `Drakkar v${appVersion}` : 'Drakkar'}><DrakkarLogo size={18} /></div>
       </div>
     </header>
 
@@ -298,27 +293,20 @@
   }
 
   .side-nav { display: flex; flex-direction: column; gap: 2px; flex: 1; padding-top: 4px; }
-  .sidebar-tail { display: flex; flex-direction: column; align-items: center; gap: 6px; }
-  .app-version {
-    font-size: 10px; color: hsl(var(--muted-foreground) / 0.7);
-    font-family: 'JetBrains Mono', monospace;
-  }
 
+  /* notif-wrap/notif-btn live in .topbar-right now (always visible, mobile
+     included) rather than the desktop-only sidebar -- previously the bell,
+     the docs link, and the version tag were reachable ONLY inside
+     `.sidebar`, which is display:none below 768px, making all three
+     completely unreachable on mobile, not just poorly laid out. */
   .notif-wrap { position: relative; }
-  .notif-btn {
-    display: grid; place-items: center; width: 40px; height: 40px;
-    border-radius: 14px; border: 1px solid transparent; cursor: pointer;
-    color: hsl(var(--muted-foreground)); background: transparent;
-  }
-  .notif-btn:hover, .notif-btn.active {
-    color: hsl(var(--foreground)); background: hsl(0 0% 100% / 0.08);
-  }
+  .notif-btn.active { color: hsl(var(--foreground)); background: hsl(0 0% 100% / 0.1); }
   .notif-backdrop {
     position: fixed; inset: 0; z-index: 89; border: 0; background: transparent; cursor: default;
   }
   .notif-popover {
-    position: absolute; left: calc(100% + 10px); bottom: 0; z-index: 90;
-    width: 320px; max-height: 420px; display: flex; flex-direction: column;
+    position: absolute; top: calc(100% + 10px); right: 0; z-index: 90;
+    width: min(320px, 90vw); max-height: 420px; display: flex; flex-direction: column;
     border-radius: 16px; border: 1px solid hsl(0 0% 100% / 0.08);
     background: hsl(212 27% 10% / 0.98); box-shadow: 0 18px 40px hsl(0 0% 0% / 0.35);
     overflow: hidden;
@@ -347,13 +335,13 @@
   .notif-message { font-size: 13px; color: hsl(var(--foreground)); line-height: 1.4; }
   .notif-time { margin-top: 2px; font-size: 11px; color: hsl(var(--muted-foreground)); }
 
-  .side-nav a, .sidebar-tail a {
+  .side-nav a {
     display: grid; place-items: center; width: 40px; height: 40px;
     border-radius: 14px; border: 1px solid transparent;
     color: hsl(var(--muted-foreground)); background: transparent; text-decoration: none;
     transition: background .12s, color .12s;
   }
-  .side-nav a:hover, .sidebar-tail a:hover {
+  .side-nav a:hover {
     color: hsl(var(--foreground)); background: hsl(0 0% 100% / 0.08);
   }
   .side-nav a.active {
@@ -452,7 +440,7 @@
   }
 
   .main { max-width: 1760px; padding: 8px 16px 100px; margin: 0 auto; }
-  @media (max-width: 600px) {
+  @media (max-width: 767px) {
     .main { padding-bottom: 80px; }
   }
 
