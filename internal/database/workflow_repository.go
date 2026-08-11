@@ -855,7 +855,7 @@ func (db *DB) GetQueueRetryTarget(ctx context.Context, queueItemID int64) (Queue
 // still-plausible pending item, protecting the shared Hydra2 rate limit.
 func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceHours int) ([]PendingLibrarySearchTarget, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
-		select item.library_item_id, item.media_type, coalesce(item.tv_show_id, 0), coalesce(item.season_number, 0), item.selected, coalesce(item.selected_release_id, 0), coalesce(item.external_url, ''), item.state, item.updated_at
+		select item.library_item_id, item.media_type, coalesce(item.tv_show_id, 0), coalesce(item.season_number, 0), item.selected, coalesce(item.selected_release_id, 0), coalesce(item.external_url, ''), item.state, item.updated_at, item.dispatch_attempt_count, item.dispatch_backoff_until
 		from (
 			select distinct on (q.library_item_id)
 				q.library_item_id,
@@ -867,6 +867,8 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceH
 				rc.external_url,
 				q.state,
 				q.updated_at,
+				q.dispatch_attempt_count,
+				q.dispatch_backoff_until,
 				q.created_at,
 				q.id
 			from queue_items q
@@ -986,12 +988,37 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceH
 	var out []PendingLibrarySearchTarget
 	for rows.Next() {
 		var item PendingLibrarySearchTarget
-		if err := rows.Scan(&item.LibraryItemID, &item.MediaType, &item.TVShowID, &item.SeasonNumber, &item.Selected, &item.SelectedReleaseID, &item.ExternalURL, &item.State, &item.UpdatedAt); err != nil {
+		var backoffUntil sql.NullTime
+		if err := rows.Scan(&item.LibraryItemID, &item.MediaType, &item.TVShowID, &item.SeasonNumber, &item.Selected, &item.SelectedReleaseID, &item.ExternalURL, &item.State, &item.UpdatedAt, &item.DispatchAttemptCount, &backoffUntil); err != nil {
 			return nil, err
+		}
+		if backoffUntil.Valid {
+			item.DispatchBackoffUntil = &backoffUntil.Time
 		}
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+// RecordDispatchAttempt persists the passive-resume dispatch sweep's
+// escalating per-item backoff state, replacing an in-memory-only map that
+// was reset to zero by every process restart -- confirmed live 2026-08-11: a
+// small cluster of library items with hundreds of rejected release
+// candidates kept getting re-dispatched every 1-2 minutes indefinitely,
+// flooding the indexer's download history, because repeated same-day
+// redeploys kept resetting the in-memory counter before it could climb to
+// its longer backoff tiers. Called only after DispatchAutomaticPending has
+// actually submitted a job for libraryItemID -- newCount/backoffUntil are
+// computed by the caller (see workflow.dispatchBackoff) so this is a plain
+// write, no read-modify-write race here (the caller already read the prior
+// count from the same ListPendingLibrarySearchTargets pass that decided to
+// dispatch).
+func (db *DB) RecordDispatchAttempt(ctx context.Context, libraryItemID int64, newCount int, backoffUntil time.Time) error {
+	_, err := db.SQL.ExecContext(ctx, `
+		update queue_items
+		set dispatch_attempt_count = $2, dispatch_backoff_until = $3
+		where library_item_id = $1`, libraryItemID, newCount, backoffUntil)
+	return err
 }
 
 // CountActiveSearchBacklog returns the number of unavailable library items

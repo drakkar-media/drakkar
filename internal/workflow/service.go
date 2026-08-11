@@ -56,6 +56,7 @@ type Repository interface {
 	GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (database.LibrarySearchInput, error)
 	LookupCandidateHistory(ctx context.Context, libraryItemID int64) (map[string]database.CandidateHistory, error)
 	ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceHours int) ([]database.PendingLibrarySearchTarget, error)
+	RecordDispatchAttempt(ctx context.Context, libraryItemID int64, newCount int, backoffUntil time.Time) error
 	CountActiveSearchBacklog(ctx context.Context) (int, error)
 	CountSelectedQueueBacklog(ctx context.Context) (int, error)
 	GetShowWithMissingEpisodes(ctx context.Context, tvShowID int64) (*database.ShowWithMissingEpisodes, error)
@@ -201,18 +202,6 @@ type Service struct {
 	recentURLHits     map[string]time.Time
 	searchAttemptMu   sync.Mutex
 	searchAttempts    map[string]searchAttemptRecord
-
-	// dispatchAttemptMu/dispatchAttempts back shouldDispatchSelectedTarget's
-	// per-item backoff. queue_items.consecutive_failure_searches looked like
-	// the right counter to reuse but isn't: ReplaceSearchCandidates resets it
-	// to 0 on every successful *selection*, including a promotion mid-fallback
-	// cascade -- so it never actually accumulates across the repeated
-	// dispatch-and-fail cycle this backoff exists to slow down. In-memory
-	// per-libraryItemID instead, cleared on restart like recentURLHits;
-	// losing it on restart just means one extra immediate attempt, not a
-	// correctness problem.
-	dispatchAttemptMu sync.Mutex
-	dispatchAttempts  map[int64]dispatchAttemptRecord
 
 	// TTL caches for policy data, guarded by profileCacheMu (O-04).
 	// These are loaded from the DB at most once per 5 minutes.
@@ -392,15 +381,6 @@ type searchAttemptRecord struct {
 	at        time.Time
 	outcome   string
 	queryText string
-}
-
-// dispatchAttemptRecord tracks how many consecutive times the passive-resume
-// sweep (DispatchAutomaticPending) has dispatched a library item without it
-// leaving the pending set (i.e. without it succeeding), and when the most
-// recent attempt was, for shouldDispatchSelectedTarget's escalating backoff.
-type dispatchAttemptRecord struct {
-	count int
-	lastAt time.Time
 }
 
 // completionFastLaneKey marks a context so a submitted download job is given
@@ -607,9 +587,8 @@ func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service 
 		dispatchC:      make(chan struct{}, 1),
 		calibrateSem:   make(chan struct{}, asyncCalibrateWorkers),
 		tmdbEnrichSem:  make(chan struct{}, tmdbEnrichWorkers),
-		recentURLHits:    make(map[string]time.Time),
-		searchAttempts:   make(map[string]searchAttemptRecord),
-		dispatchAttempts: make(map[int64]dispatchAttemptRecord),
+		recentURLHits:  make(map[string]time.Time),
+		searchAttempts: make(map[string]searchAttemptRecord),
 	}
 }
 
@@ -1417,7 +1396,10 @@ func (s *Service) DispatchAutomaticPending(ctx context.Context) (BulkSearchResul
 		}) {
 			go func() { <-resultCh }()
 			result.Searched++
-			s.recordDispatchAttempt(target.LibraryItemID, now)
+			newCount := target.DispatchAttemptCount + 1
+			if err := s.repo.RecordDispatchAttempt(ctx, target.LibraryItemID, newCount, now.Add(dispatchBackoff(newCount))); err != nil {
+				s.logger.Warn().Err(err).Int64("libraryItemId", target.LibraryItemID).Msg("dispatch: failed to persist backoff state")
+			}
 		}
 	}
 	return result, nil
@@ -1501,10 +1483,11 @@ func (s *Service) shouldDispatchSelectedTarget(target database.PendingLibrarySea
 	// cascade, so it never actually accumulates across the repeated
 	// dispatch-and-fail cycle this backoff exists to slow down (confirmed:
 	// shipping that version did not reduce the observed dispatch count at
-	// all). dispatchAttempts is separate, in-memory, per-libraryItemID state
-	// that only this sweep controls, so it doesn't get reset out from under
-	// it by an unrelated write.
-	return !s.peekDispatchBackoff(target.LibraryItemID, now)
+	// all). dispatch_attempt_count/dispatch_backoff_until are separate,
+	// dedicated columns only this sweep writes, so they don't get reset out
+	// from under it by an unrelated write -- and, being DB-persisted rather
+	// than the in-memory map this replaced, they also survive a restart.
+	return !peekDispatchBackoff(target, now)
 }
 
 // peekRecentlyDispatchedURL reports whether rawURL has an in-memory dispatch
@@ -1536,8 +1519,25 @@ func (s *Service) peekRecentlyDispatchedURL(rawURL string, now time.Time) bool {
 // dispatchBackoff returns the minimum interval required between consecutive
 // passive-resume dispatch attempts for an item that has been dispatched
 // attempts times already without succeeding (leaving the pending set).
+//
+// Persisted to queue_items.dispatch_backoff_until (see RecordDispatchAttempt)
+// rather than kept in memory -- confirmed live 2026-08-11: a small cluster of
+// library items with hundreds of rejected release_candidates (Alien: Earth
+// 689/797, Chicago P.D. S03E22 433/434) kept getting re-dispatched every
+// ~1-2 minutes indefinitely, flooding the indexer's download history,
+// because this session's own repeated same-day redeploys kept resetting the
+// previous in-memory-only counter before it could climb past its first
+// couple of tiers. The two longer tiers below (12/24+) are new, specifically
+// for that class of item: hundreds of already-rejected candidates with zero
+// success is a strong signal this item cannot be satisfied by anything
+// currently indexed, so back off hard rather than retrying at a cadence
+// that assumes the next candidate might just be the right one.
 func dispatchBackoff(attempts int) time.Duration {
 	switch {
+	case attempts >= 24:
+		return 24 * time.Hour
+	case attempts >= 12:
+		return 6 * time.Hour
 	case attempts >= 6:
 		return time.Hour
 	case attempts >= 3:
@@ -1549,42 +1549,15 @@ func dispatchBackoff(attempts int) time.Duration {
 	}
 }
 
-// peekDispatchBackoff reports whether libraryItemID is currently inside its
-// escalating per-item dispatch backoff, WITHOUT recording a new attempt --
-// read-only pre-filter for shouldDispatchSelectedTarget, mirroring
+// peekDispatchBackoff reports whether target is currently inside its
+// escalating per-item dispatch backoff (see dispatchBackoff), read straight
+// from the DB-persisted state ListPendingLibrarySearchTargets already
+// fetched -- read-only pre-filter for shouldDispatchSelectedTarget, mirroring
 // peekRecentlyDispatchedURL. The actual attempt is recorded separately, by
-// recordDispatchAttempt, only once DispatchAutomaticPending has actually
+// RecordDispatchAttempt, only once DispatchAutomaticPending has actually
 // submitted the job.
-func (s *Service) peekDispatchBackoff(libraryItemID int64, now time.Time) bool {
-	if s == nil {
-		return false
-	}
-	s.dispatchAttemptMu.Lock()
-	defer s.dispatchAttemptMu.Unlock()
-	record, ok := s.dispatchAttempts[libraryItemID]
-	if !ok {
-		return false
-	}
-	return now.Sub(record.lastAt) < dispatchBackoff(record.count)
-}
-
-// recordDispatchAttempt increments libraryItemID's consecutive dispatch-
-// attempt count and stamps the current time, called only after
-// DispatchAutomaticPending has actually submitted a job for it. Entries are
-// intentionally never explicitly cleared on success -- once an item
-// succeeds it stops appearing in ListPendingLibrarySearchTargets entirely,
-// so it simply stops being looked up; a stray leftover entry for a
-// long-since-resolved item is harmless and bounded by total library size.
-func (s *Service) recordDispatchAttempt(libraryItemID int64, now time.Time) {
-	if s == nil {
-		return
-	}
-	s.dispatchAttemptMu.Lock()
-	defer s.dispatchAttemptMu.Unlock()
-	record := s.dispatchAttempts[libraryItemID]
-	record.count++
-	record.lastAt = now
-	s.dispatchAttempts[libraryItemID] = record
+func peekDispatchBackoff(target database.PendingLibrarySearchTarget, now time.Time) bool {
+	return target.DispatchBackoffUntil != nil && now.Before(*target.DispatchBackoffUntil)
 }
 
 // claimURLInMemory atomically checks-and-sets rawURL's in-memory dispatch

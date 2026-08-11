@@ -584,6 +584,12 @@ type PendingLibrarySearchTarget struct {
 	ExternalURL       string     `json:"externalUrl,omitempty"`
 	State             QueueState `json:"state"`
 	UpdatedAt         time.Time  `json:"updatedAt"`
+	// DispatchAttemptCount/DispatchBackoffUntil persist the passive-resume
+	// sweep's escalating per-item backoff (see RecordDispatchAttempt) --
+	// DB-backed specifically so it survives a process restart, unlike the
+	// in-memory map it replaced.
+	DispatchAttemptCount int        `json:"dispatchAttemptCount"`
+	DispatchBackoffUntil *time.Time `json:"dispatchBackoffUntil,omitempty"`
 }
 
 // FailedQueueRetryTarget is a queue item in the failed state considered for

@@ -153,6 +153,19 @@ func (r *repoStub) LookupCandidateHistory(ctx context.Context, libraryItemID int
 func (r *repoStub) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceHours int) ([]database.PendingLibrarySearchTarget, error) {
 	return r.pending, nil
 }
+// RecordDispatchAttempt mutates the matching entry in r.pending in place, so
+// a test that calls DispatchAutomaticPending twice in a row sees the second
+// call's own ListPendingLibrarySearchTargets read reflect the first call's
+// persisted attempt -- mirroring the real DB round-trip this stub replaces.
+func (r *repoStub) RecordDispatchAttempt(ctx context.Context, libraryItemID int64, newCount int, backoffUntil time.Time) error {
+	for i := range r.pending {
+		if r.pending[i].LibraryItemID == libraryItemID {
+			r.pending[i].DispatchAttemptCount = newCount
+			r.pending[i].DispatchBackoffUntil = &backoffUntil
+		}
+	}
+	return nil
+}
 func (r *repoStub) CountActiveSearchBacklog(ctx context.Context) (int, error) {
 	return r.backlog, nil
 }
@@ -2334,9 +2347,16 @@ func TestShouldDispatchSelectedTargetBlocksRecentlyDispatchedSameURL(t *testing.
 // to 0 on every successful *selection*, including a promotion mid-fallback
 // cascade, so it never accumulated across the dispatch-and-fail cycle this
 // backoff needs to slow down -- confirmed live, shipping that version did
-// not reduce the observed dispatch count at all. This exercises the
-// in-memory replacement (recordDispatchAttempt/peekDispatchBackoff) that
-// DispatchAutomaticPending actually drives, not a struct field.
+// not reduce the observed dispatch count at all. A second attempt kept the
+// counter in an in-memory map, which turned out not to work either: it reset
+// to zero on every process restart, so a chronically-bad item's backoff
+// never actually reached its longer tiers across a day with several
+// redeploys -- confirmed live 2026-08-11 (Alien: Earth, Chicago P.D. S03E22,
+// hundreds of rejected candidates each, still re-dispatched every ~1-2
+// minutes). This exercises the DB-persisted replacement: the target struct
+// itself carries DispatchAttemptCount/DispatchBackoffUntil, exactly as a
+// fresh ListPendingLibrarySearchTargets read would return them after
+// RecordDispatchAttempt persisted a prior attempt.
 func TestShouldDispatchSelectedTargetAppliesPerItemBackoffOnRepeatedFailure(t *testing.T) {
 	now := time.Now()
 	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
@@ -2347,8 +2367,11 @@ func TestShouldDispatchSelectedTargetAppliesPerItemBackoffOnRepeatedFailure(t *t
 		State:             database.QueueSelected,
 	}
 	// Simulate one prior dispatch attempt, exactly as DispatchAutomaticPending
-	// would have recorded it after a successful submit().
-	service.recordDispatchAttempt(target.LibraryItemID, now)
+	// would have persisted it (via RecordDispatchAttempt) after a successful
+	// submit().
+	target.DispatchAttemptCount = 1
+	backoffUntil := now.Add(dispatchBackoff(1))
+	target.DispatchBackoffUntil = &backoffUntil
 
 	if service.shouldDispatchSelectedTarget(target, now) {
 		t.Fatal("expected an item with 1 recorded attempt to back off immediately after that attempt, even with a never-before-seen url")
@@ -2362,10 +2385,14 @@ func TestShouldDispatchSelectedTargetAppliesPerItemBackoffOnRepeatedFailure(t *t
 
 	// Simulate 5 more attempts (6 total) to reach the escalated tier.
 	attemptAt := now
+	count := 1
 	for i := 0; i < 5; i++ {
 		attemptAt = attemptAt.Add(3 * time.Minute)
-		service.recordDispatchAttempt(target.LibraryItemID, attemptAt)
+		count++
 	}
+	target.DispatchAttemptCount = count
+	until := attemptAt.Add(dispatchBackoff(count))
+	target.DispatchBackoffUntil = &until
 	if service.shouldDispatchSelectedTarget(target, attemptAt.Add(3*time.Minute)) {
 		t.Fatal("expected the escalated 1-hour backoff to still block a 6-attempt item after only 3 minutes")
 	}
