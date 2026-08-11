@@ -12,6 +12,7 @@ import (
 	"github.com/drakkar-media/drakkar/internal/database"
 	"github.com/drakkar-media/drakkar/internal/library"
 	"github.com/drakkar-media/drakkar/internal/maintenance"
+	"github.com/drakkar-media/drakkar/internal/mediaprobe"
 	"github.com/drakkar-media/drakkar/internal/workflow"
 	"github.com/rs/zerolog"
 )
@@ -266,6 +267,7 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 				logger.Debug().Int64("libraryItemId", c.LibraryItemID).Str("title", c.Title).
 					Msg("health check: passed — segments and container valid")
 				_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
+				checkDecodeIssuesAdvisory(ctx, db, logger, c)
 				continue
 			}
 		}
@@ -391,6 +393,44 @@ func readContainerHeader(path string) error {
 		return fmt.Errorf("%w: read header: %v", errContainerHeaderUnreadable, err)
 	}
 	return validateVideoContainerHeader(buf[:n])
+}
+
+// decodeIssuesProbeBytes bounds how much of a published file's decoded
+// bytes checkDecodeIssuesAdvisory reads for the ffmpeg decode-error scan --
+// generous enough to cover several seconds of most video bitrates, small
+// enough to stay a bounded background-priority read rather than a
+// meaningful fraction of the file.
+const decodeIssuesProbeBytes = 48 * 1024 * 1024
+
+// checkDecodeIssuesAdvisory is a best-effort, ADVISORY-ONLY health-check
+// addition: none of Drakkar's existing checks (yEnc/CRC segment validation,
+// container-magic-byte check) actually decode a single video frame, so a
+// release with a genuinely corrupt video bitstream but valid article bytes
+// and a valid container header passes both today. This runs
+// mediaprobe.DetectDecodeIssues against a bounded prefix and just logs a
+// warning when it finds something -- it deliberately does NOT blocklist or
+// otherwise change the item's state, since the underlying heuristic hasn't
+// been validated against real corrupt-vs-clean samples the way this
+// session's RAR5 decryption work was, and a false positive here would
+// wrongly discard a perfectly good release. Silently does nothing for
+// anything other than a "direct_nzb" virtual file (see
+// database.DB.PrefixBytesBackground's doc comment for why stored_rar --
+// including password-decrypted RAR -- isn't supported by this bounded-read
+// path yet) or when ffmpeg isn't installed.
+func checkDecodeIssuesAdvisory(ctx context.Context, db *database.DB, logger zerolog.Logger, c database.DeepHealthCandidate) {
+	data, ok, err := db.PrefixBytesBackground(ctx, c.VirtualFileID, decodeIssuesProbeBytes)
+	if err != nil || !ok || len(data) == 0 {
+		return
+	}
+	issues, err := mediaprobe.DetectDecodeIssues(ctx, data, 5)
+	if err != nil || len(issues) == 0 {
+		return
+	}
+	logger.Warn().
+		Int64("libraryItemId", c.LibraryItemID).
+		Str("title", c.Title).
+		Strs("decodeIssues", issues).
+		Msg("health check: ffmpeg reported possible decode issues (advisory only -- not blocklisting)")
 }
 
 // readContainerHeaderDirect validates the same leading-bytes magic-number
