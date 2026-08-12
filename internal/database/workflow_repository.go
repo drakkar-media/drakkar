@@ -925,7 +925,10 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceH
 			    -- Resume items: release already selected, but queue item is still
 			    -- in requested. These should be dispatched immediately so the
 			    -- worker can continue fetch/import without waiting for retry pass.
-			    or (q.state = $1 and q.selected_release_id is not null)
+			    -- Completed rows can also be requested+selected after legacy
+			    -- repairs; keep those out or the passive dispatcher backs off
+			    -- already-available items forever.
+			    or (q.state = $1 and q.selected_release_id is not null and li.available = false)
 			    -- Stranded selected items: release chosen but download not yet started.
 			    -- Submitted directly to the downloadDispatcher (bypassing BullMQ) so
 			    -- a stalled BullMQ lock cannot block their progress.
@@ -4089,14 +4092,15 @@ func (db *DB) GetShowWithMissingEpisodes(ctx context.Context, tvShowID int64) (*
 // for this show.
 func (db *DB) ListPendingTVShowLibraryItemIDs(ctx context.Context, tvShowID int64) ([]int64, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
-		select distinct li.id
+		select li.id
 		from library_items li
 		join episodes ep on ep.id = li.episode_id
 		join queue_items q on q.library_item_id = li.id
 		where ep.tv_show_id = $1
 		  and li.available = false
 		  and q.state in ($2, $3, $4)
-		order by q.last_searched_at asc nulls first`,
+		group by li.id
+		order by min(q.last_searched_at) asc nulls first, li.id asc`,
 		tvShowID,
 		QueueRequested,
 		QueueFailed,

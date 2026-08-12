@@ -2808,15 +2808,17 @@ func (s *Service) runDownloadJob(job downloadJob) {
 	default:
 	}
 	result, importedRelease, err := s.fetchIndexAndRelease(job.ctx, job.selectedReleaseID)
-	// Release the in-flight slot before sending the result so that a
-	// promoted release or a re-queued retry can be accepted immediately.
-	s.downloader.markDone(job.selectedReleaseID)
 	if err != nil || importedRelease == nil {
+		s.downloader.markDone(job.selectedReleaseID)
 		job.resultCh <- downloadJobResult{result, err}
 		resultSent = true
 		return
 	}
 	selectedReleaseID, pubErr := s.publishImportedRelease(job.ctx, *importedRelease)
+	// Keep the job context alive through publish. markDone cancels the
+	// dispatcher-owned context and must only run after post-import work has
+	// either succeeded or failed.
+	s.downloader.markDone(job.selectedReleaseID)
 	job.resultCh <- downloadJobResult{selectedReleaseID, pubErr}
 	resultSent = true
 }

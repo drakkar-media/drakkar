@@ -168,6 +168,15 @@ func TestListPendingRepublishTargets(t *testing.T) {
 	if _, err := sqlDB.ExecContext(ctx, `update library_items set available = true where id = $1`, libNoSymlink); err != nil {
 		t.Fatal(err)
 	}
+	var libManualNZB int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('manual_nzb', 'pub-republish-manual-nzb', true)
+		returning id`,
+	).Scan(&libManualNZB); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libManualNZB)
 
 	// (c) Marked available, current release has virtual files, but the
 	// existing symlink_publications row points at a stale, different release.
@@ -232,6 +241,9 @@ func TestListPendingRepublishTargets(t *testing.T) {
 	}
 	if !set[libNoSymlink] {
 		t.Errorf("expected available-without-symlink item %d to be a pending republish target", libNoSymlink)
+	}
+	if set[libManualNZB] {
+		t.Errorf("expected manual_nzb item %d to be excluded from symlink republish targets", libManualNZB)
 	}
 	if !set[libStaleSymlink] {
 		t.Errorf("expected stale-symlink item %d to be a pending republish target", libStaleSymlink)

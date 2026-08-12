@@ -153,6 +153,7 @@ func (r *repoStub) LookupCandidateHistory(ctx context.Context, libraryItemID int
 func (r *repoStub) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceHours int) ([]database.PendingLibrarySearchTarget, error) {
 	return r.pending, nil
 }
+
 // RecordDispatchAttempt mutates the matching entry in r.pending in place, so
 // a test that calls DispatchAutomaticPending twice in a row sees the second
 // call's own ListPendingLibrarySearchTargets read reflect the first call's
@@ -1986,6 +1987,55 @@ func TestFetchAndBuildImportedNZBDoesNotPromoteOnRateLimitWaitCancellation(t *te
 	}
 	if len(repo.failed) != 0 {
 		t.Fatalf("expected FailSelectedReleaseAndPromoteNext to never be called, got %d call(s) with reasons %v", len(repo.failed), repo.failed)
+	}
+}
+
+func TestRunDownloadJobKeepsContextAliveThroughPublish(t *testing.T) {
+	const selectedReleaseID int64 = 701
+	repo := &repoStub{
+		selected: database.ReleaseSummary{
+			SelectedReleaseID:  selectedReleaseID,
+			ReleaseCandidateID: 1,
+			LibraryItemID:      42,
+			Title:              "Context.Alive.2026.1080p.WEB-DL",
+			ExternalURL:        "http://example/context-alive.nzb",
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	service.fetcher = fetcherStub{
+		fileName: "context-alive.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Context Alive (2026).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+	}
+
+	var hookContextErr error
+	service.SetPostImportHook(func(ctx context.Context, item database.QueueSnapshot) error {
+		hookContextErr = ctx.Err()
+		return hookContextErr
+	})
+
+	resultCh := make(chan downloadJobResult, 1)
+	if !service.downloader.submit(downloadJob{
+		ctx:               context.Background(),
+		selectedReleaseID: selectedReleaseID,
+		resultCh:          resultCh,
+	}) {
+		t.Fatal("expected dispatcher to accept job")
+	}
+	job, ok := service.downloader.next(context.Background())
+	if !ok {
+		t.Fatal("expected queued job")
+	}
+	service.runDownloadJob(job)
+
+	result := <-resultCh
+	if result.err != nil {
+		t.Fatalf("expected publish to succeed, got %v", result.err)
+	}
+	if result.selectedReleaseID == nil || *result.selectedReleaseID != selectedReleaseID {
+		t.Fatalf("unexpected selected release result %+v", result.selectedReleaseID)
+	}
+	if hookContextErr != nil {
+		t.Fatalf("expected post-import hook to run before dispatcher context cancellation, got %v", hookContextErr)
 	}
 }
 

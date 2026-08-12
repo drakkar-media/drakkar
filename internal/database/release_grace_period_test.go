@@ -255,6 +255,158 @@ func TestListPendingLibrarySearchTargetsIncludesAvailableOrphanWithNoSelection(t
 	t.Fatalf("expected available=true orphan (no selected_release_id) to be eligible for search, got targets: %+v", targets)
 }
 
+func TestListPendingLibrarySearchTargetsSkipsAvailableResumeSelection(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	availableMovieID, availableLibID := setupPendingMovie(t, ctx, sqlDB, "resume-selected-available", -30)
+	unavailableMovieID, unavailableLibID := setupPendingMovie(t, ctx, sqlDB, "resume-selected-unavailable", -30)
+	defer func() {
+		for _, id := range []int64{availableMovieID, unavailableMovieID} {
+			sqlDB.ExecContext(ctx, `delete from movies where id = $1`, id)
+		}
+	}()
+
+	makeSelected := func(libID int64, title string) int64 {
+		t.Helper()
+		var rcID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into release_candidates (library_item_id, title, external_url, indexer_name)
+			values ($1, $2, $3, 'test-indexer')
+			returning id`, libID, title, "http://example/"+title,
+		).Scan(&rcID); err != nil {
+			t.Fatal(err)
+		}
+		var srID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into selected_releases (library_item_id, release_candidate_id)
+			values ($1, $2)
+			returning id`, libID, rcID,
+		).Scan(&srID); err != nil {
+			t.Fatal(err)
+		}
+		return srID
+	}
+	availableSRID := makeSelected(availableLibID, "resume-selected-available-release")
+	unavailableSRID := makeSelected(unavailableLibID, "resume-selected-unavailable-release")
+	if _, err := sqlDB.ExecContext(ctx, `
+		update library_items set available = true where id = $1`, availableLibID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		libID int64
+		srID  int64
+	}{
+		{availableLibID, availableSRID},
+		{unavailableLibID, unavailableSRID},
+	} {
+		if _, err := sqlDB.ExecContext(ctx, `
+			update queue_items set state = 'requested', selected_release_id = $2 where library_item_id = $1`, item.libID, item.srID,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	targets, err := db.ListPendingLibrarySearchTargets(ctx, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byLibID := make(map[int64]bool, len(targets))
+	for _, tg := range targets {
+		byLibID[tg.LibraryItemID] = true
+	}
+	if byLibID[availableLibID] {
+		t.Error("expected available=true requested item with selected release to stay out of passive resume dispatch")
+	}
+	if !byLibID[unavailableLibID] {
+		t.Error("expected unavailable requested item with selected release to remain eligible for passive resume dispatch")
+	}
+}
+
+func TestListPendingTVShowLibraryItemIDsOrdersByOldestSearch(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	var tvShowID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into tv_shows (title) values ('pending-tvshow-priority')
+		returning id`,
+	).Scan(&tvShowID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from tv_shows where id = $1`, tvShowID)
+
+	insertEpisodeItem := func(title string, episodeNumber int, available bool, searchedAt string) int64 {
+		t.Helper()
+		var episodeID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into episodes (tv_show_id, season_number, episode_number, title, air_date)
+			values ($1, 1, $2, $3, current_date - interval '1 day')
+			returning id`, tvShowID, episodeNumber, title,
+		).Scan(&episodeID); err != nil {
+			t.Fatal(err)
+		}
+		var libID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into library_items (media_type, title, episode_id, available)
+			values ('episode', $1, $2, $3)
+			returning id`, title, episodeID, available,
+		).Scan(&libID); err != nil {
+			t.Fatal(err)
+		}
+		query := `insert into queue_items (library_item_id, state, idempotency_key, last_searched_at) values ($1, 'requested', $2, `
+		args := []any{libID, title}
+		if searchedAt == "" {
+			query += `null)`
+		} else {
+			query += searchedAt + `)`
+		}
+		if _, err := sqlDB.ExecContext(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+		return libID
+	}
+
+	oldSearchLibID := insertEpisodeItem("pending-tvshow-old-search", 1, false, `now() - interval '2 hours'`)
+	neverSearchedLibID := insertEpisodeItem("pending-tvshow-never-searched", 2, false, "")
+	availableLibID := insertEpisodeItem("pending-tvshow-available", 3, true, "")
+
+	got, err := db.ListPendingTVShowLibraryItemIDs(ctx, tvShowID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 unavailable pending episodes, got %d: %v", len(got), got)
+	}
+	if got[0] != neverSearchedLibID || got[1] != oldSearchLibID {
+		t.Fatalf("expected null last_searched_at first then oldest search, got %v", got)
+	}
+	for _, id := range got {
+		if id == availableLibID {
+			t.Fatalf("expected available episode %d to be excluded, got %v", availableLibID, got)
+		}
+	}
+}
+
 // TestListPendingLibrarySearchTargetsAppliesReleaseGraceHours guards the
 // 2026-07-26 feature: search eligibility isn't just "release date has
 // passed" (a bare calendar-date comparison), it's "release date + a

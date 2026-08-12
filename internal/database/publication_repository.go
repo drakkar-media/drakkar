@@ -447,6 +447,7 @@ func (db *DB) ListPendingRepublishTargets(ctx context.Context) ([]PendingRepubli
 		select id
 		from library_items
 		where available = true
+		  and media_type != 'manual_nzb'
 		  and not exists (
 		      select 1 from symlink_publications sp
 		      where sp.library_item_id = library_items.id
