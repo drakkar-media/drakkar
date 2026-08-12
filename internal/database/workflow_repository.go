@@ -3939,6 +3939,36 @@ type MetadataBackfillTarget struct {
 	EpisodeTitle  string
 }
 
+// ListShowsWithMissingEpisodeAirDates returns one representative
+// library_item_id per TV show that has at least one episode with a NULL
+// air_date -- the same query used to confirm and remediate the 2026-08-12
+// Reacher incident (a show's episodes can be added to the library before
+// TMDB has assigned them a date; nothing previously re-checked once TMDB
+// did). Feeding each returned ID through catalog.Service.LibraryDetail
+// re-runs buildTVSeasons, which persists any now-known TMDB air date back
+// to the local column as a side effect -- see UpdateEpisodeAirDate.
+func (db *DB) ListShowsWithMissingEpisodeAirDates(ctx context.Context) ([]int64, error) {
+	rows, err := db.SQL.QueryContext(ctx, `
+		select min(li.id)
+		from episodes e
+		join library_items li on li.episode_id = e.id
+		where e.air_date is null
+		group by e.tv_show_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // ListMetadataBackfillTargets returns library items whose movie/show rows are
 // missing newly-added metadata columns (tagline, release_date, etc.).
 // Deduplicated by TMDB ID so each show/movie is only returned once.

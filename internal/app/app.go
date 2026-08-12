@@ -68,6 +68,7 @@ const (
 	taskSyncPlexDetected       = "sync_plex_detected"
 	taskArticleHealthCheck     = "article_health_check"
 	taskBacklogSearch          = "backlog_search"
+	taskEpisodeAirDateBackfill = "episode_air_date_backfill"
 )
 
 const (
@@ -249,6 +250,7 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 		{ID: taskStorageMaintenance, Label: "Storage Maintenance", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskContentMaintenance, Label: "Content Maintenance", Group: "Indexing", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskBacklogSearch, Label: "Backlog Search", Group: "Indexing", Interval: "15m", Automated: true, LastRunState: "idle"},
+		{ID: taskEpisodeAirDateBackfill, Label: "Episode Air Date Backfill", Group: "Maintenance", Interval: "168h", Automated: true, LastRunState: "idle"},
 	}
 	for i := range defs {
 		if runAt, ok := lastRuns[defs[i].ID]; ok {
@@ -1158,6 +1160,40 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// visibility into where those caps are, so this is a deliberately
 	// moderate change rather than running cycles back-to-back.
 	startRecurring(taskBacklogSearch, 15*time.Minute, true, runBacklogSearch)
+	// Confirmed live 2026-08-12: an episode added to the library before TMDB
+	// assigned it a real air date (e.g. an unreleased season) stays with a
+	// permanently-NULL local episodes.air_date forever unless someone
+	// happens to view that show's Details page again -- release-calendar
+	// (and anything else reading air_date in bulk) has no per-row TMDB
+	// round trip, so it silently excludes such episodes even once TMDB
+	// does confirm a date. This sweep is the proactive counterpart to that
+	// on-view self-heal: once a week, re-visit (via LibraryDetail, which
+	// runs the same buildTVSeasons logic) one representative episode per
+	// show that still has any NULL air_date, so the fix doesn't depend on
+	// a user coincidentally opening that specific show.
+	startRecurring(taskEpisodeAirDateBackfill, 168*time.Hour, shouldRunRecentOnStartup(ctx, db, taskEpisodeAirDateBackfill, 168*time.Hour, 0, time.Now().UTC()), func() {
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+		defer cancel()
+		ids, err := db.ListShowsWithMissingEpisodeAirDates(ctx)
+		if err != nil {
+			logger.Error().Err(err).Msg("episode air date backfill: list failed")
+			return
+		}
+		swept := 0
+		for _, id := range ids {
+			if ctx.Err() != nil {
+				break
+			}
+			if _, err := catalogSvc.LibraryDetail(ctx, id); err != nil {
+				logger.Warn().Err(err).Int64("libraryItemId", id).Msg("episode air date backfill: item failed")
+				continue
+			}
+			swept++
+			time.Sleep(200 * time.Millisecond) // spread out the TMDB calls
+		}
+		_ = db.TouchMaintenanceCursor(ctx, taskEpisodeAirDateBackfill, time.Now().UTC().Format(time.RFC3339))
+		logger.Info().Int("shows", len(ids)).Int("swept", swept).Msg("episode air date backfill complete")
+	})
 
 	webdavServer := &http.Server{
 		Addr:              rt.WebDAVAddress,

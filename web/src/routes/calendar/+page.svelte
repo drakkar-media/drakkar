@@ -71,8 +71,15 @@
   }
 
   // Short zero-padded "SxxEyy" form for the compact grid cell (e.g. "S04E01").
+  // The backend's actual runtime value for a TV episode entry is "episode"
+  // (its own doc comment claiming "tv" is stale) -- matches the same
+  // 'tv'-or-'episode' normalization already used elsewhere on this page
+  // (see the `filters`/TYPE_STYLE lookups below) so this doesn't silently
+  // return '' for every real episode entry regardless of which literal
+  // string the backend happens to use.
   function episodeCode(e: Entry): string {
-    if (e.type !== 'tv' || !e.seasonNumber || !e.episodeNumber) return '';
+    const type = e.type === 'tv' ? 'episode' : e.type;
+    if (type !== 'episode' || !e.seasonNumber || !e.episodeNumber) return '';
     return `S${String(e.seasonNumber).padStart(2, '0')}E${String(e.episodeNumber).padStart(2, '0')}`;
   }
 
@@ -127,6 +134,20 @@
   let entries: Entry[] = [];
   let loading = false;
   let selected: Entry | null = null;
+  let selectedDay: GridDay | null = null;
+  let monthPickerOpen = false;
+  let pickerYear = 0;
+  const MONTH_ABBR = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+  function openMonthPicker() {
+    pickerYear = Number(currentKey.split('-')[0]);
+    monthPickerOpen = true;
+  }
+  function pickMonth(monthIndex: number) {
+    currentKey = monthKey(pickerYear, monthIndex + 1);
+    void load(currentKey);
+    monthPickerOpen = false;
+  }
   let filters = { movie: true, episode: true };
 
   $: label = monthLabel(currentKey);
@@ -194,7 +215,37 @@
 <div class="mb-4 flex flex-wrap items-center justify-between gap-3">
   <div class="flex items-center gap-2.5">
     <button class="grid size-9.5 place-items-center rounded-xl border border-border bg-white/[0.04] text-foreground transition-colors hover:bg-white/[0.1]" on:click={prev} aria-label="Previous month"><ChevronLeft size={18} /></button>
-    <span class="min-w-47.5 text-center text-[1.1rem] font-bold">{label}</span>
+    <div class="relative">
+      <button
+        class="min-w-47.5 rounded-xl px-2 py-1 text-center text-[1.1rem] font-bold transition-colors hover:bg-white/[0.08]"
+        on:click={() => (monthPickerOpen ? (monthPickerOpen = false) : openMonthPicker())}
+        aria-haspopup="true" aria-expanded={monthPickerOpen}
+      >{label}</button>
+      {#if monthPickerOpen}
+        <div
+          class="fixed inset-0 z-40"
+          on:click={() => (monthPickerOpen = false)}
+          on:keydown={(e) => e.key === 'Escape' && (monthPickerOpen = false)}
+          role="button" tabindex="-1" aria-label="Close month picker"
+        ></div>
+        <div class="absolute left-1/2 top-[calc(100%+8px)] z-50 w-64 -translate-x-1/2 rounded-2xl border border-border bg-card p-3 shadow-[0_20px_50px_hsl(0_0%_0%/0.45)]" role="dialog" aria-label="Choose month and year">
+          <div class="mb-2 flex items-center justify-between gap-2">
+            <button class="grid size-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-white/[0.08] hover:text-foreground" on:click={() => (pickerYear -= 1)} aria-label="Previous year"><ChevronLeft size={16} /></button>
+            <span class="text-sm font-bold">{pickerYear}</span>
+            <button class="grid size-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-white/[0.08] hover:text-foreground" on:click={() => (pickerYear += 1)} aria-label="Next year"><ChevronRight size={16} /></button>
+          </div>
+          <div class="grid grid-cols-4 gap-1.5">
+            {#each MONTH_ABBR as m, i}
+              {@const isCurrentSelection = pickerYear === Number(currentKey.split('-')[0]) && i + 1 === Number(currentKey.split('-')[1])}
+              <button
+                class="rounded-lg px-2 py-1.5 text-xs font-semibold transition-colors {isCurrentSelection ? 'bg-primary text-primary-foreground' : 'text-foreground hover:bg-white/[0.08]'}"
+                on:click={() => pickMonth(i)}
+              >{m}</button>
+            {/each}
+          </div>
+        </div>
+      {/if}
+    </div>
     <button class="grid size-9.5 place-items-center rounded-xl border border-border bg-white/[0.04] text-foreground transition-colors hover:bg-white/[0.1]" on:click={next} aria-label="Next month"><ChevronRight size={18} /></button>
     <Button kind="secondary" on:click={today} disabled={loading}>Today</Button>
   </div>
@@ -258,7 +309,7 @@
                 title={statusLabel(entry)}
                 on:click={() => (selected = entry)}>
                 <span class="min-w-0 flex-1 truncate text-[11px] font-bold">
-                  {entry.title}{#if episodeCode(entry)}<span class="font-medium opacity-75"> - {episodeCode(entry)}</span>{/if}
+                  {entry.title}{#if episodeCode(entry)}{' '}<span class="font-medium opacity-75">- {episodeCode(entry)}</span>{/if}
                 </span>
                 {#if entry.available}
                   <span class="status-bar-available size-1.5 shrink-0 rounded-full" aria-hidden="true"></span>
@@ -270,7 +321,7 @@
               </button>
             {/each}
             {#if day.entries.length > 3}
-              <button class="rounded border-none bg-none px-1 py-0.5 text-left text-[11px] font-semibold text-muted-foreground hover:text-foreground" on:click={() => (selected = day.entries[3])}>
+              <button class="rounded border-none bg-none px-1 py-0.5 text-left text-[11px] font-semibold text-muted-foreground hover:text-foreground" on:click={() => (selectedDay = day)}>
                 +{day.entries.length - 3} more
               </button>
             {/if}
@@ -283,6 +334,49 @@
 
 {#if visible.length === 0 && !loading}
   <div class="p-12 text-center text-sm text-muted-foreground">No library items with release dates in {label}.</div>
+{/if}
+
+<!-- Day list modal: everything releasing on one date, opened via "+N more" -->
+{#if selectedDay}
+  {@const d = selectedDay}
+  <div
+    class="fixed inset-0 z-50 grid place-items-center bg-black/72 p-4 backdrop-blur-[8px]"
+    on:click={(e) => e.target === e.currentTarget && (selectedDay = null)}
+    on:keydown={(e) => e.key === 'Escape' && (selectedDay = null)}
+    role="button"
+    tabindex="0"
+    aria-label="Close day list dialog"
+  >
+    <div class="flex max-h-[80vh] w-full max-w-105 flex-col overflow-hidden rounded-[28px] border border-white/10 bg-card shadow-[0_40px_80px_hsl(0_0%_0%/0.5)]" role="dialog" aria-modal="true" tabindex="-1">
+      <div class="flex items-start justify-between gap-3 border-b border-white/[0.08] p-5.5 pb-4">
+        <div class="min-w-0 flex-1">
+          <h2 class="text-[1.1rem] font-bold leading-tight">{longDate(d.date)}</h2>
+          <p class="mt-0.75 text-sm text-muted-foreground">{d.entries.length} release{d.entries.length !== 1 ? 's' : ''}</p>
+        </div>
+        <button class="grid size-9.5 shrink-0 place-items-center rounded-xl border border-border bg-white/[0.04] text-foreground transition-colors hover:bg-white/[0.1]" on:click={() => (selectedDay = null)} aria-label="Close"><X size={18} /></button>
+      </div>
+      <div class="flex min-w-0 flex-col gap-1.5 overflow-y-auto p-3">
+        {#each d.entries as entry (entry.id)}
+          <button
+            class="flex min-w-0 items-center justify-between gap-2 rounded-xl border px-3 py-2 text-left transition-[filter] hover:brightness-[1.1] {TYPE_STYLE[entry.type === 'tv' ? 'episode' : entry.type] ?? ''}"
+            title={statusLabel(entry)}
+            on:click={() => (selected = entry)}
+          >
+            <span class="min-w-0 flex-1 truncate text-sm font-bold">
+              {entry.title}{#if episodeCode(entry)}{' '}<span class="font-medium opacity-75">- {episodeCode(entry)}</span>{/if}
+            </span>
+            {#if entry.available}
+              <span class="status-bar-available size-1.75 shrink-0 rounded-full" aria-hidden="true"></span>
+            {:else if entry.queueState === 'failed'}
+              <span class="status-bar-missing size-1.75 shrink-0 rounded-full" aria-hidden="true"></span>
+            {:else if entry.queueState}
+              <span class="status-bar-warning size-1.75 shrink-0 rounded-full" aria-hidden="true"></span>
+            {/if}
+          </button>
+        {/each}
+      </div>
+    </div>
+  </div>
 {/if}
 
 <!-- Detail modal -->
