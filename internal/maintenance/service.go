@@ -69,8 +69,12 @@ func NewService(repo Repository, runtime config.Runtime) *Service {
 
 // RemoveBrokenMediaSymlinks scans every known symlink publication and
 // deletes both the on-disk symlink and its database record when the symlink
-// is missing/replaced by a non-symlink, or when it still exists but its
-// target no longer resolves (e.g. the backing virtual content was removed).
+// is missing/replaced by a non-symlink, or when its target is confirmed gone
+// (e.g. the backing virtual content was removed). record.TargetPath lives
+// under the rclone FUSE VFS mount (config.DefaultFuseMountPath), which can
+// return transient errors (dir-cache reload, brief backend timeout) that are
+// not proof the content is gone -- only os.IsNotExist is treated as genuine
+// deletion; any other stat error is skipped and retried on the next run.
 func (s *Service) RemoveBrokenMediaSymlinks(ctx context.Context) (Result, error) {
 	records, err := s.repo.ListSymlinkPublicationRecords(ctx)
 	if err != nil {
@@ -79,10 +83,9 @@ func (s *Service) RemoveBrokenMediaSymlinks(ctx context.Context) (Result, error)
 	result := Result{TaskName: "broken-media-symlinks", ScannedRows: len(records)}
 	for _, record := range records {
 		info, err := os.Lstat(record.LibraryPath)
-		if err != nil || info.Mode()&os.ModeSymlink == 0 {
-			if err == nil {
-				_ = os.Remove(record.LibraryPath)
-				result.DeletedFiles++
+		if err != nil {
+			if !os.IsNotExist(err) {
+				continue
 			}
 			if err := s.repo.DeleteSymlinkPublication(ctx, record.ID); err != nil {
 				return result, err
@@ -90,7 +93,19 @@ func (s *Service) RemoveBrokenMediaSymlinks(ctx context.Context) (Result, error)
 			result.DeletedRows++
 			continue
 		}
+		if info.Mode()&os.ModeSymlink == 0 {
+			_ = os.Remove(record.LibraryPath)
+			result.DeletedFiles++
+			if err := s.repo.DeleteSymlinkPublication(ctx, record.ID); err != nil {
+				return result, err
+			}
+			result.DeletedRows++
+			continue
+		}
 		if _, err := os.Stat(record.TargetPath); err != nil {
+			if !os.IsNotExist(err) {
+				continue
+			}
 			if err := os.Remove(record.LibraryPath); err == nil {
 				result.DeletedFiles++
 			}

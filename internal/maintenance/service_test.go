@@ -60,6 +60,47 @@ func TestRemoveBrokenMediaSymlinks(t *testing.T) {
 	}
 }
 
+// TestRemoveBrokenMediaSymlinksSkipsTransientTargetStatError guards against
+// treating a non-ENOENT stat error on the FUSE-mounted target (e.g. a
+// transient rclone timeout) as proof the content is gone. Simulated here via
+// a target path with a regular file as one of its parent components, which
+// makes os.Stat fail with ENOTDIR rather than ENOENT (unlike permission
+// bits, this is enforced for root too) -- the symlink and its DB record must
+// survive so the item stays published instead of being incorrectly reset to
+// missing.
+func TestRemoveBrokenMediaSymlinksSkipsTransientTargetStatError(t *testing.T) {
+	root := t.TempDir()
+	notADir := filepath.Join(root, "not-a-dir")
+	if err := os.WriteFile(notADir, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(notADir, "target.mkv")
+
+	link := filepath.Join(root, "published.mkv")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	repo := &repoStub{
+		records: []database.SymlinkPublicationRecord{{ID: 14, LibraryPath: link, TargetPath: target}},
+	}
+	rt := config.DefaultRuntime()
+	service := NewService(repo, rt)
+
+	result, err := service.RemoveBrokenMediaSymlinks(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeletedFiles != 0 || result.DeletedRows != 0 {
+		t.Fatalf("expected transient stat error to be skipped, got %+v", result)
+	}
+	if len(repo.deleted) != 0 {
+		t.Fatalf("expected no publication rows deleted, got %v", repo.deleted)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("expected symlink to survive, err=%v", err)
+	}
+}
+
 func TestRemoveOrphanedCompletedSymlinks(t *testing.T) {
 	repo := &repoStub{
 		records: []database.SymlinkPublicationRecord{{ID: 12, LibraryPath: "/missing/file.mkv", TargetPath: "/target"}},
