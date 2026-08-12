@@ -200,6 +200,7 @@ type EpisodeDetail struct {
 }
 
 type showEpisodeRow struct {
+	EpisodeID         int64
 	SeasonNumber      int
 	EpisodeNumber     int
 	Title             string
@@ -1174,6 +1175,17 @@ func (s *Service) buildTVSeasons(ctx context.Context, detail LibraryDetail) ([]S
 				subtitleLanguages = row.SubtitleLanguages
 				if strings.TrimSpace(row.AirDate) != "" {
 					airDate = row.AirDate
+				} else if strings.TrimSpace(episode.AirDate) != "" && row.EpisodeID > 0 {
+					// Local air_date was never populated (e.g. this episode
+					// was added to the library before TMDB had assigned it a
+					// date -- confirmed live for an unreleased season).
+					// Persist the now-known TMDB date so anything reading
+					// air_date directly in bulk (release-calendar, most
+					// notably, which has no per-row TMDB round trip) sees it
+					// too, not just this live-TMDB-backed detail view.
+					// Best-effort: a failure here just means the next view
+					// of this show's details retries the same write.
+					_ = s.db.UpdateEpisodeAirDate(ctx, row.EpisodeID, episode.AirDate)
 				}
 			} else {
 				item.MissingCount++
@@ -1264,6 +1276,7 @@ func (s *Service) showEpisodes(ctx context.Context, tvShowID int64) ([]showEpiso
 	}
 	rows, err := s.db.SQL.QueryContext(ctx, `
 		select
+			e.id,
 			e.season_number,
 			e.episode_number,
 			coalesce(e.title, ''),
@@ -1283,7 +1296,7 @@ func (s *Service) showEpisodes(ctx context.Context, tvShowID int64) ([]showEpiso
 	var libraryItemIDs []int64
 	for rows.Next() {
 		var item showEpisodeRow
-		if err := rows.Scan(&item.SeasonNumber, &item.EpisodeNumber, &item.Title, &item.Available, &item.LibraryItemID, &item.AirDate); err != nil {
+		if err := rows.Scan(&item.EpisodeID, &item.SeasonNumber, &item.EpisodeNumber, &item.Title, &item.Available, &item.LibraryItemID, &item.AirDate); err != nil {
 			return nil, err
 		}
 		out = append(out, item)

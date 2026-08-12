@@ -14,6 +14,7 @@
   import CheckCircle2 from '@lucide/svelte/icons/check-circle-2';
   import Clock from '@lucide/svelte/icons/clock';
   import PageHeader from '$lib/components/PageHeader.svelte';
+  import StatusPill from '$lib/components/StatusPill.svelte';
   import Button from '$lib/components/Button.svelte';
   import { api } from '$lib/api';
   import { toastError } from '$lib/toast';
@@ -29,10 +30,12 @@
     date: string; day: number; inMonth: boolean; isToday: boolean; entries: Entry[];
   };
 
+  // Reuses the app's own design tokens (var(--primary)/var(--secondary))
+  // instead of hardcoded Tailwind colors, so this stays in sync with
+  // whatever theme/preset the rest of the app is using.
   const TYPE_STYLE: Record<string, string> = {
-    movie:   'border-cyan-400/35 bg-cyan-400/15 text-cyan-200',
-    episode: 'border-violet-400/35 bg-violet-400/15 text-violet-200',
-    tv:      'border-emerald-400/35 bg-emerald-400/15 text-emerald-200',
+    movie:   'border-primary bg-primary text-primary-foreground',
+    episode: 'border-border bg-secondary text-secondary-foreground',
   };
 
   const STATE_LABEL: Record<string, string> = {
@@ -67,10 +70,10 @@
     }).format(new Date(`${date}T00:00:00Z`));
   }
 
-  // Short "SxEy" form for the compact grid cell.
+  // Short zero-padded "SxxEyy" form for the compact grid cell (e.g. "S04E01").
   function episodeCode(e: Entry): string {
     if (e.type !== 'tv' || !e.seasonNumber || !e.episodeNumber) return '';
-    return `S${e.seasonNumber}E${e.episodeNumber}`;
+    return `S${String(e.seasonNumber).padStart(2, '0')}E${String(e.episodeNumber).padStart(2, '0')}`;
   }
 
   // Fuller "SxEy · Episode Name" form for the detail modal.
@@ -200,14 +203,14 @@
       class="inline-flex items-center gap-1.75 rounded-full border border-border px-3.5 py-1.75 text-sm font-semibold transition-colors {filters.movie ? 'bg-white/[0.08] text-foreground' : 'bg-white/[0.04] text-muted-foreground'}"
       on:click={() => (filters = { ...filters, movie: !filters.movie })} type="button"
     >
-      <span class="size-2.25 shrink-0 rounded-full bg-cyan-400 transition-opacity {filters.movie ? '' : 'opacity-30'}"></span>
+      <span class="size-2.25 shrink-0 rounded-full bg-primary transition-opacity {filters.movie ? '' : 'opacity-30'}"></span>
       <span>{movieCount} Movie{movieCount !== 1 ? 's' : ''}</span>
     </button>
     <button
       class="inline-flex items-center gap-1.75 rounded-full border border-border px-3.5 py-1.75 text-sm font-semibold transition-colors {filters.episode ? 'bg-white/[0.08] text-foreground' : 'bg-white/[0.04] text-muted-foreground'}"
       on:click={() => (filters = { ...filters, episode: !filters.episode })} type="button"
     >
-      <span class="size-2.25 shrink-0 rounded-full bg-violet-400 transition-opacity {filters.episode ? '' : 'opacity-30'}"></span>
+      <span class="size-2.25 shrink-0 rounded-full bg-muted-foreground transition-opacity {filters.episode ? '' : 'opacity-30'}"></span>
       <span>{episodeCount} Episode{episodeCount !== 1 ? 's' : ''}</span>
     </button>
   </div>
@@ -255,14 +258,14 @@
                 title={statusLabel(entry)}
                 on:click={() => (selected = entry)}>
                 <span class="min-w-0 flex-1 truncate text-[11px] font-bold">
-                  {entry.title}{#if episodeCode(entry)}<span class="font-medium opacity-75"> · {episodeCode(entry)}</span>{/if}
+                  {entry.title}{#if episodeCode(entry)}<span class="font-medium opacity-75"> - {episodeCode(entry)}</span>{/if}
                 </span>
                 {#if entry.available}
-                  <span class="size-1.5 shrink-0 rounded-full bg-emerald-400" aria-hidden="true"></span>
+                  <span class="status-bar-available size-1.5 shrink-0 rounded-full" aria-hidden="true"></span>
                 {:else if entry.queueState === 'failed'}
-                  <span class="size-1.5 shrink-0 rounded-full bg-red-400" aria-hidden="true"></span>
+                  <span class="status-bar-missing size-1.5 shrink-0 rounded-full" aria-hidden="true"></span>
                 {:else if entry.queueState}
-                  <span class="size-1.5 shrink-0 rounded-full bg-amber-400" aria-hidden="true"></span>
+                  <span class="status-bar-warning size-1.5 shrink-0 rounded-full" aria-hidden="true"></span>
                 {/if}
               </button>
             {/each}
@@ -314,20 +317,14 @@
           </div>
 
           <div class="flex flex-wrap gap-2">
-            <div
-              class="inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-sm font-semibold"
-              style={statusTone(s) === 'ok' ? 'background: hsl(142 60% 40% / 0.2); border-color: hsl(142 60% 40% / 0.3); color: hsl(142 70% 70%)'
-                : statusTone(s) === 'err' ? 'background: hsl(0 60% 45% / 0.2); border-color: hsl(0 60% 45% / 0.3); color: hsl(0 80% 75%)'
-                : statusTone(s) === 'pending' ? 'background: hsl(43 80% 50% / 0.15); border-color: hsl(43 80% 50% / 0.3); color: hsl(43 90% 75%)'
-                : 'background: hsl(0 0% 100% / 0.05); border-color: hsl(0 0% 100% / 0.08); color: var(--muted-foreground)'}
-            >
+            <StatusPill tone={statusTone(s) === 'ok' ? 'ok' : statusTone(s) === 'err' ? 'danger' : statusTone(s) === 'pending' ? 'warn' : 'neutral'}>
               {#if s.available}
                 <CheckCircle2 size={13} />
               {:else if s.queueState}
                 <Clock size={13} />
               {/if}
               {statusLabel(s)}
-            </div>
+            </StatusPill>
           </div>
 
           <div class="mt-auto flex justify-end gap-2.5">

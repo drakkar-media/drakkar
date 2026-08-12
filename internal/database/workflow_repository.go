@@ -4087,6 +4087,29 @@ func (db *DB) ListPendingTVShowLibraryItemIDs(ctx context.Context, tvShowID int6
 	return out, rows.Err()
 }
 
+// UpdateEpisodeAirDate persists a freshly-fetched air date for an already-
+// tracked episode. Only ever called with a non-empty airDate that TMDB just
+// reported (see catalog.Service.buildTVSeasons) -- never clears a stored
+// date back to unknown. This is what keeps episodes.air_date from staying
+// permanently empty for an episode created before its air date was known
+// (e.g. an unreleased season added to the library ahead of time): the
+// Details page fetches TMDB live on every view and happily falls back to
+// that live value for display, but nothing was ever writing it back to the
+// DB column that release-calendar (and anything else querying air_date in
+// bulk, without a per-row TMDB round trip) actually reads. Confirmed live
+// (2026-08-12): Reacher S04's episodes had aired-date-confirmed air dates
+// on TMDB but a genuinely empty episodes.air_date locally, silently
+// excluding them from the release calendar.
+func (db *DB) UpdateEpisodeAirDate(ctx context.Context, episodeID int64, airDate string) error {
+	if episodeID <= 0 || strings.TrimSpace(airDate) == "" {
+		return nil
+	}
+	_, err := db.SQL.ExecContext(ctx, `
+		update episodes set air_date = $2::date
+		where id = $1 and air_date is null`, episodeID, airDate)
+	return err
+}
+
 // EnsureEpisodeLibraryItemsBatch upserts episode rows for a season, inserts any
 // missing library_items in bulk, queues them for search, and returns newly
 // created library_item IDs for immediate work-queue dispatch.
