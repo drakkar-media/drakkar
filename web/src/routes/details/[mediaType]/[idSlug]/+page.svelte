@@ -11,6 +11,7 @@
    * events rather than polling.
    */
   import { page } from '$app/state';
+  import { afterNavigate } from '$app/navigation';
   import Search from '@lucide/svelte/icons/search';
   import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
   import Languages from '@lucide/svelte/icons/languages';
@@ -238,17 +239,30 @@
     }
   }
 
-  // SvelteKit reuses this component across navigations to sibling routes, so
-  // route params/query alone won't rerun on:mount logic — this reactive block
-  // re-triggers loadDetail() whenever the subject (mediaType/idSlug/query)
-  // actually changes.
-  $: {
-    const nextKey = `${page.params.mediaType}:${page.params.idSlug}:${page.url.search}`;
+  // SvelteKit reuses this component across navigations to sibling routes
+  // (e.g. clicking a Recommendations/Similar poster on this same page), so
+  // route params/query alone won't rerun on:mount logic. Reading
+  // page.params/page.url from a $: block does not reliably re-run on
+  // client-side navigation in this app -- confirmed root cause elsewhere
+  // this session (+layout.svelte, AppShell.svelte): the URL bar updates
+  // (SvelteKit's own router did navigate) but the page's own reactive
+  // block reading `page` never re-fires, so the content silently never
+  // changes. afterNavigate + a plain reassignment, plus an eager
+  // synchronous read for the very first load (afterNavigate does not fire
+  // for that one), is the reliable alternative used here and in those
+  // other two files.
+  activeKey = `${page.params.mediaType}:${page.params.idSlug}:${page.url.search}`;
+  void loadDetail();
+  afterNavigate((nav) => {
+    const params = nav.to?.params;
+    const url = nav.to?.url;
+    if (!params?.mediaType || !params?.idSlug || !url) return;
+    const nextKey = `${params.mediaType}:${params.idSlug}:${url.search}`;
     if (nextKey !== activeKey) {
       activeKey = nextKey;
       void loadDetail();
     }
-  }
+  });
 
   onMount(() => {
     // Keeps the page's data live via targeted SSE events instead of polling.
