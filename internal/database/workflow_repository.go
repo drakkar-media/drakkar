@@ -1106,16 +1106,41 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int, releas
 		    -- the same cadence as a normal, still-plausible pending item.
 		    -- Restart/stale-worker interruptions are cheap (no Hydra call)
 		    -- and stay immediate.
+		    --
+		    -- Also gated on dispatch_backoff_until (below): consecutive_failure_searches
+		    -- is reset to 0 by ReplaceSearchCandidates every time a search selects
+		    -- ANY candidate at all -- which it almost always does for an item with
+		    -- a large candidate pool (one production case had 2,759), even though
+		    -- that selection goes on to fail moments later via a completely
+		    -- separate code path (fetchAndBuildImportedNZB/promoteNextAfterFailureDepth)
+		    -- that this counter is never told about. For such an item,
+		    -- consecutive_failure_searches is permanently stuck at 0, so this
+		    -- cooldown can never escalate past its base 1-hour tier no matter how
+		    -- many times the item has already failed -- confirmed live 2026-08-12:
+		    -- dozens of The Big Bang Theory episodes, each already pushed by the
+		    -- *other*, correctly-escalating dispatch_attempt_count/dispatch_backoff_until
+		    -- mechanism (internal/workflow/service.go's dispatchBackoff) out to a
+		    -- 6-to-24-hour pause, were still getting re-searched here roughly
+		    -- hourly regardless -- the two backoffs were completely uncoordinated,
+		    -- and the broken one won in practice. Skipping while dispatch_backoff_until
+		    -- is still in the future makes this cooldown defer to whichever of the
+		    -- two is currently more conservative, instead of the working one being
+		    -- silently undermined by the broken one.
 		    (q.state = $1 and (
 		        q.failure_reason in ('interrupted_by_restart', 'stale_worker')
-		        or q.last_searched_at is null
-		        or q.last_searched_at < now() - (
-		            case
-		                when q.consecutive_failure_searches >= 10 then interval '7 days'
-		                when q.consecutive_failure_searches >= 6  then interval '1 day'
-		                when q.consecutive_failure_searches >= 3  then interval '6 hours'
-		                else interval '1 hour'
-		            end
+		        or (
+		            (q.dispatch_backoff_until is null or q.dispatch_backoff_until <= now())
+		            and (
+		                q.last_searched_at is null
+		                or q.last_searched_at < now() - (
+		                    case
+		                        when q.consecutive_failure_searches >= 10 then interval '7 days'
+		                        when q.consecutive_failure_searches >= 6  then interval '1 day'
+		                        when q.consecutive_failure_searches >= 3  then interval '6 hours'
+		                        else interval '1 hour'
+		                    end
+		                )
+		            )
 		        )
 		    ))
 		    or (q.state = $2 and q.selected_release_id is not null and q.updated_at < now() - interval '2 minutes')

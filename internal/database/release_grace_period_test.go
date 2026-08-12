@@ -139,6 +139,66 @@ func TestListFailedQueueRetryTargetsSkipsUnreleasedMovies(t *testing.T) {
 	}
 }
 
+// TestListFailedQueueRetryTargetsRespectsDispatchBackoffUntil guards a real
+// production incident (2026-08-12): consecutive_failure_searches (the
+// counter this query's own cooldown escalates on) is reset to 0 by
+// ReplaceSearchCandidates every time a search selects ANY candidate at all
+// -- which it almost always does for an item with a large candidate pool,
+// even though that selection goes on to fail moments later via a completely
+// separate code path this counter is never told about. That left the
+// cooldown permanently stuck at its base 1-hour tier for such an item, no
+// matter how many times it had already failed -- completely uncoordinated
+// with the *other*, correctly-escalating dispatch_attempt_count/
+// dispatch_backoff_until mechanism (internal/workflow/service.go's
+// dispatchBackoff), which had already pushed the same item out to a much
+// longer pause. This test confirms the query now also skips an item whose
+// dispatch_backoff_until is still in the future, even though its own
+// last_searched_at/consecutive_failure_searches cooldown has fully elapsed
+// (both null, i.e. "never searched" -- the most permissive case for the
+// query's own cooldown).
+func TestListFailedQueueRetryTargetsRespectsDispatchBackoffUntil(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	backedOffMovie, backedOffQueueID := setupFailedMovie(t, ctx, sqlDB, "backoff-failed-movie-backed-off", -1)
+	clearMovie, clearQueueID := setupFailedMovie(t, ctx, sqlDB, "backoff-failed-movie-clear", -1)
+	defer func() {
+		for _, id := range []int64{backedOffMovie, clearMovie} {
+			sqlDB.ExecContext(ctx, `delete from movies where id = $1`, id)
+		}
+	}()
+
+	if _, err := sqlDB.ExecContext(ctx, `
+		update queue_items set dispatch_backoff_until = now() + interval '6 hours' where id = $1`, backedOffQueueID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	targets, err := db.ListFailedQueueRetryTargets(ctx, 0, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byQueueID := make(map[int64]bool, len(targets))
+	for _, tg := range targets {
+		byQueueID[tg.QueueItemID] = true
+	}
+	if byQueueID[backedOffQueueID] {
+		t.Error("expected an item still within its dispatch_backoff_until window to be excluded from retry")
+	}
+	if !byQueueID[clearQueueID] {
+		t.Error("expected an item with no dispatch_backoff_until set to remain eligible for retry")
+	}
+}
+
 // TestListPendingLibrarySearchTargetsIncludesAvailableOrphanWithNoSelection
 // guards the second half of the 2026-08-10 stuck-queue fix: a queue_items
 // row can end up in state='requested' with selected_release_id=null while
