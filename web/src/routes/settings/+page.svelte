@@ -286,19 +286,36 @@
     { id: 'article_health_check',label: 'Article Health Check',   description: 'Probe first NNTP segment of every direct-NZB item. Resets items with expired or missing articles.',group:'Maintenance',interval: '6h',   manual: false, run: async () => '' },
     { id: 'storage_maintenance', label: 'Storage Maintenance',    description: 'Remove orphaned VFS content, broken media symlinks, and prune the block cache. Runs every 6 h.',  group: 'Maintenance',interval: '6h',   manual: false, run: async () => '' },
     // === Operations (individually-triggered via API) ===
-    { id: 'retry_failed_queue',       label: 'Retry Failed Queue',       description: 'Immediately retry all failed queue items using current fallback policy.',                  group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.retryFailedQueue();                    return 'started in background'; } },
-    { id: 'search_upgrades',          label: 'Search Quality Upgrades',  description: 'Re-search available items whose quality profile allows a better release.',                  group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.searchUpgrades();                       return 'started in background'; } },
+    // Every entry below except Push Library to Seerr is a finer-grained
+    // slice of one of the automated composite tasks above (e.g. Search
+    // Quality Upgrades + Fill Missing Episodes together are what Content
+    // Maintenance already runs every 6h) -- kept as its own manual "run
+    // just this part now" button rather than removed, but the description
+    // now says so explicitly. Before this, someone glancing at a full list
+    // of automated tasks AND these manual ones with no visible connection
+    // between them reasonably read it as unexplained duplication.
+    { id: 'retry_failed_queue',       label: 'Retry Failed Queue',       description: 'Immediately retry all failed queue items using current fallback policy. Also runs automatically every 10 min as part of Queue Housekeeping.',                  group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.retryFailedQueue();                    return 'started in background'; } },
+    { id: 'search_upgrades',          label: 'Search Quality Upgrades',  description: 'Re-search available items whose quality profile allows a better release. Also runs automatically every 6 h as part of Content Maintenance.',                  group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.searchUpgrades();                       return 'started in background'; } },
     // fill_missing_episodes/cache_prune/backfill_metadata/seerr_push_library all
     // respond immediately with {queued: true} and do the real work in a
     // background goroutine — the real counts arrive later via a
     // 'library.*'/'cache.*' event (see onMount below), not on this response.
     // Reading result fields here was always undefined.
-    { id: 'fill_missing_episodes',    label: 'Fill Missing Episodes',    description: 'Use TMDB episode lists to create library items for episodes not yet tracked.',              group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.fillMissingEpisodes();                   return 'started in background'; } },
-    { id: 'republish_pending',        label: 'Republish Pending',        description: 'Republish library items with a selected release but no current symlink.',                  group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.republishPendingLibrary();               return 'started in background'; } },
-    { id: 'reset_orphaned_available', label: 'Reset Orphaned Available', description: 'Reset available items with no symlink back to pending for re-search.',                     group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.resetOrphanedAvailableItems();           return 'started in background'; } },
-    { id: 'cache_prune',              label: 'Prune Block Cache',        description: 'Delete oldest decoded articles from the disk cache.',                                      group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.pruneCache();                            return 'started in background'; } },
-    { id: 'backfill_metadata',        label: 'Backfill Metadata',        description: 'Re-enrich movies and TV shows with new TMDB fields.',                                      group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.backfillMetadata();                      return 'started in background'; } },
-    { id: 'seerr_push_library',       label: 'Push Library to Seerr',    description: 'Push library items missing from Seerr as new requests.',                                  group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.pushMissingToSeerr();                    return 'started in background'; } },
+    { id: 'fill_missing_episodes',    label: 'Fill Missing Episodes',    description: 'Use TMDB episode lists to create library items for episodes not yet tracked. Also runs automatically every 6 h as part of Content Maintenance.',              group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.fillMissingEpisodes();                   return 'started in background'; } },
+    { id: 'republish_pending',        label: 'Republish Pending',        description: 'Republish library items with a selected release but no current symlink. Also runs automatically every 30 min as part of Publishing Maintenance.',                  group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.republishPendingLibrary();               return 'started in background'; } },
+    { id: 'reset_orphaned_available', label: 'Reset Orphaned Available', description: 'Reset available items with no symlink back to pending for re-search. Also runs automatically every 30 min as part of Publishing Maintenance.',                     group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.resetOrphanedAvailableItems();           return 'started in background'; } },
+    { id: 'cache_prune',              label: 'Prune Block Cache',        description: 'Delete oldest decoded articles from the disk cache. Also runs automatically every 6 h as part of Storage Maintenance.',                                      group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.pruneCache();                            return 'started in background'; } },
+    // backfill_metadata used to be the one genuinely-manual-only action
+    // with no automated counterpart at all (confirmed via app.go audit,
+    // 2026-08-12) -- fixed by adding a weekly metadata_backfill task, so
+    // this is now the same "manual override alongside automation" pattern
+    // as everything else in this group.
+    { id: 'backfill_metadata',        label: 'Backfill Metadata',        description: 'Re-enrich movies and TV shows with new TMDB fields. Also runs automatically once a week.',                                      group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.backfillMetadata();                      return 'started in background'; } },
+    // Deliberately NOT automated: unlike everything else here, this has a
+    // real external side effect (creates new requests in Seerr) every time
+    // it runs, rather than just refreshing/repairing local state -- worth
+    // keeping under manual control.
+    { id: 'seerr_push_library',       label: 'Push Library to Seerr',    description: 'Push library items missing from Seerr as new requests. Manual only -- creates real external Seerr requests, not automated.',                                  group: 'Operations', interval: '—',    manual: true,  run: async () => { await api.pushMissingToSeerr();                    return 'started in background'; } },
   ];
 
   async function loadTaskSchedules() {

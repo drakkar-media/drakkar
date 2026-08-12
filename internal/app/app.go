@@ -69,6 +69,7 @@ const (
 	taskArticleHealthCheck     = "article_health_check"
 	taskBacklogSearch          = "backlog_search"
 	taskEpisodeAirDateBackfill = "episode_air_date_backfill"
+	taskMetadataBackfill       = "metadata_backfill"
 )
 
 const (
@@ -251,6 +252,7 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 		{ID: taskContentMaintenance, Label: "Content Maintenance", Group: "Indexing", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskBacklogSearch, Label: "Backlog Search", Group: "Indexing", Interval: "15m", Automated: true, LastRunState: "idle"},
 		{ID: taskEpisodeAirDateBackfill, Label: "Episode Air Date Backfill", Group: "Maintenance", Interval: "168h", Automated: true, LastRunState: "idle"},
+		{ID: taskMetadataBackfill, Label: "Metadata Backfill", Group: "Maintenance", Interval: "168h", Automated: true, LastRunState: "idle"},
 	}
 	for i := range defs {
 		if runAt, ok := lastRuns[defs[i].ID]; ok {
@@ -1193,6 +1195,30 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}
 		_ = db.TouchMaintenanceCursor(ctx, taskEpisodeAirDateBackfill, time.Now().UTC().Format(time.RFC3339))
 		logger.Info().Int("shows", len(ids)).Int("swept", swept).Msg("episode air date backfill complete")
+	})
+	// BackfillMetadata (re-enrich movies/shows with newer TMDB fields) was
+	// previously only ever triggered manually via the Settings > Tasks
+	// "Operations" button -- confirmed via app.go audit: no startRecurring
+	// call existed for it anywhere, unlike almost everything else in that
+	// list, which already has an automated schedule alongside its manual
+	// "run now" trigger. Pure metadata enrichment (no external side
+	// effects, unlike e.g. pushing library items to Seerr as new requests),
+	// so a weekly sweep is a safe default.
+	startRecurring(taskMetadataBackfill, 168*time.Hour, shouldRunRecentOnStartup(ctx, db, taskMetadataBackfill, 168*time.Hour, 0, time.Now().UTC()), func() {
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+		defer cancel()
+		result, err := workflowSvc.BackfillMetadata(ctx)
+		if err != nil {
+			logger.Error().Err(err).Msg("metadata backfill: error")
+			return
+		}
+		_ = db.TouchMaintenanceCursor(ctx, taskMetadataBackfill, time.Now().UTC().Format(time.RFC3339))
+		logger.Info().
+			Int("processedMovies", result.ProcessedMovies).
+			Int("processedShows", result.ProcessedShows).
+			Int("enriched", result.Enriched).
+			Int("failed", result.Failed).
+			Msg("metadata backfill complete")
 	})
 
 	webdavServer := &http.Server{
