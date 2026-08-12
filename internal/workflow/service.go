@@ -2932,6 +2932,20 @@ func (s *Service) fetchAndBuildImportedNZB(ctx context.Context, current database
 	}
 	fileName, raw, err := s.fetcher.Fetch(ctx, current.ExternalURL, current.IndexerName)
 	if err != nil {
+		if errors.Is(err, ErrFetchRateLimitWaitCanceled) {
+			// This candidate never got a turn at the global fetch rate-limit
+			// gate before the caller's own context ran out -- nothing about
+			// the candidate itself has been tested, so it must not be
+			// promoted away like a real failure. Left marked "fetching";
+			// ResetStaleQueueItems' existing stale-fetch sweep (10-minute
+			// threshold) picks it back up for a clean retry rather than
+			// this permanently burning through the candidate pool for a
+			// pure scheduling/throughput reason, which is what made a
+			// chronically-contended item (e.g. a large TV show backlog)
+			// never able to land a release at all.
+			s.logger.Info().Int64("selectedReleaseId", current.SelectedReleaseID).Str("release", current.Title).Msg("download job: gave up waiting for the fetch rate-limit slot — leaving candidate intact for retry")
+			return nil, nil, nil
+		}
 		result, err := s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
 		return result, nil, err
 	}
@@ -5087,6 +5101,22 @@ var (
 // reManualSearchEpisode matches SxxExx / sxxexx in a manual search query.
 var reManualSearchEpisode = regexp.MustCompile(`(?i)s(\d{1,2})e(\d{1,2})`)
 
+// ErrFetchRateLimitWaitCanceled is returned by Fetch when the caller's
+// context is done while still queued behind the global 1/sec rate-limit
+// gate, before any real network request was even attempted. Deliberately
+// distinct from every other Fetch error (network failure, bad status,
+// timeout mid-request): a candidate that never got a turn hasn't had
+// anything about IT proven bad, so callers must not treat this the same as
+// a real fetch failure -- see promoteNextAfterFailureDepth's caller-side
+// check for why. Confirmed live (2026-08-12): under enough concurrent
+// dispatch load, a bounded per-item context (e.g. RetryFailedQueue's
+// 2-minute budget) could expire entirely while queued behind this gate,
+// which previously fed straight into promoteNextAfterFailureDepth as a
+// generic "context canceled" failure -- burning through a perfectly good
+// candidate for a reason that had nothing to do with the release itself,
+// on every retry, forever.
+var ErrFetchRateLimitWaitCanceled = errors.New("nzb fetch: rate-limit wait canceled before request started")
+
 // Fetch downloads the NZB document at rawURL and returns a filename derived
 // from the URL path along with the raw bytes. It enforces a global 1-second
 // minimum gap between any two NZB fetches (across all indexers) to avoid
@@ -5103,7 +5133,7 @@ func (f *HTTPNZBFetcher) Fetch(ctx context.Context, rawURL, indexerName string) 
 		select {
 		case <-time.After(wait):
 		case <-ctx.Done():
-			return "", nil, ctx.Err()
+			return "", nil, ErrFetchRateLimitWaitCanceled
 		}
 		nzbFetchMu.Lock()
 	}

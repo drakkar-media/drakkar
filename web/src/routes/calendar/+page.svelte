@@ -86,7 +86,15 @@
     const last  = new Date(Date.UTC(year, month, 0));
     const startDay = first.getUTCDay();
     const gridStart = new Date(Date.UTC(year, month - 1, 1 - startDay));
-    const todayISO = new Date().toISOString().slice(0, 10);
+    // Deliberately local date parts, not toISOString() (which converts to
+    // UTC first): every grid cell below is a plain calendar date with no
+    // timezone (built from Date.UTC/getUTCDate to match release dates,
+    // which are just "YYYY-MM-DD"), so "today" must be the user's own
+    // local calendar date too. toISOString() briefly disagreed with it
+    // for ~2 hours after each local midnight in any UTC+ timezone (e.g.
+    // Netherlands/CEST) -- still showing the previous day as "today".
+    const now = new Date();
+    const todayISO = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
     const byDate = new Map<string, Entry[]>();
     for (const e of entries) {

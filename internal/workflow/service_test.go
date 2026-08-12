@@ -1950,6 +1950,45 @@ func TestFetchAndImportSelectedReleaseDepthSkipsRecentlyDispatchedURL(t *testing
 	}
 }
 
+// TestFetchAndBuildImportedNZBDoesNotPromoteOnRateLimitWaitCancellation
+// guards a real production incident (2026-08-12): a candidate that simply
+// never got a turn at the global 1/sec fetch rate-limit gate before the
+// caller's own bounded context expired used to be indistinguishable from a
+// genuinely bad candidate -- Fetch returned ctx.Err() ("context canceled")
+// either way, which fed straight into promoteNextAfterFailureDepth and
+// burned through the candidate, only to hit the identical fate again next
+// cycle. Nothing about the candidate itself was ever tested in this case,
+// so it must be left completely alone (no promotion, no failure recorded)
+// rather than discarded for a pure scheduling/throughput reason.
+func TestFetchAndBuildImportedNZBDoesNotPromoteOnRateLimitWaitCancellation(t *testing.T) {
+	repo := &repoStub{
+		next: &database.ReleaseSummary{
+			SelectedReleaseID: 601,
+			LibraryItemID:     42,
+			ExternalURL:       "http://example/next-candidate.nzb",
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	service.fetcher = countingFetcherFunc(func(ctx context.Context, rawURL string) (string, []byte, error) {
+		return "", nil, ErrFetchRateLimitWaitCanceled
+	})
+
+	current := database.ReleaseSummary{SelectedReleaseID: 600, LibraryItemID: 42, ExternalURL: "http://example/current.nzb"}
+	selectedReleaseID, imported, err := service.fetchAndBuildImportedNZB(context.Background(), current, 0)
+	if err != nil {
+		t.Fatalf("expected a graceful no-op, got error: %v", err)
+	}
+	if selectedReleaseID != nil {
+		t.Fatalf("expected no selectedReleaseID (no promotion happened), got %v", *selectedReleaseID)
+	}
+	if imported != nil {
+		t.Fatalf("expected no imported NZB, got %+v", imported)
+	}
+	if len(repo.failed) != 0 {
+		t.Fatalf("expected FailSelectedReleaseAndPromoteNext to never be called, got %d call(s) with reasons %v", len(repo.failed), repo.failed)
+	}
+}
+
 // TestFetchIndexAndReleaseSkipsPersistedlyDispatchedURLAfterRestart guards
 // against the in-memory-cooldown restart gap found in the 2026-07-17
 // exhaustive audit: recentURLHits (the in-memory 30-min per-URL fetch
