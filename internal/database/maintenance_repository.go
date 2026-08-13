@@ -72,6 +72,14 @@ func (db *DB) GetMaintenanceCursor(ctx context.Context, taskName string) (string
 	return cursor, nil
 }
 
+// DeleteMaintenanceCursor removes saved progress for taskName. It is a no-op
+// when no cursor exists, allowing completion paths to be safely retried after a
+// partial failure.
+func (db *DB) DeleteMaintenanceCursor(ctx context.Context, taskName string) error {
+	_, err := db.SQL.ExecContext(ctx, `delete from maintenance_cursors where task_name = $1`, taskName)
+	return err
+}
+
 // PruneStaleReleaseCandidates deletes release_candidates rows older than
 // olderThan that were never selected and are not referenced by
 // selected_releases (which would cascade-delete real grab history). It runs

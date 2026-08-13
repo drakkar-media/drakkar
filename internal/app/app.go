@@ -63,6 +63,8 @@ const (
 	taskPublishingMaintenance  = "publishing_maintenance" // merged: republish_pending + reset_orphaned_available
 	taskHealthCheck            = "health_check"
 	taskNZBHealthCheck         = "nzb_health_check"
+	taskNZBHealthCheckProgress = "nzb_health_check_progress"
+	taskNZBHealthCoordinator   = "nzb_health_check_coordinator"
 	taskStorageMaintenance     = "storage_maintenance" // merged: cache_prune + library-cleanup
 	taskContentMaintenance     = "content_maintenance" // merged: fill_missing_episodes + search_upgrades
 	taskSyncPlexDetected       = "sync_plex_detected"
@@ -977,9 +979,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 				}
 			}
 		}
-		deepResult, err := runNZBHealthCheckBatch(ctx, db, workflowSvc, publicationSvc, logger, backgroundDeepHealthBatchSize, false)
+		deepResult, deepRan, err := maintenanceSvc.runRegularDeepNZBHealthCheck(ctx, backgroundDeepHealthBatchSize)
 		if err != nil {
 			logger.Error().Err(err).Msg("monitoring: background deep health check error")
+		} else if !deepRan {
+			logger.Info().Msg("monitoring: background deep health check skipped — worker busy")
 		}
 		calibrated, _ := db.CalibrateNZBOffsetsBatch(ctx, backgroundDeepHealthBatchSize)
 		_ = db.TouchMaintenanceCursor(ctx, taskHealthCheck, time.Now().UTC().Format(time.RFC3339))
@@ -1141,25 +1145,32 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	startRecurring(taskQueueHousekeeping, 10*time.Minute, true, runQueueHousekeeping)
 	startRecurringWithStartupDelay(taskPublishingMaintenance, 30*time.Minute, 2*time.Minute, runPublishingMaintenance)
 	startRecurringWithStartupDelay(taskHealthCheck, backgroundHealthCheckInterval, 6*time.Minute, runHealthCheck)
-	// runOnStartup checks the persisted cursor rather than a bare `false`:
-	// this task's 168-hour (7-day) in-process timer resets to zero on every
-	// restart, and a redeployed app restarts far more often than every 7
-	// days -- with a bare `false` (no startup catch-up at all, unlike this
-	// file's other long-interval tasks) this task could go without ever
-	// completing a single run for as long as deploys keep happening more
-	// often than the interval. Confirmed live: its maintenance_cursors row
-	// was 10+ days stale despite the app having been redeployed many times
-	// in that window. shouldRunRecentOnStartup runs it immediately only if
-	// actually overdue, so it still won't fire on every restart once it's
-	// caught up.
-	startRecurring(taskNZBHealthCheck, 168*time.Hour, shouldRunRecentOnStartup(ctx, db, taskNZBHealthCheck, 168*time.Hour, 0, time.Now().UTC()), func() {
-		ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	// Polling the durable sweep state separates continuation cadence from the
+	// seven-day completion cadence. An interrupted sweep resumes within one
+	// coordinator tick, while an idle coordinator performs only two cursor reads.
+	startRecurring(taskNZBHealthCoordinator, deepHealthCoordinatorTick, true, func() {
+		due, err := shouldRunDeepHealthSweep(ctx, db, time.Now().UTC())
+		if err != nil {
+			logger.Error().Err(err).Msg("deep nzb health check progress query failed")
+			return
+		}
+		if !due {
+			return
+		}
+		run, started := maintenanceSvc.TryStartDeepNZBHealthCheck()
+		if !started {
+			logger.Info().Msg("deep nzb health check skipped — worker busy")
+			return
+		}
+		runCtx, cancel := context.WithTimeout(ctx, deepHealthSweepStepTimeout)
 		defer cancel()
-		if _, err := maintenanceSvc.DeepNZBHealthCheck(ctx); err != nil {
+		result, err := run(runCtx)
+		if err != nil {
 			logger.Error().Err(err).Msg("deep nzb health check failed")
 			return
 		}
-		_ = db.TouchMaintenanceCursor(ctx, taskNZBHealthCheck, time.Now().UTC().Format(time.RFC3339))
+		logger.Info().Int("scanned", result.ScannedRows).Int("reset", result.ResetItems).
+			Msg("deep nzb health check step complete")
 	})
 	startRecurringWithStartupDelay(taskArticleHealthCheck, 6*time.Hour, 15*time.Minute, func() {
 		ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)

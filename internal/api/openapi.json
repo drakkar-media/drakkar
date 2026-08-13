@@ -2045,10 +2045,13 @@
         "tags": [
           "Health"
         ],
-        "summary": "Run deep NZB article probe (scan all published items)",
+        "summary": "Queue or resume the bounded deep NZB article sweep",
         "responses": {
-          "200": {
-            "description": "Maintenance result with scanned/reset counts"
+          "202": {
+            "description": "Sweep step reserved and queued"
+          },
+          "409": {
+            "description": "A scheduled, regular, or manual deep-health run is already active"
           }
         }
       }

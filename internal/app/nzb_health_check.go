@@ -2,11 +2,13 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/drakkar-media/drakkar/internal/database"
@@ -18,15 +20,16 @@ import (
 )
 
 // maintenanceOpsService adapts maintenance.Service to the API's maintenance
-// operations contract, adding DeepNZBHealthCheck -- a task that needs
-// database/workflow/publication dependencies the base maintenance.Service
-// does not carry -- alongside the operations it delegates unchanged.
+// operations contract and owns the shared deep-health worker. Deep checks need
+// database, workflow, and publication dependencies the base service does not
+// carry; one atomic gate serializes scheduled, regular, and manual callers.
 type maintenanceOpsService struct {
 	base           *maintenance.Service
 	db             *database.DB
 	workflowSvc    *workflow.Service
 	publicationSvc *library.Publisher
 	logger         zerolog.Logger
+	deepHealthRun  atomic.Bool
 }
 
 func (s *maintenanceOpsService) RemoveBrokenMediaSymlinks(ctx context.Context) (maintenance.Result, error) {
@@ -49,8 +52,44 @@ func (s *maintenanceOpsService) PruneOrphanedSelectedReleases(ctx context.Contex
 	return s.base.PruneOrphanedSelectedReleases(ctx)
 }
 
-func (s *maintenanceOpsService) DeepNZBHealthCheck(ctx context.Context) (maintenance.Result, error) {
-	return runNZBHealthCheck(ctx, s.db, s.workflowSvc, s.publicationSvc, s.logger)
+// TryStartDeepNZBHealthCheck reserves the process-wide deep-health worker and
+// returns its bounded, resumable sweep step. Scheduled and API callers must
+// invoke the returned function exactly once; it releases the reservation when
+// the run exits, including after cancellation or panic.
+//
+// Returns:
+//   - run: reserved work function, or nil while another deep check is active.
+//   - bool: true only when this caller acquired the reservation.
+func (s *maintenanceOpsService) TryStartDeepNZBHealthCheck() (func(context.Context) (maintenance.Result, error), bool) {
+	return s.reserveDeepHealthRun(func(ctx context.Context) (maintenance.Result, error) {
+		return runNZBHealthSweepStep(ctx, s.db, s.workflowSvc, s.publicationSvc, s.logger)
+	})
+}
+
+// reserveDeepHealthRun wraps one deep-health operation in the service's shared
+// run gate. Reservation happens before work is launched, closing the race where
+// concurrent API requests could all observe an idle worker.
+func (s *maintenanceOpsService) reserveDeepHealthRun(run func(context.Context) (maintenance.Result, error)) (func(context.Context) (maintenance.Result, error), bool) {
+	if !s.deepHealthRun.CompareAndSwap(false, true) {
+		return nil, false
+	}
+	return func(ctx context.Context) (maintenance.Result, error) {
+		defer s.deepHealthRun.Store(false)
+		return run(ctx)
+	}, true
+}
+
+// runRegularDeepNZBHealthCheck runs the age-prioritized background batch only
+// when no forced sweep or manual run owns the shared deep-health worker.
+func (s *maintenanceOpsService) runRegularDeepNZBHealthCheck(ctx context.Context, limit int) (maintenance.Result, bool, error) {
+	run, started := s.reserveDeepHealthRun(func(ctx context.Context) (maintenance.Result, error) {
+		return runNZBHealthCheckBatch(ctx, s.db, s.workflowSvc, s.publicationSvc, s.logger, limit, false)
+	})
+	if !started {
+		return maintenance.Result{TaskName: "nzb-health-check"}, false, nil
+	}
+	result, err := run(ctx)
+	return result, true, err
 }
 
 // nextDeepHealthCheckDelay computes the interval before an item's next deep
@@ -113,6 +152,24 @@ func isTransientHealthCheckErr(err error) bool {
 	return strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "provider circuit open")
 }
 
+const deepHealthPacingDelay = 500 * time.Millisecond
+
+// waitForDeepHealthPacing applies provider-friendly spacing while remaining
+// responsive to cancellation and a bounded sweep's work deadline.
+func waitForDeepHealthPacing(ctx context.Context, stopAt time.Time) bool {
+	if !stopAt.IsZero() && time.Until(stopAt) < deepHealthPacingDelay {
+		return false
+	}
+	timer := time.NewTimer(deepHealthPacingDelay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
 // runNZBHealthCheckBatch scans up to limit deep-health candidates (0 means
 // no limit) and, for each: repairs a broken publish symlink by
 // re-publishing, skips non-VFS-backed symlinks and items not yet due, then
@@ -133,12 +190,30 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 		logger.Error().Err(err).Msg("health check: query failed")
 		return result, err
 	}
+	result, _ = runDeepHealthCandidates(ctx, db, workflowSvc, publicationSvc, logger, candidates, force, time.Time{})
+	return result, nil
+}
+
+// runDeepHealthCandidates processes a previously selected, stable candidate
+// page. stopAt is checked between candidates so a full sweep can yield after a
+// bounded work window; processed reports the contiguous prefix safe to persist
+// as its resume cursor.
+func runDeepHealthCandidates(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, publicationSvc *library.Publisher, logger zerolog.Logger, candidates []database.DeepHealthCandidate, force bool, stopAt time.Time) (maintenance.Result, int) {
+	result := maintenance.Result{TaskName: "nzb-health-check"}
 	now := time.Now()
 	logger.Info().Int("count", len(candidates)).Bool("force", force).Msg("health check: scanning deep-check candidates")
 	resetSeen := make(map[int64]struct{})
 	repairedSeen := make(map[int64]struct{})
+	processed := 0
+	// A started candidate may finish through a cancellation/transient branch.
+	// Advancing past that attempt prevents one slow row from pinning the durable
+	// sweep forever; its untouched last_checked_at keeps it eligible for regular
+	// priority retries.
+	markProcessed := func() {
+		processed++
+	}
 	for i, c := range candidates {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || (!stopAt.IsZero() && !time.Now().Before(stopAt)) {
 			break
 		}
 		if i > 0 {
@@ -148,7 +223,9 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 			// up as generic FUSE read EOFs, not recognizable NNTP errors,
 			// and caused a wave of false "corrupt content" verdicts across
 			// completely unrelated releases within the same few seconds.
-			time.Sleep(500 * time.Millisecond)
+			if !waitForDeepHealthPacing(ctx, stopAt) {
+				break
+			}
 		}
 		result.ScannedRows++
 		// symlinkOK only proves the symlink resolves into the VFS content
@@ -186,6 +263,7 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 				}
 			}
 			if !symlinkOK && !force {
+				markProcessed()
 				continue
 			}
 		}
@@ -195,13 +273,16 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 			logger.Debug().Int64("libraryItemId", c.LibraryItemID).Str("targetPath", c.TargetPath).
 				Msg("health check: non-VFS symlink, skipping deep validation")
 			_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
+			markProcessed()
 			continue
 		}
 		if !force && !shouldRunDeepHealthCheck(now, c) {
 			logger.Debug().Int64("libraryItemId", c.LibraryItemID).Msg("health check: skipping — not due yet")
+			markProcessed()
 			continue
 		}
 		if c.NZBDocumentID <= 0 {
+			markProcessed()
 			continue
 		}
 		checkCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
@@ -216,6 +297,7 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 				Str("title", c.Title).
 				Err(err).
 				Msg("health check: transient error during validation — skipping, will retry next pass")
+			markProcessed()
 			continue
 		}
 		if err == nil {
@@ -250,6 +332,7 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 									repairedSeen[c.LibraryItemID] = struct{}{}
 									result.RepairedItems++
 								}
+								markProcessed()
 								continue
 							}
 							magicErr = retryErr
@@ -260,6 +343,7 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 						Str("title", c.Title).
 						Err(magicErr).
 						Msg("health check: transient container-read error — skipping, will retry next pass")
+					markProcessed()
 					continue
 				}
 				err = fmt.Errorf("invalid video container: %w", magicErr)
@@ -268,6 +352,7 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 					Msg("health check: passed — segments and container valid")
 				_ = db.RecordHealthCheck(ctx, c.PublicationID, true)
 				checkDecodeIssuesAdvisory(ctx, db, logger, c)
+				markProcessed()
 				continue
 			}
 		}
@@ -304,20 +389,174 @@ func runNZBHealthCheckBatch(ctx context.Context, db *database.DB, workflowSvc *w
 			resetSeen[c.LibraryItemID] = struct{}{}
 			result.ResetItems++
 		}
+		markProcessed()
 	}
-	return result, nil
+	return result, processed
 }
 
-// runNZBHealthCheck repairs bad symlinks by re-publishing them, performs decoded-
-// segment validation on available items, resets broken releases for re-queue,
-// and resets sample-only publications.
-func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, publicationSvc *library.Publisher, logger zerolog.Logger) (maintenance.Result, error) {
-	result, err := runNZBHealthCheckBatch(ctx, db, workflowSvc, publicationSvc, logger, 0, true)
+const (
+	deepHealthSweepWorkBudget   = 10 * time.Minute
+	deepHealthCheckpointTimeout = 5 * time.Second
+	deepHealthSweepStepTimeout  = 15 * time.Minute
+	deepHealthCoordinatorTick   = 15 * time.Minute
+	deepHealthFullSweepInterval = 168 * time.Hour
+)
+
+// deepHealthSweepProgress is the durable keyset checkpoint for one forced
+// library sweep. ThroughLibraryItemID freezes its population; subsequent runs
+// resume strictly after AfterLibraryItemID until that snapshot is exhausted.
+type deepHealthSweepProgress struct {
+	StartedAt            time.Time `json:"startedAt"`
+	AfterLibraryItemID   int64     `json:"afterLibraryItemId"`
+	ThroughLibraryItemID int64     `json:"throughLibraryItemId"`
+	ScannedRows          int       `json:"scannedRows"`
+}
+
+func decodeDeepHealthSweepProgress(raw string) (deepHealthSweepProgress, error) {
+	var progress deepHealthSweepProgress
+	if err := json.Unmarshal([]byte(raw), &progress); err != nil {
+		return progress, fmt.Errorf("decode deep health sweep progress: %w", err)
+	}
+	if progress.StartedAt.IsZero() || progress.AfterLibraryItemID < 0 || progress.ThroughLibraryItemID < progress.AfterLibraryItemID || progress.ScannedRows < 0 {
+		return progress, errors.New("invalid deep health sweep progress")
+	}
+	return progress, nil
+}
+
+func saveDeepHealthSweepProgress(ctx context.Context, db *database.DB, progress deepHealthSweepProgress) error {
+	raw, err := json.Marshal(progress)
+	if err != nil {
+		return err
+	}
+	return db.TouchMaintenanceCursor(ctx, taskNZBHealthCheckProgress, string(raw))
+}
+
+// shouldRunDeepHealthSweep reports whether the coordinator has unfinished
+// progress or the last completed weekly sweep is due. Progress always wins so a
+// recent completion timestamp cannot strand a checkpoint left by a partial
+// completion cleanup.
+func shouldRunDeepHealthSweep(ctx context.Context, db *database.DB, now time.Time) (bool, error) {
+	progress, err := db.GetMaintenanceCursor(ctx, taskNZBHealthCheckProgress)
+	if err != nil {
+		return false, err
+	}
+	if strings.TrimSpace(progress) != "" {
+		return true, nil
+	}
+	return shouldRunRecentOnStartup(ctx, db, taskNZBHealthCheck, deepHealthFullSweepInterval, 0, now), nil
+}
+
+// loadOrStartDeepHealthSweep restores an unfinished snapshot or records a new
+// one before any candidate work begins. Invalid internal state is discarded and
+// rebuilt so one damaged cursor cannot permanently disable maintenance.
+func loadOrStartDeepHealthSweep(ctx context.Context, db *database.DB, logger zerolog.Logger) (deepHealthSweepProgress, error) {
+	raw, err := db.GetMaintenanceCursor(ctx, taskNZBHealthCheckProgress)
+	if err != nil {
+		return deepHealthSweepProgress{}, err
+	}
+	if strings.TrimSpace(raw) != "" {
+		progress, decodeErr := decodeDeepHealthSweepProgress(raw)
+		if decodeErr == nil {
+			return progress, nil
+		}
+		logger.Warn().Err(decodeErr).Msg("health check: resetting invalid sweep progress")
+		if err := db.DeleteMaintenanceCursor(ctx, taskNZBHealthCheckProgress); err != nil {
+			return deepHealthSweepProgress{}, err
+		}
+	}
+
+	upperBound, err := db.DeepHealthSweepUpperBound(ctx)
+	if err != nil {
+		return deepHealthSweepProgress{}, err
+	}
+	progress := deepHealthSweepProgress{
+		StartedAt:            time.Now().UTC(),
+		ThroughLibraryItemID: upperBound,
+	}
+	if err := saveDeepHealthSweepProgress(ctx, db, progress); err != nil {
+		return deepHealthSweepProgress{}, err
+	}
+	return progress, nil
+}
+
+func addMaintenanceResult(total *maintenance.Result, part maintenance.Result) {
+	total.ScannedRows += part.ScannedRows
+	total.ResetItems += part.ResetItems
+	total.RepairedItems += part.RepairedItems
+	total.DegradedItems += part.DegradedItems
+}
+
+// runNZBHealthSweepStep advances a forced sweep for at most one bounded work
+// window. Every completed page (including a partial final page) is checkpointed
+// with a short cancellation-independent DB context, allowing timeout, restart,
+// or deployment to resume without rescanning the full library.
+func runNZBHealthSweepStep(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, publicationSvc *library.Publisher, logger zerolog.Logger) (maintenance.Result, error) {
+	result := maintenance.Result{TaskName: "nzb-health-check"}
+	progress, err := loadOrStartDeepHealthSweep(ctx, db, logger)
 	if err != nil {
 		return result, err
 	}
-	resetSeen := make(map[int64]struct{})
+	stopAt := time.Now().Add(deepHealthSweepWorkBudget)
 
+	for {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		candidates, err := db.ListDeepHealthCandidatesPage(ctx, progress.AfterLibraryItemID, progress.ThroughLibraryItemID, backgroundDeepHealthBatchSize)
+		if err != nil {
+			return result, err
+		}
+		if len(candidates) == 0 {
+			reset, err := resetSampleOnlyPublications(ctx, db, workflowSvc, logger)
+			if err != nil {
+				return result, err
+			}
+			result.ResetItems += reset
+			completionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deepHealthCheckpointTimeout)
+			defer cancel()
+			if err := db.TouchMaintenanceCursor(completionCtx, taskNZBHealthCheck, time.Now().UTC().Format(time.RFC3339)); err != nil {
+				return result, err
+			}
+			if err := db.DeleteMaintenanceCursor(completionCtx, taskNZBHealthCheckProgress); err != nil {
+				return result, err
+			}
+			logger.Info().Int("scanned", progress.ScannedRows).Int("reset", result.ResetItems).
+				Msg("health check: full sweep complete")
+			return result, nil
+		}
+
+		pageResult, processed := runDeepHealthCandidates(ctx, db, workflowSvc, publicationSvc, logger, candidates, true, stopAt)
+		addMaintenanceResult(&result, pageResult)
+		if processed > 0 {
+			progress.AfterLibraryItemID = candidates[processed-1].LibraryItemID
+			progress.ScannedRows += pageResult.ScannedRows
+			checkpointCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deepHealthCheckpointTimeout)
+			err = saveDeepHealthSweepProgress(checkpointCtx, db, progress)
+			cancel()
+			if err != nil {
+				return result, err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		if processed < len(candidates) || !time.Now().Before(stopAt) {
+			logger.Info().Int64("afterLibraryItemId", progress.AfterLibraryItemID).
+				Int64("throughLibraryItemId", progress.ThroughLibraryItemID).
+				Int("scanned", progress.ScannedRows).
+				Msg("health check: full sweep checkpointed")
+			return result, nil
+		}
+	}
+}
+
+// resetSampleOnlyPublications blocklists available releases whose only video
+// file is a sample. It runs once after the forced candidate snapshot is fully
+// consumed, before the sweep completion cursor is advanced.
+func resetSampleOnlyPublications(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, logger zerolog.Logger) (int, error) {
+	if workflowSvc == nil {
+		return 0, errors.New("workflow service unavailable")
+	}
 	sampleRows, err := db.SQL.QueryContext(ctx, `
 		SELECT DISTINCT qi.library_item_id, li.title, sr.id
 		FROM queue_items qi
@@ -331,39 +570,34 @@ func runNZBHealthCheck(ctx context.Context, db *database.DB, workflowSvc *workfl
 		      WHERE vf2.selected_release_id = sr.id
 		        AND lower(vf2.file_name) !~ '^(sample|sample[-_].+|.+[-_]sample)\.(mkv|mp4|avi)$'
 		  )`)
-	if err == nil {
-		defer sampleRows.Close()
-		for sampleRows.Next() {
-			var libID, selectedReleaseID int64
-			var title string
-			if err := sampleRows.Scan(&libID, &title, &selectedReleaseID); err != nil {
-				continue
-			}
-			if _, exists := resetSeen[libID]; exists {
-				continue
-			}
-			// Blocklist the sample-only release rather than a plain reset —
-			// a plain reset only applies a ranking penalty, which isn't
-			// enough to stop the same sample-only release being reselected
-			// out of a small candidate pool.
-			logger.Warn().Int64("libraryItemId", libID).Str("title", title).
-				Msg("health check: only sample file published — blocklisting release and promoting next")
-			if resetErr := workflowSvc.FailAndBlocklistRelease(ctx, selectedReleaseID, "sample-only release"); resetErr != nil {
-				logger.Error().Err(resetErr).Int64("libraryItemId", libID).Msg("health check: sample blocklist failed")
-			} else {
-				resetSeen[libID] = struct{}{}
-				result.ResetItems++
-			}
-		}
+	if err != nil {
+		return 0, err
 	}
+	defer sampleRows.Close()
 
-	if err := db.TouchMaintenanceCursor(ctx, taskNZBHealthCheck, time.Now().UTC().Format(time.RFC3339)); err != nil {
-		return result, err
+	resetSeen := make(map[int64]struct{})
+	reset := 0
+	for sampleRows.Next() {
+		var libID, selectedReleaseID int64
+		var title string
+		if err := sampleRows.Scan(&libID, &title, &selectedReleaseID); err != nil {
+			return reset, err
+		}
+		if _, exists := resetSeen[libID]; exists {
+			continue
+		}
+		// Blocklisting prevents a small candidate pool from immediately selecting
+		// the same sample-only release again after a plain state reset.
+		logger.Warn().Int64("libraryItemId", libID).Str("title", title).
+			Msg("health check: only sample file published — blocklisting release and promoting next")
+		if resetErr := workflowSvc.FailAndBlocklistRelease(ctx, selectedReleaseID, "sample-only release"); resetErr != nil {
+			logger.Error().Err(resetErr).Int64("libraryItemId", libID).Msg("health check: sample blocklist failed")
+			continue
+		}
+		resetSeen[libID] = struct{}{}
+		reset++
 	}
-	if result.ResetItems > 0 {
-		logger.Info().Int("reset", result.ResetItems).Msg("health check: reset broken items for re-queue")
-	}
-	return result, nil
+	return reset, sampleRows.Err()
 }
 
 // errContainerHeaderUnreadable means the header bytes themselves could not be

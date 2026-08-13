@@ -209,10 +209,11 @@ type PublicationService interface {
 	RepublishPendingLibrary(ctx context.Context) (library.BulkRepublishResult, error)
 }
 
-// MaintenanceService defines the operation required to run a deep,
-// on-demand NZB health check across the library.
+// MaintenanceService defines reservation of the shared deep-health worker.
+// Implementations must reject overlapping scheduled, regular, and manual runs;
+// an acquired run must release its reservation on every exit path.
 type MaintenanceService interface {
-	DeepNZBHealthCheck(ctx context.Context) (maintenance.Result, error)
+	TryStartDeepNZBHealthCheck() (func(context.Context) (maintenance.Result, error), bool)
 }
 
 // CacheService defines the operation required to prune the on-disk segment
@@ -1836,9 +1837,16 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			respondError(w, http.StatusNotImplemented, errors.New("maintenance unavailable"))
 			return
 		}
+		run, started := maintenance.TryStartDeepNZBHealthCheck()
+		if !started {
+			respondJSON(w, http.StatusConflict, map[string]any{"queued": false, "running": true})
+			return
+		}
 		go func() {
 			defer observability.Recover("nzb-health-check")
-			result, err := maintenance.DeepNZBHealthCheck(context.Background())
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+			defer cancel()
+			result, err := run(ctx)
 			if err != nil {
 				slog.Error("nzb health check background", "err", err)
 				return

@@ -61,7 +61,9 @@ type publicationStub struct {
 	pending     library.BulkRepublishResult
 }
 
-type maintenanceStub struct{}
+type maintenanceStub struct {
+	running bool
+}
 type cacheStub struct{}
 type probeStub struct {
 	report probe.Report
@@ -261,8 +263,13 @@ func (p *publicationStub) RepublishPendingLibrary(ctx context.Context) (library.
 	return p.pending, nil
 }
 
-func (maintenanceStub) DeepNZBHealthCheck(ctx context.Context) (maintenance.Result, error) {
-	return maintenance.Result{TaskName: "nzb-health-check", ScannedRows: 4, ResetItems: 2}, nil
+func (s maintenanceStub) TryStartDeepNZBHealthCheck() (func(context.Context) (maintenance.Result, error), bool) {
+	if s.running {
+		return nil, false
+	}
+	return func(context.Context) (maintenance.Result, error) {
+		return maintenance.Result{TaskName: "nzb-health-check", ScannedRows: 4, ResetItems: 2}, nil
+	}, true
 }
 
 func (cacheStub) Prune(ctx context.Context) (cache.PruneResult, error) {
@@ -804,6 +811,12 @@ func TestWorkflowEndpoints(t *testing.T) {
 	router.ServeHTTP(nzbHealthRec, nzbHealthReq)
 	if nzbHealthRec.Code != http.StatusAccepted || !strings.Contains(nzbHealthRec.Body.String(), `"queued":true`) {
 		t.Fatalf("unexpected nzb health response %d %s", nzbHealthRec.Code, nzbHealthRec.Body.String())
+	}
+	busyRouter := Router(statusStub{}, queueSvc, workflowSvc, pub, maintenanceStub{running: true}, cacheSvc, subtitles, blocklist, probes, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	busyHealthRec := httptest.NewRecorder()
+	busyRouter.ServeHTTP(busyHealthRec, httptest.NewRequest(http.MethodPost, "/api/maintenance/nzb-health-check", nil))
+	if busyHealthRec.Code != http.StatusConflict || !strings.Contains(busyHealthRec.Body.String(), `"running":true`) {
+		t.Fatalf("unexpected busy nzb health response %d %s", busyHealthRec.Code, busyHealthRec.Body.String())
 	}
 
 	searchReq := httptest.NewRequest(http.MethodPost, "/api/library/42/search", nil)

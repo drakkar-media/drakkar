@@ -115,6 +115,27 @@ func TestListDeepHealthCandidatesUsesPublishedReleaseSource(t *testing.T) {
 		if c.VirtualFileID != vfOldID {
 			t.Fatalf("expected published virtual_file_id %d, got %d", vfOldID, c.VirtualFileID)
 		}
+		upperBound, err := db.DeepHealthSweepUpperBound(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if upperBound < libID {
+			t.Fatalf("sweep upper bound %d excludes library item %d", upperBound, libID)
+		}
+		page, err := db.ListDeepHealthCandidatesPage(ctx, libID-1, libID, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page) != 1 || page[0].LibraryItemID != libID {
+			t.Fatalf("unexpected keyset page: %+v", page)
+		}
+		nextPage, err := db.ListDeepHealthCandidatesPage(ctx, libID, libID, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(nextPage) != 0 {
+			t.Fatalf("exclusive cursor returned completed item: %+v", nextPage)
+		}
 		sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
 		return
 	}

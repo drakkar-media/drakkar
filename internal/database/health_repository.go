@@ -269,6 +269,34 @@ func (db *DB) RecordHealthStatus(ctx context.Context, publicationID int64, ok bo
 	return err
 }
 
+const deepHealthCandidatesQuery = `
+	SELECT DISTINCT ON (sp.library_item_id)
+	    sp.id AS publication_id,
+	    sp.library_item_id,
+	    sp.library_path,
+	    sp.target_path,
+	    sp.created_at,
+	    sp.last_checked_at,
+	    sp.health_ok,
+	    nd.id,
+	    li.title,
+	    EXISTS (
+	        SELECT 1
+	        FROM nzb_files nf
+	        WHERE nf.nzb_document_id = nd.id
+	          AND lower(nf.subject) LIKE '%.par2%'
+	    ) AS has_par2,
+	    vf.selected_release_id AS selected_release_id,
+	    sp.virtual_file_id
+	FROM symlink_publications sp
+	JOIN virtual_files vf ON vf.id = sp.virtual_file_id
+	JOIN library_items li ON li.id = sp.library_item_id
+	JOIN queue_items qi ON qi.library_item_id = sp.library_item_id
+	JOIN nzb_documents nd ON nd.selected_release_id = vf.selected_release_id
+	WHERE li.available = true
+	  AND qi.state IN ('available', 'degraded')
+	ORDER BY sp.library_item_id ASC, qi.id DESC`
+
 // ListDeepHealthCandidates returns publications eligible for deep (content-
 // level) health checking: one row per library item, taken from its most
 // recent queue item, restricted to items that are available and whose queue
@@ -282,37 +310,10 @@ func (db *DB) RecordHealthStatus(ctx context.Context, publicationID int64, ok bo
 //   - limit: maximum number of candidates to return; a non-positive value
 //     returns all eligible candidates.
 func (db *DB) ListDeepHealthCandidates(ctx context.Context, limit int) ([]DeepHealthCandidate, error) {
-	query := `
-		SELECT DISTINCT ON (sp.library_item_id)
-		    sp.id AS publication_id,
-		    sp.library_item_id,
-		    sp.library_path,
-		    sp.target_path,
-		    sp.created_at,
-		    sp.last_checked_at,
-		    sp.health_ok,
-		    nd.id,
-		    li.title,
-		    EXISTS (
-		        SELECT 1
-		        FROM nzb_files nf
-		        WHERE nf.nzb_document_id = nd.id
-		          AND lower(nf.subject) LIKE '%.par2%'
-		    ) AS has_par2,
-		    vf.selected_release_id AS selected_release_id,
-		    sp.virtual_file_id
-		FROM symlink_publications sp
-		JOIN virtual_files vf ON vf.id = sp.virtual_file_id
-		JOIN library_items li ON li.id = sp.library_item_id
-		JOIN queue_items qi ON qi.library_item_id = sp.library_item_id
-		JOIN nzb_documents nd ON nd.selected_release_id = vf.selected_release_id
-		WHERE li.available = true
-		  AND qi.state IN ('available', 'degraded')
-		ORDER BY sp.library_item_id ASC, qi.id DESC`
 	if limit > 0 {
-		query = `
+		query := `
 			SELECT *
-			FROM (` + query + `) candidates
+			FROM (` + deepHealthCandidatesQuery + `) candidates
 			ORDER BY last_checked_at ASC NULLS FIRST, created_at ASC, publication_id ASC
 			LIMIT $1`
 		rows, err := db.SQL.QueryContext(ctx, query, limit)
@@ -324,13 +325,51 @@ func (db *DB) ListDeepHealthCandidates(ctx context.Context, limit int) ([]DeepHe
 	}
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT *
-		FROM (`+query+`) candidates
+		FROM (`+deepHealthCandidatesQuery+`) candidates
 		ORDER BY last_checked_at ASC NULLS FIRST, created_at ASC, publication_id ASC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanDeepHealthCandidates(rows)
+}
+
+// ListDeepHealthCandidatesPage returns one stable keyset page for a full
+// library sweep. Library-item IDs are used instead of health timestamps because
+// checking a row changes its timestamp and would otherwise reorder later pages.
+// The inclusive upper bound freezes the sweep's population while new library
+// items continue to arrive.
+//
+// Parameters:
+//   - afterLibraryItemID: exclusive keyset cursor from the previous page.
+//   - throughLibraryItemID: inclusive snapshot upper bound for this sweep.
+//   - limit: maximum rows to return; a non-positive value returns an empty page.
+func (db *DB) ListDeepHealthCandidatesPage(ctx context.Context, afterLibraryItemID, throughLibraryItemID int64, limit int) ([]DeepHealthCandidate, error) {
+	if limit <= 0 {
+		return []DeepHealthCandidate{}, nil
+	}
+	rows, err := db.SQL.QueryContext(ctx, `
+		SELECT *
+		FROM (`+deepHealthCandidatesQuery+`) candidates
+		WHERE library_item_id > $1
+		  AND library_item_id <= $2
+		ORDER BY library_item_id ASC
+		LIMIT $3`, afterLibraryItemID, throughLibraryItemID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanDeepHealthCandidates(rows)
+}
+
+// DeepHealthSweepUpperBound returns a cheap, stable library-item ID ceiling for
+// a new deep-health sweep. It intentionally includes currently-ineligible items;
+// page queries filter eligibility, while the broad primary-key maximum avoids an
+// expensive duplicate of the candidate join merely to establish a snapshot.
+func (db *DB) DeepHealthSweepUpperBound(ctx context.Context) (int64, error) {
+	var upperBound int64
+	err := db.SQL.QueryRowContext(ctx, `select coalesce(max(id), 0) from library_items`).Scan(&upperBound)
+	return upperBound, err
 }
 
 // deepHealthScanner abstracts *sql.Rows so scanDeepHealthCandidates can be
