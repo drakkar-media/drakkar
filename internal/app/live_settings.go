@@ -504,6 +504,7 @@ func (c *liveSettingsController) ApplySettings(ctx context.Context, cfg config.S
 			MaximumSizeMB:     cfg.Indexer.MaximumSizeMB,
 			ReleaseGraceHours: cfg.Indexer.ReleaseGraceHours,
 		})
+		c.workflowSvc.SetSearchCacheTTL(time.Duration(cfg.NZBHydra2.SearchCacheTTLSeconds) * time.Second)
 	}
 	if c.workQueue != nil {
 		if err := c.workQueue.Resize(cfg.Indexer.BackgroundSearchWorkers); err != nil {

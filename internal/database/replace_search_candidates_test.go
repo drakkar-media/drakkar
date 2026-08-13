@@ -141,12 +141,10 @@ func TestReplaceSearchCandidatesUpgradeSearchPreservesWorkingReleaseWhenNothingB
 	}
 }
 
-// TestReplaceSearchCandidatesUpgradeSearchReplacesWhenGenuinelyBetterFound is
-// the other half: when a real replacement candidate IS selected, the old
-// release must actually be superseded (old selected_releases/virtual_files
-// gone, new selected_releases row in place) -- the fix must not leave stale
-// duplicate rows around.
-func TestReplaceSearchCandidatesUpgradeSearchReplacesWhenGenuinelyBetterFound(t *testing.T) {
+// TestReplaceSearchCandidatesUpgradeSearchStagesBetterCandidate keeps the
+// current published release active while a better upgrade candidate is fetched
+// and verified. The queue pointer must switch only after publication succeeds.
+func TestReplaceSearchCandidatesUpgradeSearchStagesBetterCandidate(t *testing.T) {
 	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
@@ -173,37 +171,57 @@ func TestReplaceSearchCandidatesUpgradeSearchReplacesWhenGenuinelyBetterFound(t 
 		t.Fatal("expected a new selection when a genuinely better candidate is found")
 	}
 	if *selectedReleaseID == oldSelectedReleaseID {
-		t.Fatalf("expected a NEW selected_releases id, got the old one (%d)", oldSelectedReleaseID)
+		t.Fatalf("expected a NEW staged selected_releases id, got the old one (%d)", oldSelectedReleaseID)
 	}
 
 	var oldStillExists bool
 	if err := sqlDB.QueryRowContext(ctx, `select exists(select 1 from selected_releases where id = $1)`, oldSelectedReleaseID).Scan(&oldStillExists); err != nil {
 		t.Fatal(err)
 	}
-	if oldStillExists {
-		t.Fatalf("expected the old selected_releases row %d to be gone once replaced", oldSelectedReleaseID)
+	if !oldStillExists {
+		t.Fatalf("expected the old selected_releases row %d to remain active while upgrade is staged", oldSelectedReleaseID)
 	}
 	var oldCandidateStillExists bool
 	if err := sqlDB.QueryRowContext(ctx, `select exists(select 1 from release_candidates where id = $1)`, oldReleaseCandidateID).Scan(&oldCandidateStillExists); err != nil {
 		t.Fatal(err)
 	}
-	if oldCandidateStillExists {
-		t.Fatalf("expected the old release_candidates row %d to be gone once replaced", oldReleaseCandidateID)
+	if !oldCandidateStillExists {
+		t.Fatalf("expected the old release_candidates row %d to remain until staged publish succeeds", oldReleaseCandidateID)
 	}
 	var oldVFStillExists bool
 	if err := sqlDB.QueryRowContext(ctx, `select exists(select 1 from virtual_files where id = $1)`, oldVirtualFileID).Scan(&oldVFStillExists); err != nil {
 		t.Fatal(err)
 	}
-	if oldVFStillExists {
-		t.Fatalf("expected the old virtual_files row %d to cascade-delete once replaced", oldVirtualFileID)
+	if !oldVFStillExists {
+		t.Fatalf("expected the old virtual_files row %d to remain publishable while upgrade is staged", oldVirtualFileID)
 	}
 
 	var state string
-	if err := sqlDB.QueryRowContext(ctx, `select state from queue_items where library_item_id = $1`, libID).Scan(&state); err != nil {
+	var available bool
+	var qSelectedReleaseID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		select q.state, li.available, q.selected_release_id
+		from queue_items q
+		join library_items li on li.id = q.library_item_id
+		where q.library_item_id = $1`, libID).Scan(&state, &available, &qSelectedReleaseID); err != nil {
 		t.Fatal(err)
 	}
-	if state != string(QueueSelected) {
-		t.Fatalf("expected queue_items state 'selected' after a genuine replacement, got %q", state)
+	if state != string(QueueAvailable) {
+		t.Fatalf("expected queue_items state to remain 'available' while upgrade is staged, got %q", state)
+	}
+	if !available {
+		t.Fatal("expected library item to remain available while upgrade is staged")
+	}
+	if qSelectedReleaseID != oldSelectedReleaseID {
+		t.Fatalf("expected queue_items.selected_release_id to remain on old release %d until publish succeeds, got %d", oldSelectedReleaseID, qSelectedReleaseID)
+	}
+
+	staged, err := db.GetSelectedReleaseSummary(ctx, *selectedReleaseID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !staged.StagedUpgrade {
+		t.Fatal("expected the replacement selected release to be marked as a staged upgrade")
 	}
 }
 
@@ -443,5 +461,76 @@ func TestReplaceSearchCandidatesRejectsCandidateNotBeatingFreshExistingScore(t *
 	}
 	if !qSelectedReleaseID.Valid || qSelectedReleaseID.Int64 != activeSelectedReleaseID {
 		t.Fatalf("expected the concurrently-installed better release %d to survive untouched, got %+v", activeSelectedReleaseID, qSelectedReleaseID)
+	}
+}
+
+func TestFailSelectedReleaseKeepsCurrentReleaseWhenStagedUpgradeFails(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	libID, activeSelectedReleaseID, _, activeVirtualFileID := setupWorkingLibraryItem(t, ctx, sqlDB, "upgrade-staged-fails")
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+
+	var stagedCandidateID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, score, selected, external_url)
+		values ($1, 'Broken 2160p Upgrade', 900, true, 'https://example.invalid/broken.nzb')
+		returning id`, libID,
+	).Scan(&stagedCandidateID); err != nil {
+		t.Fatal(err)
+	}
+	var stagedSelectedReleaseID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, libID, stagedCandidateID,
+	).Scan(&stagedSelectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+
+	next, err := db.FailSelectedReleaseAndPromoteNext(ctx, stagedSelectedReleaseID, "early preflight: article missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != nil {
+		t.Fatalf("expected staged upgrade failure not to promote over the active release, got %+v", next)
+	}
+
+	var state string
+	var qSelectedReleaseID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		select state, selected_release_id
+		from queue_items
+		where library_item_id = $1`, libID,
+	).Scan(&state, &qSelectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(QueueAvailable) || qSelectedReleaseID != activeSelectedReleaseID {
+		t.Fatalf("expected active release %d to remain available, got state=%q selected=%d", activeSelectedReleaseID, state, qSelectedReleaseID)
+	}
+
+	var activeVFStillExists bool
+	if err := sqlDB.QueryRowContext(ctx, `select exists(select 1 from virtual_files where id = $1)`, activeVirtualFileID).Scan(&activeVFStillExists); err != nil {
+		t.Fatal(err)
+	}
+	if !activeVFStillExists {
+		t.Fatalf("expected active virtual file %d to survive failed staged upgrade", activeVirtualFileID)
+	}
+
+	var stagedStillExists bool
+	if err := sqlDB.QueryRowContext(ctx, `select exists(select 1 from selected_releases where id = $1)`, stagedSelectedReleaseID).Scan(&stagedStillExists); err != nil {
+		t.Fatal(err)
+	}
+	if stagedStillExists {
+		t.Fatalf("expected failed staged selected release %d to be removed", stagedSelectedReleaseID)
 	}
 }

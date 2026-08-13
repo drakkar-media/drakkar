@@ -238,6 +238,7 @@ type Service struct {
 	recentURLHits     map[string]time.Time
 	searchAttemptMu   sync.Mutex
 	searchAttempts    map[string]searchAttemptRecord
+	searchCooldown    time.Duration
 
 	// TTL caches for policy data, guarded by profileCacheMu (O-04).
 	// These are loaded from the DB at most once per 5 minutes.
@@ -442,16 +443,16 @@ const (
 	// deferring the rest to the next queue pass; busyQueueDepthThreshold is
 	// the backlog size past which the shallower "busy" depth applies instead
 	// of the default. See maxInlineFallbackDepth.
-	defaultInlineFallbackDepth  = 3
-	busyInlineFallbackDepth     = 1
-	fastLaneInlineFallbackDepth = 3
-	busyQueueDepthThreshold     = 150
-	selectedURLCooldown         = 30 * time.Minute
-	searchRequestCooldown       = 20 * time.Minute
-	asyncCalibrateBudget        = 2 * time.Minute
-	asyncCalibrateWorkers       = 2
-	tmdbEnrichWorkers           = 5
-	requestEnrichmentBudget     = 10 * time.Minute
+	defaultInlineFallbackDepth   = 3
+	busyInlineFallbackDepth      = 1
+	fastLaneInlineFallbackDepth  = 3
+	busyQueueDepthThreshold      = 150
+	selectedURLCooldown          = 30 * time.Minute
+	defaultSearchRequestCooldown = 20 * time.Minute
+	asyncCalibrateBudget         = 2 * time.Minute
+	asyncCalibrateWorkers        = 2
+	tmdbEnrichWorkers            = 5
+	requestEnrichmentBudget      = 10 * time.Minute
 	// maxCandidateFailuresBeforeGiveUp bounds how many real NZB fetch
 	// attempts a single release_candidate gets before it's force-blocklisted
 	// as "too_many_failures", regardless of whether its specific failure
@@ -684,6 +685,7 @@ func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service 
 		backgroundCancel:   backgroundCancel,
 		recentURLHits:      make(map[string]time.Time),
 		searchAttempts:     make(map[string]searchAttemptRecord),
+		searchCooldown:     defaultSearchRequestCooldown,
 	}
 }
 
@@ -775,6 +777,26 @@ func (s *Service) DispatchWakeCh() <-chan struct{} {
 // candidate ranking.
 func (s *Service) SetIndexerLimits(limits IndexerLimits) {
 	s.indexerLimits = limits
+}
+
+// SetSearchCacheTTL configures the workflow's same-request search dedupe so it
+// never suppresses a Hydra search after the Hydra result cache has expired.
+func (s *Service) SetSearchCacheTTL(ttl time.Duration) {
+	if s == nil {
+		return
+	}
+	cooldown := defaultSearchRequestCooldown
+	if ttl <= 0 {
+		cooldown = 0
+	} else if ttl < cooldown {
+		cooldown = ttl
+	}
+	s.searchAttemptMu.Lock()
+	if s.searchCooldown != cooldown {
+		s.searchAttempts = make(map[string]searchAttemptRecord)
+	}
+	s.searchCooldown = cooldown
+	s.searchAttemptMu.Unlock()
 }
 
 // SetNZBFetcher overrides the default (unrouted) fetcher -- used to inject
@@ -2135,8 +2157,13 @@ func (s *Service) shouldSkipSearchRequest(ctx context.Context, libraryItemID int
 	key := searchRequestFingerprint(libraryItemID, request)
 	s.searchAttemptMu.Lock()
 	defer s.searchAttemptMu.Unlock()
+	cooldown := s.searchCooldown
+	if cooldown <= 0 {
+		clear(s.searchAttempts)
+		return false
+	}
 	for attemptKey, record := range s.searchAttempts {
-		if now.Sub(record.at) >= searchRequestCooldown {
+		if now.Sub(record.at) >= cooldown {
 			delete(s.searchAttempts, attemptKey)
 		}
 	}
@@ -2146,15 +2173,15 @@ func (s *Service) shouldSkipSearchRequest(ctx context.Context, libraryItemID int
 	}
 	switch record.outcome {
 	case "selected", "usable", "rejected_only", "empty":
-		return now.Sub(record.at) < searchRequestCooldown
+		return now.Sub(record.at) < cooldown
 	default:
 		return false
 	}
 }
 
 // rememberSearchRequest records the outcome of a completed search under its
-// fingerprint so a later shouldSkipSearchRequest call within
-// searchRequestCooldown can short-circuit an identical request.
+// fingerprint so a later shouldSkipSearchRequest call within the configured
+// workflow cooldown can short-circuit an identical request.
 func (s *Service) rememberSearchRequest(libraryItemID int64, request hydra.SearchRequest, outcome string, now time.Time) {
 	if s == nil {
 		return
@@ -3340,12 +3367,14 @@ func (s *Service) fetchIndexAndRelease(ctx context.Context, selectedReleaseID in
 	if item.NZBDocumentID != nil {
 		s.calibrateImportedDocumentBestEffort(*item.NZBDocumentID)
 	}
-	if err := s.repo.SetImportedNZBIndexed(ctx, item.QueueItemID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil, nil
+	if !item.StagedUpgrade {
+		if err := s.repo.SetImportedNZBIndexed(ctx, item.QueueItemID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, nil, nil
+			}
+			result, err := s.promoteNextAfterFailure(ctx, current, err.Error())
+			return result, nil, err
 		}
-		result, err := s.promoteNextAfterFailure(ctx, current, err.Error())
-		return result, nil, err
 	}
 	item.State = database.QueuePreflight
 	if s.preflightChecker != nil {
@@ -3489,7 +3518,7 @@ func (s *Service) publishImportedRelease(ctx context.Context, p pendingPublish) 
 	if err == nil && updated.VirtualFileCount == 0 {
 		return s.promoteNextAfterFailure(ctx, p.current, zeroVirtualFilesReason(updated.ArchiveRejects))
 	}
-	if p.item.QueueItemID > 0 {
+	if p.item.QueueItemID > 0 && !p.item.StagedUpgrade {
 		if publisher, ok := s.repo.(interface {
 			MarkQueueItemPublishing(context.Context, int64) error
 		}); ok {
@@ -4305,11 +4334,13 @@ func (s *Service) importSelectedRelease(ctx context.Context, current database.Re
 	if item.NZBDocumentID != nil {
 		s.calibrateImportedDocumentBestEffort(*item.NZBDocumentID)
 	}
-	if err := s.repo.SetImportedNZBIndexed(ctx, item.QueueItemID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+	if !item.StagedUpgrade {
+		if err := s.repo.SetImportedNZBIndexed(ctx, item.QueueItemID); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, nil
+			}
+			return s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
 		}
-		return s.promoteNextAfterFailureDepth(ctx, current, err.Error(), depth)
 	}
 	item.State = database.QueuePreflight
 	// Preflight: verify first segments are reachable on NNTP before publishing --
@@ -6039,7 +6070,8 @@ func (s *Service) PrioritizeTVShowMissing(ctx context.Context, tvShowID int64) (
 	}
 	if s.WorkQueue != nil {
 		for id := range queuedSet {
-			s.WorkQueue.Push(ctx, id, 10)
+			_ = s.WorkQueue.Remove(ctx, id)
+			s.WorkQueue.Push(ctx, id, 0)
 			result.Queued++
 		}
 		return result, nil

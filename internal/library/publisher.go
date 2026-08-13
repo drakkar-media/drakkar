@@ -151,6 +151,10 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 		}
 		libraryItemIDs[file.LibraryItemID] = struct{}{}
 	}
+	metrics.M.PublishedVirtualFiles.Add(int64(len(files)))
+	if err := p.repo.MarkReleaseAvailable(ctx, selectedReleaseID); err != nil {
+		return err
+	}
 	// Only call the post-publish hook (subtitle search/publish) for new publications.
 	// During startup RebuildPublications, subtitles are already in place.
 	// A targeted repair republish (notifyMediaServers) skips subtitle search
@@ -169,10 +173,6 @@ func (p *Publisher) publishSelectedRelease(ctx context.Context, selectedReleaseI
 				return err
 			}
 		}
-	}
-	metrics.M.PublishedVirtualFiles.Add(int64(len(files)))
-	if err := p.repo.MarkReleaseAvailable(ctx, selectedReleaseID); err != nil {
-		return err
 	}
 	// For season packs: fulfil any other episode library items that are covered
 	// by virtual files in this release but were searched as separate items.

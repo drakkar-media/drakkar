@@ -612,6 +612,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		MaximumSizeMB:     cfg.Indexer.MaximumSizeMB,
 		ReleaseGraceHours: cfg.Indexer.ReleaseGraceHours,
 	})
+	workflowSvc.SetSearchCacheTTL(time.Duration(cfg.NZBHydra2.SearchCacheTTLSeconds) * time.Second)
 	// Always construct TMDB/TVDB clients (even with an empty key at startup)
 	// -- Client.Enabled() already gates real usage on a non-empty key, and
 	// SetConfig lets a key added later via Settings take effect live instead

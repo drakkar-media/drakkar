@@ -19,7 +19,7 @@ func newWorkQueueStub() *workQueueStub {
 func (s *workQueueStub) Push(_ context.Context, libraryItemID int64, priority int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.items[libraryItemID]; !ok || priority > existing {
+	if existing, ok := s.items[libraryItemID]; !ok || priority < existing {
 		s.items[libraryItemID] = priority
 	}
 }

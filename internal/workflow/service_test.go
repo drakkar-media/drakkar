@@ -4148,6 +4148,36 @@ func TestFillMissingEpisodesQueuesRecentlyAiredNewItems(t *testing.T) {
 	}
 }
 
+func TestPrioritizeTVShowMissingRequeuesAtFastLanePriority(t *testing.T) {
+	repo := &repoStub{
+		missingShows: []database.ShowWithMissingEpisodes{{
+			TVShowID:  99,
+			TMDBID:    9876,
+			ShowTitle: "Priority Show",
+		}},
+		batchCreatedIDs: []int64{701, 702},
+	}
+	queue := newWorkQueueStub()
+	queue.Push(context.Background(), 701, 10)
+
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	service.SetTMDBClient(tmdbFillMissingStub{})
+	service.WorkQueue = queue
+
+	result, err := service.PrioritizeTVShowMissing(context.Background(), 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Queued != 2 {
+		t.Fatalf("queued = %d, want 2", result.Queued)
+	}
+	for _, id := range []int64{701, 702} {
+		if got := queue.items[id]; got != 0 {
+			t.Fatalf("library item %d priority = %d, want fast-lane priority 0", id, got)
+		}
+	}
+}
+
 type fetchResult struct {
 	fileName string
 	raw      []byte
@@ -4265,6 +4295,33 @@ func TestForceSearchBypassesDedupCooldown(t *testing.T) {
 	}
 	if service.shouldSkipSearchRequest(WithForceSearch(context.Background()), 1, req, now) {
 		t.Fatal("WithForceSearch should bypass the dedup cooldown for manual search callers")
+	}
+}
+
+func TestSearchRequestDedupExpiresWithConfiguredSearchCacheTTL(t *testing.T) {
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
+	service.SetSearchCacheTTL(5 * time.Minute)
+	req := hydraSearchRequestForTest()
+	now := time.Now()
+
+	service.rememberSearchRequest(1, req, "empty", now)
+	if !service.shouldSkipSearchRequest(context.Background(), 1, req, now.Add(4*time.Minute)) {
+		t.Fatal("identical automated request inside configured cache TTL should be skipped")
+	}
+	if service.shouldSkipSearchRequest(context.Background(), 1, req, now.Add(5*time.Minute)) {
+		t.Fatal("identical automated request at configured cache TTL expiry should refresh")
+	}
+}
+
+func TestSearchRequestDedupDisabledWhenSearchCacheDisabled(t *testing.T) {
+	service := NewService(&repoStub{}, seerrStub{}, hydraStub{})
+	service.SetSearchCacheTTL(0)
+	req := hydraSearchRequestForTest()
+	now := time.Now()
+
+	service.rememberSearchRequest(1, req, "empty", now)
+	if service.shouldSkipSearchRequest(context.Background(), 1, req, now) {
+		t.Fatal("search dedupe should not skip when Hydra search cache TTL is disabled")
 	}
 }
 

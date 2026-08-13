@@ -289,6 +289,64 @@ func TestMarkReleaseAvailableClearsFailureReasonAndMarksAvailable(t *testing.T) 
 	}
 }
 
+func TestMarkReleaseAvailableActivatesStagedUpgrade(t *testing.T) {
+	db, sqlDB, ctx := openPublicationTestDB(t)
+
+	libID, oldSRID := pubTestFixture(t, ctx, sqlDB, "pub-staged-upgrade", "available", true)
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+
+	var newRCID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, score, selected)
+		values ($1, 'staged 2160p upgrade', 900, true)
+		returning id`, libID,
+	).Scan(&newRCID); err != nil {
+		t.Fatal(err)
+	}
+	var newSRID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, libID, newRCID,
+	).Scan(&newSRID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, reader_kind)
+		values ($1, '/staged/upgrade.mkv', 'upgrade.mkv', 'archive')`, newSRID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.MarkReleaseAvailable(ctx, newSRID); err != nil {
+		t.Fatal(err)
+	}
+
+	var qSelectedReleaseID int64
+	var state string
+	if err := sqlDB.QueryRowContext(ctx, `
+		select state, selected_release_id
+		from queue_items
+		where library_item_id = $1`, libID,
+	).Scan(&state, &qSelectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(QueueAvailable) {
+		t.Fatalf("state = %q, want %q", state, QueueAvailable)
+	}
+	if qSelectedReleaseID != newSRID {
+		t.Fatalf("selected_release_id = %d, want staged upgrade %d", qSelectedReleaseID, newSRID)
+	}
+
+	var oldStillExists bool
+	if err := sqlDB.QueryRowContext(ctx, `select exists(select 1 from selected_releases where id = $1)`, oldSRID).Scan(&oldStillExists); err != nil {
+		t.Fatal(err)
+	}
+	if oldStillExists {
+		t.Fatalf("expected old selected release %d to be pruned after staged upgrade publish", oldSRID)
+	}
+}
+
 func TestSymlinkPublicationCRUD(t *testing.T) {
 	db, sqlDB, ctx := openPublicationTestDB(t)
 

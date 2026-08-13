@@ -1663,6 +1663,7 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 	// against the row actually locked here, at commit time, independent of
 	// whatever the caller believed earlier.
 	requireBeatExisting := upgradeSearch && hasExisting
+	stageUpgradeSelection := upgradeSearch && hasExisting
 
 	if _, err = tx.ExecContext(ctx, `
 		update queue_items
@@ -1749,13 +1750,13 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 		}
 		if shouldSelect {
 			if hasExisting {
-				// A genuinely-better candidate was found: only now tear down
-				// the preserved old selection (cascades to
-				// virtual_files/symlink_publications) to make way for it.
-				if _, err = tx.ExecContext(ctx, `delete from selected_releases where id = $1`, existingSelectedReleaseID); err != nil {
-					return nil, err
-				}
-				if _, err = tx.ExecContext(ctx, `delete from release_candidates where id = $1`, existingReleaseCandidateID); err != nil {
+				// Upgrade candidates are staged beside the current working
+				// release. The active queue pointer is switched only after
+				// fetch/import/preflight and symlink publication succeed.
+				if _, err = tx.ExecContext(ctx, `
+						update release_candidates
+						set selected = false
+						where id = $1`, existingReleaseCandidateID); err != nil {
 					return nil, err
 				}
 				hasExisting = false
@@ -1781,11 +1782,26 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 	}
 
 	if selectedReleaseID != nil {
-		if _, err = tx.ExecContext(ctx, `
-			update queue_items
-			set state = $2, selected_release_id = $3, updated_at = now(), consecutive_failure_searches = 0
-			where library_item_id = $1`, libraryItemID, QueueSelected, *selectedReleaseID); err != nil {
-			return nil, err
+		if stageUpgradeSelection {
+			if _, err = tx.ExecContext(ctx, `
+				update queue_items
+				set failure_reason = '', updated_at = now(), consecutive_failure_searches = 0
+				where library_item_id = $1`, libraryItemID); err != nil {
+				return nil, err
+			}
+		} else {
+			if _, err = tx.ExecContext(ctx, `
+				update queue_items
+				set state = $2, selected_release_id = $3, updated_at = now(), consecutive_failure_searches = 0
+				where library_item_id = $1`, libraryItemID, QueueSelected, *selectedReleaseID); err != nil {
+				return nil, err
+			}
+			if _, err = tx.ExecContext(ctx, `
+				update library_items
+				set available = false
+				where id = $1`, libraryItemID); err != nil {
+				return nil, err
+			}
 		}
 	} else if hasExisting {
 		// Upgrade search found nothing genuinely better -- the existing
@@ -2095,10 +2111,15 @@ func (db *DB) GetSelectedReleaseSummary(ctx context.Context, selectedReleaseID i
 			coalesce((select count(*) from archive_volumes av join archives a on a.id = av.archive_id where a.selected_release_id = sr.id), 0),
 			coalesce((select string_agg(distinct a.status, ',' order by a.status) from archives a where a.selected_release_id = sr.id), ''),
 			coalesce((select string_agg(distinct a.reject_reason, ',' order by a.reject_reason) from archives a where a.selected_release_id = sr.id and a.reject_reason <> ''), ''),
-			coalesce((select count(*) from virtual_files vf where vf.selected_release_id = sr.id), 0),
-			rc.created_at,
-			n.id,
-			coalesce(n.file_name, '')
+				coalesce((select count(*) from virtual_files vf where vf.selected_release_id = sr.id), 0),
+				rc.created_at,
+				n.id,
+				coalesce(n.file_name, ''),
+				not exists (
+					select 1 from queue_items q
+					where q.library_item_id = sr.library_item_id
+					  and q.selected_release_id = sr.id
+				)
 		from selected_releases sr
 		join release_candidates rc on rc.id = sr.release_candidate_id
 		left join nzb_documents n on n.selected_release_id = sr.id
@@ -2129,6 +2150,7 @@ func (db *DB) GetSelectedReleaseSummary(ctx context.Context, selectedReleaseID i
 		&item.CreatedAt,
 		&nzbDocument,
 		&item.NZBFileName,
+		&item.StagedUpgrade,
 	)
 	if err != nil {
 		return ReleaseSummary{}, err
@@ -2880,8 +2902,8 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		return nil, fmt.Errorf("fail/lock-queue-item (li=%d): %w", libraryItemID, err)
 	}
 
-	// Re-verify this selected_releases row is still the library item's
-	// current selection now that we hold the row lock. The pre-lock read
+	// Re-verify this selected_releases row still exists and whether it is the
+	// library item's current selection now that we hold the row lock. The pre-lock read
 	// above (capturing releaseCandidateID/externalURL) ran before we had
 	// exclusive access to this item's selection state, so a concurrent
 	// caller racing on the same originally-selected release (e.g. a manual
@@ -2892,15 +2914,16 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 	// winner may have already picked, reproducing the duplicate
 	// selected_releases-row defect fixed in c4ead9f via a call-site pair
 	// that fix's lock ordering alone doesn't cover.
-	var stillCurrent bool
+	var stillExists, activeSelection bool
 	if err = tx.QueryRowContext(ctx, `
-		select exists(
-			select 1 from selected_releases where id = $1 and library_item_id = $2
-		)`, selectedReleaseID, libraryItemID,
-	).Scan(&stillCurrent); err != nil {
+		select
+			exists(select 1 from selected_releases where id = $1 and library_item_id = $2),
+			exists(select 1 from queue_items where library_item_id = $2 and selected_release_id = $1)`,
+		selectedReleaseID, libraryItemID,
+	).Scan(&stillExists, &activeSelection); err != nil {
 		return nil, fmt.Errorf("fail/recheck-sr (sr=%d): %w", selectedReleaseID, err)
 	}
-	if !stillCurrent {
+	if !stillExists {
 		// Concurrent transaction already superseded this selection while
 		// we were waiting on the lock -- nothing left to fail.
 		return nil, tx.Rollback()
@@ -2972,6 +2995,13 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		where id = $1`, selectedReleaseID,
 	); err != nil {
 		return nil, fmt.Errorf("fail/delete-sr (sr=%d): %w", selectedReleaseID, err)
+	}
+	if !activeSelection {
+		if err = tx.Commit(); err != nil {
+			return nil, fmt.Errorf("fail/commit-staged (li=%d): %w", libraryItemID, err)
+		}
+		db.flushBlocklistKeys(pendingBlocklistKeys, reason, pendingBlocklistTTL)
+		return nil, nil
 	}
 
 	// Buffer candidate metadata, close its rows, then look up only the derived

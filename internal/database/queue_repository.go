@@ -499,11 +499,13 @@ func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID in
 
 	var snapshot QueueSnapshot
 	err = tx.QueryRowContext(ctx, `
-		select q.id, q.library_item_id, l.title, q.idempotency_key, q.created_at
-		from queue_items q
+		select q.id, q.library_item_id, l.title, q.idempotency_key, q.created_at,
+		       q.selected_release_id is distinct from sr.id
+		from selected_releases sr
+		join queue_items q on q.library_item_id = sr.library_item_id
 		join library_items l on l.id = q.library_item_id
-		where q.selected_release_id = $1`, selectedReleaseID,
-	).Scan(&snapshot.QueueItemID, &snapshot.LibraryItemID, &snapshot.LibraryTitle, &snapshot.IdempotencyKey, &snapshot.CreatedAt)
+		where sr.id = $1`, selectedReleaseID,
+	).Scan(&snapshot.QueueItemID, &snapshot.LibraryItemID, &snapshot.LibraryTitle, &snapshot.IdempotencyKey, &snapshot.CreatedAt, &snapshot.StagedUpgrade)
 	if err != nil {
 		return QueueSnapshot{}, err
 	}
@@ -544,13 +546,21 @@ func (db *DB) ImportSelectedReleaseNZB(ctx context.Context, selectedReleaseID in
 		return QueueSnapshot{}, err
 	}
 
-	if err = tx.QueryRowContext(ctx, `
-		update queue_items
-		set state = $2, failure_reason = '', updated_at = now()
-		where id = $1
-		returning updated_at`, snapshot.QueueItemID, QueueIndexing,
-	).Scan(&snapshot.UpdatedAt); err != nil {
-		return QueueSnapshot{}, err
+	if snapshot.StagedUpgrade {
+		if err = tx.QueryRowContext(ctx, `
+			select updated_at from queue_items where id = $1`, snapshot.QueueItemID,
+		).Scan(&snapshot.UpdatedAt); err != nil {
+			return QueueSnapshot{}, err
+		}
+	} else {
+		if err = tx.QueryRowContext(ctx, `
+			update queue_items
+			set state = $2, failure_reason = '', updated_at = now()
+			where id = $1
+			returning updated_at`, snapshot.QueueItemID, QueueIndexing,
+		).Scan(&snapshot.UpdatedAt); err != nil {
+			return QueueSnapshot{}, err
+		}
 	}
 
 	snapshot.State = QueueIndexing

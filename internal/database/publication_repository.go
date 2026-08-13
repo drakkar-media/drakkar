@@ -106,29 +106,60 @@ func (db *DB) UpsertSymlinkPublication(ctx context.Context, libraryItemID, virtu
 	return err
 }
 
-// MarkReleaseAvailable marks the queue item and its library item available
-// for the given selected release.
+// MarkReleaseAvailable makes selectedReleaseID the active published release for
+// its library item and marks the item available.
+//
+// A staged upgrade is deliberately not pointed at by queue_items until after
+// symlink publication succeeds. This method is the commit point that switches
+// the queue pointer from the previous working release to the verified upgrade.
 func (db *DB) MarkReleaseAvailable(ctx context.Context, selectedReleaseID int64) error {
+	tx, err := db.SQL.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var libraryItemID int64
+	if err = tx.QueryRowContext(ctx, `
+		select library_item_id
+		from selected_releases
+		where id = $1`, selectedReleaseID,
+	).Scan(&libraryItemID); err != nil {
+		return err
+	}
+	if err = lockLibraryItemQueueRow(ctx, tx, libraryItemID); err != nil {
+		return err
+	}
 	// Clear failure_reason too: without this, an item that failed on an
 	// earlier candidate and later succeeded on a different one keeps
 	// showing that old error on the frontend indefinitely, even though the
 	// item is fine — it just looks like something is still broken.
-	_, err := db.SQL.ExecContext(ctx, `
+	if _, err = tx.ExecContext(ctx, `
 		update queue_items
-		set state = $2, failure_reason = '', updated_at = now()
-		where selected_release_id = $1`, selectedReleaseID, QueueAvailable,
-	)
-	if err != nil {
+		set state = $2, failure_reason = '', selected_release_id = $1, updated_at = now()
+		where library_item_id = $3`, selectedReleaseID, QueueAvailable, libraryItemID,
+	); err != nil {
 		return err
 	}
-	_, err = db.SQL.ExecContext(ctx, `
+	if _, err = tx.ExecContext(ctx, `
 		update library_items
 		set available = true
-		where id in (
-			select library_item_id from selected_releases where id = $1
-		)`, selectedReleaseID,
-	)
-	return err
+		where id = $1`, libraryItemID,
+	); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `
+		delete from selected_releases
+		where library_item_id = $1
+		  and id <> $2`, libraryItemID, selectedReleaseID,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ListCompletedSymlinkEntries returns every symlink_publications row, with

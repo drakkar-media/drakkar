@@ -47,6 +47,7 @@ type QueueSnapshot struct {
 	DispatchBackoffUntil *time.Time `json:"dispatchBackoffUntil,omitempty"`
 	CreatedAt            time.Time  `json:"createdAt"`
 	UpdatedAt            time.Time  `json:"updatedAt"`
+	StagedUpgrade        bool       `json:"-"`
 }
 
 // ImportedNZB holds the fully parsed contents of a manually-imported NZB --
@@ -257,6 +258,7 @@ type ReleaseSummary struct {
 	CreatedAt             time.Time               `json:"createdAt"`
 	NZBDocumentID         *int64                  `json:"nzbDocumentId,omitempty"`
 	NZBFileName           string                  `json:"nzbFileName,omitempty"`
+	StagedUpgrade         bool                    `json:"-"`
 }
 
 // FailedReleaseAttempt records one past failure of a release candidate, kept
