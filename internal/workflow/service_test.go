@@ -535,6 +535,25 @@ func (s seerrStub) CreateTVSeasonRequestNoWait(_ context.Context, _ int64, _ []i
 }
 func (s seerrStub) PartialTVItems(_ context.Context) ([]seerr.PartialTVItem, error) { return nil, nil }
 
+type blockingSeerrStub struct {
+	seerrStub
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
+	calls     atomic.Int32
+}
+
+func (s *blockingSeerrStub) PendingRequests(ctx context.Context) ([]seerr.Request, error) {
+	s.calls.Add(1)
+	s.startOnce.Do(func() { close(s.started) })
+	select {
+	case <-s.release:
+		return s.requests, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 type seasonRequestSeerrStub struct {
 	seerrStub
 	seasonRequestID int64
@@ -730,6 +749,66 @@ func TestSyncRequests(t *testing.T) {
 	}
 	if episodeMeta.tmdbID != 84958 || episodeMeta.show != "Loki" || episodeMeta.imdbID != "tt9140554" {
 		t.Fatalf("unexpected episode metadata %+v", episodeMeta)
+	}
+}
+
+func TestSyncRequestsCoalescesOverlappingCalls(t *testing.T) {
+	repo := &repoStub{existingRequests: true}
+	client := &blockingSeerrStub{
+		seerrStub: seerrStub{requests: []seerr.Request{
+			{ID: 91, Type: "movie", MediaTitle: "Shared Sync", MediaYear: 2026, TMDBID: 910091},
+		}},
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	service := NewService(repo, client, hydraStub{})
+
+	type syncOutcome struct {
+		result SyncResult
+		err    error
+	}
+	ownerDone := make(chan syncOutcome, 1)
+	go func() {
+		result, err := service.SyncRequests(context.Background())
+		ownerDone <- syncOutcome{result: result, err: err}
+	}()
+
+	select {
+	case <-client.started:
+	case <-time.After(time.Second):
+		t.Fatal("initial request sync did not start")
+	}
+
+	waiterCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := service.SyncRequests(waiterCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("overlapping caller error = %v, want context deadline exceeded", err)
+	}
+	if calls := client.calls.Load(); calls != 1 {
+		t.Fatalf("overlapping caller started %d Seerr fetches, want 1", calls)
+	}
+
+	close(client.release)
+	select {
+	case outcome := <-ownerDone:
+		if outcome.err != nil {
+			t.Fatalf("initial request sync: %v", outcome.err)
+		}
+		if outcome.result.Seen != 1 || outcome.result.Created != 0 {
+			t.Fatalf("unexpected initial sync result: %+v", outcome.result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial request sync did not finish")
+	}
+	if repo.movieCalls != 1 {
+		t.Fatalf("overlapping sync performed %d movie upserts, want 1", repo.movieCalls)
+	}
+
+	if _, err := service.SyncRequests(context.Background()); err != nil {
+		t.Fatalf("sync after completed flight: %v", err)
+	}
+	if calls := client.calls.Load(); calls != 2 {
+		t.Fatalf("completed flight was not cleared: Seerr fetches = %d, want 2", calls)
 	}
 }
 

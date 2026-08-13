@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -15,13 +15,14 @@ import (
 	"github.com/drakkar-media/drakkar/internal/ranking"
 )
 
-// blocklistCache is a short-lived in-process cache for loadBlocklistMap (O-10).
-// The blocklist is read on every search but rarely changes; a 30-second TTL
-// avoids full table scans per candidate batch while keeping data fresh.
 var (
-	blocklistCacheMu  sync.Mutex
-	blocklistCached   map[string]string
-	blocklistCachedAt time.Time
+	pgTextArrayEscaper      = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+	ambiguityWordSeparators = strings.NewReplacer(
+		".", " ", "_", " ", "-", " ", ":", " ", ";", " ", ",", " ", "'", "",
+	)
+	releaseTitleSeparators = strings.NewReplacer(
+		".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ", "{", " ", "}", " ",
+	)
 )
 
 // preDeleteVFRBySelectedRelease was a bulk pre-delete of virtual_file_ranges rows
@@ -46,7 +47,7 @@ func pgTextArray(vals []string) string {
 	parts := make([]string, len(vals))
 	for i, v := range vals {
 		// Escape double-quotes and backslashes inside array elements.
-		escaped := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(v)
+		escaped := pgTextArrayEscaper.Replace(v)
 		parts[i] = `"` + escaped + `"`
 	}
 	return "{" + strings.Join(parts, ",") + "}"
@@ -151,6 +152,28 @@ func (db *DB) DetectMovieSearchConflict(ctx context.Context, libraryItemID int64
 	return strings.TrimSpace(reason), nil
 }
 
+// lockSeerrRequestUpsert serializes request and media identity reconciliation
+// across processes. Sorting every key prevents deadlocks when requests share
+// only one provider identity, such as TVDB/TMDB aliases for the same show.
+func lockSeerrRequestUpsert(ctx context.Context, tx *sql.Tx, keys ...string) error {
+	sort.Strings(keys)
+	uniqueKeys := keys[:0]
+	for _, key := range keys {
+		if key == "" || (len(uniqueKeys) > 0 && key == uniqueKeys[len(uniqueKeys)-1]) {
+			continue
+		}
+		uniqueKeys = append(uniqueKeys, key)
+	}
+	if len(uniqueKeys) == 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `
+		select pg_advisory_xact_lock(hashtextextended(lock_key, 0))
+		from unnest($1::text[]) as lock_keys(lock_key)
+		order by lock_key`, pgTextArray(uniqueKeys))
+	return err
+}
+
 // UpsertMovieRequest idempotently records an incoming Seerr movie request:
 // finds or creates the movies/library_items rows for tmdbID and a
 // media_requests row keyed by externalID, then (re)queues the item for
@@ -161,77 +184,91 @@ func (db *DB) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID 
 	if err != nil {
 		return 0, false, err
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
+	defer tx.Rollback()
+
+	lockKeys := []string{"seerr-request:movie:" + externalID}
+	if tmdbID > 0 {
+		lockKeys = append(lockKeys, fmt.Sprintf("seerr-movie:tmdb:%d", tmdbID))
+	}
 
 	var requestID int64
-	err = tx.QueryRowContext(ctx, `select id from media_requests where external_id = $1 and request_type = 'movie'`, externalID).Scan(&requestID)
-	requestExists := err == nil
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, false, err
-	}
-	if requestExists {
-		var libraryItemID int64
-		err = tx.QueryRowContext(ctx, `
-			select li.id from library_items li
-			join movies m on m.id = li.movie_id
-			where m.tmdb_id = $1
-			limit 1`, tmdbID).Scan(&libraryItemID)
-		if err == nil {
-			if err = tx.Commit(); err != nil {
-				return 0, false, err
-			}
-			return libraryItemID, false, nil
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
+	var requestExists bool
+	locked := false
+	for {
+		err = tx.QueryRowContext(ctx, `select id from media_requests where external_id = $1 and request_type = 'movie'`, externalID).Scan(&requestID)
+		requestExists = err == nil
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return 0, false, err
 		}
-		// The movie lookup by tmdb_id found nothing, but this request was
-		// already tracked -- check whether it's still durably associated with
-		// a library item via its own queue_items row before assuming the
-		// library item is genuinely gone. This distinguishes "library item
-		// deleted, needs recreating" from "Seerr/TMDB now reports a different
-		// tmdb_id for the same, still-fully-intact request" (confirmed live
-		// 2026-08-09: a TMDB ID merge/redirect made Seerr report a different
-		// tmdb_id for an already-fulfilled movie request; the naive "recreate"
-		// fallback below tried inserting a second movie/library_item/
-		// queue_item for it, colliding on idempotency_key -- which is keyed by
-		// externalID and unaffected by tmdb_id drift -- permanently jamming
-		// every future sync on that same conflict). If this request's own
-		// queue_items row still exists, its library_item_id is definitionally
-		// correct for this request regardless of what tmdb_id Seerr reports
-		// today.
-		var existingLibraryItemID int64
-		err = tx.QueryRowContext(ctx, `
-			select library_item_id from queue_items where idempotency_key = $1`,
-			"seerr-movie-"+externalID).Scan(&existingLibraryItemID)
-		if err == nil {
-			if err = tx.Commit(); err != nil {
+		if requestExists {
+			var libraryItemID int64
+			err = tx.QueryRowContext(ctx, `
+				select li.id from library_items li
+				join movies m on m.id = li.movie_id
+				where m.tmdb_id = $1
+				limit 1`, tmdbID).Scan(&libraryItemID)
+			if err == nil {
+				if err = tx.Commit(); err != nil {
+					return 0, false, err
+				}
+				return libraryItemID, false, nil
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
 				return 0, false, err
 			}
-			return existingLibraryItemID, false, nil
+			// The movie lookup by tmdb_id found nothing, but this request was
+			// already tracked -- check whether it's still durably associated with
+			// a library item via its own queue_items row before assuming the
+			// library item is genuinely gone. This distinguishes "library item
+			// deleted, needs recreating" from "Seerr/TMDB now reports a different
+			// tmdb_id for the same, still-fully-intact request" (confirmed live
+			// 2026-08-09: a TMDB ID merge/redirect made Seerr report a different
+			// tmdb_id for an already-fulfilled movie request; the naive "recreate"
+			// fallback below tried inserting a second movie/library_item/
+			// queue_item for it, colliding on idempotency_key -- which is keyed by
+			// externalID and unaffected by tmdb_id drift -- permanently jamming
+			// every future sync on that same conflict). If this request's own
+			// queue_items row still exists, its library_item_id is definitionally
+			// correct for this request regardless of what tmdb_id Seerr reports
+			// today.
+			var existingLibraryItemID int64
+			err = tx.QueryRowContext(ctx, `
+				select library_item_id from queue_items where idempotency_key = $1`,
+				"seerr-movie-"+externalID).Scan(&existingLibraryItemID)
+			if err == nil {
+				if err = tx.Commit(); err != nil {
+					return 0, false, err
+				}
+				return existingLibraryItemID, false, nil
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return 0, false, err
+			}
+			// The media_request row exists but its movie/library_item is
+			// genuinely gone (e.g. the user deleted it from the library, and its
+			// queue_items row was cascade-deleted along with it) — fall through
+			// and recreate it below instead of silently no-op'ing on every future
+			// sync for this externalID.
+			err = nil
 		}
-		if !errors.Is(err, sql.ErrNoRows) {
+		if locked {
+			break
+		}
+		if err = lockSeerrRequestUpsert(ctx, tx, lockKeys...); err != nil {
 			return 0, false, err
 		}
-		// The media_request row exists but its movie/library_item is
-		// genuinely gone (e.g. the user deleted it from the library, and its
-		// queue_items row was cascade-deleted along with it) — fall through
-		// and recreate it below instead of silently no-op'ing on every future
-		// sync for this externalID.
-		err = nil
+		locked = true
 	}
 
 	var movieID int64
+	movieCreated := false
 	err = tx.QueryRowContext(ctx, `select id from movies where tmdb_id = $1`, tmdbID).Scan(&movieID)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = tx.QueryRowContext(ctx, `
 			insert into movies (tmdb_id, title, release_year)
 			values ($1, $2, $3)
 			returning id`, tmdbID, title, year).Scan(&movieID)
+		movieCreated = err == nil
 	}
 	if err != nil {
 		return 0, false, err
@@ -254,6 +291,8 @@ func (db *DB) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID 
 		if err = tx.QueryRowContext(ctx, `
 			insert into media_requests (external_id, request_type)
 			values ($1, 'movie')
+			on conflict (external_id, request_type) do update
+			set external_id = excluded.external_id
 			returning id`, externalID).Scan(&requestID); err != nil {
 			return 0, false, err
 		}
@@ -271,6 +310,9 @@ func (db *DB) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID 
 
 	if err = tx.Commit(); err != nil {
 		return 0, false, err
+	}
+	if movieCreated {
+		db.invalidateCatalogAmbiguityIndex()
 	}
 	return libraryItemID, true, nil
 }
@@ -370,6 +412,9 @@ func (db *DB) EnrichMovieFull(ctx context.Context, libraryItemID int64, e MovieE
 	if err != nil {
 		return err
 	}
+	if strings.TrimSpace(e.Title) != "" || len(e.AlternativeTitles) > 0 {
+		db.invalidateCatalogAmbiguityIndex()
+	}
 	if strings.TrimSpace(e.Title) == "" {
 		return nil
 	}
@@ -387,73 +432,89 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 	if err != nil {
 		return 0, false, err
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
+	defer tx.Rollback()
+
+	lockKeys := []string{"seerr-request:tv:" + externalID}
+	if tvdbID > 0 {
+		lockKeys = append(lockKeys, fmt.Sprintf("seerr-show:tvdb:%d", tvdbID))
+	}
+	if tmdbID > 0 {
+		lockKeys = append(lockKeys, fmt.Sprintf("seerr-show:tmdb:%d", tmdbID))
+	}
 
 	var requestID int64
-	err = tx.QueryRowContext(ctx, `select id from media_requests where external_id = $1 and request_type = 'tv'`, externalID).Scan(&requestID)
-	requestExists := err == nil
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return 0, false, err
-	}
-	if requestExists {
-		var libraryItemID int64
-		err = tx.QueryRowContext(ctx, `
-			select li.id from library_items li
-			join episodes e on e.id = li.episode_id
-			join tv_shows ts on ts.id = e.tv_show_id
-			where ts.tvdb_id = $1 and e.season_number = $2 and e.episode_number = $3
-			limit 1`, tvdbID, season, episode).Scan(&libraryItemID)
-		if errors.Is(err, sql.ErrNoRows) && tmdbID > 0 {
-			// TMDB-only show: tvdb_id is NULL, fall back to tmdb_id lookup.
+	var requestExists bool
+	locked := false
+	for {
+		err = tx.QueryRowContext(ctx, `select id from media_requests where external_id = $1 and request_type = 'tv'`, externalID).Scan(&requestID)
+		requestExists = err == nil
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return 0, false, err
+		}
+		if requestExists {
+			var libraryItemID int64
 			err = tx.QueryRowContext(ctx, `
 				select li.id from library_items li
 				join episodes e on e.id = li.episode_id
 				join tv_shows ts on ts.id = e.tv_show_id
-				where ts.tmdb_id = $1 and e.season_number = $2 and e.episode_number = $3
-				limit 1`, tmdbID, season, episode).Scan(&libraryItemID)
-		}
-		if err == nil {
-			if err = tx.Commit(); err != nil {
+				where ts.tvdb_id = $1 and e.season_number = $2 and e.episode_number = $3
+				limit 1`, tvdbID, season, episode).Scan(&libraryItemID)
+			if errors.Is(err, sql.ErrNoRows) && tmdbID > 0 {
+				// TMDB-only show: tvdb_id is NULL, fall back to tmdb_id lookup.
+				err = tx.QueryRowContext(ctx, `
+					select li.id from library_items li
+					join episodes e on e.id = li.episode_id
+					join tv_shows ts on ts.id = e.tv_show_id
+					where ts.tmdb_id = $1 and e.season_number = $2 and e.episode_number = $3
+					limit 1`, tmdbID, season, episode).Scan(&libraryItemID)
+			}
+			if err == nil {
+				if err = tx.Commit(); err != nil {
+					return 0, false, err
+				}
+				return libraryItemID, false, nil
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
 				return 0, false, err
 			}
-			return libraryItemID, false, nil
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return 0, false, err
-		}
-		// See the matching comment in UpsertMovieRequest: check this
-		// request's own queue_items row before assuming the episode/
-		// library_item is genuinely gone, so a tvdb_id/tmdb_id drift on an
-		// already-fulfilled request doesn't try to insert a duplicate
-		// library_item/queue_item that collides on idempotency_key (which is
-		// keyed by externalID, not by tvdb_id/tmdb_id).
-		var existingLibraryItemID int64
-		err = tx.QueryRowContext(ctx, `
-			select library_item_id from queue_items where idempotency_key = $1`,
-			"seerr-tv-"+externalID).Scan(&existingLibraryItemID)
-		if err == nil {
-			if err = tx.Commit(); err != nil {
+			// See the matching comment in UpsertMovieRequest: check this
+			// request's own queue_items row before assuming the episode/
+			// library_item is genuinely gone, so a tvdb_id/tmdb_id drift on an
+			// already-fulfilled request doesn't try to insert a duplicate
+			// library_item/queue_item that collides on idempotency_key (which is
+			// keyed by externalID, not by tvdb_id/tmdb_id).
+			var existingLibraryItemID int64
+			err = tx.QueryRowContext(ctx, `
+				select library_item_id from queue_items where idempotency_key = $1`,
+				"seerr-tv-"+externalID).Scan(&existingLibraryItemID)
+			if err == nil {
+				if err = tx.Commit(); err != nil {
+					return 0, false, err
+				}
+				return existingLibraryItemID, false, nil
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
 				return 0, false, err
 			}
-			return existingLibraryItemID, false, nil
+			// The media_request row exists but its episode/library_item is
+			// genuinely gone (e.g. the user deleted it from the library, and its
+			// queue_items row was cascade-deleted along with it) — fall through
+			// and recreate it below instead of silently no-op'ing on every future
+			// sync for this externalID.
+			err = nil
 		}
-		if !errors.Is(err, sql.ErrNoRows) {
+		if locked {
+			break
+		}
+		if err = lockSeerrRequestUpsert(ctx, tx, lockKeys...); err != nil {
 			return 0, false, err
 		}
-		// The media_request row exists but its episode/library_item is
-		// genuinely gone (e.g. the user deleted it from the library, and its
-		// queue_items row was cascade-deleted along with it) — fall through
-		// and recreate it below instead of silently no-op'ing on every future
-		// sync for this externalID.
-		err = nil
+		locked = true
 	}
 
 	var showID int64
 	var existingTmdbID int64
+	showCreated := false
 	err = tx.QueryRowContext(ctx, `select id, coalesce(tmdb_id, 0) from tv_shows where tvdb_id = $1`, tvdbID).Scan(&showID, &existingTmdbID)
 	if err == nil && tmdbID > 0 && existingTmdbID > 0 && existingTmdbID != tmdbID {
 		// tvdb_id found but belongs to a different show (tmdb_id mismatch) — look up by tmdb_id instead
@@ -463,12 +524,14 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 				insert into tv_shows (tmdb_id, title, release_year)
 				values ($1, $2, $3)
 				returning id`, tmdbID, show, year).Scan(&showID)
+			showCreated = err == nil
 		}
 	} else if errors.Is(err, sql.ErrNoRows) {
 		err = tx.QueryRowContext(ctx, `
 			insert into tv_shows (tvdb_id, tmdb_id, title, release_year)
 			values ($1, $2, $3, $4)
 			returning id`, tvdbID, tmdbID, show, year).Scan(&showID)
+		showCreated = err == nil
 	}
 	if err != nil {
 		return 0, false, err
@@ -510,6 +573,8 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 		if err = tx.QueryRowContext(ctx, `
 			insert into media_requests (external_id, request_type)
 			values ($1, 'tv')
+			on conflict (external_id, request_type) do update
+			set external_id = excluded.external_id
 			returning id`, externalID).Scan(&requestID); err != nil {
 			return 0, false, err
 		}
@@ -527,6 +592,9 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 
 	if err = tx.Commit(); err != nil {
 		return 0, false, err
+	}
+	if showCreated {
+		db.invalidateCatalogAmbiguityIndex()
 	}
 	return libraryItemID, true, nil
 }
@@ -638,6 +706,9 @@ func (db *DB) EnrichTVFull(ctx context.Context, libraryItemID int64, episodeTitl
 	if err != nil {
 		return err
 	}
+	if strings.TrimSpace(e.ShowTitle) != "" || len(e.AlternativeTitles) > 0 {
+		db.invalidateCatalogAmbiguityIndex()
+	}
 	if strings.TrimSpace(episodeTitle) != "" {
 		if _, err = db.SQL.ExecContext(ctx, `
 			update episodes
@@ -685,6 +756,7 @@ func (db *DB) GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (L
 			li.media_type,
 			coalesce(li.title, ''),
 			coalesce(m.imdb_id, ''),
+			coalesce(m.id, 0),
 			coalesce(m.release_year, 0),
 			coalesce(m.tmdb_id, 0),
 			coalesce(tv.title, ''),
@@ -709,6 +781,7 @@ func (db *DB) GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (L
 		&item.MediaType,
 		&item.Title,
 		&item.IMDbID,
+		&item.MovieID,
 		&item.MovieYear,
 		&item.MovieTMDBID,
 		&item.ShowTitle,
@@ -727,7 +800,7 @@ func (db *DB) GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (L
 	if err != nil {
 		return item, err
 	}
-	item.AlternateTitles, err = db.filterAmbiguousAlternateTitles(ctx, item.AlternateTitles, item.TVShowID, item.MovieTMDBID)
+	item.AlternateTitles, err = db.filterAmbiguousAlternateTitles(ctx, item.AlternateTitles, item.TVShowID, item.MovieID)
 	return item, err
 }
 
@@ -738,12 +811,129 @@ func (db *DB) GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (L
 // match of ranking's tokenizer, just consistent enough to catch "Daredevil"
 // as the first word of "Daredevil: Born Again".
 func firstNormalizedWord(s string) string {
-	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", ":", " ", ";", " ", ",", " ", "'", "")
-	fields := strings.Fields(strings.ToLower(replacer.Replace(s)))
+	fields := strings.Fields(strings.ToLower(ambiguityWordSeparators.Replace(s)))
 	if len(fields) == 0 {
 		return ""
 	}
 	return fields[0]
+}
+
+type catalogEntityKind uint8
+
+const (
+	catalogEntityTVShow catalogEntityKind = iota + 1
+	catalogEntityMovie
+)
+
+type catalogEntity struct {
+	kind catalogEntityKind
+	id   int64
+}
+
+// catalogAmbiguityIndex stores how many distinct catalog entities use each
+// normalized first word. entityFirstWords lets a search subtract its own
+// movie/show before deciding whether an alias collides with another entity.
+// All maps and slices are immutable after publication through DB's atomic
+// cache pointer.
+type catalogAmbiguityIndex struct {
+	firstWordEntityCounts map[string]int
+	entityFirstWords      map[catalogEntity][]string
+}
+
+func (index *catalogAmbiguityIndex) ambiguous(firstWord string, excluded catalogEntity) bool {
+	count := index.firstWordEntityCounts[firstWord]
+	for _, ownWord := range index.entityFirstWords[excluded] {
+		if ownWord == firstWord {
+			count--
+			break
+		}
+	}
+	return count > 0
+}
+
+// getCatalogAmbiguityIndex returns the immutable cached title index, building
+// it once when a search first needs one-word alias disambiguation. The build
+// mutex also coordinates invalidation so a metadata write cannot be followed
+// by publication of a stale in-flight rebuild.
+func (db *DB) getCatalogAmbiguityIndex(ctx context.Context) (*catalogAmbiguityIndex, error) {
+	if index := db.catalogAmbiguity.Load(); index != nil {
+		return index, nil
+	}
+
+	db.catalogAmbiguityMu.Lock()
+	defer db.catalogAmbiguityMu.Unlock()
+	if index := db.catalogAmbiguity.Load(); index != nil {
+		return index, nil
+	}
+
+	rows, err := db.SQL.QueryContext(ctx, `
+		select entity_kind, entity_id, title
+		from (
+			select 1::smallint as entity_kind, tv.id as entity_id, tv.title
+			from tv_shows tv
+			union all
+			select 1::smallint, tv.id, alternate.title
+			from tv_shows tv
+			cross join lateral unnest(coalesce(tv.alternative_titles, '{}'::text[])) as alternate(title)
+			union all
+			select 2::smallint, movie.id, movie.title
+			from movies movie
+			union all
+			select 2::smallint, movie.id, alternate.title
+			from movies movie
+			cross join lateral unnest(coalesce(movie.alternative_titles, '{}'::text[])) as alternate(title)
+		) catalog_titles
+		where btrim(title) <> ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	index := &catalogAmbiguityIndex{
+		firstWordEntityCounts: make(map[string]int),
+		entityFirstWords:      make(map[catalogEntity][]string),
+	}
+	type entityWord struct {
+		entity catalogEntity
+		word   string
+	}
+	seen := make(map[entityWord]struct{})
+	for rows.Next() {
+		var (
+			kindValue int
+			entityID  int64
+			title     string
+		)
+		if err := rows.Scan(&kindValue, &entityID, &title); err != nil {
+			return nil, err
+		}
+		word := firstNormalizedWord(title)
+		if word == "" {
+			continue
+		}
+		entity := catalogEntity{kind: catalogEntityKind(kindValue), id: entityID}
+		pair := entityWord{entity: entity, word: word}
+		if _, exists := seen[pair]; exists {
+			continue
+		}
+		seen[pair] = struct{}{}
+		index.firstWordEntityCounts[word]++
+		index.entityFirstWords[entity] = append(index.entityFirstWords[entity], word)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	db.catalogAmbiguity.Store(index)
+	return index, nil
+}
+
+// invalidateCatalogAmbiguityIndex clears the cached title index after a
+// committed movie/show insert or metadata update. Taking the build mutex
+// ensures an older concurrent rebuild cannot publish after this invalidation.
+func (db *DB) invalidateCatalogAmbiguityIndex() {
+	db.catalogAmbiguityMu.Lock()
+	db.catalogAmbiguity.Store(nil)
+	db.catalogAmbiguityMu.Unlock()
 }
 
 // filterAmbiguousAlternateTitles drops single-word alternate titles that
@@ -757,10 +947,10 @@ func firstNormalizedWord(s string) string {
 // actually belongs to -- unlike a multi-word alias ("Marvel's Daredevil"),
 // which still requires the rest of the words to line up too. Multi-word
 // alternate titles are left untouched; this only removes the single-word
-// ambiguous ones. Fetches all other shows/movies once and compares in Go
-// (rather than SQL LIKE/regex) so title text can't be misinterpreted as a
-// wildcard/regex pattern.
-func (db *DB) filterAmbiguousAlternateTitles(ctx context.Context, titles []string, excludeTVShowID, excludeMovieTMDBID int64) ([]string, error) {
+// ambiguous ones. The immutable catalog index is shared across searches and
+// invalidated by movie/show writes, avoiding repeated full-catalog queries
+// while keeping title text out of SQL LIKE/regex expressions.
+func (db *DB) filterAmbiguousAlternateTitles(ctx context.Context, titles []string, excludeTVShowID, excludeMovieID int64) ([]string, error) {
 	hasSingleWord := false
 	for _, title := range titles {
 		if len(strings.Fields(title)) == 1 {
@@ -772,32 +962,13 @@ func (db *DB) filterAmbiguousAlternateTitles(ctx context.Context, titles []strin
 		return titles, nil
 	}
 
-	rows, err := db.SQL.QueryContext(ctx, `
-		select title from tv_shows where id != $1
-		union all
-		select unnest(alternative_titles) from tv_shows where id != $1
-		union all
-		select title from movies where tmdb_id != $2
-		union all
-		select unnest(alternative_titles) from movies where tmdb_id != $2`,
-		excludeTVShowID, excludeMovieTMDBID,
-	)
+	index, err := db.getCatalogAmbiguityIndex(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	otherFirstWords := make(map[string]struct{})
-	for rows.Next() {
-		var otherTitle string
-		if err := rows.Scan(&otherTitle); err != nil {
-			return nil, err
-		}
-		if w := firstNormalizedWord(otherTitle); w != "" {
-			otherFirstWords[w] = struct{}{}
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	excluded := catalogEntity{kind: catalogEntityMovie, id: excludeMovieID}
+	if excludeTVShowID > 0 {
+		excluded = catalogEntity{kind: catalogEntityTVShow, id: excludeTVShowID}
 	}
 
 	out := make([]string, 0, len(titles))
@@ -806,7 +977,7 @@ func (db *DB) filterAmbiguousAlternateTitles(ctx context.Context, titles []strin
 			out = append(out, title)
 			continue
 		}
-		if _, ambiguous := otherFirstWords[firstNormalizedWord(title)]; ambiguous {
+		if index.ambiguous(firstNormalizedWord(title), excluded) {
 			continue
 		}
 		out = append(out, title)
@@ -1477,11 +1648,11 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 		}
 	}
 
-	blocked, err := loadBlocklistMap(ctx, db.SQL)
+	scopeKey, err := resolveMediaScopeKey(ctx, tx, libraryItemID)
 	if err != nil {
 		return nil, err
 	}
-	scopeKey, err := resolveMediaScopeKey(ctx, tx, libraryItemID)
+	blocked, err := loadCandidateBlocklist(ctx, tx, scopeKey, candidates)
 	if err != nil {
 		return nil, err
 	}
@@ -1613,14 +1784,6 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 // candidate from an earlier search can sit untouched indefinitely — the item
 // never re-selects it and never gets a chance to replace it either.
 func (db *DB) PromoteExistingCandidate(ctx context.Context, libraryItemID int64) (*int64, error) {
-	// Preload before opening the transaction -- see FailSelectedReleaseAndPromoteNext,
-	// which does the same to avoid holding release_candidates write locks
-	// during this (potentially large) read.
-	blocked, err := loadBlocklistMapUncached(ctx, db.SQL)
-	if err != nil {
-		return nil, err
-	}
-
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -1645,7 +1808,7 @@ func (db *DB) PromoteExistingCandidate(ctx context.Context, libraryItemID int64)
 	// candidate" function that filtered only on rejected=false, so an
 	// already-blocklisted sibling candidate (same content, different
 	// indexer/URL) could be promoted and re-fetched here.
-	releaseCandidateIDOpt, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, blocked, `
+	releaseCandidateIDOpt, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, `
 		select rc.id, rc.title, coalesce(rc.external_url, ''), coalesce(rc.indexer_name, ''), coalesce(rc.size_bytes, 0), coalesce(rc.posted_at, to_timestamp(0))
 		from release_candidates rc
 		where rc.library_item_id = $1
@@ -2191,14 +2354,6 @@ func (db *DB) PromoteAlternativeRetryCandidate(ctx context.Context, libraryItemI
 // eligible candidate exists, or when a concurrent selection wins the race
 // before the final read.
 func (db *DB) promoteRetryCandidate(ctx context.Context, libraryItemID int64, excludeReleaseCandidateID int64, excludeCurrent bool) (*ReleaseSummary, error) {
-	// Preload before opening the transaction -- see FailSelectedReleaseAndPromoteNext,
-	// which does the same to avoid holding release_candidates write locks
-	// during this (potentially large) read.
-	blocked, err := loadBlocklistMapUncached(ctx, db.SQL)
-	if err != nil {
-		return nil, err
-	}
-
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -2244,7 +2399,7 @@ func (db *DB) promoteRetryCandidate(ctx context.Context, libraryItemID int64, ex
 	}
 	query += `
 		order by rc.failure_count asc, rc.score desc, rc.created_at asc, rc.id asc`
-	releaseCandidateIDOpt, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, blocked, query, args...)
+	releaseCandidateIDOpt, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -2295,14 +2450,6 @@ func (db *DB) promoteRetryCandidate(ctx context.Context, libraryItemID int64, ex
 // second selected_releases row for a candidate a concurrent winner already
 // picked.
 func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int64, reason string) (*ReleaseSummary, error) {
-	// Preload before opening the transaction -- see FailSelectedReleaseAndPromoteNext,
-	// which does the same to avoid holding release_candidates write locks
-	// during this (potentially large) read.
-	blocked, err := loadBlocklistMapUncached(ctx, db.SQL)
-	if err != nil {
-		return nil, err
-	}
-
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -2387,7 +2534,7 @@ func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int
 		return nil, err
 	}
 
-	nextCandidateID, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, blocked, `
+	nextCandidateID, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, `
 		select rc.id, rc.title, coalesce(rc.external_url, ''), coalesce(rc.indexer_name, ''), coalesce(rc.size_bytes, 0), coalesce(rc.posted_at, to_timestamp(0))
 		from release_candidates rc
 		where rc.library_item_id = $1
@@ -2657,15 +2804,6 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 	ctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
 
-	// Pre-load the blocklist map before opening the transaction. This is a
-	// large read (1500+ rows) and doing it inside the transaction held write
-	// locks on release_candidates, causing "driver: bad connection" when many
-	// workers hit the same indexer group simultaneously.
-	blocked, err := loadBlocklistMapUncached(ctx, db.SQL)
-	if err != nil {
-		return nil, fmt.Errorf("fail/blocklist-preload (sr=%d): %w", selectedReleaseID, err)
-	}
-
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("fail/begin (sr=%d): %w", selectedReleaseID, err)
@@ -2792,13 +2930,10 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		return nil, fmt.Errorf("fail/delete-sr (sr=%d): %w", selectedReleaseID, err)
 	}
 
-	// Collect blocked candidates and the next viable candidate in a single read
-	// pass. rows must be closed before issuing any ExecContext on this
-	// transaction — pgx holds a pgConn lock for the duration of the rows
-	// resultReader, and ExecContext on the same connection returns
-	// driver.ErrBadConn (connLockError.SafeToRetry = true) while that lock
-	// is held.
-	nextCandidateID, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, blocked, `
+	// Buffer candidate metadata, close its rows, then look up only the derived
+	// blocklist keys. Closing rows before the lookup and later writes matters:
+	// pgx holds the connection lock for an active result reader.
+	nextCandidateID, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, `
 		select rc.id, rc.title, coalesce(rc.external_url, ''), coalesce(rc.indexer_name, ''), coalesce(rc.size_bytes, 0), coalesce(rc.posted_at, to_timestamp(0))
 		from release_candidates rc
 		where rc.library_item_id = $1
@@ -2905,13 +3040,15 @@ type blockedCandidateEntry struct {
 // external_url; PromoteExistingCandidate orders by score alone) and should
 // stay that way.
 //
-// The passed-in tx must not have any other open rows when this is called --
-// rows are closed internally before returning, same requirement as every
-// other rows-then-ExecContext sequence on this transaction.
-func scanNextViableCandidate(ctx context.Context, tx *sql.Tx, scopeKey string, blocked map[string]string, query string, args ...any) (sql.NullInt64, []blockedCandidateEntry, error) {
+// Candidate metadata is buffered before querying blocklist_items so the
+// release-candidate rows are closed and only this batch's derived keys are
+// looked up through the unique key index.
+func scanNextViableCandidate(ctx context.Context, tx *sql.Tx, scopeKey string, query string, args ...any) (sql.NullInt64, []blockedCandidateEntry, error) {
 	var (
 		next           sql.NullInt64
 		blockedEntries []blockedCandidateEntry
+		candidateIDs   []int64
+		candidates     []SearchCandidateRecord
 	)
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -2924,18 +3061,27 @@ func scanNextViableCandidate(ctx context.Context, tx *sql.Tx, scopeKey string, b
 			rows.Close()
 			return next, nil, err
 		}
-		if reason, isBlocked := blockedReleaseReason(scopeKey, blocked, candidate); isBlocked {
-			blockedEntries = append(blockedEntries, blockedCandidateEntry{id: candidateID, reason: reason})
-			continue
-		}
-		next = sql.NullInt64{Int64: candidateID, Valid: true}
-		break
+		candidateIDs = append(candidateIDs, candidateID)
+		candidates = append(candidates, candidate)
 	}
 	if rowsErr := rows.Err(); rowsErr != nil {
 		rows.Close()
 		return next, nil, rowsErr
 	}
 	rows.Close()
+
+	blocked, err := loadCandidateBlocklist(ctx, tx, scopeKey, candidates)
+	if err != nil {
+		return next, nil, err
+	}
+	for i, candidate := range candidates {
+		if reason, isBlocked := blockedReleaseReason(scopeKey, blocked, candidate); isBlocked {
+			blockedEntries = append(blockedEntries, blockedCandidateEntry{id: candidateIDs[i], reason: reason})
+			continue
+		}
+		next = sql.NullInt64{Int64: candidateIDs[i], Valid: true}
+		break
+	}
 	return next, blockedEntries, nil
 }
 
@@ -3284,17 +3430,35 @@ func globalBlocklistKeysForRelease(title, externalURL, indexerName string, sizeB
 	return keys
 }
 
+func candidateBlocklistKeys(scopeKey string, candidate SearchCandidateRecord) []string {
+	keys := blocklistKeysForRelease(scopeKey, candidate.Title, candidate.ExternalURL, candidate.IndexerName, candidate.SizeBytes, candidate.PostedAt)
+	return append(keys, globalBlocklistKeysForRelease(candidate.Title, candidate.ExternalURL, candidate.IndexerName, candidate.SizeBytes, candidate.PostedAt)...)
+}
+
+// candidateBatchBlocklistKeys derives the distinct scoped and global keys
+// needed to decide one candidate batch, preserving first-seen order so lookup
+// inputs and tests remain deterministic.
+func candidateBatchBlocklistKeys(scopeKey string, candidates []SearchCandidateRecord) []string {
+	keys := make([]string, 0, len(candidates)*6)
+	seen := make(map[string]struct{}, len(candidates)*6)
+	for _, candidate := range candidates {
+		for _, key := range candidateBlocklistKeys(scopeKey, candidate) {
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
 // blockedReleaseReason reports whether candidate matches any live blocklist
 // entry, checking both scopeKey-prefixed keys (blocklistKeysForRelease) and
 // unprefixed global keys (globalBlocklistKeysForRelease, written by the
 // manual blocklist admin API) -- a candidate can be blocked by either.
 func blockedReleaseReason(scopeKey string, blocked map[string]string, candidate SearchCandidateRecord) (string, bool) {
-	for _, key := range blocklistKeysForRelease(scopeKey, candidate.Title, candidate.ExternalURL, candidate.IndexerName, candidate.SizeBytes, candidate.PostedAt) {
-		if reason, ok := blocked[key]; ok {
-			return reason, true
-		}
-	}
-	for _, key := range globalBlocklistKeysForRelease(candidate.Title, candidate.ExternalURL, candidate.IndexerName, candidate.SizeBytes, candidate.PostedAt) {
+	for _, key := range candidateBlocklistKeys(scopeKey, candidate) {
 		if reason, ok := blocked[key]; ok {
 			return reason, true
 		}
@@ -3309,8 +3473,7 @@ func blockedReleaseReason(scopeKey string, blocked map[string]string, candidate 
 // S01E01") normalize to the same string. Used as the basis for every
 // blocklist key variant and for candidate-merge title comparisons.
 func NormalizeReleaseTitle(value string) string {
-	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ", "{", " ", "}", " ")
-	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(strings.TrimSpace(value)))), " ")
+	return strings.Join(strings.Fields(strings.ToLower(releaseTitleSeparators.Replace(strings.TrimSpace(value)))), " ")
 }
 
 // normalizeReleasePattern reduces a normalized release title to its
@@ -3409,61 +3572,6 @@ func canonicalSourceToken(token string) string {
 	}
 }
 
-// loadBlocklistMap returns the live (non-expired) blocklist as a key->reason
-// map, served from blocklistCache when the cache is younger than 30s and
-// refreshed from the database otherwise (see the blocklistCache doc comment
-// for why). Functions that need to preload this map before opening a
-// transaction specifically to avoid holding release_candidates write locks
-// during a large, uncached read (e.g. FailSelectedReleaseAndPromoteNext,
-// promoteRetryCandidate) call loadBlocklistMapUncached instead, since a
-// transaction-scoped read should reflect the database at query time, not
-// whatever happened to be cached moments earlier.
-func loadBlocklistMap(ctx context.Context, q sqlQuerier) (map[string]string, error) {
-	const cacheTTL = 30 * time.Second
-	blocklistCacheMu.Lock()
-	if blocklistCached != nil && time.Since(blocklistCachedAt) < cacheTTL {
-		out := make(map[string]string, len(blocklistCached))
-		for k, v := range blocklistCached {
-			out[k] = v
-		}
-		blocklistCacheMu.Unlock()
-		return out, nil
-	}
-	blocklistCacheMu.Unlock()
-
-	rows, err := q.QueryContext(ctx, `
-		select key, reason
-		from blocklist_items
-		where expires_at is null or expires_at > now()`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := map[string]string{}
-	for rows.Next() {
-		var key, reason string
-		if err := rows.Scan(&key, &reason); err != nil {
-			return nil, err
-		}
-		out[key] = reason
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	cached := make(map[string]string, len(out))
-	for k, v := range out {
-		cached[k] = v
-	}
-	blocklistCacheMu.Lock()
-	blocklistCached = cached
-	blocklistCachedAt = time.Now()
-	blocklistCacheMu.Unlock()
-
-	return out, nil
-}
-
 // sqlQuerier is satisfied by both *sql.DB and *sql.Tx.
 type sqlQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
@@ -3475,22 +3583,30 @@ type sqlRowQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// loadBlocklistMapUncached is loadBlocklistMap without the 30s cache --
-// always issues a fresh query. Used by callers that must read the blocklist
-// before opening a transaction that will subsequently take write locks on
-// release_candidates, since running this same query inside that transaction
-// would hold those locks for the duration of a large (1500+ row) read.
-func loadBlocklistMapUncached(ctx context.Context, q sqlQuerier) (map[string]string, error) {
+// loadCandidateBlocklist returns only live blocklist rows whose unique keys
+// can match candidates. The lateral lookup keeps each probe anchored to the
+// blocklist_items.key index instead of scanning or cloning the full table.
+func loadCandidateBlocklist(ctx context.Context, q sqlQuerier, scopeKey string, candidates []SearchCandidateRecord) (map[string]string, error) {
+	keys := candidateBatchBlocklistKeys(scopeKey, candidates)
+	if len(keys) == 0 {
+		return map[string]string{}, nil
+	}
 	rows, err := q.QueryContext(ctx, `
-		select key, reason
-		from blocklist_items
-		where expires_at is null or expires_at > now()`)
+		select matched.key, matched.reason
+		from unnest($1::text[]) as requested(key)
+		cross join lateral (
+			select b.key, b.reason
+			from blocklist_items b
+			where b.key = requested.key
+			  and (b.expires_at is null or b.expires_at > now())
+			limit 1
+		) matched`, pgTextArray(keys))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	out := map[string]string{}
+	out := make(map[string]string)
 	for rows.Next() {
 		var key, reason string
 		if err := rows.Scan(&key, &reason); err != nil {
@@ -3536,14 +3652,6 @@ func (db *DB) flushBlocklistKeys(keys []string, reason string, ttlDays int) {
 		on conflict (key)
 		do update set reason = excluded.reason, expires_at = excluded.expires_at, message_id = excluded.message_id`,
 		pgTextArray(keys), cleanReason, ttlDays, sql.NullString{String: messageID, Valid: messageID != ""})
-	invalidateBlocklistCache()
-}
-
-func invalidateBlocklistCache() {
-	blocklistCacheMu.Lock()
-	blocklistCached = nil
-	blocklistCachedAt = time.Time{}
-	blocklistCacheMu.Unlock()
 }
 
 // BlocklistQueueSelectedRelease persists blocklist_items entries for a queue

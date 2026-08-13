@@ -157,6 +157,45 @@ func TestReadAheadManagerStopCancelsRequest(t *testing.T) {
 	}
 }
 
+func TestReadAheadManagerCoalescesNotificationsWithinWindow(t *testing.T) {
+	manager := NewReadAheadManager(128)
+	manager.SetArticleBufferSize(2)
+	fetcher := &priorityFetcherStub{calls: make(chan priorityFetchCall, 8)}
+	manager.Register("stream-coalesce", []SegmentSpan{
+		{SegmentID: 1, MessageID: "<msg1>", Start: 0, End: 64},
+		{SegmentID: 2, MessageID: "<msg2>", Start: 64, End: 128},
+		{SegmentID: 3, MessageID: "<msg3>", Start: 128, End: 192},
+	}, fetcher)
+	defer manager.Stop("stream-coalesce")
+
+	manager.NotifyRead("stream-coalesce", 0)
+	first := <-fetcher.calls
+	<-fetcher.calls
+
+	manager.NotifyRead("stream-coalesce", 32)
+	select {
+	case <-first.ctx.Done():
+		t.Fatal("notification inside first half of window cancelled active prefetch")
+	case call := <-fetcher.calls:
+		t.Fatalf("notification inside first half of window scheduled duplicate fetch %#v", call.segment)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	manager.NotifyRead("stream-coalesce", 64)
+	select {
+	case <-first.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("crossing window midpoint did not cancel previous prefetch")
+	}
+	for range 2 {
+		select {
+		case <-fetcher.calls:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for replacement prefetch")
+		}
+	}
+}
+
 // TestSetConnectionBudgetScalesWithStreamingBudget guards the read-ahead
 // throughput fix for high-bitrate content: sustaining something like an
 // ~84.5 Mbps 4K remux needs many concurrent segment fetches in flight, and
@@ -210,7 +249,7 @@ func TestReadAheadManagerRampsUpParallelismOverFirstWindows(t *testing.T) {
 	manager.SetConnectionBudget(25, 80) // full per-stream share = 20
 	manager.SetArticleBufferSize(30)
 
-	spans := make([]SegmentSpan, 30)
+	spans := make([]SegmentSpan, 80)
 	for i := range spans {
 		spans[i] = SegmentSpan{SegmentID: int64(i + 1), MessageID: fmt.Sprintf("<msg%d>", i+1), Start: int64(i) * 64, End: int64(i+1) * 64}
 	}
@@ -237,7 +276,9 @@ func TestReadAheadManagerRampsUpParallelismOverFirstWindows(t *testing.T) {
 
 	wantByWindow := []int{11, 14, 17, 20} // floor 8 + (20-8)*windowIndex/4, then full from window 4
 	for i, want := range wantByWindow {
-		manager.NotifyRead("stream-ramp", 0)
+		// A 30-article window covers 1,920 bytes, so each 960-byte advance
+		// crosses its midpoint and starts one genuinely new window.
+		manager.NotifyRead("stream-ramp", int64(i)*960)
 		if got := drainConcurrentCalls(); got != want {
 			t.Fatalf("window %d: expected %d concurrent fetches, got %d", i+1, want, got)
 		}
@@ -260,7 +301,7 @@ func TestReadAheadManagerSeekResetsRamp(t *testing.T) {
 	manager.SetConnectionBudget(25, 80) // full per-stream share = 20
 	manager.SetArticleBufferSize(30)
 
-	spans := make([]SegmentSpan, 30)
+	spans := make([]SegmentSpan, 80)
 	for i := range spans {
 		spans[i] = SegmentSpan{SegmentID: int64(i + 1), MessageID: fmt.Sprintf("<msg%d>", i+1), Start: int64(i) * 64, End: int64(i+1) * 64}
 	}
@@ -282,8 +323,8 @@ func TestReadAheadManagerSeekResetsRamp(t *testing.T) {
 	}
 
 	// Play sequentially through all 4 ramp windows to reach full parallelism.
-	for range 4 {
-		manager.NotifyRead("stream-seek-ramp", 0)
+	for i := range 4 {
+		manager.NotifyRead("stream-seek-ramp", int64(i)*960)
 		drainConcurrentCalls()
 	}
 	if got := drainConcurrentCalls(); got != 0 {
@@ -298,6 +339,38 @@ func TestReadAheadManagerSeekResetsRamp(t *testing.T) {
 	manager.NotifyRead("stream-seek-ramp", 0)
 	if got := drainConcurrentCalls(); got != 11 {
 		t.Fatalf("expected the window right after a seek to ramp back down to 11, got %d", got)
+	}
+}
+
+type immediatePriorityFetcher struct{}
+
+func (immediatePriorityFetcher) FetchRange(context.Context, SegmentRange) ([]byte, error) {
+	return nil, nil
+}
+
+func (immediatePriorityFetcher) FetchRangePriority(context.Context, SegmentRange, FetchPriority) ([]byte, error) {
+	return nil, nil
+}
+
+func BenchmarkReadAheadManagerCoalescedNotify(b *testing.B) {
+	const spanSize = int64(750 << 10)
+	spans := make([]SegmentSpan, 2_800)
+	for i := range spans {
+		spans[i] = SegmentSpan{
+			SegmentID: int64(i + 1),
+			Start:     int64(i) * spanSize,
+			End:       int64(i+1) * spanSize,
+		}
+	}
+	manager := NewReadAheadManager(512 << 20)
+	manager.Register("benchmark-coalesce", spans, immediatePriorityFetcher{})
+	manager.NotifyRead("benchmark-coalesce", 0)
+	b.Cleanup(func() { manager.Stop("benchmark-coalesce") })
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		manager.NotifyRead("benchmark-coalesce", 64<<10)
 	}
 }
 

@@ -28,7 +28,15 @@ const maxCandidateFailuresBeforeExclude = 1
 // cache the same handful of patterns were being recompiled from scratch on
 // every single candidate. The pattern set is admin-configured and small, so
 // this cache stays bounded in practice.
-var compiledRegexCache sync.Map // pattern string -> cachedRegex
+var (
+	compiledRegexCache       sync.Map // pattern string -> cachedRegex
+	normalizedTextSeparators = strings.NewReplacer(
+		".", " ", "_", " ", "-", " ",
+		"[", " ", "]", " ",
+		"(", " ", ")", " ",
+		":", " ", ";", " ", ",", " ",
+	)
+)
 
 type cachedRegex struct {
 	re  *regexp.Regexp
@@ -1231,13 +1239,7 @@ func normalizeText(value string) string {
 	value = strings.ReplaceAll(value, "?", "")
 	value = strings.ReplaceAll(value, " & ", " and ")
 	value = strings.ReplaceAll(value, "&", " and ")
-	replacer := strings.NewReplacer(
-		".", " ", "_", " ", "-", " ",
-		"[", " ", "]", " ",
-		"(", " ", ")", " ",
-		":", " ", ";", " ", ",", " ",
-	)
-	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(value))), " ")
+	return strings.Join(strings.Fields(strings.ToLower(normalizedTextSeparators.Replace(value))), " ")
 }
 
 func matchYear(title string, requiredYear int) yearMatch {

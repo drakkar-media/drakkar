@@ -39,6 +39,10 @@ import (
 	"github.com/drakkar-media/drakkar/internal/tvdb"
 )
 
+var searchTitleSeparators = strings.NewReplacer(
+	".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ",
+)
+
 // Repository is the persistence contract the workflow Service depends on for
 // every library, queue, search-candidate, and release-selection operation.
 // Implemented by internal/database against Postgres.
@@ -225,6 +229,12 @@ type Service struct {
 	// spawned from SyncRequests/syncSeasonRequest, which otherwise fan out one
 	// goroutine per pending Seerr request with no cap on simultaneous TMDB calls.
 	tmdbEnrichSem chan struct{}
+
+	// requestSyncMu guards activeRequestSync. Overlapping scheduler, webhook,
+	// and API syncs share one reconciliation pass instead of repeating Seerr,
+	// database, and detached enrichment work.
+	requestSyncMu     sync.Mutex
+	activeRequestSync *requestSyncCall
 }
 
 // WorkQueueStatus reports whether the BullMQ work queue is paused and how
@@ -269,6 +279,14 @@ type SyncResult struct {
 	Seen                  int     `json:"seen"`
 	Created               int     `json:"created"`
 	CreatedLibraryItemIDs []int64 `json:"createdLibraryItemIds,omitempty"`
+}
+
+// requestSyncCall holds the immutable result published to callers waiting on
+// one in-flight request reconciliation.
+type requestSyncCall struct {
+	done   chan struct{}
+	result SyncResult
+	err    error
 }
 
 // SearchResult reports the outcome of a single library item's search: the
@@ -793,10 +811,59 @@ func (s *Service) ListRequests(ctx context.Context) ([]database.MediaRequestSumm
 // sync loop -- items are queued for search immediately and metadata arrives
 // shortly after. Waking the pending-dispatch loop is deferred until after all
 // requests are processed, so a single sync pass triggers at most one wake.
-func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
+// Concurrent callers share the active pass; a waiting caller can cancel its
+// own wait without canceling the pass owned by the initiating caller.
+func (s *Service) SyncRequests(ctx context.Context) (result SyncResult, err error) {
 	if s == nil || s.seerr == nil {
 		return SyncResult{}, fmt.Errorf("seerr client unavailable")
 	}
+
+	s.requestSyncMu.Lock()
+	if active := s.activeRequestSync; active != nil {
+		s.requestSyncMu.Unlock()
+		select {
+		case <-active.done:
+			return cloneSyncResult(active.result), active.err
+		default:
+		}
+		select {
+		case <-active.done:
+			return cloneSyncResult(active.result), active.err
+		case <-ctx.Done():
+			return SyncResult{}, ctx.Err()
+		}
+	}
+	active := &requestSyncCall{done: make(chan struct{})}
+	s.activeRequestSync = active
+	s.requestSyncMu.Unlock()
+
+	defer func() {
+		recovered := recover()
+		s.requestSyncMu.Lock()
+		active.result = cloneSyncResult(result)
+		active.err = err
+		if recovered != nil {
+			active.err = fmt.Errorf("request sync panic: %v", recovered)
+		}
+		if s.activeRequestSync == active {
+			s.activeRequestSync = nil
+		}
+		close(active.done)
+		s.requestSyncMu.Unlock()
+		if recovered != nil {
+			panic(recovered)
+		}
+	}()
+
+	return s.syncRequests(ctx)
+}
+
+func cloneSyncResult(result SyncResult) SyncResult {
+	result.CreatedLibraryItemIDs = append([]int64(nil), result.CreatedLibraryItemIDs...)
+	return result
+}
+
+func (s *Service) syncRequests(ctx context.Context) (SyncResult, error) {
 	requests, err := s.seerr.PendingRequests(ctx)
 	if err != nil {
 		return SyncResult{}, err
@@ -3274,8 +3341,7 @@ func dedupeSearchResultsByLink(results []hydra.SearchResult) []hydra.SearchResul
 // (dots, dashes, underscores, brackets) to single spaces so that e.g.
 // "Show.S01E01.1080p" and "Show S01E01 1080p" compare equal.
 func normReleaseTitle(title string) string {
-	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ")
-	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(title))), " ")
+	return strings.Join(strings.Fields(strings.ToLower(searchTitleSeparators.Replace(title))), " ")
 }
 
 // sizesClose returns true when two sizes are within 5% of each other.
@@ -3828,8 +3894,7 @@ func hasSeasonPackToken(title string, seasonNumber int) bool {
 // punctuation (dots, underscores, hyphens, brackets) into single spaces so
 // title/token matching is insensitive to scene-naming formatting differences.
 func normalizeSearchText(value string) string {
-	replacer := strings.NewReplacer(".", " ", "_", " ", "-", " ", "[", " ", "]", " ", "(", " ", ")", " ")
-	return strings.Join(strings.Fields(strings.ToLower(replacer.Replace(value))), " ")
+	return strings.Join(strings.Fields(strings.ToLower(searchTitleSeparators.Replace(value))), " ")
 }
 
 // importSelectedRelease persists a fetched-and-parsed NZB against the

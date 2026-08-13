@@ -3,11 +3,8 @@ package database
 import (
 	"context"
 	"database/sql"
-	"os"
 	"testing"
 	"time"
-
-	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 // Regression tests for a gap found in the 2026-07-18 exhaustive audit:
@@ -66,22 +63,159 @@ func blocklistPromoteTestFixture(t *testing.T, ctx context.Context, sqlDB *sql.D
 	); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		_, _ = sqlDB.ExecContext(context.Background(), `delete from blocklist_items where key = $1`, familyKey)
+	})
 
 	return libID, rcPriority, rcFallback
 }
 
-func TestPromoteExistingCandidateSkipsBlocklistedSibling(t *testing.T) {
-	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+func attachSelectedBlocklistTestCandidate(t *testing.T, ctx context.Context, sqlDB *sql.DB, libraryItemID int64, namePrefix string) (releaseCandidateID, selectedReleaseID int64) {
+	t.Helper()
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, external_url, indexer_name, selected)
+		values ($1, 'Currently Selected Release', $2, 'test-indexer', true)
+		returning id`, libraryItemID, namePrefix+"-current-url",
+	).Scan(&releaseCandidateID); err != nil {
+		t.Fatal(err)
 	}
-	sqlDB, err := sql.Open("pgx", dsn)
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, libraryItemID, releaseCandidateID,
+	).Scan(&selectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `
+		update queue_items
+		set state = 'selected', selected_release_id = $2
+		where library_item_id = $1`, libraryItemID, selectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+	return releaseCandidateID, selectedReleaseID
+}
+
+func TestLoadCandidateBlocklistOnlyReturnsMatchingLiveKeys(t *testing.T) {
+	db, sqlDB, ctx := openBlocklistTestDB(t)
+	const scopeKey = "movie:991060"
+	candidate := SearchCandidateRecord{
+		Title:       "Targeted Blocklist Lookup 991060",
+		ExternalURL: "http://example/targeted-blocklist-991060.nzb",
+		IndexerName: "targeted-indexer",
+		SizeBytes:   2_100_000_000,
+		PostedAt:    time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC),
+	}
+	activeScopedKey := scopeKey + "|" + blocklistReleaseFamilyKey(candidate.Title, candidate.SizeBytes, candidate.PostedAt)
+	activeGlobalKey := blocklistKeyForExternalURL(candidate.ExternalURL)
+	expiredKey := scopeKey + "|" + blocklistReleaseSignatureKey(candidate.Title, candidate.IndexerName, candidate.SizeBytes, candidate.PostedAt)
+	unrelatedKey := "external_url:http://example/unrelated-targeted-blocklist-991060.nzb"
+	keys := []string{activeScopedKey, activeGlobalKey, expiredKey, unrelatedKey}
+	_, _ = sqlDB.ExecContext(ctx, `delete from blocklist_items where key = any($1::text[])`, pgTextArray(keys))
+	t.Cleanup(func() {
+		_, _ = sqlDB.ExecContext(context.Background(), `delete from blocklist_items where key = any($1::text[])`, pgTextArray(keys))
+	})
+
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into blocklist_items (key, reason, expires_at)
+		values
+			($1, 'scoped-active', null),
+			($2, 'global-active', now() + interval '1 day'),
+			($3, 'expired', now() - interval '1 day'),
+			($4, 'unrelated-active', null)`,
+		activeScopedKey, activeGlobalKey, expiredKey, unrelatedKey,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	duplicateBatch := []SearchCandidateRecord{candidate, candidate}
+	if keys := candidateBatchBlocklistKeys(scopeKey, duplicateBatch); len(keys) != 6 {
+		t.Fatalf("duplicate candidate batch produced %d lookup keys, want 6", len(keys))
+	}
+	blocked, err := loadCandidateBlocklist(ctx, db.SQL, scopeKey, duplicateBatch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer sqlDB.Close()
-	ctx := context.Background()
-	db := &DB{SQL: sqlDB}
+	if len(blocked) != 2 {
+		t.Fatalf("targeted lookup returned %d rows, want 2: %v", len(blocked), blocked)
+	}
+	if blocked[activeScopedKey] != "scoped-active" || blocked[activeGlobalKey] != "global-active" {
+		t.Fatalf("targeted lookup missed active matches: %v", blocked)
+	}
+	if _, exists := blocked[expiredKey]; exists {
+		t.Fatal("targeted lookup returned an expired entry")
+	}
+	if _, exists := blocked[unrelatedKey]; exists {
+		t.Fatal("targeted lookup returned an unrelated entry")
+	}
+	if reason, found := blockedReleaseReason(scopeKey, blocked, candidate); !found || reason != "scoped-active" {
+		t.Fatalf("blocked release reason = %q, found=%v", reason, found)
+	}
+}
+
+func TestReplaceSearchCandidatesSkipsBlocklistedCandidate(t *testing.T) {
+	db, sqlDB, ctx := openBlocklistTestDB(t)
+	libID := setupRaceTestLibraryItem(t, ctx, sqlDB, "replace-targeted-blocklist", "requested")
+	t.Cleanup(func() {
+		_, _ = sqlDB.ExecContext(context.Background(), `delete from library_items where id = $1`, libID)
+	})
+	scopeKey, err := resolveMediaScopeKey(ctx, sqlDB, libID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blockedCandidate := SearchCandidateRecord{
+		Title:       "Replace Blocklisted Candidate 2026",
+		ExternalURL: "replace-targeted-blocklist-priority-url",
+		IndexerName: "indexer-a",
+		SizeBytes:   2_200_000_000,
+		PostedAt:    time.Date(2026, 8, 13, 0, 0, 0, 0, time.UTC),
+		Score:       100,
+	}
+	fallbackCandidate := SearchCandidateRecord{
+		Title:       "Replace Viable Fallback 2026",
+		ExternalURL: "replace-targeted-blocklist-fallback-url",
+		IndexerName: "indexer-b",
+		SizeBytes:   2_300_000_000,
+		PostedAt:    blockedCandidate.PostedAt,
+		Score:       50,
+	}
+	blockedKey := scopeKey + "|" + blocklistReleaseFamilyKey(blockedCandidate.Title, blockedCandidate.SizeBytes, blockedCandidate.PostedAt)
+	if _, err := sqlDB.ExecContext(ctx, `insert into blocklist_items (key, reason) values ($1, 'replace-blocked')`, blockedKey); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = sqlDB.ExecContext(context.Background(), `delete from blocklist_items where key = $1`, blockedKey)
+	})
+
+	selectedReleaseID, err := db.ReplaceSearchCandidates(ctx, libID, []SearchCandidateRecord{blockedCandidate, fallbackCandidate}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selectedReleaseID == nil {
+		t.Fatal("expected fallback candidate selection")
+	}
+	var selectedTitle string
+	if err := sqlDB.QueryRowContext(ctx, `
+		select rc.title
+		from selected_releases sr
+		join release_candidates rc on rc.id = sr.release_candidate_id
+		where sr.id = $1`, *selectedReleaseID,
+	).Scan(&selectedTitle); err != nil {
+		t.Fatal(err)
+	}
+	if selectedTitle != fallbackCandidate.Title {
+		t.Fatalf("selected %q, want %q", selectedTitle, fallbackCandidate.Title)
+	}
+	var rejected bool
+	if err := sqlDB.QueryRowContext(ctx, `select rejected from release_candidates where library_item_id = $1 and title = $2`, libID, blockedCandidate.Title).Scan(&rejected); err != nil {
+		t.Fatal(err)
+	}
+	if !rejected {
+		t.Fatal("expected matching candidate to be persisted as rejected")
+	}
+}
+
+func TestPromoteExistingCandidateSkipsBlocklistedSibling(t *testing.T) {
+	db, sqlDB, ctx := openBlocklistTestDB(t)
 
 	libID, rcPriority, rcFallback := blocklistPromoteTestFixture(t, ctx, sqlDB, "promote-existing-blocklist")
 	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
@@ -112,17 +246,7 @@ func TestPromoteExistingCandidateSkipsBlocklistedSibling(t *testing.T) {
 }
 
 func TestPromoteBestRetryCandidateSkipsBlocklistedSibling(t *testing.T) {
-	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
-	}
-	sqlDB, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sqlDB.Close()
-	ctx := context.Background()
-	db := &DB{SQL: sqlDB}
+	db, sqlDB, ctx := openBlocklistTestDB(t)
 
 	libID, rcPriority, rcFallback := blocklistPromoteTestFixture(t, ctx, sqlDB, "promote-retry-blocklist")
 	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
@@ -148,17 +272,7 @@ func TestPromoteBestRetryCandidateSkipsBlocklistedSibling(t *testing.T) {
 }
 
 func TestRejectReleaseCandidatePromotesAroundBlocklistedSibling(t *testing.T) {
-	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
-	}
-	sqlDB, err := sql.Open("pgx", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sqlDB.Close()
-	ctx := context.Background()
-	db := &DB{SQL: sqlDB}
+	db, sqlDB, ctx := openBlocklistTestDB(t)
 
 	libID, rcPriority, rcFallback := blocklistPromoteTestFixture(t, ctx, sqlDB, "reject-around-blocklist")
 	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
@@ -166,25 +280,7 @@ func TestRejectReleaseCandidatePromotesAroundBlocklistedSibling(t *testing.T) {
 	// A third, currently-selected candidate is the one actually being
 	// rejected -- RejectReleaseCandidate then has to pick a replacement from
 	// rcPriority/rcFallback, and must skip the blocklisted one.
-	var rcCurrent int64
-	if err := sqlDB.QueryRowContext(ctx, `
-		insert into release_candidates (library_item_id, title, external_url, indexer_name, selected)
-		values ($1, 'Currently Selected Release', $2, 'test-indexer', true)
-		returning id`, libID, "reject-around-blocklist-current-url",
-	).Scan(&rcCurrent); err != nil {
-		t.Fatal(err)
-	}
-	var selectedReleaseID int64
-	if err := sqlDB.QueryRowContext(ctx, `
-		insert into selected_releases (library_item_id, release_candidate_id)
-		values ($1, $2)
-		returning id`, libID, rcCurrent,
-	).Scan(&selectedReleaseID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqlDB.ExecContext(ctx, `update queue_items set selected_release_id = $2 where library_item_id = $1`, libID, selectedReleaseID); err != nil {
-		t.Fatal(err)
-	}
+	rcCurrent, _ := attachSelectedBlocklistTestCandidate(t, ctx, sqlDB, libID, "reject-around-blocklist")
 
 	summary, err := db.RejectReleaseCandidate(ctx, rcCurrent, "test_manual_reject")
 	if err != nil {
@@ -203,5 +299,33 @@ func TestRejectReleaseCandidatePromotesAroundBlocklistedSibling(t *testing.T) {
 	}
 	if !priorityRejected {
 		t.Fatal("expected the blocklisted candidate encountered during the scan to be marked rejected")
+	}
+}
+
+func TestFailSelectedReleaseAndPromoteNextSkipsBlocklistedSibling(t *testing.T) {
+	db, sqlDB, ctx := openBlocklistTestDB(t)
+	libID, rcPriority, rcFallback := blocklistPromoteTestFixture(t, ctx, sqlDB, "fail-around-blocklist")
+	t.Cleanup(func() {
+		_, _ = sqlDB.ExecContext(context.Background(), `delete from library_items where id = $1`, libID)
+	})
+	_, selectedReleaseID := attachSelectedBlocklistTestCandidate(t, ctx, sqlDB, libID, "fail-around-blocklist")
+
+	summary, err := db.FailSelectedReleaseAndPromoteNext(ctx, selectedReleaseID, "context deadline exceeded")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary == nil {
+		t.Fatal("expected a replacement candidate to be promoted")
+	}
+	if summary.ReleaseCandidateID != rcFallback {
+		t.Fatalf("expected blocklisted candidate %d to be skipped in favor of %d, but %d was promoted", rcPriority, rcFallback, summary.ReleaseCandidateID)
+	}
+
+	var priorityRejected bool
+	if err := sqlDB.QueryRowContext(ctx, `select rejected from release_candidates where id = $1`, rcPriority).Scan(&priorityRejected); err != nil {
+		t.Fatal(err)
+	}
+	if !priorityRejected {
+		t.Fatal("expected blocklisted candidate to be marked rejected")
 	}
 }

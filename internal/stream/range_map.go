@@ -1,6 +1,9 @@
 package stream
 
-import "errors"
+import (
+	"errors"
+	"sort"
+)
 
 // ErrRangeOutsideFile is returned when a requested byte range cannot be
 // fully satisfied by the given spans — either it falls outside [0, size), or
@@ -25,10 +28,10 @@ type SegmentRange struct {
 // SegmentSpan describes one NZB segment's placement within a virtual file's
 // byte space: [Start, End) is the segment's contiguous slice of the VF, in
 // VF-relative bytes. Readers keep a []SegmentSpan sorted and, in steady
-// state, contiguous (each span's Start equal to the previous span's End);
-// DirectNzbReader.realignSpans and StoredRarReader.realignSpan are the only
-// code paths permitted to mutate a span in place, and both preserve
-// contiguity by shifting every later span's Start/End by the same delta.
+// state, contiguous (each span's Start equal to the previous span's End).
+// DirectNzbReader realigns its guarded table in place; StoredRarReader
+// publishes immutable corrected copies. Both preserve contiguity by shifting
+// every later span's Start/End by the same delta.
 type SegmentSpan struct {
 	SegmentID        int64
 	MessageID        string
@@ -52,6 +55,14 @@ type SegmentSpan struct {
 //     is not fully covered by spans, or a gap exists between two spans that
 //     should have been contiguous.
 func ResolveRange(spans []SegmentSpan, offset, length int64) ([]SegmentRange, error) {
+	return resolveRange(spans, offset, length, 0)
+}
+
+// resolveRange returns a contiguous range plan using binary search to enter
+// the span table. maxRanges > 0 intentionally returns a covered prefix after
+// that many segments; read-ahead uses this to enforce its article limit
+// without constructing and then discarding the rest of a large window.
+func resolveRange(spans []SegmentSpan, offset, length int64, maxRanges int) ([]SegmentRange, error) {
 	if length < 0 || offset < 0 {
 		return nil, ErrRangeOutsideFile
 	}
@@ -59,48 +70,51 @@ func ResolveRange(spans []SegmentSpan, offset, length int64) ([]SegmentRange, er
 		return []SegmentRange{}, nil
 	}
 	requestEnd := offset + length
-	var out []SegmentRange
-	for _, span := range spans {
-		if requestEnd <= span.Start {
-			break
+	if requestEnd < offset {
+		return nil, ErrRangeOutsideFile
+	}
+	first := sort.Search(len(spans), func(i int) bool { return spans[i].End > offset })
+	if first == len(spans) || spans[first].Start > offset {
+		return nil, ErrRangeOutsideFile
+	}
+	last := sort.Search(len(spans), func(i int) bool { return spans[i].End >= requestEnd })
+	capacity := len(spans) - first
+	if last >= first && last < len(spans) {
+		capacity = last - first + 1
+	}
+	if capacity <= 0 {
+		return nil, ErrRangeOutsideFile
+	}
+	if maxRanges > 0 && capacity > maxRanges {
+		capacity = maxRanges
+	}
+	out := make([]SegmentRange, 0, capacity)
+	cursor := offset
+	for i := first; i < len(spans) && cursor < requestEnd; i++ {
+		span := spans[i]
+		if span.End <= span.Start || (i == first && span.Start > cursor) || (i > first && span.Start != cursor) {
+			return nil, ErrRangeOutsideFile
 		}
-		if offset >= span.End {
-			continue
-		}
-		start := max(offset, span.Start)
 		end := min(requestEnd, span.End)
-		if start >= end {
-			continue
-		}
-		// Every span appended after the first must pick up exactly where the
-		// previous one left off. Found during the 2026-07-25 corruption
-		// audit as an unguarded gap: nothing previously checked this, only
-		// that the LAST returned range reached requestEnd -- a gap between
-		// two middle spans (which shouldn't occur by construction today,
-		// since realignSpans/realignSpan always shift every later span by
-		// the same delta to preserve contiguity, but nothing enforced that
-		// invariant here) would have silently dropped/misaligned the bytes
-		// in between instead of surfacing an error, exactly the class of
-		// bug already fixed twice this session via other mechanisms.
-		if len(out) > 0 && start != out[len(out)-1].RangeEnd {
+		if end <= cursor {
 			return nil, ErrRangeOutsideFile
 		}
 		out = append(out, SegmentRange{
 			SegmentID:        span.SegmentID,
 			MessageID:        span.MessageID,
-			RangeStart:       start,
+			RangeStart:       cursor,
 			RangeEnd:         end,
 			SegmentStart:     span.Start,
 			SegmentEnd:       span.End,
 			DecodedStart:     span.DecodedStart,
 			SegmentByteStart: span.SegmentByteStart,
 		})
+		cursor = end
+		if maxRanges > 0 && len(out) == maxRanges {
+			break
+		}
 	}
-	if len(out) == 0 {
-		return nil, ErrRangeOutsideFile
-	}
-	last := out[len(out)-1]
-	if last.RangeEnd != requestEnd {
+	if cursor != requestEnd && !(maxRanges > 0 && len(out) == maxRanges) {
 		return nil, ErrRangeOutsideFile
 	}
 	return out, nil

@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/drakkar-media/drakkar/internal/metrics"
@@ -155,6 +156,10 @@ type readAheadSession struct {
 	meta           SessionMeta
 	currentOffset  int64
 	windowsStarted int
+	windowStart    int64
+	rescheduleAt   int64
+	windowValid    bool
+	generation     uint64
 }
 
 // NewReadAheadManager creates a ReadAheadManager that prefetches up to
@@ -376,6 +381,8 @@ func (m *ReadAheadManager) Seek(sessionID string, offset int64) {
 			session.cancel = nil
 		}
 		session.windowsStarted = 0
+		session.windowValid = false
+		session.generation++
 	}
 	m.mu.Unlock()
 }
@@ -405,13 +412,12 @@ func (m *ReadAheadManager) Stop(sessionID string) {
 	}
 }
 
-// schedule cancels sessionID's previous read-ahead window (if any) and
-// launches a new one covering up to windowBytes ahead of offset, clamped to
-// the remaining file length. It is called from NotifyRead on every
-// interactive read, so windows are constantly superseded as the read
-// position advances; the old window's context is cancelled before the new
-// one starts so a stale fetch in flight doesn't hold a connection-budget slot
-// past its usefulness.
+// schedule launches a read-ahead window covering up to windowBytes ahead of
+// offset, clamped to the remaining file length and articleLimit. Notifications
+// inside the first half of an existing window are coalesced; once playback
+// crosses that midpoint, the old window is cancelled and replaced. This keeps
+// coverage ahead of playback without copying the span table or rebuilding a
+// nearly identical 512 MiB plan after every foreground read.
 //
 // Prefetch runs in a background goroutine and divides the manager's
 // maxParallelism across currently active sessions (floor of
@@ -428,46 +434,58 @@ func (m *ReadAheadManager) schedule(sessionID string, offset int64) {
 		m.mu.Unlock()
 		return
 	}
+	if session.windowValid && offset >= session.windowStart && offset < session.rescheduleAt {
+		m.mu.Unlock()
+		return
+	}
 	if session.cancel != nil {
 		session.cancel()
+		session.cancel = nil
 	}
+	session.generation++
+	generation := session.generation
+	session.windowValid = false
+
+	spans := session.spans
+	if len(spans) == 0 || offset >= spans[len(spans)-1].End {
+		m.mu.Unlock()
+		return
+	}
+	window := m.windowBytes
+	if remaining := spans[len(spans)-1].End - offset; remaining < window {
+		window = remaining
+	}
+	articleLimit := m.articleLimit
+	ranges, err := resolveRange(spans, offset, window, articleLimit)
+	if err != nil || len(ranges) == 0 {
+		m.mu.Unlock()
+		return
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	session.cancel = cancel
 	if session.windowsStarted < readAheadRampWindows {
 		session.windowsStarted++
 	}
 	windowIndex := session.windowsStarted
-	spans := make([]SegmentSpan, len(session.spans))
-	copy(spans, session.spans)
+	windowEnd := ranges[len(ranges)-1].RangeEnd
+	rescheduleAt := offset + (windowEnd-offset)/2
+	if rescheduleAt <= offset {
+		rescheduleAt = windowEnd
+	}
+	session.windowStart = offset
+	session.rescheduleAt = rescheduleAt
+	session.windowValid = true
 	fetcher := session.fetcher
-	window := m.windowBytes
 	maxParallelism := m.maxParallelism
-	articleLimit := m.articleLimit
+	activeStreams := len(m.sessions)
+	scheduledSession := session
 	m.mu.Unlock()
 
 	go func() {
-		if len(spans) == 0 {
-			return
-		}
-		fileEnd := spans[len(spans)-1].End
-		if offset >= fileEnd {
-			return
-		}
-		if remaining := fileEnd - offset; remaining < window {
-			window = remaining
-		}
-		ranges, err := ResolveRange(spans, offset, window)
-		if err != nil {
-			return
-		}
-		if articleLimit > 0 && len(ranges) > articleLimit {
-			ranges = ranges[:articleLimit]
-		}
 		// Divide read-ahead parallelism across active streams so every player
 		// gets a fair share of NNTP connections (reference: 80% streaming
-		// priority split per-stream). Minimum 4 per stream so slow networks
-		// still prefetch ahead.
-		activeStreams := m.ActiveCount()
+		// priority split per-stream). Keep at least one worker per stream.
 		if activeStreams < 1 {
 			activeStreams = 1
 		}
@@ -491,6 +509,7 @@ func (m *ReadAheadManager) schedule(sessionID string, offset int64) {
 		}
 		sem := make(chan struct{}, parallelism)
 		var wg sync.WaitGroup
+		var fetchFailed atomic.Bool
 	readAhead:
 		for _, segment := range ranges {
 			select {
@@ -505,9 +524,23 @@ func (m *ReadAheadManager) schedule(sessionID string, offset int64) {
 				if ctx.Err() != nil {
 					return
 				}
-				_, _ = fetcher.FetchRangePriority(ctx, seg, PriorityReadAhead)
+				if _, err := fetcher.FetchRangePriority(ctx, seg, PriorityReadAhead); err != nil && ctx.Err() == nil {
+					fetchFailed.Store(true)
+				}
 			}(segment)
 		}
 		wg.Wait()
+		wasCancelled := ctx.Err() != nil
+		cancel()
+
+		m.mu.Lock()
+		current := m.sessions[sessionID]
+		if current == scheduledSession && current.generation == generation {
+			current.cancel = nil
+			if fetchFailed.Load() && !wasCancelled {
+				current.windowValid = false
+			}
+		}
+		m.mu.Unlock()
 	}()
 }

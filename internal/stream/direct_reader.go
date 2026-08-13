@@ -61,10 +61,10 @@ func (r *DirectNzbReader) Size() int64 {
 // together while holding the same lock (direct_reader.go:136-156), so any
 // unguarded read here is a real data race and can also silently use a stale
 // value: confirmed live (2026-07-25) as the cause of intermittent decode
-// corruption during playback. Unlike StoredRarReader.ReadAt (which
-// re-snapshots size/spans every loop iteration via snapshot()), this
-// function used to read r.size exactly once, unguarded, at the very top and
-// never refreshed it -- if a concurrent ReadAt on the same reader instance
+// corruption during playback. Unlike StoredRarReader.ReadAt (which loads an
+// immutable atomic state version each loop), this function used to read
+// r.size exactly once, unguarded, at the very top and never refreshed it --
+// if a concurrent ReadAt on the same reader instance
 // (e.g. Plex issuing overlapping Range requests) triggered a mid-flight
 // yEnc-offset recalibration via realignSpans, this call's cached `length`
 // bound could go stale relative to the now-shifted spans/size, letting the
@@ -251,8 +251,8 @@ func (r *DirectNzbReader) StartSession(sessionID string) {
 	}
 	// Snapshot under r.mu rather than passing r.spans directly -- found
 	// during the 2026-07-25 corruption audit as the same unguarded-shared-
-	// array class already fixed in ReadAt/realignSpans and in
-	// StoredRarReader.snapshot(); not currently reachable (the sole caller
+	// array class already fixed in ReadAt/realignSpans and by
+	// StoredRarReader's immutable state; not currently reachable (the sole caller
 	// calls this synchronously before the reader is ever read from), but
 	// left unguarded here would silently reopen the same hazard the moment
 	// that assumption changes.

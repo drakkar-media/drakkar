@@ -49,3 +49,46 @@ func TestResolveRangeRejectsGapBetweenSpans(t *testing.T) {
 		t.Fatal("expected an error for a request crossing a gap between spans, got none")
 	}
 }
+
+func TestResolveRangeCapsCoveredPrefix(t *testing.T) {
+	spans := []SegmentSpan{
+		{SegmentID: 1, Start: 0, End: 100},
+		{SegmentID: 2, Start: 100, End: 200},
+		{SegmentID: 3, Start: 200, End: 300},
+	}
+	ranges, err := resolveRange(spans, 50, 250, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ranges) != 2 || ranges[0].RangeStart != 50 || ranges[1].RangeEnd != 200 {
+		t.Fatalf("unexpected capped prefix: %+v", ranges)
+	}
+}
+
+func TestResolveRangeRejectsOverflow(t *testing.T) {
+	spans := []SegmentSpan{{SegmentID: 1, Start: 0, End: 100}}
+	if _, err := ResolveRange(spans, 90, int64(^uint64(0)>>1)); err == nil {
+		t.Fatal("expected overflowing range to be rejected")
+	}
+}
+
+func BenchmarkResolveRangeCappedReadAheadWindow(b *testing.B) {
+	const spanSize = int64(750 << 10)
+	spans := make([]SegmentSpan, 2_800)
+	for i := range spans {
+		spans[i] = SegmentSpan{
+			SegmentID: int64(i + 1),
+			Start:     int64(i) * spanSize,
+			End:       int64(i+1) * spanSize,
+		}
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		ranges, err := resolveRange(spans, 1_024, 512<<20, 40)
+		if err != nil || len(ranges) != 40 {
+			b.Fatalf("resolveRange = (%d ranges, %v), want (40, nil)", len(ranges), err)
+		}
+	}
+}

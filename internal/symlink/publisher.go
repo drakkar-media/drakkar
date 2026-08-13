@@ -11,6 +11,8 @@ import (
 	"strings"
 )
 
+var pathComponentSanitizer = strings.NewReplacer("/", "-", "\\", "-", ":", " -")
+
 // mediaExt extracts the file extension from a raw NZB filename (e.g. ".mkv").
 // Returns ".mkv" as the fallback when nothing is recognised.
 func mediaExt(rawFileName string) string {
@@ -101,8 +103,7 @@ func EpisodePath(root, show string, year int, tvdbID int, season, episode int, r
 // sanitize replaces path-hostile characters in a title/show name so it can
 // be used as a filesystem path component.
 func sanitize(input string) string {
-	replacer := strings.NewReplacer("/", "-", "\\", "-", ":", " -")
-	out := replacer.Replace(strings.TrimSpace(input))
+	out := pathComponentSanitizer.Replace(strings.TrimSpace(input))
 	// A result of "." or ".." (or empty, from blank/whitespace-only metadata)
 	// would resolve to the library root or its parent when joined into a
 	// path — filepath.Join does not stop a ".." segment from escaping root.

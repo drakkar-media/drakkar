@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 // ErrStoredRarLayoutInvalid is returned when a StoredRarReader's spans don't
@@ -18,19 +20,25 @@ var ErrStoredRarLayoutInvalid = errors.New("stored_rar layout invalid")
 // since a stored-RAR segment mixes RAR volume/file headers with raw file
 // data.
 //
-// size and spans self-correct the same way DirectNzbReader's do: an initial
-// decoded-size estimate for a segment can be wrong (most often the last
-// segment of the last volume, which is hardest to estimate), and realignSpan
-// corrects the affected span once a fetch reveals its true boundaries. All
-// access to size and spans must go through mu; StoredRarReader is safe for
-// concurrent ReadAt calls.
+// Its span layout is immutable between realignments. Readers load one atomic
+// state pointer without copying the complete span table; realignSpan publishes
+// a corrected copy while retaining old versions for reads already in flight.
+// StoredRarReader is safe for concurrent ReadAt calls.
 type StoredRarReader struct {
 	name    string
-	size    int64
-	spans   []SegmentSpan
 	fetcher SegmentFetcher
 	manager *ReadAheadManager
-	mu      sync.Mutex
+	state   atomic.Pointer[storedRarSpanState]
+	stateMu sync.Mutex
+}
+
+// storedRarSpanState is an immutable, versioned virtual-file layout. Published
+// states and their span slices must never be mutated.
+type storedRarSpanState struct {
+	spans       []SegmentSpan
+	size        int64
+	version     uint64
+	layoutValid bool
 }
 
 // NewStoredRarReader creates a StoredRarReader for a file embedded across the
@@ -39,11 +47,15 @@ type StoredRarReader struct {
 func NewStoredRarReader(name string, size int64, spans []SegmentSpan, fetcher SegmentFetcher, manager *ReadAheadManager) *StoredRarReader {
 	reader := &StoredRarReader{
 		name:    name,
-		size:    size,
 		fetcher: fetcher,
 		manager: manager,
 	}
-	reader.spans = append(reader.spans, spans...)
+	stateSpans := append([]SegmentSpan(nil), spans...)
+	reader.state.Store(&storedRarSpanState{
+		spans:       stateSpans,
+		size:        size,
+		layoutValid: validateStoredRarSpans(stateSpans, size) == nil,
+	})
 	return reader
 }
 
@@ -55,29 +67,7 @@ func (r *StoredRarReader) Name() string {
 // Size returns the file's current size, which may have been corrected since
 // construction as realignSpan learned segments' true decoded boundaries.
 func (r *StoredRarReader) Size() int64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.size
-}
-
-// snapshot returns an independent COPY of r.spans, not just the slice header.
-// Confirmed live (2026-07-25) as a second, distinct source of the same
-// intermittent decode-corruption bug fixed in DirectNzbReader: returning
-// `r.spans` directly only copies the slice header (pointer+len+cap) -- every
-// caller still aliases the SAME backing array. realignSpan mutates that
-// array's elements in place under r.mu (direct field assignment, not a
-// slice replacement), so a concurrent ReadAt on the same reader (Plex/rclone
-// routinely issue overlapping Range requests for one file) could read
-// torn/in-flight Start/End/DecodedStart values through ResolveRange with no
-// lock of its own. Re-snapshotting every loop iteration (as ReadAt already
-// did) provided no actual protection against this, since every snapshot
-// pointed at the identical live array regardless of when it was taken.
-func (r *StoredRarReader) snapshot() ([]SegmentSpan, int64) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make([]SegmentSpan, len(r.spans))
-	copy(out, r.spans)
-	return out, r.size
+	return r.state.Load().size
 }
 
 // ReadAt fills dst with up to len(dst) bytes starting at offset (in this
@@ -100,56 +90,61 @@ func (r *StoredRarReader) snapshot() ([]SegmentSpan, int64) {
 // Safe for concurrent use; concurrent ReadAt calls on the same reader may
 // each trigger and observe realignment independently.
 func (r *StoredRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) (int, error) {
-	spans, size := r.snapshot()
-	if err := validateStoredRarSpans(spans, size); err != nil {
-		return 0, err
+	state := r.state.Load()
+	if !state.layoutValid {
+		return 0, ErrStoredRarLayoutInvalid
 	}
-	if offset >= size {
+	if offset < 0 {
+		return 0, ErrRangeOutsideFile
+	}
+	if offset >= state.size {
 		return 0, io.EOF
 	}
 	length := int64(len(dst))
-	if offset+length > size {
-		length = size - offset
+	if remaining := state.size - offset; length > remaining {
+		length = remaining
 	}
 	written := 0
 	current := offset
 	emptyCount := 0
 	for int64(written) < length {
-		spans, size = r.snapshot()
-		if current >= size {
+		state = r.state.Load()
+		if !state.layoutValid {
+			return written, ErrStoredRarLayoutInvalid
+		}
+		if current >= state.size {
 			break
 		}
-		ranges, err := ResolveRange(spans, current, min64(length-int64(written), size-current))
+		span, err := findStoredRarSpan(state.spans, current)
 		if err != nil {
 			if written > 0 {
 				return written, io.EOF
 			}
 			return written, err
 		}
-		if len(ranges) == 0 {
-			break
+		requestEnd := span.End
+		remaining := length - int64(written)
+		if stateRemaining := state.size - current; remaining > stateRemaining {
+			remaining = stateRemaining
 		}
-		// Only the first resolved range is used per iteration -- spans are
-		// re-snapshotted fresh every loop so a realignment below (correcting
-		// a wrong decoded-segment-size estimate) is picked up immediately by
-		// the next range resolved, instead of continuing to use the rest of
-		// a batch resolved against now-stale span data.
-		rng := ranges[0]
+		if finalEnd := current + remaining; requestEnd > finalEnd {
+			requestEnd = finalEnd
+		}
 		// Translate VF byte positions to decoded-segment byte positions.
-		// rng.RangeStart/End are in VF space; the NNTP fetcher expects archive
+		// current/requestEnd are in VF space; the NNTP fetcher expects archive
 		// (decoded) byte positions. The offset into the decoded segment is:
 		//   segment_byte_start + (vf_pos - span_vf_start)
 		// where segment_byte_start accounts for the RAR header that precedes the
 		// embedded file in the first segment of each volume.
-		segOffset := rng.SegmentByteStart + (rng.RangeStart - rng.SegmentStart)
-		reqLength := rng.RangeEnd - rng.RangeStart
+		segOffset := span.SegmentByteStart + (current - span.Start)
+		reqLength := requestEnd - current
 		adj := SegmentRange{
-			SegmentID:    rng.SegmentID,
-			MessageID:    rng.MessageID,
-			RangeStart:   rng.DecodedStart + segOffset,
-			RangeEnd:     rng.DecodedStart + segOffset + reqLength,
-			SegmentStart: rng.DecodedStart,
-			SegmentEnd:   rng.DecodedStart + (rng.SegmentEnd - rng.SegmentStart) + rng.SegmentByteStart,
+			SegmentID:    span.SegmentID,
+			MessageID:    span.MessageID,
+			RangeStart:   span.DecodedStart + segOffset,
+			RangeEnd:     span.DecodedStart + segOffset + reqLength,
+			SegmentStart: span.DecodedStart,
+			SegmentEnd:   span.DecodedStart + (span.End - span.Start) + span.SegmentByteStart,
 		}
 		var (
 			block      []byte
@@ -164,6 +159,12 @@ func (r *StoredRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 			hasActual = actualSpan.MessageID != ""
 		} else {
 			block, err2 = r.fetcher.FetchRange(ctx, adj)
+		}
+		// A concurrent correction can shift this virtual offset into another
+		// segment while the network fetch is in flight. Retry against the new
+		// immutable version instead of consuming bytes resolved from stale state.
+		if r.state.Load().version != state.version {
+			continue
 		}
 		expected := int(reqLength)
 		if err2 == nil && len(block) < expected && hasActual {
@@ -181,7 +182,7 @@ func (r *StoredRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 			// that point, which for the last segment meant every Range
 			// request landing near real EOF (exactly where a player probes
 			// for trailing container metadata) got a short/empty read.
-			if r.realignSpan(rng.SegmentID, actualSpan) {
+			if r.realignSpan(span.SegmentID, actualSpan) || r.state.Load().version != state.version {
 				continue
 			}
 		}
@@ -191,8 +192,7 @@ func (r *StoredRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 		if len(block) < expected {
 			if len(block) == 0 {
 				emptyCount++
-				_, curSize := r.snapshot()
-				if emptyCount > 5 || current >= curSize {
+				if emptyCount > 5 || current >= r.state.Load().size {
 					if written > 0 {
 						return written, io.EOF
 					}
@@ -222,11 +222,12 @@ func (r *StoredRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 // whether a correction was actually made (false if segmentID wasn't found,
 // e.g. a concurrent realignment already ran).
 func (r *StoredRarReader) realignSpan(segmentID int64, actual SegmentSpan) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	state := r.state.Load()
 	index := -1
-	for i := range r.spans {
-		if r.spans[i].SegmentID == segmentID {
+	for i := range state.spans {
+		if state.spans[i].SegmentID == segmentID {
 			index = i
 			break
 		}
@@ -234,7 +235,7 @@ func (r *StoredRarReader) realignSpan(segmentID int64, actual SegmentSpan) bool 
 	if index < 0 {
 		return false
 	}
-	old := r.spans[index]
+	old := state.spans[index]
 	available := actual.End - actual.Start - old.SegmentByteStart
 	if available < 0 {
 		available = 0
@@ -246,24 +247,34 @@ func (r *StoredRarReader) realignSpan(segmentID int64, actual SegmentSpan) bool 
 	if old.DecodedStart == actual.Start && old.End-old.Start == newLen {
 		return false // nothing to correct; avoid an infinite retry loop
 	}
-	r.spans[index].DecodedStart = actual.Start
-	r.spans[index].End = old.Start + newLen
-	delta := r.spans[index].End - old.End
+	spans := append([]SegmentSpan(nil), state.spans...)
+	spans[index].DecodedStart = actual.Start
+	spans[index].End = old.Start + newLen
+	delta := spans[index].End - old.End
 	if delta != 0 {
-		for i := index + 1; i < len(r.spans); i++ {
-			r.spans[i].Start += delta
-			r.spans[i].End += delta
+		for i := index + 1; i < len(spans); i++ {
+			spans[i].Start += delta
+			spans[i].End += delta
 		}
 	}
-	r.size = r.spans[len(r.spans)-1].End
+	size := spans[len(spans)-1].End
+	r.state.Store(&storedRarSpanState{
+		spans:       spans,
+		size:        size,
+		version:     state.version + 1,
+		layoutValid: validateStoredRarSpans(spans, size) == nil,
+	})
 	return true
 }
 
-func min64(a, b int64) int64 {
-	if a < b {
-		return a
+// findStoredRarSpan resolves one virtual offset without constructing ranges
+// for the rest of the request. spans belongs to an immutable state version.
+func findStoredRarSpan(spans []SegmentSpan, offset int64) (SegmentSpan, error) {
+	i := sort.Search(len(spans), func(i int) bool { return spans[i].End > offset })
+	if i < len(spans) && spans[i].Start <= offset {
+		return spans[i], nil
 	}
-	return b
+	return SegmentSpan{}, ErrRangeOutsideFile
 }
 
 // StartSession registers this reader with its ReadAheadManager under
@@ -277,8 +288,8 @@ func (r *StoredRarReader) StartSession(sessionID string) {
 	if !ok {
 		return
 	}
-	spans, _ := r.snapshot()
-	r.manager.Register(sessionID, spans, fetcher)
+	state := r.state.Load()
+	r.manager.Register(sessionID, state.spans, fetcher)
 }
 
 // NotifyRead reports the current read position for sessionID to the
@@ -317,13 +328,11 @@ func (r *StoredRarReader) RegisterMeta(sessionID string, meta SessionMeta) {
 	r.manager.RegisterMeta(sessionID, meta)
 }
 
-// validateStoredRarSpans reports whether spans form a valid layout for a
-// file of the given size: sorted, contiguous from 0, with no zero-or-negative
-// length span, and collectively covering exactly [0, size). ReadAt checks
-// this on every call (against a fresh snapshot) rather than only at
-// construction, since realignSpan mutates spans concurrently with reads and
-// a bug in that self-correction logic should surface as an explicit error
-// instead of corrupting the served stream.
+// validateStoredRarSpans reports whether spans form a valid layout for a file
+// of the given size: sorted, contiguous from 0, with no zero-or-negative
+// length span, and collectively covering exactly [0, size). Validation runs
+// when each immutable state version is created; ReadAt checks the stored
+// verdict without rescanning the complete table.
 func validateStoredRarSpans(spans []SegmentSpan, size int64) error {
 	if size < 0 {
 		return ErrStoredRarLayoutInvalid

@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/drakkar-media/drakkar/internal/config"
@@ -58,6 +59,12 @@ type DB struct {
 
 	vfCacheMu sync.RWMutex
 	vfCache   map[int64]*cachedVF
+
+	// catalogAmbiguity is an immutable first-word index used by release
+	// searches. Reads are lock-free after the first build; catalogAmbiguityMu
+	// serializes rebuilds and invalidation after movie/show metadata changes.
+	catalogAmbiguity   atomic.Pointer[catalogAmbiguityIndex]
+	catalogAmbiguityMu sync.Mutex
 
 	// defaultMovieProfileName/defaultTvProfileName mirror the workflow
 	// service's own copies (see Service.SetDefaultProfileNames) so every

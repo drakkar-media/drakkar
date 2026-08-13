@@ -14,6 +14,8 @@ import (
 	"github.com/drakkar-media/drakkar/internal/tmdb"
 )
 
+var catalogSearchSeparators = strings.NewReplacer("-", " ", "_", " ", ".", " ", ":", " ", "/", " ")
+
 // TMDBClient defines the subset of TMDB metadata lookups the catalog
 // service needs to enrich library items and serve the discover/dashboard
 // views.
@@ -1460,7 +1462,7 @@ func (s *Service) resolveTMDBID(ctx context.Context, lookup DiscoverLookup) (int
 
 func normalizeSearch(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
-	value = strings.NewReplacer("-", " ", "_", " ", ".", " ", ":", " ", "/", " ").Replace(value)
+	value = catalogSearchSeparators.Replace(value)
 	return strings.Join(strings.Fields(value), " ")
 }
 

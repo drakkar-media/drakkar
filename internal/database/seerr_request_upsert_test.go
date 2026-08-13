@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"sync"
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -179,5 +180,163 @@ func TestUpsertEpisodeRequestReusesLibraryItemWhenTvdbIDDrifts(t *testing.T) {
 	}
 	if libraryItemCount != 1 {
 		t.Errorf("expected exactly 1 library_item across old/new tvdb_id, got %d (a duplicate was created)", libraryItemCount)
+	}
+}
+
+// TestUpsertMovieRequestSerializesConcurrentFirstSightings verifies that
+// independent sync processes can reconcile the same new Seerr movie without
+// surfacing a unique-constraint error or reporting multiple creations.
+func TestUpsertMovieRequestSerializesConcurrentFirstSightings(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	const externalID = "concurrent-movie-9910060"
+	const tmdbID = 9910060
+	cleanup := func() {
+		_, _ = sqlDB.ExecContext(ctx, `delete from media_requests where external_id = $1`, externalID)
+		_, _ = sqlDB.ExecContext(ctx, `delete from movies where tmdb_id = $1`, tmdbID)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	const callers = 16
+	ids := make([]int64, callers)
+	created := make([]bool, callers)
+	errs := make([]error, callers)
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	var done sync.WaitGroup
+	ready.Add(callers)
+	done.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			defer done.Done()
+			ready.Done()
+			<-start
+			ids[i], created[i], errs[i] = db.UpsertMovieRequest(ctx, externalID, tmdbID, "Concurrent Movie", 2026)
+		}(i)
+	}
+	ready.Wait()
+	close(start)
+	done.Wait()
+
+	createdCount := 0
+	for i := 0; i < callers; i++ {
+		if errs[i] != nil {
+			t.Fatalf("call %d returned error: %v", i, errs[i])
+		}
+		if ids[i] != ids[0] {
+			t.Fatalf("call %d returned library item %d, want %d", i, ids[i], ids[0])
+		}
+		if created[i] {
+			createdCount++
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created=true count = %d, want 1", createdCount)
+	}
+
+	var requestCount, movieCount, libraryItemCount, queueItemCount int
+	if err := sqlDB.QueryRowContext(ctx, `
+		select
+			(select count(*) from media_requests where external_id = $1 and request_type = 'movie'),
+			(select count(*) from movies where tmdb_id = $2),
+			(select count(*) from library_items li join movies m on m.id = li.movie_id where m.tmdb_id = $2),
+			(select count(*) from queue_items where idempotency_key = 'seerr-movie-' || $1)`,
+		externalID, tmdbID,
+	).Scan(&requestCount, &movieCount, &libraryItemCount, &queueItemCount); err != nil {
+		t.Fatal(err)
+	}
+	if requestCount != 1 || movieCount != 1 || libraryItemCount != 1 || queueItemCount != 1 {
+		t.Fatalf("unexpected row counts: request=%d movie=%d library=%d queue=%d", requestCount, movieCount, libraryItemCount, queueItemCount)
+	}
+}
+
+// TestUpsertEpisodeRequestSerializesConcurrentFirstSightings verifies the
+// equivalent cross-process guarantee for a new TV episode and its shared show.
+func TestUpsertEpisodeRequestSerializesConcurrentFirstSightings(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	const externalID = "concurrent-episode-9910061"
+	const tvdbID, tmdbID = 9910061, 9910062
+	cleanup := func() {
+		_, _ = sqlDB.ExecContext(ctx, `delete from media_requests where external_id = $1`, externalID)
+		_, _ = sqlDB.ExecContext(ctx, `delete from tv_shows where tvdb_id = $1 or tmdb_id = $2`, tvdbID, tmdbID)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	const callers = 16
+	ids := make([]int64, callers)
+	created := make([]bool, callers)
+	errs := make([]error, callers)
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	var done sync.WaitGroup
+	ready.Add(callers)
+	done.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			defer done.Done()
+			ready.Done()
+			<-start
+			ids[i], created[i], errs[i] = db.UpsertEpisodeRequest(
+				ctx, externalID, tvdbID, tmdbID, "Concurrent Show", 2026, 1, 1, "Pilot",
+			)
+		}(i)
+	}
+	ready.Wait()
+	close(start)
+	done.Wait()
+
+	createdCount := 0
+	for i := 0; i < callers; i++ {
+		if errs[i] != nil {
+			t.Fatalf("call %d returned error: %v", i, errs[i])
+		}
+		if ids[i] != ids[0] {
+			t.Fatalf("call %d returned library item %d, want %d", i, ids[i], ids[0])
+		}
+		if created[i] {
+			createdCount++
+		}
+	}
+	if createdCount != 1 {
+		t.Fatalf("created=true count = %d, want 1", createdCount)
+	}
+
+	var requestCount, showCount, episodeCount, libraryItemCount, queueItemCount int
+	if err := sqlDB.QueryRowContext(ctx, `
+		select
+			(select count(*) from media_requests where external_id = $1 and request_type = 'tv'),
+			(select count(*) from tv_shows where tvdb_id = $2 and tmdb_id = $3),
+			(select count(*) from episodes e join tv_shows ts on ts.id = e.tv_show_id where ts.tvdb_id = $2 and e.season_number = 1 and e.episode_number = 1),
+			(select count(*) from library_items li join episodes e on e.id = li.episode_id join tv_shows ts on ts.id = e.tv_show_id where ts.tvdb_id = $2 and e.season_number = 1 and e.episode_number = 1),
+			(select count(*) from queue_items where idempotency_key = 'seerr-tv-' || $1)`,
+		externalID, tvdbID, tmdbID,
+	).Scan(&requestCount, &showCount, &episodeCount, &libraryItemCount, &queueItemCount); err != nil {
+		t.Fatal(err)
+	}
+	if requestCount != 1 || showCount != 1 || episodeCount != 1 || libraryItemCount != 1 || queueItemCount != 1 {
+		t.Fatalf("unexpected row counts: request=%d show=%d episode=%d library=%d queue=%d", requestCount, showCount, episodeCount, libraryItemCount, queueItemCount)
 	}
 }

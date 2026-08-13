@@ -559,6 +559,7 @@ type LibrarySearchInput struct {
 	MediaType     string
 	Title         string
 	IMDbID        string
+	MovieID       int64 // DB primary key used to exclude this movie from ambiguity checks
 	MovieYear     int
 	MovieTMDBID   int64 // used in tmdbid= query parameter (Radarr approach)
 	ShowTitle     string

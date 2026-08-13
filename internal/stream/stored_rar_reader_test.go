@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestStoredRarReaderReadAt(t *testing.T) {
@@ -105,21 +106,18 @@ func TestStoredRarReaderRealignsLastSegmentEstimate(t *testing.T) {
 	}
 }
 
-// TestStoredRarReaderSnapshotIsIndependentCopy directly guards the aliasing
-// bug fixed alongside DirectNzbReader's race (2026-07-25): snapshot() used
-// to return r.spans itself -- copying only the slice header, not the
-// backing array -- so a snapshot taken BEFORE a realignment would silently
-// change underneath its holder once realignSpan mutated the shared array,
-// even with no concurrency at all. This is deterministic (no goroutines,
-// no timing dependency), unlike the -race concurrency test below whose
-// window is too narrow to hit on every run.
-func TestStoredRarReaderSnapshotIsIndependentCopy(t *testing.T) {
+// TestStoredRarReaderStateRemainsStableAfterRealign guards the immutable
+// copy-on-write state contract: a state obtained before realignment must
+// retain its original backing data after the corrected version is published.
+func TestStoredRarReaderStateRemainsStableAfterRealign(t *testing.T) {
 	reader := NewStoredRarReader("test.mkv", 20, []SegmentSpan{
 		{SegmentID: 1, Start: 0, End: 10, DecodedStart: 0},
 		{SegmentID: 2, Start: 10, End: 20, DecodedStart: 10},
 	}, fetcherStub{}, nil)
 
-	before, beforeSize := reader.snapshot()
+	beforeState := reader.state.Load()
+	before := beforeState.spans
+	beforeSize := beforeState.size
 	beforeSpan2 := before[1]
 
 	if !reader.realignSpan(2, SegmentSpan{SegmentID: 2, Start: 10, End: 18}) {
@@ -127,18 +125,80 @@ func TestStoredRarReaderSnapshotIsIndependentCopy(t *testing.T) {
 	}
 
 	if before[1] != beforeSpan2 {
-		t.Fatalf("snapshot taken before realignSpan was mutated by it: got %+v, want unchanged %+v (snapshot() is aliasing r.spans instead of copying it)", before[1], beforeSpan2)
+		t.Fatalf("state changed after realignment: got %+v, want unchanged %+v", before[1], beforeSpan2)
 	}
 	if beforeSize != 20 {
 		t.Fatalf("unexpected pre-realign size %d", beforeSize)
 	}
 
-	after, afterSize := reader.snapshot()
+	afterState := reader.state.Load()
+	after := afterState.spans
+	afterSize := afterState.size
 	if after[1].End != 18 {
 		t.Fatalf("expected a FRESH snapshot to see the corrected span, got End=%d", after[1].End)
 	}
 	if afterSize != 18 {
 		t.Fatalf("expected a fresh snapshot to see the corrected size 18, got %d", afterSize)
+	}
+}
+
+type blockingStoredRarFetcher struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (f *blockingStoredRarFetcher) FetchRange(_ context.Context, segment SegmentRange) ([]byte, error) {
+	if segment.SegmentID == 2 {
+		close(f.started)
+		<-f.release
+	}
+	return []byte{byte('A' + segment.SegmentID - 1)}, nil
+}
+
+func TestStoredRarReaderRetriesFetchFromSupersededState(t *testing.T) {
+	fetcher := &blockingStoredRarFetcher{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	reader := NewStoredRarReader("test.mkv", 30, []SegmentSpan{
+		{SegmentID: 1, Start: 0, End: 10, DecodedStart: 0},
+		{SegmentID: 2, Start: 10, End: 20, DecodedStart: 10},
+		{SegmentID: 3, Start: 20, End: 30, DecodedStart: 20},
+	}, fetcher, nil)
+
+	type readResult struct {
+		value byte
+		n     int
+		err   error
+	}
+	result := make(chan readResult, 1)
+	go func() {
+		buf := make([]byte, 1)
+		n, err := reader.ReadAt(context.Background(), buf, 15)
+		result <- readResult{value: buf[0], n: n, err: err}
+	}()
+
+	select {
+	case <-fetcher.started:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stale-state fetch")
+	}
+	if !reader.realignSpan(1, SegmentSpan{SegmentID: 1, Start: 0, End: 5}) {
+		t.Fatal("expected first span to shrink")
+	}
+	close(fetcher.release)
+
+	var got readResult
+	select {
+	case got = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for retried read")
+	}
+	if got.err != nil || got.n != 1 {
+		t.Fatalf("ReadAt = (%d, %v), want (1, nil)", got.n, got.err)
+	}
+	if got.value != 'C' {
+		t.Fatalf("ReadAt returned %q from stale segment 2, want %q from corrected segment 3", got.value, byte('C'))
 	}
 }
 
@@ -192,14 +252,9 @@ func (f *concurrentRealignRarFetcher) FetchRangeInfo(ctx context.Context, segmen
 
 // TestStoredRarReaderConcurrentReadAtDuringRealign guards a second, distinct
 // production corruption bug found while investigating residual pixelation
-// after the DirectNzbReader fix (v0.2.63): StoredRarReader.snapshot()
-// returned r.spans directly -- copying only the slice header, not the
-// underlying array -- so every "fresh" snapshot taken by ReadAt (including
-// one held by a concurrent ReadAt on the same reader, e.g. overlapping Plex
-// Range requests) still aliased the SAME backing array realignSpan mutates
-// in place under lock. Run with -race: this must not report a data race, and
-// every concurrent read must return the correct segment's byte content, not
-// another segment's or torn data.
+// after the DirectNzbReader fix (v0.2.63). Run with -race: immutable state
+// versions must prevent torn span data while concurrent reads and realignment
+// overlap, and every read must return the correct segment's byte content.
 func TestStoredRarReaderConcurrentReadAtDuringRealign(t *testing.T) {
 	fetcher := &concurrentRealignRarFetcher{
 		data: map[int64][]byte{
@@ -265,6 +320,50 @@ func TestStoredRarReaderConcurrentReadAtDuringRealign(t *testing.T) {
 					t.Fatalf("offset %d: got %q, expected all bytes %q (wrong-segment data landed in this read -- corruption)", p.offset, results[idx], string(p.want))
 				}
 			}
+		}
+	}
+}
+
+type benchmarkStoredRarFetcher struct {
+	block []byte
+}
+
+func (f benchmarkStoredRarFetcher) FetchRange(_ context.Context, segment SegmentRange) ([]byte, error) {
+	return f.block[:segment.RangeEnd-segment.RangeStart], nil
+}
+
+func BenchmarkStoredRarReaderReadAt(b *testing.B) {
+	const (
+		spanCount = 2_800
+		spanSize  = int64(750 << 10)
+		readSize  = 64 << 10
+	)
+	spans := make([]SegmentSpan, spanCount)
+	for i := range spans {
+		spans[i] = SegmentSpan{
+			SegmentID:    int64(i + 1),
+			Start:        int64(i) * spanSize,
+			End:          int64(i+1) * spanSize,
+			DecodedStart: int64(i) * spanSize,
+		}
+	}
+	reader := NewStoredRarReader(
+		"benchmark.mkv",
+		int64(spanCount)*spanSize,
+		spans,
+		benchmarkStoredRarFetcher{block: make([]byte, readSize)},
+		nil,
+	)
+	dst := make([]byte, readSize)
+	offset := int64(spanCount/2)*spanSize + 1_024
+
+	b.ReportAllocs()
+	b.SetBytes(readSize)
+	b.ResetTimer()
+	for range b.N {
+		n, err := reader.ReadAt(context.Background(), dst, offset)
+		if err != nil || n != len(dst) {
+			b.Fatalf("ReadAt = (%d, %v), want (%d, nil)", n, err, len(dst))
 		}
 	}
 }
