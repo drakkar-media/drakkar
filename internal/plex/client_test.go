@@ -91,6 +91,39 @@ func TestRemoveFromWatchlistResolvesTMDBGuid(t *testing.T) {
 	}
 }
 
+func TestRemoveFromWatchlistAcceptsStringGuid(t *testing.T) {
+	var removed string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Plex-Token") != "token" || r.Header.Get("Accept") != "application/json" {
+			http.Error(w, "missing Plex headers", http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/library/sections/watchlist/all":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"MediaContainer":{"totalSize":1,"Metadata":[{"ratingKey":"string-guid"}]}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/library/metadata/string-guid":
+			_, _ = w.Write([]byte(`{"MediaContainer":{"Metadata":[{"type":"movie","Guid":"tmdb://321"}]}}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/actions/removeFromWatchlist":
+			removed = r.URL.Query().Get("ratingKey")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "token")
+	client.cloudURL = server.URL
+	result, err := client.RemoveFromWatchlist(context.Background(), "movie", 321)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result || removed != "string-guid" {
+		t.Fatalf("watchlist item was not removed: result=%t key=%q", result, removed)
+	}
+}
+
 func TestRemoveFromWatchlistRejectsUnsupportedMediaType(t *testing.T) {
 	client := NewClient("http://plex", "token")
 	_, err := client.RemoveFromWatchlist(context.Background(), "music", 1)

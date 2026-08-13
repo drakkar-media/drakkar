@@ -133,13 +133,13 @@ func insertImportedFiles(ctx context.Context, tx *sql.Tx, selectedReleaseID, nzb
 		if err := tx.QueryRowContext(ctx, `
 			insert into nzb_files (
 				nzb_document_id, subject, poster, posted_at, file_size_bytes,
-				message_ids, message_ids_packed, message_id_count,
+				message_ids, message_id_count,
 				decoded_segment_size, last_decoded_size
 			)
-			values ($1, $2, $3, $4, $5, '{}', $6, $7, $8, $9)
+			values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			returning id`,
 			nzbDocumentID, file.Subject, file.Poster, postedAt, file.FileSizeBytes,
-			packMessageIDs(msgIDs), len(msgIDs), decSegSize, lastDecSize,
+			pgTextArray(msgIDs), len(msgIDs), decSegSize, lastDecSize,
 		).Scan(&nzbFileID); err != nil {
 			return nil, err
 		}

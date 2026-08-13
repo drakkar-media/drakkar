@@ -64,36 +64,37 @@ func unpackMessageIDs(packed []byte, legacyRaw string) ([]string, error) {
 	return out, nil
 }
 
-// CompactNZBFileMessageIDs converts legacy text[] segment identifiers to the
-// packed representation in batches, then clears the legacy array so pg_dump no
-// longer carries both copies. Rows already packed are skipped.
-func (db *DB) CompactNZBFileMessageIDs(ctx context.Context) (int64, error) {
+// RestoreNZBFileMessageIDs converts rows written by v0.3.42 back to the
+// legacy text[] representation. The packed bytea copy remains a temporary read
+// fallback only; text arrays compress better in PostgreSQL custom-format dumps.
+func (db *DB) RestoreNZBFileMessageIDs(ctx context.Context) (int64, error) {
 	const batchSize = 1000
 	var total int64
 	for {
 		rows, err := db.SQL.QueryContext(ctx, `
-			select id, coalesce(message_ids::text, '{}')
+			select id, message_ids_packed, coalesce(message_ids::text, '{}')
 			from nzb_files
-			where message_ids_packed is null
-			  and coalesce(array_length(message_ids, 1), 0) > 0
+			where message_ids_packed is not null
 			order by id
 			limit $1`, batchSize)
 		if err != nil {
 			return total, err
 		}
 		type item struct {
-			id  int64
-			ids []string
+			id     int64
+			packed []byte
+			raw    string
 		}
 		batch := make([]item, 0, batchSize)
 		for rows.Next() {
 			var id int64
+			var packed []byte
 			var raw string
-			if err := rows.Scan(&id, &raw); err != nil {
+			if err := rows.Scan(&id, &packed, &raw); err != nil {
 				_ = rows.Close()
 				return total, err
 			}
-			batch = append(batch, item{id: id, ids: parsePostgresArray(raw)})
+			batch = append(batch, item{id: id, packed: packed, raw: raw})
 		}
 		if err := rows.Close(); err != nil {
 			return total, err
@@ -105,17 +106,21 @@ func (db *DB) CompactNZBFileMessageIDs(ctx context.Context) (int64, error) {
 			if err := ctx.Err(); err != nil {
 				return total, err
 			}
-			if len(row.ids) == 0 {
+			ids, err := unpackMessageIDs(row.packed, row.raw)
+			if err != nil {
+				return total, err
+			}
+			if len(ids) == 0 {
 				continue
 			}
 			res, err := db.SQL.ExecContext(ctx, `
 				update nzb_files
-				set message_ids_packed = $2,
+				set message_ids = $2,
 				    message_id_count = $3,
-				    message_ids = '{}'
+				    message_ids_packed = null
 				where id = $1
-				  and message_ids_packed is null`,
-				row.id, packMessageIDs(row.ids), len(row.ids))
+				  and message_ids_packed is not null`,
+				row.id, pgTextArray(ids), len(ids))
 			if err != nil {
 				return total, err
 			}

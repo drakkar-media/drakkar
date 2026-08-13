@@ -39,7 +39,7 @@ func (r *repoStub) PruneOrphanedSelectedReleases(ctx context.Context, olderThan 
 	return 0, nil
 }
 
-func (r *repoStub) CompactNZBFileMessageIDs(ctx context.Context) (int64, error) {
+func (r *repoStub) RestoreNZBFileMessageIDs(ctx context.Context) (int64, error) {
 	return 0, nil
 }
 

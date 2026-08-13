@@ -1130,10 +1130,10 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		} else if result.DeletedRows > 0 {
 			logger.Info().Int("deletedRows", result.DeletedRows).Msg("monitoring: pruned orphaned selected releases")
 		}
-		if result, err := maintenanceSvc.CompactNZBFileMessageIDs(ctx); err != nil {
-			logger.Error().Err(err).Msg("monitoring: nzb message-id compaction error")
+		if result, err := maintenanceSvc.RestoreNZBFileMessageIDs(ctx); err != nil {
+			logger.Error().Err(err).Msg("monitoring: nzb message-id restore error")
 		} else if result.DeletedRows > 0 {
-			logger.Info().Int("updatedRows", result.DeletedRows).Msg("monitoring: compacted nzb message ids")
+			logger.Info().Int("updatedRows", result.DeletedRows).Msg("monitoring: restored nzb message ids")
 		}
 		// recent_url_fetches only needs to outlive the 30-min per-URL fetch
 		// cooldown it backstops; keep a comfortable multiple of that so a

@@ -52,8 +52,8 @@ func (s *maintenanceOpsService) PruneOrphanedSelectedReleases(ctx context.Contex
 	return s.base.PruneOrphanedSelectedReleases(ctx)
 }
 
-func (s *maintenanceOpsService) CompactNZBFileMessageIDs(ctx context.Context) (maintenance.Result, error) {
-	return s.base.CompactNZBFileMessageIDs(ctx)
+func (s *maintenanceOpsService) RestoreNZBFileMessageIDs(ctx context.Context) (maintenance.Result, error) {
+	return s.base.RestoreNZBFileMessageIDs(ctx)
 }
 
 // TryStartDeepNZBHealthCheck reserves the process-wide deep-health worker and

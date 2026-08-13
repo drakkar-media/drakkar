@@ -305,18 +305,40 @@ type plexWatchlistPage struct {
 type plexCloudMetadata struct {
 	MediaContainer struct {
 		Metadata []struct {
-			Type string `json:"type"`
-			Guid []struct {
-				ID string `json:"id"`
-			} `json:"Guid"`
+			Type string    `json:"type"`
+			Guid plexGUIDs `json:"Guid"`
 		} `json:"Metadata"`
 		Video []struct {
-			Type string `json:"type"`
-			Guid []struct {
-				ID string `json:"id"`
-			} `json:"Guid"`
+			Type string    `json:"type"`
+			Guid plexGUIDs `json:"Guid"`
 		} `json:"Video"`
 	} `json:"MediaContainer"`
+}
+
+type plexGUIDs []string
+
+func (g *plexGUIDs) UnmarshalJSON(data []byte) error {
+	var arr []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(data, &arr); err == nil {
+		*g = (*g)[:0]
+		for _, item := range arr {
+			if strings.TrimSpace(item.ID) != "" {
+				*g = append(*g, item.ID)
+			}
+		}
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		if strings.TrimSpace(s) == "" {
+			*g = nil
+		} else {
+			*g = []string{s}
+		}
+	}
+	return nil
 }
 
 func (c *Client) watchlistItemMatches(ctx context.Context, ratingKey, wantedType string, tmdbID int64) (bool, error) {
@@ -334,17 +356,11 @@ func (c *Client) watchlistItemMatches(ctx context.Context, ratingKey, wantedType
 	}
 	items := make([]guidItem, 0, len(payload.MediaContainer.Metadata)+len(payload.MediaContainer.Video))
 	for _, item := range payload.MediaContainer.Metadata {
-		entry := guidItem{mediaType: item.Type}
-		for _, guid := range item.Guid {
-			entry.guids = append(entry.guids, guid.ID)
-		}
+		entry := guidItem{mediaType: item.Type, guids: item.Guid}
 		items = append(items, entry)
 	}
 	for _, item := range payload.MediaContainer.Video {
-		entry := guidItem{mediaType: item.Type}
-		for _, guid := range item.Guid {
-			entry.guids = append(entry.guids, guid.ID)
-		}
+		entry := guidItem{mediaType: item.Type, guids: item.Guid}
 		items = append(items, entry)
 	}
 	needle := fmt.Sprintf("tmdb://%d", tmdbID)

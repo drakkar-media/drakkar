@@ -24,7 +24,7 @@ type Repository interface {
 	TouchMaintenanceCursor(ctx context.Context, taskName string, cursor string) error
 	PruneStaleReleaseCandidates(ctx context.Context, olderThan time.Duration) (int64, error)
 	PruneOrphanedSelectedReleases(ctx context.Context, olderThan time.Duration) (int64, error)
-	CompactNZBFileMessageIDs(ctx context.Context) (int64, error)
+	RestoreNZBFileMessageIDs(ctx context.Context) (int64, error)
 }
 
 // releaseCandidateRetention is how long an unselected, unreferenced
@@ -167,11 +167,11 @@ func (s *Service) PruneOrphanedSelectedReleases(ctx context.Context) (Result, er
 	return result, s.repo.TouchMaintenanceCursor(ctx, result.TaskName, time.Now().UTC().Format(time.RFC3339))
 }
 
-// CompactNZBFileMessageIDs moves legacy text[] segment IDs into the compact
-// packed bytea column so backups stop carrying oversized array TOAST data.
-func (s *Service) CompactNZBFileMessageIDs(ctx context.Context) (Result, error) {
-	updated, err := s.repo.CompactNZBFileMessageIDs(ctx)
-	result := Result{TaskName: "compact-nzb-message-ids", DeletedRows: int(updated)}
+// RestoreNZBFileMessageIDs moves message IDs written in the temporary packed
+// format back to the legacy text[] column used by the rest of the system.
+func (s *Service) RestoreNZBFileMessageIDs(ctx context.Context) (Result, error) {
+	updated, err := s.repo.RestoreNZBFileMessageIDs(ctx)
+	result := Result{TaskName: "restore-nzb-message-ids", DeletedRows: int(updated)}
 	if err != nil {
 		return result, err
 	}
