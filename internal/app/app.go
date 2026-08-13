@@ -220,15 +220,13 @@ func (s *fileSettingsService) ListBackups(ctx context.Context) ([]systembackup.B
 	return backup.List(ctx)
 }
 
-// CreateBackup creates a new settings/database bundle.
-func (s *fileSettingsService) CreateBackup(ctx context.Context) (systembackup.BackupInfo, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// StartBackup starts a server-owned settings/database backup operation.
+func (s *fileSettingsService) StartBackup(_ context.Context) (systembackup.OperationStatus, error) {
 	backup, err := s.backupService()
 	if err != nil {
-		return systembackup.BackupInfo{}, err
+		return systembackup.OperationStatus{}, err
 	}
-	return backup.Create(ctx)
+	return backup.StartCreate()
 }
 
 // WriteBackupArchive streams a named bundle to dst.
@@ -258,15 +256,14 @@ func (s *fileSettingsService) DeleteBackup(ctx context.Context, name string) err
 	return backup.Delete(ctx, name)
 }
 
-// StageBackupRestore validates a bundle and schedules pre-start restoration.
-func (s *fileSettingsService) StageBackupRestore(ctx context.Context, name string) (systembackup.RestoreStatus, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// StartBackupRestore validates a bundle and schedules pre-start restoration in
+// the background.
+func (s *fileSettingsService) StartBackupRestore(_ context.Context, name string) (systembackup.OperationStatus, error) {
 	backup, err := s.backupService()
 	if err != nil {
-		return systembackup.RestoreStatus{}, err
+		return systembackup.OperationStatus{}, err
 	}
-	return backup.StageRestore(ctx, name)
+	return backup.StartRestore(name)
 }
 
 // BackupRestoreStatus returns the latest persisted restore outcome.
@@ -276,6 +273,15 @@ func (s *fileSettingsService) BackupRestoreStatus(ctx context.Context) (systemba
 		return systembackup.RestoreStatus{}, err
 	}
 	return backup.Status(ctx)
+}
+
+// BackupOperationStatus returns the current in-process backup operation.
+func (s *fileSettingsService) BackupOperationStatus(ctx context.Context) (systembackup.OperationStatus, error) {
+	backup, err := s.backupService()
+	if err != nil {
+		return systembackup.OperationStatus{}, err
+	}
+	return backup.OperationStatus(ctx), nil
 }
 
 func (s *fileSettingsService) backupService() (*systembackup.Service, error) {
@@ -1123,6 +1129,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			logger.Error().Err(err).Msg("monitoring: orphaned selected-release prune error")
 		} else if result.DeletedRows > 0 {
 			logger.Info().Int("deletedRows", result.DeletedRows).Msg("monitoring: pruned orphaned selected releases")
+		}
+		if result, err := maintenanceSvc.CompactNZBFileMessageIDs(ctx); err != nil {
+			logger.Error().Err(err).Msg("monitoring: nzb message-id compaction error")
+		} else if result.DeletedRows > 0 {
+			logger.Info().Int("updatedRows", result.DeletedRows).Msg("monitoring: compacted nzb message ids")
 		}
 		// recent_url_fetches only needs to outlive the 30-min per-URL fetch
 		// cooldown it backstops; keep a comfortable multiple of that so a

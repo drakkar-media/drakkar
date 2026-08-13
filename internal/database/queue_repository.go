@@ -32,7 +32,14 @@ const queueSnapshotQuery = `
 		n.id,
 		coalesce(n.file_name, ''),
 		coalesce((select count(*) from nzb_files nf where nf.nzb_document_id = n.id), 0),
-		coalesce((select sum(array_length(nf.message_ids, 1)) from nzb_files nf where nf.nzb_document_id = n.id), 0),
+		coalesce((
+			select sum(case
+				when nf.message_id_count > 0 then nf.message_id_count
+				else coalesce(array_length(nf.message_ids, 1), 0)
+			end)
+			from nzb_files nf
+			where nf.nzb_document_id = n.id
+		), 0),
 		ep.season_number,
 		ep.episode_number,
 		q.on_hold,
@@ -124,11 +131,15 @@ func insertImportedFiles(ctx context.Context, tx *sql.Tx, selectedReleaseID, nzb
 		decSegSize, lastDecSize := segmentSizes(file.Segments)
 		var nzbFileID int64
 		if err := tx.QueryRowContext(ctx, `
-			insert into nzb_files (nzb_document_id, subject, poster, posted_at, file_size_bytes, message_ids, decoded_segment_size, last_decoded_size)
-			values ($1, $2, $3, $4, $5, $6, $7, $8)
+			insert into nzb_files (
+				nzb_document_id, subject, poster, posted_at, file_size_bytes,
+				message_ids, message_ids_packed, message_id_count,
+				decoded_segment_size, last_decoded_size
+			)
+			values ($1, $2, $3, $4, $5, '{}', $6, $7, $8, $9)
 			returning id`,
 			nzbDocumentID, file.Subject, file.Poster, postedAt, file.FileSizeBytes,
-			pgTextArray(msgIDs), decSegSize, lastDecSize,
+			packMessageIDs(msgIDs), len(msgIDs), decSegSize, lastDecSize,
 		).Scan(&nzbFileID); err != nil {
 			return nil, err
 		}

@@ -17,10 +17,11 @@
   import { api } from '$lib/api';
   import { bytes, dateTime } from '$lib/format';
   import { toastError, toastSuccess } from '$lib/toast';
-  import type { BackupInfo, RestoreStatus } from '$lib/types';
+  import type { BackupInfo, BackupOperationStatus, RestoreStatus } from '$lib/types';
 
   let backups: BackupInfo[] = [];
   let restoreStatus: RestoreStatus = { state: 'idle' };
+  let operation: BackupOperationStatus = { state: 'idle' };
   let loading = true;
   let creating = false;
   let uploading = false;
@@ -28,12 +29,17 @@
   let deleting = '';
   let fileInput: HTMLInputElement;
   let disposed = false;
+  let pollTimer: number | undefined;
 
   async function load() {
     try {
-      const [backupResponse, status] = await Promise.all([api.backups(), api.restoreStatus()]);
+      const [backupResponse, status, op] = await Promise.all([api.backups(), api.restoreStatus(), api.backupOperation()]);
       backups = backupResponse.items ?? [];
       restoreStatus = status;
+      operation = op;
+      creating = operation.state === 'creating';
+      restoring = operation.state === 'validating_restore' ? (operation.backupName ?? '') : restoring;
+      scheduleOperationPoll();
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -44,13 +50,102 @@
   async function createBackup() {
     creating = true;
     try {
-      const backup = await api.createBackup();
-      toastSuccess(`Backup created: ${backup.name}`);
-      await load();
+      operation = await api.createBackup();
+      toastSuccess('Backup started');
+      scheduleOperationPoll();
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
-    } finally {
       creating = false;
+    }
+  }
+
+  async function refreshOperation() {
+    if (disposed) return;
+    const previous = operation.state;
+    try {
+      operation = await api.backupOperation();
+      creating = operation.state === 'creating';
+      if (operation.state === 'validating_restore') {
+        restoring = operation.backupName ?? restoring;
+      }
+      if (previous === 'creating' && operation.state === 'completed') {
+        toastSuccess(operation.backupName ? `Backup created: ${operation.backupName}` : 'Backup created');
+        await load();
+        return;
+      }
+      if (previous === 'validating_restore' && operation.state === 'scheduled') {
+        toastSuccess('Restore staged; Drakkar is restarting');
+        await waitForRestart();
+        return;
+      }
+      if (operation.state === 'failed') {
+        toastError(operation.error || 'Backup operation failed');
+        creating = false;
+        restoring = '';
+        return;
+      }
+      scheduleOperationPoll();
+    } catch (error) {
+      toastError(error instanceof Error ? error.message : String(error));
+      scheduleOperationPoll();
+    }
+  }
+
+  function scheduleOperationPoll() {
+    if (pollTimer) {
+      window.clearTimeout(pollTimer);
+      pollTimer = undefined;
+    }
+    if (disposed || !['creating', 'validating_restore'].includes(operation.state)) {
+      return;
+    }
+    pollTimer = window.setTimeout(() => void refreshOperation(), 2000);
+  }
+
+  function operationText(status: BackupOperationStatus) {
+    if (status.state === 'creating') return 'creating backup';
+    if (status.state === 'validating_restore') return 'validating restore';
+    if (status.state === 'scheduled') return 'restore scheduled';
+    return status.state.replace('_', ' ');
+  }
+
+  function operationTone(state: BackupOperationStatus['state']): 'neutral' | 'ok' | 'warn' | 'danger' {
+    if (state === 'completed') return 'ok';
+    if (state === 'creating' || state === 'validating_restore' || state === 'scheduled') return 'warn';
+    if (state === 'failed') return 'danger';
+    return 'neutral';
+  }
+
+  function backupBusy() {
+    return ['creating', 'validating_restore', 'scheduled'].includes(operation.state);
+  }
+
+  function restoreBusy() {
+    return ['scheduled', 'restoring', 'rebuilding'].includes(restoreStatus.state);
+  }
+
+  function actionDisabled() {
+    return uploading || creating || !!restoring || backupBusy() || restoreBusy();
+  }
+
+  function startedAt(status: BackupOperationStatus) {
+    return status.startedAt ? dateTime(status.startedAt) : '';
+  }
+
+  function operationTitle(status: BackupOperationStatus) {
+    if (status.backupName) return status.backupName;
+    if (status.operation === 'create_backup') return 'Backup';
+    if (status.operation === 'restore_backup') return 'Restore';
+    return 'Operation';
+  }
+
+  $: creating = operation.state === 'creating';
+
+  async function reloadAfterUpload() {
+    try {
+      await load();
+    } finally {
+      uploading = false;
     }
   }
 
@@ -63,10 +158,9 @@
     try {
       const backup = await api.uploadBackup(file);
       toastSuccess(`Backup imported: ${backup.name}`);
-      await load();
+      await reloadAfterUpload();
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
-    } finally {
       uploading = false;
     }
   }
@@ -98,9 +192,9 @@
     }
     restoring = name;
     try {
-      restoreStatus = await api.restoreBackup(name);
-      toastSuccess('Restore staged; Drakkar is restarting');
-      await waitForRestart();
+      operation = await api.restoreBackup(name);
+      toastSuccess('Restore validation started');
+      scheduleOperationPoll();
     } catch (error) {
       toastError(error instanceof Error ? error.message : String(error));
       restoring = '';
@@ -143,18 +237,21 @@
 
   onMount(() => {
     void load();
-    return () => { disposed = true; };
+    return () => {
+      disposed = true;
+      if (pollTimer) window.clearTimeout(pollTimer);
+    };
   });
 </script>
 
 <Panel title="Backup & Restore" subtitle="Settings and PostgreSQL database bundles.">
   <svelte:fragment slot="actions">
     <div class="flex flex-wrap justify-end gap-2">
-      <Button kind="secondary" on:click={() => fileInput.click()} disabled={uploading || creating || !!restoring}>
+      <Button kind="secondary" on:click={() => fileInput.click()} disabled={actionDisabled()}>
         {#if uploading}<RefreshCw size={14} class="animate-spin" />{:else}<Upload size={14} />{/if}
         Import
       </Button>
-      <Button kind="primary" on:click={createBackup} disabled={creating || uploading || !!restoring}>
+      <Button kind="primary" on:click={createBackup} disabled={actionDisabled()}>
         {#if creating}<RefreshCw size={14} class="animate-spin" />{:else}<DatabaseBackup size={14} />{/if}
         {creating ? 'Creating…' : 'Create Backup'}
       </Button>
@@ -172,6 +269,18 @@
     </div>
   {/if}
 
+  {#if operation.state !== 'idle'}
+    <div class="mb-3 flex min-w-0 items-center justify-between gap-3 rounded-lg border border-border bg-background/40 px-3 py-2.5">
+      <div class="min-w-0">
+        <div class="truncate text-sm font-semibold">{operationTitle(operation)}</div>
+        <div class="mt-1 truncate text-xs text-muted-foreground">
+          {#if operation.error}{operation.error}{:else if startedAt(operation)}Started {startedAt(operation)}{/if}
+        </div>
+      </div>
+      <StatusPill tone={operationTone(operation.state)}>{operationText(operation)}</StatusPill>
+    </div>
+  {/if}
+
   {#if loading}
     <div class="py-5 text-center text-sm text-muted-foreground">Loading…</div>
   {:else if backups.length === 0}
@@ -185,14 +294,14 @@
             <div class="mt-1 text-xs text-muted-foreground">{dateTime(backup.createdAt)} · {bytes(backup.sizeBytes)} · v{backup.drakkarVersion}</div>
           </div>
           <div class="flex flex-wrap items-center justify-end gap-1.5 max-[620px]:justify-start">
-            <Button kind="ghost" class="h-8 w-8 px-0" title="Download backup" aria-label={`Download ${backup.name}`} on:click={() => downloadBackup(backup.name)} disabled={!!restoring}>
+            <Button kind="ghost" class="h-8 w-8 px-0" title="Download backup" aria-label={`Download ${backup.name}`} on:click={() => downloadBackup(backup.name)} disabled={actionDisabled()}>
               <Download size={14} />
             </Button>
-            <Button kind="secondary" on:click={() => restoreBackup(backup.name)} disabled={!!restoring || creating || uploading}>
+            <Button kind="secondary" on:click={() => restoreBackup(backup.name)} disabled={actionDisabled()}>
               {#if restoring === backup.name}<RefreshCw size={14} class="animate-spin" />{:else}<RotateCcw size={14} />{/if}
               Restore
             </Button>
-            <Button kind="ghost" class="h-8 w-8 px-0" title="Delete backup" aria-label={`Delete ${backup.name}`} on:click={() => deleteBackup(backup.name)} disabled={deleting === backup.name || !!restoring}>
+            <Button kind="ghost" class="h-8 w-8 px-0" title="Delete backup" aria-label={`Delete ${backup.name}`} on:click={() => deleteBackup(backup.name)} disabled={deleting === backup.name || actionDisabled()}>
               <Trash2 size={14} />
             </Button>
           </div>

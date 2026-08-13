@@ -572,6 +572,17 @@ export type RestoreStatus = {
   error?: string;
 };
 
+/** Tracks in-process backup operations that continue after page navigation. */
+export type BackupOperationStatus = {
+  state: 'idle' | 'creating' | 'validating_restore' | 'scheduled' | 'completed' | 'failed';
+  operation?: 'create_backup' | 'restore_backup';
+  backupName?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  error?: string;
+  backup?: BackupInfo;
+};
+
 export type SpeedTestResult = {
   fileName: string;
   fileSizeBytes: number;

@@ -57,6 +57,19 @@ type RestoreStatus struct {
 	Error      string     `json:"error,omitempty"`
 }
 
+// OperationStatus reports a long-running in-process backup operation. It is
+// intentionally separate from RestoreStatus: restore status survives the
+// restart, while create/import validation only needs process-local progress.
+type OperationStatus struct {
+	State      string      `json:"state"`
+	Operation  string      `json:"operation,omitempty"`
+	BackupName string      `json:"backupName,omitempty"`
+	StartedAt  *time.Time  `json:"startedAt,omitempty"`
+	FinishedAt *time.Time  `json:"finishedAt,omitempty"`
+	Error      string      `json:"error,omitempty"`
+	Backup     *BackupInfo `json:"backup,omitempty"`
+}
+
 type manifest struct {
 	FormatVersion  int                `json:"formatVersion"`
 	CreatedAt      time.Time          `json:"createdAt"`
@@ -105,6 +118,8 @@ type Service struct {
 	runner       commandRunner
 	restart      func()
 	mu           sync.Mutex
+	opMu         sync.Mutex
+	operation    OperationStatus
 }
 
 // NewService creates a backup service rooted beside settingsPath. restart is
@@ -185,6 +200,27 @@ func (s *Service) Create(ctx context.Context) (BackupInfo, error) {
 		return BackupInfo{}, err
 	}
 	return backupInfo(finalDir, name, m)
+}
+
+// StartCreate starts backup creation in a process-owned goroutine. The work
+// uses context.Background so browser navigation or request timeout cannot
+// cancel pg_dump after the operation has been accepted.
+func (s *Service) StartCreate() (OperationStatus, error) {
+	started := time.Now().UTC()
+	status := OperationStatus{State: "creating", Operation: "create_backup", StartedAt: &started}
+	if err := s.startOperation(status); err != nil {
+		return OperationStatus{}, err
+	}
+	go func() {
+		info, err := s.Create(context.Background())
+		if err != nil {
+			s.finishOperation(OperationStatus{State: "failed", Operation: "create_backup", Error: err.Error()})
+			return
+		}
+		completed := OperationStatus{State: "completed", Operation: "create_backup", BackupName: info.Name, Backup: &info}
+		s.finishOperation(completed)
+	}()
+	return status, nil
 }
 
 // List returns completed bundles newest first. Incomplete hidden directories
@@ -381,6 +417,25 @@ func (s *Service) StageRestore(ctx context.Context, name string) (RestoreStatus,
 	return status, nil
 }
 
+// StartRestore validates and stages a restore in the background, then lets the
+// existing staged-restore restart path take over.
+func (s *Service) StartRestore(name string) (OperationStatus, error) {
+	started := time.Now().UTC()
+	status := OperationStatus{State: "validating_restore", Operation: "restore_backup", BackupName: name, StartedAt: &started}
+	if err := s.startOperation(status); err != nil {
+		return OperationStatus{}, err
+	}
+	go func() {
+		restoreStatus, err := s.StageRestore(context.Background(), name)
+		if err != nil {
+			s.finishOperation(OperationStatus{State: "failed", Operation: "restore_backup", BackupName: name, Error: err.Error()})
+			return
+		}
+		s.finishOperation(OperationStatus{State: restoreStatus.State, Operation: "restore_backup", BackupName: name})
+	}()
+	return status, nil
+}
+
 // Status returns the latest persisted restore status, or idle before the first
 // restore attempt.
 func (s *Service) Status(_ context.Context) (RestoreStatus, error) {
@@ -390,6 +445,49 @@ func (s *Service) Status(_ context.Context) (RestoreStatus, error) {
 		return RestoreStatus{State: "idle"}, nil
 	}
 	return status, err
+}
+
+// OperationStatus returns the current or most recent in-process backup
+// operation. It is deliberately memory-only; completed backup bundles and
+// staged restore status remain the durable records.
+func (s *Service) OperationStatus(_ context.Context) OperationStatus {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if s.operation.State == "" {
+		return OperationStatus{State: "idle"}
+	}
+	return s.operation
+}
+
+func (s *Service) startOperation(status OperationStatus) error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if backupOperationActive(s.operation.State) {
+		return errors.New("a backup or restore operation is already running")
+	}
+	s.operation = status
+	return nil
+}
+
+func (s *Service) finishOperation(status OperationStatus) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	finished := time.Now().UTC()
+	status.StartedAt = s.operation.StartedAt
+	status.FinishedAt = &finished
+	if status.BackupName == "" {
+		status.BackupName = s.operation.BackupName
+	}
+	s.operation = status
+}
+
+func backupOperationActive(state string) bool {
+	switch state {
+	case "creating", "validating_restore", "scheduled", "restoring", "rebuilding":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Service) validateBundle(ctx context.Context, dir string) (manifest, error) {

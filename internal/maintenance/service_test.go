@@ -39,6 +39,10 @@ func (r *repoStub) PruneOrphanedSelectedReleases(ctx context.Context, olderThan 
 	return 0, nil
 }
 
+func (r *repoStub) CompactNZBFileMessageIDs(ctx context.Context) (int64, error) {
+	return 0, nil
+}
+
 func TestRemoveBrokenMediaSymlinks(t *testing.T) {
 	root := t.TempDir()
 	link := filepath.Join(root, "broken.mkv")

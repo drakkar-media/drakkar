@@ -46,6 +46,7 @@ import type {
   QueuedResult,
   MediaDeletionResult,
   BackupInfo,
+  BackupOperationStatus,
   RestoreStatus
 } from '$lib/types';
 
@@ -470,7 +471,8 @@ export const api = {
   prioritizeTVShowMissing: (tvShowId: number) =>
     request<QueuedResult>(`/api/tv-shows/${tvShowId}/prioritize-missing`, { method: 'POST' }),
   backups: () => request<{ items: BackupInfo[] }>('/api/system/backups'),
-  createBackup: () => request<BackupInfo>('/api/system/backups', { method: 'POST' }),
+  createBackup: () => request<BackupOperationStatus>('/api/system/backups', { method: 'POST' }),
+  backupOperation: () => request<BackupOperationStatus>('/api/system/backup-operation'),
   uploadBackup: (file: File) => {
     const form = new FormData();
     form.set('backup', file);
@@ -478,7 +480,7 @@ export const api = {
   },
   deleteBackup: (name: string) => request<void>(`/api/system/backups/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   restoreBackup: (name: string) =>
-    request<RestoreStatus>(`/api/system/backups/${encodeURIComponent(name)}/restore`, {
+    request<BackupOperationStatus>(`/api/system/backups/${encodeURIComponent(name)}/restore`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ confirmation: name })

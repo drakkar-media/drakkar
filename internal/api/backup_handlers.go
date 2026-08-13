@@ -18,12 +18,13 @@ import (
 // operations optionally exposed by a SettingsService implementation.
 type SystemBackupService interface {
 	ListBackups(ctx context.Context) ([]systembackup.BackupInfo, error)
-	CreateBackup(ctx context.Context) (systembackup.BackupInfo, error)
+	StartBackup(ctx context.Context) (systembackup.OperationStatus, error)
 	WriteBackupArchive(ctx context.Context, name string, dst io.Writer) error
 	ImportBackupArchive(ctx context.Context, src io.Reader) (systembackup.BackupInfo, error)
 	DeleteBackup(ctx context.Context, name string) error
-	StageBackupRestore(ctx context.Context, name string) (systembackup.RestoreStatus, error)
+	StartBackupRestore(ctx context.Context, name string) (systembackup.OperationStatus, error)
 	BackupRestoreStatus(ctx context.Context) (systembackup.RestoreStatus, error)
+	BackupOperationStatus(ctx context.Context) (systembackup.OperationStatus, error)
 }
 
 type backupDownloadWriter struct {
@@ -47,12 +48,20 @@ func registerSystemBackupRoutes(r chi.Router, service SystemBackupService) {
 		respondJSON(w, http.StatusOK, map[string]any{"items": items})
 	}))
 	r.Post("/api/system/backups", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
-		item, err := service.CreateBackup(r.Context())
+		status, err := service.StartBackup(r.Context())
+		if err != nil {
+			respondError(w, http.StatusConflict, err)
+			return
+		}
+		respondJSON(w, http.StatusAccepted, status)
+	}))
+	r.Get("/api/system/backup-operation", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+		status, err := service.BackupOperationStatus(r.Context())
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, err)
 			return
 		}
-		respondJSON(w, http.StatusCreated, item)
+		respondJSON(w, http.StatusOK, status)
 	}))
 	r.Get("/api/system/backups/{name}/download", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 		name := chi.URLParam(r, "name")
@@ -122,9 +131,9 @@ func registerSystemBackupRoutes(r chi.Router, service SystemBackupService) {
 			respondError(w, http.StatusBadRequest, fmt.Errorf("confirmation must exactly match backup name %q", name))
 			return
 		}
-		status, err := service.StageBackupRestore(r.Context(), name)
+		status, err := service.StartBackupRestore(r.Context(), name)
 		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+			respondError(w, http.StatusConflict, err)
 			return
 		}
 		respondJSON(w, http.StatusAccepted, status)

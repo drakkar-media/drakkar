@@ -688,6 +688,7 @@ func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, 
 	var nzbFileID sql.NullInt64
 	var segByteOffset, decodedSegSize, lastDecSize int64
 	var messageIDsRaw *string // scan as nullable string then parse
+	var messageIDsPacked []byte
 	var rarSalt, rarIV []byte
 	var rarLg2Count sql.NullInt32
 	var archivePassword sql.NullString
@@ -695,6 +696,7 @@ func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, 
 	err := db.SQL.QueryRowContext(ctx, `
 		SELECT vf.file_name, vf.reader_kind, vf.inline_bytes, vf.size_bytes,
 		       vf.nzb_file_id, vf.segment_byte_offset,
+		       nf.message_ids_packed,
 		       COALESCE(nf.message_ids::text, '{}'),
 		       COALESCE(nf.decoded_segment_size, 0),
 		       COALESCE(nf.last_decoded_size, 0),
@@ -705,7 +707,7 @@ func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, 
 		LEFT JOIN nzb_documents nd ON nd.id = nf.nzb_document_id
 		WHERE vf.id = $1`, virtualFileID,
 	).Scan(&entry.name, &entry.readerKind, &entry.inlineData, &entry.size,
-		&nzbFileID, &segByteOffset, &messageIDsRaw, &decodedSegSize, &lastDecSize,
+		&nzbFileID, &segByteOffset, &messageIDsPacked, &messageIDsRaw, &decodedSegSize, &lastDecSize,
 		&rarSalt, &rarIV, &rarLg2Count, &archivePassword)
 	if err != nil {
 		return nil, err
@@ -732,9 +734,13 @@ func (db *DB) loadVFCache(ctx context.Context, virtualFileID int64) (*cachedVF, 
 		}
 	}
 	if len(entry.spans) == 0 && (entry.readerKind == "direct_nzb" || entry.readerKind == "stored_rar") {
-		var msgIDs []string
+		legacyRaw := "{}"
 		if messageIDsRaw != nil {
-			msgIDs = parsePostgresArray(*messageIDsRaw)
+			legacyRaw = *messageIDsRaw
+		}
+		msgIDs, err := unpackMessageIDs(messageIDsPacked, legacyRaw)
+		if err != nil {
+			return nil, err
 		}
 		entry.spans = computeSpans(msgIDs, decodedSegSize, lastDecSize, segByteOffset, entry.size)
 	}
@@ -907,7 +913,7 @@ func (db *DB) loadStoredRarSpansUncorrected(ctx context.Context, virtualFileID i
 	}
 
 	sourceRows, err := db.SQL.QueryContext(ctx, `
-		SELECT nf.subject, COALESCE(nf.message_ids::text, '{}'),
+		SELECT nf.subject, nf.message_ids_packed, COALESCE(nf.message_ids::text, '{}'),
 		       COALESCE(nf.decoded_segment_size, 0),
 		       COALESCE(nf.last_decoded_size, 0),
 		       COALESCE(nf.file_size_bytes, 0)
@@ -922,14 +928,18 @@ func (db *DB) loadStoredRarSpansUncorrected(ctx context.Context, virtualFileID i
 	sources := make(map[string]storedRarNZBSource)
 	for sourceRows.Next() {
 		var (
-			subject       string
-			messageIDsRaw string
-			source        storedRarNZBSource
+			subject          string
+			messageIDsPacked []byte
+			messageIDsRaw    string
+			source           storedRarNZBSource
 		)
-		if err := sourceRows.Scan(&subject, &messageIDsRaw, &source.DecodedSegmentSize, &source.LastDecodedSize, &source.FileSizeBytes); err != nil {
+		if err := sourceRows.Scan(&subject, &messageIDsPacked, &messageIDsRaw, &source.DecodedSegmentSize, &source.LastDecodedSize, &source.FileSizeBytes); err != nil {
 			return nil, err
 		}
-		source.MessageIDs = parsePostgresArray(messageIDsRaw)
+		source.MessageIDs, err = unpackMessageIDs(messageIDsPacked, messageIDsRaw)
+		if err != nil {
+			return nil, err
+		}
 		name := strings.ToLower(filepath.Base(strings.TrimSpace(parseNZBSubjectFilename(subject))))
 		if name == "" {
 			name = strings.ToLower(filepath.Base(strings.TrimSpace(subject)))

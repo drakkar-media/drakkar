@@ -43,11 +43,14 @@ func (db *DB) loadNZBFirstLastSegmentPairs(ctx context.Context, nzbDocumentID in
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT
 		    nf.subject,
-		    nf.message_ids[1],
-		    nf.message_ids[array_length(nf.message_ids, 1)]
+		    nf.message_ids_packed,
+		    coalesce(nf.message_ids::text, '{}')
 		FROM nzb_files nf
 		WHERE nf.nzb_document_id = $1
-		  AND array_length(nf.message_ids, 1) > 0
+		  AND (
+		    nf.message_id_count > 0
+		    OR coalesce(array_length(nf.message_ids, 1), 0) > 0
+		  )
 		ORDER BY nf.id ASC`, nzbDocumentID)
 	if err != nil {
 		return nil, err
@@ -56,13 +59,22 @@ func (db *DB) loadNZBFirstLastSegmentPairs(ctx context.Context, nzbDocumentID in
 	var qualifying []segmentPair
 	for rows.Next() {
 		var subject string
-		var p segmentPair
-		if err := rows.Scan(&subject, &p.first, &p.last); err != nil {
+		var packed []byte
+		var raw string
+		if err := rows.Scan(&subject, &packed, &raw); err != nil {
 			return nil, err
 		}
 		if !shouldValidateNZBSubject(subject) {
 			continue
 		}
+		ids, err := unpackMessageIDs(packed, raw)
+		if err != nil {
+			return nil, err
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		p := segmentPair{first: ids[0], last: ids[len(ids)-1]}
 		qualifying = append(qualifying, p)
 	}
 	if err := rows.Err(); err != nil {
@@ -207,10 +219,13 @@ func (db *DB) loadNZBInteriorSampleSegments(ctx context.Context, nzbDocumentID i
 		return nil, nil
 	}
 	rows, err := db.SQL.QueryContext(ctx, `
-		SELECT nf.subject, nf.message_ids::text
+		SELECT nf.subject, nf.message_ids_packed, coalesce(nf.message_ids::text, '{}')
 		FROM nzb_files nf
 		WHERE nf.nzb_document_id = $1
-		  AND array_length(nf.message_ids, 1) > 0
+		  AND (
+		    nf.message_id_count > 0
+		    OR coalesce(array_length(nf.message_ids, 1), 0) > 0
+		  )
 		ORDER BY nf.id ASC`, nzbDocumentID)
 	if err != nil {
 		return nil, err
@@ -220,7 +235,8 @@ func (db *DB) loadNZBInteriorSampleSegments(ctx context.Context, nzbDocumentID i
 	qualifyingFiles := 0
 	for rows.Next() {
 		var subject, idsRaw string
-		if err := rows.Scan(&subject, &idsRaw); err != nil {
+		var packed []byte
+		if err := rows.Scan(&subject, &packed, &idsRaw); err != nil {
 			return nil, err
 		}
 		if !shouldValidateNZBSubject(subject) {
@@ -230,7 +246,10 @@ func (db *DB) loadNZBInteriorSampleSegments(ctx context.Context, nzbDocumentID i
 		if qualifyingFiles > 1 {
 			continue // keep scanning to detect multi-file, but stop collecting
 		}
-		messageIDs = parsePostgresArray(idsRaw)
+		messageIDs, err = unpackMessageIDs(packed, idsRaw)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -517,14 +536,17 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 
 	rows, err := db.SQL.QueryContext(ctx, `
 		SELECT nf.id,
-		       nf.message_ids[1],
+		       nf.message_ids_packed,
+		       coalesce(nf.message_ids::text, '{}'),
 		       nf.decoded_segment_size,
-		       nf.message_ids[array_length(nf.message_ids, 1)],
 		       nf.last_decoded_size
 		FROM nzb_files nf
 		WHERE nf.nzb_document_id = $1
 		  AND nf.calibrated_at IS NULL
-		  AND array_length(nf.message_ids, 1) > 0`, nzbDocumentID)
+		  AND (
+		    nf.message_id_count > 0
+		    OR coalesce(array_length(nf.message_ids, 1), 0) > 0
+		  )`, nzbDocumentID)
 	if err != nil {
 		return err
 	}
@@ -540,9 +562,20 @@ func (db *DB) CalibrateNZBOffsets(ctx context.Context, nzbDocumentID int64) erro
 	var files []fileInfo
 	for rows.Next() {
 		var f fileInfo
-		if err := rows.Scan(&f.id, &f.firstMsgID, &f.estFirstSize, &f.lastMsgID, &f.estLastSize); err != nil {
+		var packed []byte
+		var raw string
+		if err := rows.Scan(&f.id, &packed, &raw, &f.estFirstSize, &f.estLastSize); err != nil {
 			return err
 		}
+		ids, err := unpackMessageIDs(packed, raw)
+		if err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		f.firstMsgID = ids[0]
+		f.lastMsgID = ids[len(ids)-1]
 		if f.firstMsgID != "" && f.estFirstSize > 0 {
 			files = append(files, f)
 		}
@@ -684,7 +717,10 @@ func (db *DB) rescaleFileSegments(ctx context.Context, nzbFileID, actualFirstSiz
 		SET decoded_segment_size = $2,
 		    last_decoded_size     = $3
 		WHERE id = $1
-		RETURNING COALESCE(array_length(message_ids, 1), 0)`,
+		RETURNING case
+			when message_id_count > 0 then message_id_count
+			else coalesce(array_length(message_ids, 1), 0)
+		end`,
 		nzbFileID, actualFirstSize, actualLastSize,
 	).Scan(&segmentCount); err != nil {
 		return err
@@ -735,29 +771,47 @@ type PublishedDirectNzbSegment struct {
 // is considered unplayable.
 func (db *DB) ListPublishedDirectNzbSegments(ctx context.Context) ([]PublishedDirectNzbSegment, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
-		SELECT DISTINCT ON (sp.library_item_id)
+		SELECT
 		    sp.library_item_id,
-		    nf.message_ids[1],
+		    nf.message_ids_packed,
+		    coalesce(nf.message_ids::text, '{}'),
 		    coalesce(qi.selected_release_id, 0)
 		FROM symlink_publications sp
 		JOIN virtual_files vf ON vf.id = sp.virtual_file_id
 		JOIN nzb_files nf ON nf.id = vf.nzb_file_id
 		LEFT JOIN queue_items qi ON qi.library_item_id = sp.library_item_id
 		WHERE vf.reader_kind = 'direct_nzb'
-		  AND nf.message_ids IS NOT NULL
-		  AND array_length(nf.message_ids, 1) > 0
+		  AND (
+		    nf.message_id_count > 0
+		    OR coalesce(array_length(nf.message_ids, 1), 0) > 0
+		  )
 		ORDER BY sp.library_item_id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []PublishedDirectNzbSegment
+	seen := make(map[int64]struct{})
 	for rows.Next() {
 		var s PublishedDirectNzbSegment
-		if err := rows.Scan(&s.LibraryItemID, &s.FirstMsgID, &s.SelectedReleaseID); err != nil {
+		var packed []byte
+		var raw string
+		if err := rows.Scan(&s.LibraryItemID, &packed, &raw, &s.SelectedReleaseID); err != nil {
 			return nil, err
 		}
+		if _, ok := seen[s.LibraryItemID]; ok {
+			continue
+		}
+		ids, err := unpackMessageIDs(packed, raw)
+		if err != nil {
+			return nil, err
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		s.FirstMsgID = ids[0]
 		out = append(out, s)
+		seen[s.LibraryItemID] = struct{}{}
 	}
 	return out, rows.Err()
 }

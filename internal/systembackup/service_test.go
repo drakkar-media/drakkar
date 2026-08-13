@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/drakkar-media/drakkar/internal/config"
 )
@@ -60,6 +61,20 @@ func newTestService(t *testing.T) (*Service, config.Settings) {
 	return service, cfg
 }
 
+func waitForOperationState(t *testing.T, service *Service, state string) OperationStatus {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		status := service.OperationStatus(context.Background())
+		if status.State == state {
+			return status
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("operation did not reach %q, last=%+v", state, service.OperationStatus(context.Background()))
+	return OperationStatus{}
+}
+
 func TestServiceArchiveRoundTrip(t *testing.T) {
 	service, _ := newTestService(t)
 	created, err := service.Create(context.Background())
@@ -98,6 +113,36 @@ func TestServiceArchiveRoundTrip(t *testing.T) {
 	}
 	if err := imported.Delete(context.Background(), info.Name); err == nil {
 		t.Fatal("expected staged backup deletion to be rejected")
+	}
+}
+
+func TestStartCreateRunsInBackground(t *testing.T) {
+	service, _ := newTestService(t)
+	status, err := service.StartCreate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.State != "creating" || status.Operation != "create_backup" {
+		t.Fatalf("unexpected start status: %+v", status)
+	}
+	done := waitForOperationState(t, service, "completed")
+	if done.BackupName == "" || done.Backup == nil || done.Backup.Name != done.BackupName {
+		t.Fatalf("completed status missing backup metadata: %+v", done)
+	}
+	items, err := service.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Name != done.BackupName {
+		t.Fatalf("backup not listed after background create: %+v", items)
+	}
+}
+
+func TestStartCreateRejectsConcurrentOperation(t *testing.T) {
+	service, _ := newTestService(t)
+	service.operation = OperationStatus{State: "creating", Operation: "create_backup"}
+	if _, err := service.StartCreate(); err == nil {
+		t.Fatal("expected concurrent operation to be rejected")
 	}
 }
 

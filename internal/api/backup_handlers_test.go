@@ -18,6 +18,7 @@ import (
 type systemBackupStub struct {
 	items          []systembackup.BackupInfo
 	restoreStatus  systembackup.RestoreStatus
+	opStatus       systembackup.OperationStatus
 	downloadBody   string
 	downloadErr    error
 	stagedName     string
@@ -27,8 +28,8 @@ type systemBackupStub struct {
 func (s *systemBackupStub) ListBackups(context.Context) ([]systembackup.BackupInfo, error) {
 	return s.items, nil
 }
-func (s *systemBackupStub) CreateBackup(context.Context) (systembackup.BackupInfo, error) {
-	return s.items[0], nil
+func (s *systemBackupStub) StartBackup(context.Context) (systembackup.OperationStatus, error) {
+	return s.opStatus, nil
 }
 func (s *systemBackupStub) WriteBackupArchive(_ context.Context, _ string, dst io.Writer) error {
 	if s.downloadBody != "" {
@@ -40,12 +41,15 @@ func (s *systemBackupStub) ImportBackupArchive(context.Context, io.Reader) (syst
 	return s.importedBackup, nil
 }
 func (s *systemBackupStub) DeleteBackup(context.Context, string) error { return nil }
-func (s *systemBackupStub) StageBackupRestore(_ context.Context, name string) (systembackup.RestoreStatus, error) {
+func (s *systemBackupStub) StartBackupRestore(_ context.Context, name string) (systembackup.OperationStatus, error) {
 	s.stagedName = name
-	return s.restoreStatus, nil
+	return s.opStatus, nil
 }
 func (s *systemBackupStub) BackupRestoreStatus(context.Context) (systembackup.RestoreStatus, error) {
 	return s.restoreStatus, nil
+}
+func (s *systemBackupStub) BackupOperationStatus(context.Context) (systembackup.OperationStatus, error) {
+	return s.opStatus, nil
 }
 
 func backupTestRequest(method, target, body string) *http.Request {
@@ -58,6 +62,7 @@ func TestSystemBackupRoutesRequireAdminAndConfirmRestore(t *testing.T) {
 	service := &systemBackupStub{
 		items:         []systembackup.BackupInfo{{Name: name, CreatedAt: time.Now().UTC()}},
 		restoreStatus: systembackup.RestoreStatus{State: "scheduled", BackupName: name},
+		opStatus:      systembackup.OperationStatus{State: "validating_restore", Operation: "restore_backup", BackupName: name},
 	}
 	router := chi.NewRouter()
 	registerSystemBackupRoutes(router, service)

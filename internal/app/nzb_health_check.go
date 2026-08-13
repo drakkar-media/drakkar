@@ -52,6 +52,10 @@ func (s *maintenanceOpsService) PruneOrphanedSelectedReleases(ctx context.Contex
 	return s.base.PruneOrphanedSelectedReleases(ctx)
 }
 
+func (s *maintenanceOpsService) CompactNZBFileMessageIDs(ctx context.Context) (maintenance.Result, error) {
+	return s.base.CompactNZBFileMessageIDs(ctx)
+}
+
 // TryStartDeepNZBHealthCheck reserves the process-wide deep-health worker and
 // returns its bounded, resumable sweep step. Scheduled and API callers must
 // invoke the returned function exactly once; it releases the reservation when
