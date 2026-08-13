@@ -450,3 +450,51 @@ func TestCreateSeasonPackEpisodeItemsSkipsImplausibleSeasonNumber(t *testing.T) 
 		t.Fatalf("expected no episode row created for implausible season 19 (show has 3 seasons), got %d", count)
 	}
 }
+
+func TestCreateSeasonPackEpisodeItemSkipsImplausibleSeasonNumber(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	const showTitle = "Season Pack Direct Implausible Show"
+	var tvShowID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into tv_shows (title, number_of_seasons) values ($1, 1) returning id`, showTitle,
+	).Scan(&tvShowID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from tv_shows where id = $1`, tvShowID)
+
+	triggerLibID := setupRaceTestLibraryItem(t, ctx, sqlDB, "season-pack-direct-implausible-trigger", "available")
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, triggerLibID)
+
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, external_url, indexer_name)
+		values ($1, 'Season Pack Direct Implausible Release', 'http://example/season-pack-direct-implausible', 'test-indexer')
+		returning id`, triggerLibID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.createSeasonPackEpisodeItem(ctx, tvShowID, showTitle, rcID, 7, 1); err != nil {
+		t.Fatalf("createSeasonPackEpisodeItem: %v", err)
+	}
+
+	var count int
+	if err := sqlDB.QueryRowContext(ctx, `
+		select count(*) from episodes where tv_show_id = $1 and season_number = 7`, tvShowID,
+	).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("expected no direct episode row created for implausible season 7 (show has 1 season), got %d", count)
+	}
+}

@@ -254,6 +254,12 @@ func (db *DB) createSeasonPackEpisodeItem(ctx context.Context, tvShowID int64, s
 	}
 	defer tx.Rollback()
 
+	if ok, err := seasonWithinKnownShowBounds(ctx, tx, tvShowID, season); err != nil {
+		return err
+	} else if !ok {
+		return tx.Commit()
+	}
+
 	// Upsert the episode record.
 	var episodeID int64
 	if err := tx.QueryRowContext(ctx, `
@@ -320,6 +326,20 @@ func (db *DB) createSeasonPackEpisodeItem(ctx context.Context, tvShowID int64, s
 	}
 
 	return tx.Commit()
+}
+
+func seasonWithinKnownShowBounds(ctx context.Context, exec sqlQueryer, tvShowID int64, season int) (bool, error) {
+	if tvShowID <= 0 || season <= 0 {
+		return false, nil
+	}
+	var numberOfSeasons int
+	if err := exec.QueryRowContext(ctx, `select coalesce(number_of_seasons, 0) from tv_shows where id = $1`, tvShowID).Scan(&numberOfSeasons); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return numberOfSeasons == 0 || season <= numberOfSeasons+1, nil
 }
 
 // resolveSeasonPackShow resolves the TV show ID and title for a triggering
@@ -454,6 +474,10 @@ func (db *DB) FulfillEpisodeLibraryItem(ctx context.Context, libraryItemID, sour
 // the same statement helper whether or not they're inside a transaction.
 type sqlExecer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+type sqlQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 // markLibraryItemAvailable marks a library item and its queue item

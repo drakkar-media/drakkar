@@ -61,6 +61,7 @@ type repoStub struct {
 	retryTarget               database.QueueRetryTarget
 	skipped                   []int64
 	requeued                  []int64
+	clearedDispatchBackoff    []int64
 	paused                    []int64
 	resumed                   []int64
 	pausedSelectedReleaseID   int64
@@ -221,6 +222,10 @@ func (r *repoStub) RecordDispatchAttempt(ctx context.Context, libraryItemID int6
 			r.pending[i].DispatchBackoffUntil = &backoffUntil
 		}
 	}
+	return nil
+}
+func (r *repoStub) ClearDispatchBackoff(ctx context.Context, libraryItemID int64) error {
+	r.clearedDispatchBackoff = append(r.clearedDispatchBackoff, libraryItemID)
 	return nil
 }
 func (r *repoStub) CountActiveSearchBacklog(ctx context.Context) (int, error) {
@@ -3831,6 +3836,9 @@ func TestRetryQueueItemSelectedRelease(t *testing.T) {
 	if result.Action != "retried_selected_release" || result.SelectedReleaseID == nil || *result.SelectedReleaseID != 303 {
 		t.Fatalf("unexpected result %+v", result)
 	}
+	if len(repo.clearedDispatchBackoff) != 1 || repo.clearedDispatchBackoff[0] != 42 {
+		t.Fatalf("expected retry to clear dispatch backoff for library item 42, got %v", repo.clearedDispatchBackoff)
+	}
 }
 
 // TestRetryQueueItemNoOpsWhenAlreadyAvailable guards against a gap found in
@@ -4021,6 +4029,7 @@ func TestSearchUpgradesRequiresMinimumCustomFormatScoreIncrement(t *testing.T) {
 			MediaType:     "movie",
 			Title:         "Dune",
 			MovieYear:     2021,
+			Available:     true,
 		},
 		selected: database.ReleaseSummary{
 			SelectedReleaseID:  90,
@@ -4064,6 +4073,7 @@ func TestSearchUpgradesSkipsItemAlreadyInFlight(t *testing.T) {
 			MediaType:     "movie",
 			Title:         "Dune",
 			MovieYear:     2021,
+			Available:     true,
 		},
 		selected: database.ReleaseSummary{
 			SelectedReleaseID:  90,
@@ -4462,6 +4472,7 @@ func TestSearchLibraryTreatsExistingSelectionAsUpgradeSearch(t *testing.T) {
 			MediaType:     "movie",
 			Title:         "Dune",
 			MovieYear:     2021,
+			Available:     true,
 		},
 		selected: database.ReleaseSummary{
 			SelectedReleaseID:  90,
@@ -4516,6 +4527,45 @@ func TestSearchLibraryTreatsNewItemAsNonUpgradeSearch(t *testing.T) {
 	}
 	if result.SelectedReleaseID == nil {
 		t.Fatalf("expected the fresh candidate to be selected normally, got %+v", result)
+	}
+}
+
+// TestSearchLibraryTreatsUnavailableSelectionAsNonUpgradeSearch covers missing
+// items whose queue row still points at an old, failed selected release. That
+// selection is not playable, so it must not impose upgrade-only filtering.
+func TestSearchLibraryTreatsUnavailableSelectionAsNonUpgradeSearch(t *testing.T) {
+	repo := &repoStub{
+		searchInput: database.LibrarySearchInput{
+			LibraryItemID: 42,
+			MediaType:     "movie",
+			Title:         "Dune",
+			MovieYear:     2021,
+			Available:     false,
+		},
+		selected: database.ReleaseSummary{
+			SelectedReleaseID:  90,
+			LibraryItemID:      42,
+			Score:              1_000_000,
+			ReleaseCandidateID: 9,
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
+		{Title: "Dune.2021.2160p.WEB-DL.Atmos-GRP", Link: "http://example/nzb", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+	}})
+	service.fetcher = fetcherStub{
+		fileName: "dune.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Dune.mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+	}
+
+	result, err := service.SearchLibrary(context.Background(), 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.lastUpgradeSearch {
+		t.Fatal("expected an unavailable item with a stale selection to use non-upgrade search semantics")
+	}
+	if result.SelectedReleaseID == nil {
+		t.Fatalf("expected unavailable stale-selection item to select a fresh candidate, got %+v", result)
 	}
 }
 

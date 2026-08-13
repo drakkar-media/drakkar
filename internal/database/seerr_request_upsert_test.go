@@ -183,6 +183,107 @@ func TestUpsertEpisodeRequestReusesLibraryItemWhenTvdbIDDrifts(t *testing.T) {
 	}
 }
 
+func TestUpsertEpisodeRequestSkipsImplausibleKnownSeason(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	const externalID = "implausible-season-777"
+	const tvdbID, tmdbID = 880001, 880002
+	cleanup := func() {
+		_, _ = sqlDB.ExecContext(ctx, `delete from media_requests where external_id = $1`, externalID)
+		_, _ = sqlDB.ExecContext(ctx, `delete from tv_shows where tvdb_id = $1 or tmdb_id = $2`, tvdbID, tmdbID)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into tv_shows (tvdb_id, tmdb_id, title, release_year, number_of_seasons)
+		values ($1, $2, 'Known Short Show', 2025, 1)`, tvdbID, tmdbID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	libraryItemID, created, err := db.UpsertEpisodeRequest(ctx, externalID, tvdbID, tmdbID, "Wrong Imported Show", 2025, 7, 1, "Bad")
+	if err != nil {
+		t.Fatalf("upsert implausible season: %v", err)
+	}
+	if libraryItemID != 0 || created {
+		t.Fatalf("expected implausible season to be ignored, got libraryItemID=%d created=%v", libraryItemID, created)
+	}
+
+	var episodeCount, libraryItemCount, queueItemCount int
+	if err := sqlDB.QueryRowContext(ctx, `
+		select
+			(select count(*) from episodes e join tv_shows ts on ts.id = e.tv_show_id where ts.tvdb_id = $1 and e.season_number = 7),
+			(select count(*) from library_items li join episodes e on e.id = li.episode_id join tv_shows ts on ts.id = e.tv_show_id where ts.tvdb_id = $1 and e.season_number = 7),
+			(select count(*) from queue_items where idempotency_key = 'seerr-tv-' || $2)`,
+		tvdbID, externalID,
+	).Scan(&episodeCount, &libraryItemCount, &queueItemCount); err != nil {
+		t.Fatal(err)
+	}
+	if episodeCount != 0 || libraryItemCount != 0 || queueItemCount != 0 {
+		t.Fatalf("expected no implausible season rows, got episode=%d library=%d queue=%d", episodeCount, libraryItemCount, queueItemCount)
+	}
+}
+
+func TestEnsureEpisodeLibraryItemsBatchSkipsImplausibleKnownSeason(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	const showTitle = "Missing Batch Short Show"
+	var tvShowID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into tv_shows (title, tmdb_id, number_of_seasons)
+		values ($1, 880003, 1)
+		returning id`, showTitle,
+	).Scan(&tvShowID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from tv_shows where id = $1`, tvShowID)
+
+	createdIDs, err := db.EnsureEpisodeLibraryItemsBatch(ctx, tvShowID, showTitle, []MissingEpisodeBatchInput{
+		{SeasonNumber: 7, EpisodeNumber: 1, Title: "Bad"},
+		{SeasonNumber: 1, EpisodeNumber: 1, Title: "Good"},
+	})
+	if err != nil {
+		t.Fatalf("EnsureEpisodeLibraryItemsBatch: %v", err)
+	}
+	if len(createdIDs) != 1 {
+		t.Fatalf("expected only the valid season to be created, got %v", createdIDs)
+	}
+
+	var badEpisodeCount, goodEpisodeCount int
+	if err := sqlDB.QueryRowContext(ctx, `
+		select
+			(select count(*) from episodes where tv_show_id = $1 and season_number = 7),
+			(select count(*) from episodes where tv_show_id = $1 and season_number = 1 and episode_number = 1)`,
+		tvShowID,
+	).Scan(&badEpisodeCount, &goodEpisodeCount); err != nil {
+		t.Fatal(err)
+	}
+	if badEpisodeCount != 0 || goodEpisodeCount != 1 {
+		t.Fatalf("unexpected episode counts bad=%d good=%d", badEpisodeCount, goodEpisodeCount)
+	}
+}
+
 // TestUpsertMovieRequestSerializesConcurrentFirstSightings verifies that
 // independent sync processes can reconcile the same new Seerr movie without
 // surfacing a unique-constraint error or reporting multiple creations.

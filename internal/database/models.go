@@ -559,6 +559,7 @@ type SubtitleCandidateRecord struct {
 type LibrarySearchInput struct {
 	LibraryItemID int64
 	MediaType     string
+	Available     bool
 	Title         string
 	IMDbID        string
 	MovieID       int64 // DB primary key used to exclude this movie from ambiguity checks

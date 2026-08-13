@@ -556,6 +556,11 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 	if err != nil {
 		return 0, false, err
 	}
+	if ok, err := seasonWithinKnownShowBounds(ctx, tx, showID, season); err != nil {
+		return 0, false, err
+	} else if !ok {
+		return 0, false, nil
+	}
 
 	var episodeID int64
 	err = tx.QueryRowContext(ctx, `
@@ -798,6 +803,7 @@ func (db *DB) GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (L
 		select
 			li.id,
 			li.media_type,
+			li.available,
 			coalesce(li.title, ''),
 			coalesce(m.imdb_id, ''),
 			coalesce(m.id, 0),
@@ -823,6 +829,7 @@ func (db *DB) GetLibrarySearchInput(ctx context.Context, libraryItemID int64) (L
 	).Scan(
 		&item.LibraryItemID,
 		&item.MediaType,
+		&item.Available,
 		&item.Title,
 		&item.IMDbID,
 		&item.MovieID,
@@ -1236,6 +1243,19 @@ func (db *DB) RecordDispatchAttempt(ctx context.Context, libraryItemID int64, ne
 		update queue_items
 		set dispatch_attempt_count = $2, dispatch_backoff_until = $3
 		where library_item_id = $1`, libraryItemID, newCount, backoffUntil)
+	return err
+}
+
+// ClearDispatchBackoff removes the passive-resume throttle for a library item.
+//
+// User-triggered retry/reset actions use this to make "Retry now" literal
+// without weakening the automatic backoff that protects indexers from repeated
+// failing downloads.
+func (db *DB) ClearDispatchBackoff(ctx context.Context, libraryItemID int64) error {
+	_, err := db.SQL.ExecContext(ctx, `
+		update queue_items
+		set dispatch_attempt_count = 0, dispatch_backoff_until = null
+		where library_item_id = $1`, libraryItemID)
 	return err
 }
 
@@ -3897,7 +3917,8 @@ func (db *DB) ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) 
 		// can be re-dispatched by the normal retry loop.
 		if _, err = tx.ExecContext(ctx, `
 			update queue_items
-			set selected_release_id = null, updated_at = now()
+			set selected_release_id = null, dispatch_attempt_count = 0,
+				dispatch_backoff_until = null, updated_at = now()
 			where id = $1`, queueItemID,
 		); err != nil {
 			return err
@@ -3908,7 +3929,8 @@ func (db *DB) ClearQueueSelectedRelease(ctx context.Context, queueItemID int64) 
 		// looping forever in AutoManageFailedQueue.
 		if _, err = tx.ExecContext(ctx, `
 			update queue_items
-			set state = $2, failure_reason = '', selected_release_id = null, updated_at = now()
+			set state = $2, failure_reason = '', selected_release_id = null,
+				dispatch_attempt_count = 0, dispatch_backoff_until = null, updated_at = now()
 			where id = $1`, queueItemID, QueueRequested,
 		); err != nil {
 			return err
@@ -4004,7 +4026,8 @@ func (db *DB) ResumeQueueItem(ctx context.Context, queueItemID int64) error {
 func (db *DB) RequeueSelectedRelease(ctx context.Context, queueItemID int64) error {
 	_, err := db.SQL.ExecContext(ctx, `
 		update queue_items
-		set state = $2, failure_reason = '', updated_at = now()
+		set state = $2, failure_reason = '', dispatch_attempt_count = 0,
+			dispatch_backoff_until = null, updated_at = now()
 		where id = $1
 		  and selected_release_id is not null`,
 		queueItemID, QueueRequested,
@@ -4436,7 +4459,14 @@ func (db *DB) EnsureEpisodeLibraryItemsBatch(ctx context.Context, tvShowID int64
 				title text,
 				air_date text
 			)
+			CROSS JOIN (
+				SELECT coalesce(number_of_seasons, 0) AS number_of_seasons
+				FROM tv_shows
+				WHERE id = $1
+			) tv
 			WHERE x.episode_number > 0
+			  AND x.season_number > 0
+			  AND (tv.number_of_seasons = 0 OR x.season_number <= tv.number_of_seasons + 1)
 		),
 		upserted_episodes AS (
 			INSERT INTO episodes (tv_show_id, season_number, episode_number, title, air_date)

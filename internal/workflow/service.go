@@ -63,6 +63,7 @@ type Repository interface {
 	LookupCandidateHistory(ctx context.Context, libraryItemID int64) (map[string]database.CandidateHistory, error)
 	ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceHours int) ([]database.PendingLibrarySearchTarget, error)
 	RecordDispatchAttempt(ctx context.Context, libraryItemID int64, newCount int, backoffUntil time.Time) error
+	ClearDispatchBackoff(ctx context.Context, libraryItemID int64) error
 	CountActiveSearchBacklog(ctx context.Context) (int, error)
 	CountSelectedQueueBacklog(ctx context.Context) (int, error)
 	GetShowWithMissingEpisodes(ctx context.Context, tvShowID int64) (*database.ShowWithMissingEpisodes, error)
@@ -2730,6 +2731,9 @@ func (s *Service) searchLibraryOnceWithMode(ctx context.Context, libraryItemID i
 		}
 		return SearchResult{}, err
 	}
+	if upgradeSearch && !input.Available {
+		upgradeSearch = false
+	}
 	// Refuse to search with no title to verify candidates against. Ranking's
 	// title check (containsNormalized/titlesWordMatch) trivially accepts any
 	// candidate when the required title tokenizes to zero words -- that's
@@ -4831,6 +4835,9 @@ func (s *Service) RetryQueueItem(ctx context.Context, queueItemID int64) (QueueR
 	// from the indexer just to resolve one already-available episode.
 	if target.State == database.QueueAvailable {
 		return QueueRetryResult{QueueItemID: queueItemID, Action: "already_available"}, nil
+	}
+	if err := s.repo.ClearDispatchBackoff(ctx, target.LibraryItemID); err != nil {
+		return QueueRetryResult{}, err
 	}
 	if target.SelectedReleaseID != nil {
 		summary, err := s.repo.GetSelectedReleaseSummary(ctx, *target.SelectedReleaseID)
