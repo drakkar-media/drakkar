@@ -189,7 +189,7 @@ type WorkflowService interface {
 	SearchUpgrades(ctx context.Context) (workflow.UpgradeSearchResult, error)
 	ManualSearch(ctx context.Context, query string) ([]workflow.ManualSearchItem, error)
 	ManualImport(ctx context.Context, libraryItemID int64, title, externalURL, indexerName, resolution string, sizeBytes int64, score int) (workflow.ReleaseActionResult, error)
-	ImportNZBFromPush(ctx context.Context, content []byte, filename, mediaType string) (string, error)
+	ImportNZBFromPush(ctx context.Context, content io.Reader, filename, mediaType string) (string, error)
 	ResetLibraryItem(ctx context.Context, libraryItemID int64) error
 	ResetOrphanedAvailableItems(ctx context.Context) (workflow.ResetOrphanedAvailableItemsResult, error)
 	PushMissingLibraryItemsToSeerr(ctx context.Context) (workflow.PushMissingToSeerrResult, error)
@@ -326,6 +326,7 @@ type Status struct {
 	DiskCacheLimitBytes  int64          `json:"diskCacheLimitBytes"`
 	ReadAheadLimitBytes  int64          `json:"readAheadLimitBytes"`
 	MemoryHotCacheBytes  int64          `json:"memoryHotCacheBytes"`
+	NZBUploadLimitBytes  int64          `json:"nzbUploadLimitBytes"`
 	BackgroundQueueDepth int            `json:"backgroundQueueDepth"`
 }
 
@@ -391,6 +392,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 	r := chi.NewRouter()
 	r.Use(corsMiddleware)
 	r.Use(authMiddlewareFor(userRepo))
+	r.Use(requestBodyLimitMiddleware(status))
 	publishMutation := func(kind string, fields map[string]any) {
 		if broker == nil {
 			return
@@ -465,6 +467,19 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 				return mp
 			}(),
 			claimURLForFetch: workflowSvc.ClaimURLForFetch,
+			loadSecurity: func(ctx context.Context) (sabSecurityConfig, error) {
+				if settingsSvc == nil {
+					return sabSecurityConfig{}, errors.New("settings service unavailable")
+				}
+				cfg, err := settingsSvc.GetSettings(ctx)
+				if err != nil {
+					return sabSecurityConfig{}, err
+				}
+				return sabSecurityConfig{
+					apiKey:              cfg.SABNZBD.APIKey,
+					trustedUpstreamURLs: []string{cfg.NZBHydra2.URL},
+				}, nil
+			},
 		}
 		r.HandleFunc("/sabnzbd/api", sabH.ServeHTTP)
 		r.HandleFunc("/api/sabnzbd/api", sabH.ServeHTTP)
@@ -700,7 +715,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		var body struct {
 			Action string `json:"action"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := decodeJSONBody(r, &body); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -721,7 +736,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			QueueItemIDs []int64 `json:"queueItemIds"`
 			Action       string  `json:"action"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := decodeJSONBody(r, &body); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -745,7 +760,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		var body struct {
 			Action string `json:"action"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := decodeJSONBody(r, &body); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -784,7 +799,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		if err != nil {
 			switch {
 			case errors.Is(err, nzb.ErrUploadTooLarge):
-				respondError(w, http.StatusInsufficientStorage, err)
+				respondError(w, http.StatusRequestEntityTooLarge, err)
 			case errors.Is(err, nzb.ErrEmptyDocument):
 				respondError(w, http.StatusBadRequest, err)
 			default:
@@ -799,7 +814,15 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		var body struct {
 			URL string `json:"url"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.URL == "" {
+		if err := decodeJSONBody(r, &body); err != nil {
+			if isRequestBodyTooLarge(err) {
+				respondError(w, http.StatusBadRequest, err)
+			} else {
+				respondError(w, http.StatusBadRequest, errors.New("url required"))
+			}
+			return
+		}
+		if body.URL == "" {
 			respondError(w, http.StatusBadRequest, errors.New("url required"))
 			return
 		}
@@ -826,7 +849,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		if err != nil {
 			switch {
 			case errors.Is(err, nzb.ErrUploadTooLarge):
-				respondError(w, http.StatusInsufficientStorage, err)
+				respondError(w, http.StatusRequestEntityTooLarge, err)
 			case errors.Is(err, nzb.ErrEmptyDocument):
 				respondError(w, http.StatusBadRequest, err)
 			default:
@@ -861,7 +884,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		var body struct {
 			ProfileID *int64 `json:"profileId"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := decodeJSONBody(r, &body); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -1091,8 +1114,12 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			LibraryItemIDs []int64  `json:"libraryItemIds"`
 			Languages      []string `json:"languages"`
 		}
-		if r.Body == nil || json.NewDecoder(r.Body).Decode(&payload) != nil {
-			respondError(w, http.StatusBadRequest, errors.New("invalid request body"))
+		if err := decodeJSONBody(r, &payload); err != nil {
+			if isRequestBodyTooLarge(err) {
+				respondError(w, http.StatusBadRequest, err)
+			} else {
+				respondError(w, http.StatusBadRequest, errors.New("invalid request body"))
+			}
 			return
 		}
 		if len(payload.LibraryItemIDs) == 0 {
@@ -1175,8 +1202,9 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		var payload struct {
 			Languages []string `json:"languages"`
 		}
-		if r.Body != nil {
-			_ = json.NewDecoder(r.Body).Decode(&payload)
+		if err := decodeOptionalJSONBody(r, &payload); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
 		}
 		languages := payload.Languages
 		go func() {
@@ -1201,7 +1229,11 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		}
 		result, err := uploadSubtitleRequest(r, subtitleSvc, libraryItemID)
 		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+			if errors.Is(err, intsub.ErrSubtitleTooLarge) {
+				respondError(w, http.StatusRequestEntityTooLarge, err)
+			} else {
+				respondError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		publishMutation("subtitle.upload", map[string]any{"libraryItemId": libraryItemID, "language": result.Language, "provider": result.Provider})
@@ -1376,7 +1408,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			}
 		}
 		var payload seerr.WebhookPayload
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := decodeJSONBody(r, &payload); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -1476,7 +1508,15 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			TmdbID    int64  `json:"tmdbId"`
 			Seasons   []int  `json:"seasons"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.TmdbID == 0 {
+		if err := decodeJSONBody(r, &body); err != nil {
+			if isRequestBodyTooLarge(err) {
+				respondError(w, http.StatusBadRequest, err)
+			} else {
+				respondError(w, http.StatusBadRequest, errors.New("tmdbId and mediaType required"))
+			}
+			return
+		}
+		if body.TmdbID == 0 {
 			respondError(w, http.StatusBadRequest, errors.New("tmdbId and mediaType required"))
 			return
 		}
@@ -1623,8 +1663,9 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		var payload struct {
 			Reason string `json:"reason"`
 		}
-		if r.Body != nil {
-			_ = json.NewDecoder(r.Body).Decode(&payload)
+		if err := decodeOptionalJSONBody(r, &payload); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
 		}
 		result, err := workflowSvc.RejectRelease(workflow.WithAsyncDownload(r.Context()), id, payload.Reason)
 		if err != nil {
@@ -1933,7 +1974,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		var input policy.Settings
-		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		if err := decodeJSONBody(r, &input); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -1963,7 +2004,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		var input config.Settings
-		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		if err := decodeJSONBody(r, &input); err != nil {
 			respondError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
 			return
 		}
@@ -1993,7 +2034,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			WireGuard  config.PrivacyWireGuardConfig `json:"wireguard"`
 			TargetAddr string                        `json:"targetAddr"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := decodeJSONBody(r, &body); err != nil {
 			respondError(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
 			return
 		}
@@ -2147,7 +2188,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		var p database.QualityProfile
-		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		if err := decodeJSONBody(r, &p); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -2199,7 +2240,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			return
 		}
 		var d database.QualityDefinition
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+		if err := decodeJSONBody(r, &d); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -2259,8 +2300,12 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			SizeBytes   int64  `json:"sizeBytes"`
 			Score       int    `json:"score"`
 		}
-		if r.Body == nil || json.NewDecoder(r.Body).Decode(&payload) != nil {
-			respondError(w, http.StatusBadRequest, errors.New("invalid request body"))
+		if err := decodeJSONBody(r, &payload); err != nil {
+			if isRequestBodyTooLarge(err) {
+				respondError(w, http.StatusBadRequest, err)
+			} else {
+				respondError(w, http.StatusBadRequest, errors.New("invalid request body"))
+			}
 			return
 		}
 		result, err := workflowSvc.ManualImport(r.Context(), libraryItemID, payload.Title, payload.ExternalURL, payload.IndexerName, payload.Resolution, payload.SizeBytes, payload.Score)
@@ -2284,10 +2329,11 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		if !ok {
 			return
 		}
-		if err := r.ParseMultipartForm(64 << 20); err != nil {
+		if err := r.ParseMultipartForm(2 << 20); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
+		defer r.MultipartForm.RemoveAll()
 		file, header, err := r.FormFile("file")
 		if err != nil {
 			respondError(w, http.StatusBadRequest, err)
@@ -2296,7 +2342,11 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		defer file.Close()
 		item, err := queue.ImportNZBForLibraryItem(r.Context(), libraryItemID, multipartFileName(header), file)
 		if err != nil {
-			respondError(w, http.StatusBadRequest, err)
+			if errors.Is(err, nzb.ErrUploadTooLarge) {
+				respondError(w, http.StatusRequestEntityTooLarge, err)
+			} else {
+				respondError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		publishMutation("library.manual_import", map[string]any{"libraryItemId": libraryItemID, "selectedReleaseId": item.SelectedRelease})
@@ -2349,7 +2399,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		var body struct {
 			ProfileID *int64 `json:"profileId"` // null = clear override
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := decodeJSONBody(r, &body); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -2466,7 +2516,15 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		var body struct {
 			PinID int64 `json:"pinId"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.PinID <= 0 {
+		if err := decodeJSONBody(r, &body); err != nil {
+			if isRequestBodyTooLarge(err) {
+				respondError(w, http.StatusBadRequest, err)
+			} else {
+				respondError(w, http.StatusBadRequest, errors.New("pinId required"))
+			}
+			return
+		}
+		if body.PinID <= 0 {
 			respondError(w, http.StatusBadRequest, errors.New("pinId required"))
 			return
 		}
@@ -2535,7 +2593,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		var body struct {
 			Mode string `json:"mode"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := decodeJSONBody(r, &body); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -2749,6 +2807,10 @@ func respondJSON(w http.ResponseWriter, status int, payload any) {
 // respondError writes err as the standard {"error": "..."} JSON error body
 // with the given status code.
 func respondError(w http.ResponseWriter, status int, err error) {
+	if isRequestBodyTooLarge(err) {
+		status = http.StatusRequestEntityTooLarge
+		err = errRequestBodyTooLarge
+	}
 	respondJSON(w, status, map[string]any{
 		"error": err.Error(),
 	})
@@ -2797,6 +2859,7 @@ func StatusFromConfig(rt config.Runtime, cfg config.Settings, startedAt time.Tim
 		DiskCacheLimitBytes: rt.DiskCacheLimitBytes,
 		ReadAheadLimitBytes: rt.ReadAheadLimitBytes,
 		MemoryHotCacheBytes: rt.MemoryHotCacheMaxBytes,
+		NZBUploadLimitBytes: rt.NZBUploadLimitBytes,
 	}
 }
 
@@ -2935,8 +2998,7 @@ func usenetDetail(enabled, configured int) string {
 // multipart form path when the client uploaded it as multipart/form-data
 // and otherwise treating the entire body as the raw NZB document.
 func importNZBRequest(r *http.Request, queue QueueService) (database.QueueSnapshot, error) {
-	contentType := r.Header.Get("Content-Type")
-	if strings.HasPrefix(contentType, "multipart/form-data") {
+	if isMultipartRequest(r) {
 		return importMultipartNZB(r, queue)
 	}
 	fileName := nzb.ImportRawBodyName(r.Header.Get("Content-Disposition"))
@@ -2949,6 +3011,7 @@ func importMultipartNZB(r *http.Request, queue QueueService) (database.QueueSnap
 	if err := r.ParseMultipartForm(2 << 20); err != nil {
 		return database.QueueSnapshot{}, err
 	}
+	defer r.MultipartForm.RemoveAll()
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		return database.QueueSnapshot{}, err
@@ -2970,11 +3033,11 @@ func multipartFileName(header *multipart.FileHeader) string {
 // multipart/form-data body (file + language field) or, for simple clients,
 // a raw body with language/fileName supplied as query parameters.
 func uploadSubtitleRequest(r *http.Request, subtitles SubtitleService, libraryItemID int64) (intsub.UploadResult, error) {
-	contentType := r.Header.Get("Content-Type")
-	if strings.HasPrefix(contentType, "multipart/form-data") {
-		if err := r.ParseMultipartForm(4 << 20); err != nil {
+	if isMultipartRequest(r) {
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
 			return intsub.UploadResult{}, err
 		}
+		defer r.MultipartForm.RemoveAll()
 		language := r.FormValue("language")
 		file, header, err := r.FormFile("file")
 		if err != nil {
@@ -3005,7 +3068,7 @@ func parseManualBlocklistMutation(r *http.Request) (database.BlocklistMutation, 
 		Reason       string     `json:"reason"`
 		ExpiresAt    *time.Time `json:"expiresAt"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSONBody(r, &body); err != nil {
 		return database.BlocklistMutation{}, err
 	}
 	key, err := manualBlocklistKey(body.KeyType, body.Key, body.ExternalURL, body.ReleaseTitle, body.IndexerName, body.SizeMB, body.PostedDate)

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -37,7 +36,7 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			return
 		}
 		var f database.CustomFormat
-		if err := json.NewDecoder(rq.Body).Decode(&f); err != nil {
+		if err := decodeJSONBody(rq, &f); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -58,7 +57,7 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			return
 		}
 		var f database.CustomFormat
-		if err := json.NewDecoder(rq.Body).Decode(&f); err != nil {
+		if err := decodeJSONBody(rq, &f); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -91,7 +90,7 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			return
 		}
 		var formats []database.CustomFormat
-		if err := json.NewDecoder(rq.Body).Decode(&formats); err != nil {
+		if err := decodeJSONBody(rq, &formats); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -127,7 +126,7 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			return
 		}
 		var rule database.ReleaseBlockRule
-		if err := json.NewDecoder(rq.Body).Decode(&rule); err != nil {
+		if err := decodeJSONBody(rq, &rule); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -152,7 +151,7 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			return
 		}
 		var rule database.ReleaseBlockRule
-		if err := json.NewDecoder(rq.Body).Decode(&rule); err != nil {
+		if err := decodeJSONBody(rq, &rule); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -174,7 +173,7 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			return
 		}
 		var rules []database.ReleaseBlockRule
-		if err := json.NewDecoder(rq.Body).Decode(&rules); err != nil {
+		if err := decodeJSONBody(rq, &rules); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -216,7 +215,7 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			Title     string `json:"title"`
 			MediaType string `json:"mediaType"`
 		}
-		if err := json.NewDecoder(rq.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(rq, &req); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -260,7 +259,7 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			return
 		}
 		var p database.IndexerPolicy
-		if err := json.NewDecoder(rq.Body).Decode(&p); err != nil {
+		if err := decodeJSONBody(rq, &p); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -285,7 +284,7 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			return
 		}
 		var p database.IndexerPolicy
-		if err := json.NewDecoder(rq.Body).Decode(&p); err != nil {
+		if err := decodeJSONBody(rq, &p); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -335,7 +334,7 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			return
 		}
 		var p database.SubtitleProfile
-		if err := json.NewDecoder(rq.Body).Decode(&p); err != nil {
+		if err := decodeJSONBody(rq, &p); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -360,7 +359,7 @@ func registerProfileRoutes(r chi.Router, repo ProfilesRepository) {
 			return
 		}
 		var p database.SubtitleProfile
-		if err := json.NewDecoder(rq.Body).Decode(&p); err != nil {
+		if err := decodeJSONBody(rq, &p); err != nil {
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}

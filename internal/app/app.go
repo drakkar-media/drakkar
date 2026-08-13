@@ -145,9 +145,8 @@ type runtimeStatus struct {
 // fileSettingsService implements the API's settings persistence contract
 // backed by the on-disk settings file at path. UpdateSettings merges secrets
 // from the currently-saved config into the incoming update (so a client that
-// omits a secret field doesn't blank it out), persists the merged result,
-// and -- when applier is set -- re-applies the new settings to every live
-// component via liveSettingsController.ApplySettings before returning.
+// omits a secret field doesn't blank it out), validates it in a staged file,
+// applies it live, and only then atomically replaces the persisted settings.
 type fileSettingsService struct {
 	path    string
 	mu      sync.Mutex
@@ -163,10 +162,10 @@ func (s *fileSettingsService) GetSettings(_ context.Context) (config.Settings, e
 	return config.Load(s.path)
 }
 
-// UpdateSettings persists cfg, merging in secrets from the currently-saved
-// settings so a client omitting a secret field does not blank it out, then
-// re-applies the merged settings to every live component when an applier is
-// configured. See fileSettingsService's type comment for the full contract.
+// UpdateSettings stages and validates cfg, merging in secrets from the
+// currently-saved settings so a client omitting a secret field does not blank
+// it out. The staged file replaces the active file only after live application
+// succeeds; failures trigger a best-effort runtime rollback to current.
 func (s *fileSettingsService) UpdateSettings(_ context.Context, cfg config.Settings) (config.Settings, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -175,17 +174,32 @@ func (s *fileSettingsService) UpdateSettings(_ context.Context, cfg config.Setti
 		return config.Settings{}, err
 	}
 	merged := config.MergeSecrets(current, cfg)
-	if err := config.Save(s.path, merged); err != nil {
+	pendingPath := s.path + ".pending"
+	defer func() { _ = os.Remove(pendingPath) }()
+	if err := config.Save(pendingPath, merged); err != nil {
 		return config.Settings{}, err
 	}
-	loaded, err := config.Load(s.path)
+	loaded, err := config.Load(pendingPath)
 	if err != nil {
 		return config.Settings{}, err
 	}
 	if s.applier != nil {
 		if err := s.applier.ApplySettings(context.Background(), loaded); err != nil {
-			return config.Settings{}, err
+			applyErr := fmt.Errorf("apply settings: %w", err)
+			if rollbackErr := s.applier.ApplySettings(context.Background(), current); rollbackErr != nil {
+				return config.Settings{}, errors.Join(applyErr, fmt.Errorf("rollback live settings: %w", rollbackErr))
+			}
+			return config.Settings{}, applyErr
 		}
+	}
+	if err := os.Rename(pendingPath, s.path); err != nil {
+		saveErr := fmt.Errorf("save settings: %w", err)
+		if s.applier != nil {
+			if rollbackErr := s.applier.ApplySettings(context.Background(), current); rollbackErr != nil {
+				return config.Settings{}, errors.Join(saveErr, fmt.Errorf("rollback live settings: %w", rollbackErr))
+			}
+		}
+		return config.Settings{}, saveErr
 	}
 	return loaded, nil
 }
@@ -271,6 +285,19 @@ func (s *taskScheduleStatusService) SetRSSIntervals(tvMinutes, movieMinutes int)
 	defer s.mu.Unlock()
 	s.tvRssSyncIntervalMinutes = tvMinutes
 	s.movieRssSyncIntervalMinutes = movieMinutes
+}
+
+// newBoundedHTTPServer limits slow request bodies and idle keep-alive sockets.
+// WriteTimeout stays unset because SSE, WebDAV, and media responses may stream
+// for much longer than a normal API request.
+func newBoundedHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       2 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+	}
 }
 
 // Run constructs and runs the entire Drakkar application: it loads
@@ -467,6 +494,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// else could run concurrently with it.
 	const importWorkers = 8
 	workflowSvc.SetImportConcurrency(importWorkers) // keeps importSem sized for ImportNZBFromPush
+	workflowSvc.SetPushNZBUploadLimit(rt.NZBUploadLimitBytes)
 	if checker, ok := db.SegmentFetcher.(database.SegmentChecker); ok {
 		workflowSvc.SetEarlyChecker(checker.Exists)
 		workflowSvc.SetArticleChecker(checker.Exists)
@@ -707,11 +735,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		readAhead:      db.ReadAhead,
 	}
 
-	server := &http.Server{
-		Addr:              rt.HTTPAddress,
-		Handler:           api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, jellyfinClient, &fileSettingsService{path: rt.SettingsPath, applier: liveSettings}, privacyMgr, hydraClient, db, db, metricsColl),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	server := newBoundedHTTPServer(rt.HTTPAddress, api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, jellyfinClient, &fileSettingsService{path: rt.SettingsPath, applier: liveSettings}, privacyMgr, hydraClient, db, db, metricsColl))
 
 	// Reset queue items that were left in transitional states by a previous crash.
 	if n, err := db.ResetStuckQueueItems(ctx); err != nil {
@@ -1221,21 +1245,13 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			Msg("metadata backfill complete")
 	})
 
-	webdavServer := &http.Server{
-		Addr:              rt.WebDAVAddress,
-		Handler:           dav.Handler(db, rt.MovieLibraryPath, rt.TVLibraryPath),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	webdavServer := newBoundedHTTPServer(rt.WebDAVAddress, dav.Handler(db, rt.MovieLibraryPath, rt.TVLibraryPath))
 
 	// Loopback-only pprof server -- not published in docker-compose.yml, so
 	// it's reachable solely via `docker exec ... wget http://127.0.0.1:6060/debug/pprof/...`.
 	// Added to diagnose a live CPU/stall issue under 4K streaming load; kept
 	// permanently since profiling access has no cost when nothing is polling it.
-	debugServer := &http.Server{
-		Addr:              "127.0.0.1:6060",
-		Handler:           http.DefaultServeMux,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	debugServer := newBoundedHTTPServer("127.0.0.1:6060", http.DefaultServeMux)
 
 	errCh := make(chan error, 1)
 	go func() {

@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +16,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/drakkar-media/drakkar/internal/database"
+	"github.com/drakkar-media/drakkar/internal/nzb"
 )
 
 const sabVersion = "4.5.1"
@@ -25,18 +29,25 @@ type sabRepository interface {
 	DismissSabItems(ctx context.Context, libraryItemIDs []int64) error
 }
 
+type sabSecurityConfig struct {
+	apiKey              string
+	trustedUpstreamURLs []string
+}
+
 // sabHandler implements a SABnzbd-compatible HTTP API so download-client
 // integrations that only speak the SABnzbd protocol (Sonarr, Radarr) can
 // operate against Drakkar without any changes on their end.
 type sabHandler struct {
-	importFn      func(ctx context.Context, content []byte, filename, mediaType string) (string, error)
+	importFn      func(ctx context.Context, content io.Reader, filename, mediaType string) (string, error)
 	repo          sabRepository
 	fuseMountPath string
 	log           zerolog.Logger
-	// apiKey, if non-empty, must be supplied by callers via the "apikey" param
-	// (matching real SABnzbd behavior). Empty preserves the historical
-	// no-auth behavior for existing Sonarr/Radarr download-client configs.
-	apiKey string
+	// loadSecurity reads current settings for every request so key rotation and
+	// upstream changes apply without restarting Drakkar. apiKey and
+	// trustedUpstreamURLs support isolated handler tests.
+	loadSecurity        func(ctx context.Context) (sabSecurityConfig, error)
+	apiKey              string
+	trustedUpstreamURLs []string
 	// claimURLForFetch provides handleAddURL the exact same atomic per-URL
 	// fetch claim workflow.Service's own dispatch pipeline uses
 	// (Service.ClaimURLForFetch, shared by fetchIndexAndRelease/
@@ -56,32 +67,59 @@ type sabHandler struct {
 	fetchFn func(ctx context.Context, rawURL string) ([]byte, error)
 }
 
-func (h *sabHandler) fetchRemote(ctx context.Context, rawURL string) ([]byte, error) {
+func (h *sabHandler) fetchRemote(ctx context.Context, rawURL string, trustedUpstreamURLs []string) ([]byte, error) {
 	if h.fetchFn != nil {
 		return h.fetchFn(ctx, rawURL)
 	}
-	return fetchRemoteURL(ctx, rawURL)
+	return fetchRemoteURLFromUpstreams(ctx, rawURL, trustedUpstreamURLs)
+}
+
+func (h *sabHandler) securityConfig(ctx context.Context) (sabSecurityConfig, error) {
+	if h.loadSecurity != nil {
+		return h.loadSecurity(ctx)
+	}
+	return sabSecurityConfig{apiKey: h.apiKey, trustedUpstreamURLs: h.trustedUpstreamURLs}, nil
 }
 
 // ServeHTTP implements the SABnzbd HTTP API: every operation is dispatched
 // by a single "mode" query/form parameter, matching SABnzbd's own endpoint
 // design so Sonarr/Radarr's SABnzbd download-client integration works
-// unmodified against Drakkar. When h.apiKey is configured, requests must
-// present it via the "apikey" param, mirroring SABnzbd's own key check.
+// unmodified against Drakkar. Every request must present the configured key
+// via SABnzbd's "apikey" query parameter.
 func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h.apiKey != "" {
-		key := r.FormValue("apikey")
-		if key == "" {
-			key = r.URL.Query().Get("apikey")
+	security, err := h.securityConfig(r.Context())
+	if err != nil {
+		h.log.Error().Err(err).Msg("sabnzbd: load security settings")
+		h.writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{"status": false, "error": "SAB API authentication unavailable"})
+		return
+	}
+	configuredKey := security.apiKey
+	if strings.TrimSpace(configuredKey) == "" {
+		h.writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{"status": false, "error": "SAB API key is not configured"})
+		return
+	}
+	presentedKey := r.URL.Query().Get("apikey")
+	if subtle.ConstantTimeCompare([]byte(presentedKey), []byte(configuredKey)) != 1 {
+		h.writeJSONStatus(w, http.StatusUnauthorized, map[string]any{"status": false, "error": "API Key Incorrect"})
+		return
+	}
+	contentType := strings.ToLower(r.Header.Get("Content-Type"))
+	switch {
+	case strings.HasPrefix(contentType, "multipart/form-data"):
+		if err := r.ParseMultipartForm(1 << 20); err != nil {
+			h.writeRequestError(w, "parse multipart form", err)
+			return
 		}
-		if key != h.apiKey {
-			h.writeJSON(w, map[string]any{"status": false, "error": "API Key Incorrect"})
+		defer r.MultipartForm.RemoveAll()
+	case strings.HasPrefix(contentType, "application/x-www-form-urlencoded"):
+		if err := r.ParseForm(); err != nil {
+			h.writeRequestError(w, "parse form", err)
 			return
 		}
 	}
-	mode := r.FormValue("mode")
+	mode := r.URL.Query().Get("mode")
 	if mode == "" {
-		mode = r.URL.Query().Get("mode")
+		mode = r.FormValue("mode")
 	}
 	switch mode {
 	case "version":
@@ -102,7 +140,7 @@ func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "addfile":
 		h.handleAddFile(w, r)
 	case "addurl":
-		h.handleAddURL(w, r)
+		h.handleAddURL(w, r, security.trustedUpstreamURLs)
 	case "queue":
 		name := r.FormValue("name")
 		if name == "" {
@@ -124,9 +162,7 @@ func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.handleHistory(w, r)
 		}
 	default:
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		fmt.Fprintf(w, `{"status":false,"error":"invalid mode: %s"}`, mode)
+		h.writeError(w, "invalid mode: "+mode)
 	}
 }
 
@@ -156,8 +192,8 @@ func (h *sabHandler) handleGetConfig(w http.ResponseWriter, _ *http.Request) {
 // It accepts the file under any of nzbFile, nzbfile, or name, since
 // SABnzbd-client implementations disagree on the field name.
 func (h *sabHandler) handleAddFile(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		h.writeError(w, "parse multipart form: "+err.Error())
+	if r.MultipartForm == nil {
+		h.writeError(w, "multipart form required")
 		return
 	}
 	file := r.MultipartForm.File["nzbFile"]
@@ -178,25 +214,18 @@ func (h *sabHandler) handleAddFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	content, err := io.ReadAll(f)
-	if err != nil {
-		h.writeError(w, "read upload: "+err.Error())
-		return
-	}
 	filename := multipartFilename(r, fh.Filename)
-	nzoID, err := h.importFn(r.Context(), content, filename, catToMediaType(sabCategory(r)))
+	nzoID, err := h.importFn(r.Context(), f, filename, catToMediaType(sabCategory(r)))
 	if err != nil {
-		h.writeError(w, "import: "+err.Error())
+		h.writeRequestError(w, "import", err)
 		return
 	}
 	h.writeJSON(w, map[string]any{"status": true, "nzo_ids": []string{nzoID}})
 }
 
-// handleAddURL is reachable via the unauthenticated SABnzbd-compatible shim,
-// so the remote fetch below (fetchRemoteURL) must defend against SSRF (a
-// caller using this server to probe/reach internal-only services) and
-// against an unbounded/slow response tying up the request indefinitely.
-func (h *sabHandler) handleAddURL(w http.ResponseWriter, r *http.Request) {
+// handleAddURL allows public destinations plus exact configured upstream
+// authorities. Private redirects to any other service remain blocked.
+func (h *sabHandler) handleAddURL(w http.ResponseWriter, r *http.Request, trustedUpstreamURLs []string) {
 	nzbURL := r.FormValue("name")
 	if nzbURL == "" {
 		nzbURL = r.URL.Query().Get("name")
@@ -215,7 +244,7 @@ func (h *sabHandler) handleAddURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	content, err := h.fetchRemote(r.Context(), nzbURL)
+	content, err := h.fetchRemote(r.Context(), nzbURL, trustedUpstreamURLs)
 	if err != nil {
 		h.writeError(w, err.Error())
 		return
@@ -229,9 +258,9 @@ func (h *sabHandler) handleAddURL(w http.ResponseWriter, r *http.Request) {
 		filename += ".nzb"
 	}
 
-	nzoID, err := h.importFn(r.Context(), content, filename, catToMediaType(sabCategory(r)))
+	nzoID, err := h.importFn(r.Context(), bytes.NewReader(content), filename, catToMediaType(sabCategory(r)))
 	if err != nil {
-		h.writeError(w, "import: "+err.Error())
+		h.writeRequestError(w, "import", err)
 		return
 	}
 	h.writeJSON(w, map[string]any{"status": true, "nzo_ids": []string{nzoID}})
@@ -356,7 +385,12 @@ func (h *sabHandler) handleHistoryDelete(w http.ResponseWriter, r *http.Request)
 }
 
 func (h *sabHandler) writeJSON(w http.ResponseWriter, v any) {
+	h.writeJSONStatus(w, http.StatusOK, v)
+}
+
+func (h *sabHandler) writeJSONStatus(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		h.log.Error().Err(err).Msg("sabnzbd: encode response")
 	}
@@ -366,9 +400,19 @@ func (h *sabHandler) writeJSON(w http.ResponseWriter, v any) {
 // {"status":false,"error":...} error shape.
 func (h *sabHandler) writeError(w http.ResponseWriter, msg string) {
 	h.log.Warn().Str("error", msg).Msg("sabnzbd api error")
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
-	fmt.Fprintf(w, `{"status":false,"error":%q}`, msg)
+	h.writeJSONStatus(w, http.StatusBadRequest, map[string]any{"status": false, "error": msg})
+}
+
+func (h *sabHandler) writeRequestError(w http.ResponseWriter, operation string, err error) {
+	if isRequestBodyTooLarge(err) || errors.Is(err, nzb.ErrUploadTooLarge) {
+		h.log.Warn().Str("operation", operation).Msg("sabnzbd request body too large")
+		h.writeJSONStatus(w, http.StatusRequestEntityTooLarge, map[string]any{
+			"status": false,
+			"error":  errRequestBodyTooLarge.Error(),
+		})
+		return
+	}
+	h.writeError(w, operation+": "+err.Error())
 }
 
 // parseSabNzoIDs reads one or more `value` params (Radarr/Sonarr send each id

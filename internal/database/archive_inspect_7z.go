@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
-	"fmt"
 	"io"
+	"math"
 	"reflect"
 	"strings"
 
@@ -62,8 +62,15 @@ func buildImportedArchiveReader(ctx context.Context, volumes []ImportedArchiveVo
 			return nil, nil, 0, errArchiveHeadersInvalid
 		}
 		actualSize, _ := importedFileActualSize(ctx, file, fetcher)
+		if actualSize < 0 || totalSize > math.MaxInt64-actualSize {
+			return nil, nil, 0, errArchiveHeadersInvalid
+		}
 		volumeSizes[volume.VolumeIndex] = actualSize
 		for _, segment := range file.Segments {
+			if segment.DecodedStartOffset < 0 || segment.DecodedEndOffset < segment.DecodedStartOffset ||
+				totalSize > math.MaxInt64-segment.DecodedEndOffset {
+				return nil, nil, 0, errArchiveHeadersInvalid
+			}
 			spans = append(spans, stream.SegmentSpan{
 				MessageID: segment.MessageID,
 				Start:     totalSize + segment.DecodedStartOffset,
@@ -192,9 +199,15 @@ func newSevenZipInspector(reader *sevenzip.Reader) (*sevenZipInspector, error) {
 // across volumes via splitArchiveRange since the underlying data may span a
 // multi-volume 7z set.
 func (s *sevenZipInspector) entry(file *sevenzip.File, volumeSizes map[int]int64) (ImportedArchiveEntry, error) {
+	if s == nil || !s.folders.IsValid() || file == nil || file.UncompressedSize > math.MaxInt64 {
+		return ImportedArchiveEntry{}, errArchiveHeadersInvalid
+	}
 	fv := reflect.ValueOf(file).Elem()
 	folder := int(fv.FieldByName("folder").Int())
 	offset := fv.FieldByName("offset").Int()
+	if folder < 0 || folder >= s.folders.Len() || offset < 0 {
+		return ImportedArchiveEntry{}, errArchiveHeadersInvalid
+	}
 	coderIDs, encrypted := s.folderCoderInfo(folder)
 	method := sevenZipMethodName(coderIDs)
 	if len(coderIDs) != 1 || !bytes.Equal(coderIDs[0], sevenZipCopyCoder) {
@@ -203,15 +216,20 @@ func (s *sevenZipInspector) entry(file *sevenzip.File, volumeSizes map[int]int64
 		}
 		return ImportedArchiveEntry{}, errArchiveCompressionUnsupported
 	}
-	archiveOffset := s.folderOffset(folder) + offset
-	ranges, err := splitArchiveRange(volumeSizes, archiveOffset, int64(file.UncompressedSize))
+	folderOffset, ok := s.folderOffset(folder)
+	if !ok || folderOffset > math.MaxInt64-offset {
+		return ImportedArchiveEntry{}, errArchiveHeadersInvalid
+	}
+	archiveOffset := folderOffset + offset
+	fileSize := int64(file.UncompressedSize)
+	ranges, err := splitArchiveRange(volumeSizes, archiveOffset, fileSize)
 	if err != nil {
 		return ImportedArchiveEntry{}, errArchiveHeadersInvalid
 	}
 	entry := ImportedArchiveEntry{
 		Path:              file.Name,
-		SizeBytes:         int64(file.UncompressedSize),
-		PackedSizeBytes:   int64(file.UncompressedSize),
+		SizeBytes:         fileSize,
+		PackedSizeBytes:   fileSize,
 		CompressionMethod: method,
 		Encrypted:         false,
 		Solid:             false,
@@ -249,18 +267,30 @@ func (s *sevenZipInspector) folderCoderInfo(folder int) ([][]byte, bool) {
 // folderOffset returns the absolute archive byte offset where the given
 // folder's packed data begins, computed by summing the pack-stream sizes of
 // every preceding folder (offset from packPosition, the base of the pack
-// section).
-func (s *sevenZipInspector) folderOffset(folder int) int64 {
-	var offset uint64
+// section). The boolean is false when malformed metadata would overflow or
+// reference pack streams outside the parsed table.
+func (s *sevenZipInspector) folderOffset(folder int) (int64, bool) {
+	if s == nil || !s.folders.IsValid() || s.packPosition > math.MaxInt64 || folder < 0 || folder > s.folders.Len() {
+		return 0, false
+	}
+	total := s.packPosition
 	packedOffset := 0
 	for i := 0; i < folder; i++ {
-		packedStreams := int(s.folders.Index(i).Elem().FieldByName("packedStreams").Uint())
+		rawPackedStreams := s.folders.Index(i).Elem().FieldByName("packedStreams").Uint()
+		if rawPackedStreams > math.MaxInt || packedOffset > len(s.packSizes)-int(rawPackedStreams) {
+			return 0, false
+		}
+		packedStreams := int(rawPackedStreams)
 		for j := 0; j < packedStreams; j++ {
-			offset += s.packSizes[packedOffset+j]
+			size := s.packSizes[packedOffset+j]
+			if size > math.MaxInt64-total {
+				return 0, false
+			}
+			total += size
 		}
 		packedOffset += packedStreams
 	}
-	return int64(s.packPosition + offset)
+	return int64(total), true
 }
 
 // splitArchiveRange breaks a single [archiveOffset, archiveOffset+size)
@@ -269,8 +299,8 @@ func (s *sevenZipInspector) folderOffset(folder int) int64 {
 // volume's bytes start and end within that logical stream. Returns an error
 // if the known volumes can't fully account for size (e.g. a missing volume).
 func splitArchiveRange(volumeSizes map[int]int64, archiveOffset, size int64) ([]ImportedArchiveRange, error) {
-	if size < 0 {
-		return nil, fmt.Errorf("invalid archive size")
+	if archiveOffset < 0 || size < 0 || archiveOffset > math.MaxInt64-size {
+		return nil, errArchiveHeadersInvalid
 	}
 	if size == 0 {
 		return nil, nil
@@ -282,6 +312,9 @@ func splitArchiveRange(volumeSizes map[int]int64, archiveOffset, size int64) ([]
 		volumeSize, ok := volumeSizes[volumeIndex]
 		if !ok {
 			break
+		}
+		if volumeSize < 0 || current > math.MaxInt64-volumeSize {
+			return nil, errArchiveHeadersInvalid
 		}
 		volumeStart := current
 		volumeEnd := volumeStart + volumeSize

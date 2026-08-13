@@ -139,11 +139,11 @@ func Open(cfg config.DatabaseConfig) (*DB, error) {
 	// Ping before returning any idle connection from the pool. pgxpool's
 	// background health check only runs every HealthCheckPeriod (default 1min),
 	// so a silently-dropped TCP connection can slip through and cause
-	// "driver: bad connection" on the first I/O. BeforeAcquire forces a
+	// "driver: bad connection" on the first I/O. PrepareConn forces a
 	// round-trip on every acquire — sub-millisecond on a local Docker network
 	// but guarantees the connection is alive before the caller sees it.
-	poolCfg.BeforeAcquire = func(ctx context.Context, c *pgx.Conn) bool {
-		return c.Ping(ctx) == nil
+	poolCfg.PrepareConn = func(ctx context.Context, c *pgx.Conn) (bool, error) {
+		return c.Ping(ctx) == nil, nil
 	}
 	poolCfg.MaxConns = 25
 	poolCfg.MinConns = 2

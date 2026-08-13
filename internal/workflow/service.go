@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/rs/zerolog"
 
+	"github.com/drakkar-media/drakkar/internal/config"
 	"github.com/drakkar-media/drakkar/internal/database"
 	"github.com/drakkar-media/drakkar/internal/hydra"
 	"github.com/drakkar-media/drakkar/internal/library"
@@ -180,7 +182,8 @@ type Service struct {
 
 	// importSem is kept for ImportNZBFromPush (SABnzbd push path) only.
 	// The main download path uses downloader instead.
-	importSem chan struct{}
+	importSem          chan struct{}
+	pushNZBUploadLimit int64
 
 	// downloader is a priority download queue processed by dedicated workers
 	// (started in app.go). Replaces the importSem lottery so downloads execute
@@ -558,12 +561,6 @@ func (d *downloadDispatcher) next(ctx context.Context) (downloadJob, bool) {
 	}
 }
 
-func (d *downloadDispatcher) depth() int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return len(d.queue)
-}
-
 func (d *downloadDispatcher) incWorker() { d.mu.Lock(); d.workerCount++; d.mu.Unlock() }
 func (d *downloadDispatcher) decWorker() { d.mu.Lock(); d.workerCount--; d.mu.Unlock() }
 func (d *downloadDispatcher) hasWorkers() bool {
@@ -578,17 +575,18 @@ func (d *downloadDispatcher) hasWorkers() bool {
 // values are safe defaults suitable for tests.
 func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service {
 	return &Service{
-		repo:           repo,
-		seerr:          seerr,
-		hydra:          hydra,
-		fetcher:        NewHTTPNZBFetcher(nil, nil),
-		importSem:      make(chan struct{}, 2), // kept for ImportNZBFromPush only
-		downloader:     newDownloadDispatcher(),
-		dispatchC:      make(chan struct{}, 1),
-		calibrateSem:   make(chan struct{}, asyncCalibrateWorkers),
-		tmdbEnrichSem:  make(chan struct{}, tmdbEnrichWorkers),
-		recentURLHits:  make(map[string]time.Time),
-		searchAttempts: make(map[string]searchAttemptRecord),
+		repo:               repo,
+		seerr:              seerr,
+		hydra:              hydra,
+		fetcher:            NewHTTPNZBFetcher(nil, nil),
+		importSem:          make(chan struct{}, 2), // kept for ImportNZBFromPush only
+		pushNZBUploadLimit: config.DefaultNZBUploadLimitBytes,
+		downloader:         newDownloadDispatcher(),
+		dispatchC:          make(chan struct{}, 1),
+		calibrateSem:       make(chan struct{}, asyncCalibrateWorkers),
+		tmdbEnrichSem:      make(chan struct{}, tmdbEnrichWorkers),
+		recentURLHits:      make(map[string]time.Time),
+		searchAttempts:     make(map[string]searchAttemptRecord),
 	}
 }
 
@@ -658,6 +656,15 @@ func (s *Service) SetImportConcurrency(workers int) {
 		workers = 1
 	}
 	s.importSem = make(chan struct{}, workers)
+}
+
+// SetPushNZBUploadLimit sets the maximum SABnzbd addfile payload accepted
+// before parsing. Values below one restore the application default.
+func (s *Service) SetPushNZBUploadLimit(limit int64) {
+	if limit <= 0 {
+		limit = config.DefaultNZBUploadLimitBytes
+	}
+	s.pushNZBUploadLimit = limit
 }
 
 // SetEarlyChecker registers a callback run against a single message ID
@@ -808,18 +815,18 @@ func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 				result.Created++
 				result.CreatedLibraryItemIDs = append(result.CreatedLibraryItemIDs, libraryItemID)
 				s.logger.Info().Str("title", request.MediaTitle).Int("year", request.MediaYear).Int64("libraryItemId", libraryItemID).Msg("request: new movie requested")
+				lid, tmdbID := libraryItemID, request.TMDBID
+				go func() {
+					defer observability.Recover("enrich-movie-request")
+					if s.tmdbEnrichSem != nil {
+						s.tmdbEnrichSem <- struct{}{}
+						defer func() { <-s.tmdbEnrichSem }()
+					}
+					enrichCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					_ = s.enrichMovieRequest(enrichCtx, lid, tmdbID)
+				}()
 			}
-			lid, tmdbID := libraryItemID, request.TMDBID
-			go func() {
-				defer observability.Recover("enrich-movie-request")
-				if s.tmdbEnrichSem != nil {
-					s.tmdbEnrichSem <- struct{}{}
-					defer func() { <-s.tmdbEnrichSem }()
-				}
-				enrichCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				_ = s.enrichMovieRequest(enrichCtx, lid, tmdbID)
-			}()
 		case "tv":
 			if len(request.Seasons) > 0 {
 				// Season-level request: expand into per-episode library items via TMDB.
@@ -853,18 +860,18 @@ func (s *Service) SyncRequests(ctx context.Context) (SyncResult, error) {
 				result.Created++
 				result.CreatedLibraryItemIDs = append(result.CreatedLibraryItemIDs, libraryItemID)
 				s.logger.Info().Str("title", request.MediaTitle).Int("season", request.SeasonNumber).Int("episode", request.EpisodeNumber).Int64("libraryItemId", libraryItemID).Msg("request: new episode requested")
+				lid, tmdbID, tvdbID, epTitle := libraryItemID, request.TMDBID, request.TVDBID, request.EpisodeTitle
+				go func() {
+					defer observability.Recover("enrich-episode-request")
+					if s.tmdbEnrichSem != nil {
+						s.tmdbEnrichSem <- struct{}{}
+						defer func() { <-s.tmdbEnrichSem }()
+					}
+					enrichCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					_ = s.enrichEpisodeRequest(enrichCtx, lid, tmdbID, tvdbID, epTitle)
+				}()
 			}
-			lid, tmdbID, tvdbID, epTitle := libraryItemID, request.TMDBID, request.TVDBID, request.EpisodeTitle
-			go func() {
-				defer observability.Recover("enrich-episode-request")
-				if s.tmdbEnrichSem != nil {
-					s.tmdbEnrichSem <- struct{}{}
-					defer func() { <-s.tmdbEnrichSem }()
-				}
-				enrichCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-				defer cancel()
-				_ = s.enrichEpisodeRequest(enrichCtx, lid, tmdbID, tvdbID, epTitle)
-			}()
 		}
 	}
 	if result.Created > 0 {
@@ -4901,9 +4908,19 @@ func (s *Service) loadIndexerPolicyMap(ctx context.Context) map[string]int {
 // (pushed by Radarr/Sonarr). It bypasses the search/ranking pipeline and
 // immediately starts the import → preflight → publish sequence asynchronously.
 // Returns the nzo_id (e.g. "item-42") that Radarr/Sonarr use to poll status.
-func (s *Service) ImportNZBFromPush(ctx context.Context, content []byte, filename, mediaType string) (string, error) {
-	jobName := strings.TrimSuffix(filename, ".nzb")
-	idempotencyKey := fmt.Sprintf("sabnzbd-push:%s", filename)
+func (s *Service) ImportNZBFromPush(ctx context.Context, src io.Reader, filename, mediaType string) (string, error) {
+	limit := s.pushNZBUploadLimit
+	if limit <= 0 {
+		limit = config.DefaultNZBUploadLimitBytes
+	}
+	content, err := io.ReadAll(io.LimitReader(src, limit+1))
+	if err != nil {
+		return "", fmt.Errorf("read nzb: %w", err)
+	}
+	if err := nzb.ValidateUploadLimit(int64(len(content)), limit); err != nil {
+		return "", err
+	}
+	idempotencyKey := sabPushIdempotencyKey(content, mediaType)
 	imported, err := nzb.BuildImportedNZB(filename, content, idempotencyKey, "")
 	if err != nil {
 		return "", fmt.Errorf("parse nzb: %w", err)
@@ -4921,19 +4938,20 @@ func (s *Service) ImportNZBFromPush(ctx context.Context, content []byte, filenam
 			<-s.importSem
 		}
 	}()
-	item, err := s.repo.CreateImportedNZB(ctx, imported)
+	item, created, err := s.createSABPushImport(ctx, imported)
 	<-s.importSem
 	semReleased = true
 	if err != nil {
 		return "", fmt.Errorf("create imported nzb: %w", err)
+	}
+	if !created {
+		return fmt.Sprintf("item-%d", item.LibraryItemID), nil
 	}
 
 	current, err := s.repo.GetSelectedReleaseSummary(ctx, *item.SelectedRelease)
 	if err != nil {
 		return "", fmt.Errorf("get release summary: %w", err)
 	}
-	_ = jobName
-
 	go func() {
 		defer observability.Recover("sabnzbd-push-import")
 		// 10m ceiling: generous relative to preflightChecker's own internal 5m
@@ -4988,6 +5006,27 @@ func (s *Service) ImportNZBFromPush(ctx context.Context, content []byte, filenam
 	}()
 
 	return fmt.Sprintf("item-%d", item.LibraryItemID), nil
+}
+
+type importedNZBIfAbsentCreator interface {
+	CreateImportedNZBIfAbsent(ctx context.Context, imported database.ImportedNZB) (database.QueueSnapshot, bool, error)
+}
+
+func (s *Service) createSABPushImport(ctx context.Context, imported database.ImportedNZB) (database.QueueSnapshot, bool, error) {
+	if creator, ok := s.repo.(importedNZBIfAbsentCreator); ok {
+		return creator.CreateImportedNZBIfAbsent(ctx, imported)
+	}
+	item, err := s.repo.CreateImportedNZB(ctx, imported)
+	return item, true, err
+}
+
+func sabPushIdempotencyKey(content []byte, mediaType string) string {
+	digest := sha256.Sum256(content)
+	scope := strings.ToLower(strings.TrimSpace(mediaType))
+	if scope == "" {
+		scope = "unknown"
+	}
+	return fmt.Sprintf("sabnzbd-push:%s:%x", scope, digest)
 }
 
 func detectOne(title string, options ...string) string {

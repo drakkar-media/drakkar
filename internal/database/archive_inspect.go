@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -447,7 +448,7 @@ func rar4FindDataStart(raw []byte) (int64, error) {
 		return 0, errArchiveHeadersInvalid
 	}
 	offset := 7
-	for offset+7 <= len(raw) {
+	for offset <= len(raw)-7 {
 		headType := raw[offset+2]
 		headFlags := binary.LittleEndian.Uint16(raw[offset+3 : offset+5])
 		headSize := int(binary.LittleEndian.Uint16(raw[offset+5 : offset+7]))
@@ -640,7 +641,7 @@ func enrichFileByNameFromPar2(ctx context.Context, files []ImportedNZBFile, file
 	wg.Wait()
 	for _, descs := range allDescs {
 		for _, d := range descs {
-			if d.FileName == "" {
+			if d.FileName == "" || d.FileLength > math.MaxInt64 {
 				continue
 			}
 			if entry, ok := fileByName[d.FileName]; ok {
@@ -1144,7 +1145,7 @@ func inspectRAR4(raw []byte) ([]ImportedArchiveEntry, error) {
 		headType := raw[offset+2]
 		headFlags := binary.LittleEndian.Uint16(raw[offset+3 : offset+5])
 		headSize := int(binary.LittleEndian.Uint16(raw[offset+5 : offset+7]))
-		if headSize < 7 || offset+headSize > len(raw) {
+		if headSize < 7 || headSize > len(raw)-offset {
 			return nil, errArchiveHeadersInvalid
 		}
 		body := raw[offset+7 : offset+headSize]
@@ -1152,7 +1153,8 @@ func inspectRAR4(raw []byte) ([]ImportedArchiveEntry, error) {
 		case 0x73:
 			mainFlags = headFlags
 		case 0x74:
-			entry, packedSize, err := parseRAR4FileHeader(body, headFlags, mainFlags, int64(offset+headSize))
+			dataOffset := int64(offset) + int64(headSize)
+			entry, packedSize, err := parseRAR4FileHeader(body, headFlags, mainFlags, dataOffset)
 			if err != nil {
 				return nil, err
 			}
@@ -1169,7 +1171,14 @@ func inspectRAR4(raw []byte) ([]ImportedArchiveEntry, error) {
 					return nil, errArchiveCompressionUnsupported
 				}
 			}
-			offset += headSize + int(packedSize) //nolint:gosec // packedSize fits int on all supported platforms
+			if packedSize > math.MaxInt64-dataOffset {
+				return nil, errArchiveHeadersInvalid
+			}
+			nextOffset := dataOffset + packedSize
+			if nextOffset > math.MaxInt {
+				return nil, errArchiveHeadersInvalid
+			}
+			offset = int(nextOffset)
 			continue
 		case 0x7b:
 			offset = len(raw)
@@ -1207,6 +1216,9 @@ func parseRAR4FileHeader(body []byte, headFlags, mainFlags uint16, dataOffset in
 		packedSize |= highPacked << 32
 		unpackedSize |= highUnpacked << 32
 		pos += 8
+	}
+	if packedSize > math.MaxInt64 || unpackedSize > math.MaxInt64 {
+		return ImportedArchiveEntry{}, 0, errArchiveHeadersInvalid
 	}
 	if len(body) < pos+nameSize {
 		return ImportedArchiveEntry{}, 0, errArchiveHeadersInvalid

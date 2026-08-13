@@ -3,7 +3,10 @@
 // performing any repair or disk writes.
 package par2
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"math"
+)
 
 // Par2 packet layout (all integers little-endian):
 //
@@ -45,11 +48,12 @@ func ParseFileDescs(data []byte) []FileDesc {
 			i++
 			continue
 		}
-		pktLen := int(binary.LittleEndian.Uint64(data[i+8 : i+16]))
-		if pktLen < 64 || i+pktLen > len(data) {
+		rawPacketLength := binary.LittleEndian.Uint64(data[i+8 : i+16])
+		if rawPacketLength < 64 || rawPacketLength > uint64(len(data)-i) {
 			i++
 			continue
 		}
+		pktLen := int(rawPacketLength)
 		if [16]byte(data[i+48:i+64]) == fileDescType {
 			if fd, ok := parseFileDescBody(data[i+64 : i+pktLen]); ok {
 				out = append(out, fd)
@@ -79,5 +83,5 @@ func parseFileDescBody(body []byte) (FileDesc, bool) {
 		}
 		fd.FileName = string(raw[:n])
 	}
-	return fd, fd.FileLength > 0
+	return fd, fd.FileLength > 0 && fd.FileLength <= math.MaxInt64
 }

@@ -83,6 +83,18 @@ type blocklistStub struct {
 	lastBody database.BlocklistMutation
 }
 
+type settingsStub struct {
+	cfg config.Settings
+}
+
+func (s settingsStub) GetSettings(context.Context) (config.Settings, error) {
+	return s.cfg, nil
+}
+
+func (s settingsStub) UpdateSettings(_ context.Context, cfg config.Settings) (config.Settings, error) {
+	return cfg, nil
+}
+
 type profilesStub struct {
 	profiles         []database.QualityProfile
 	requestLibraryID int64
@@ -213,11 +225,12 @@ func (w workflowStub) ClaimURLForFetch(_ context.Context, rawURL string) bool {
 	return false
 }
 
-func (w workflowStub) ImportNZBFromPush(_ context.Context, content []byte, filename, mediaType string) (string, error) {
+func (w workflowStub) ImportNZBFromPush(_ context.Context, content io.Reader, filename, mediaType string) (string, error) {
 	if w.importCall != nil {
+		raw, _ := io.ReadAll(content)
 		w.importCall.filename = filename
 		w.importCall.mediaType = mediaType
-		w.importCall.size = len(content)
+		w.importCall.size = len(raw)
 	}
 	return "item-42", nil
 }
@@ -465,6 +478,19 @@ func TestImportNZBEndpoint(t *testing.T) {
 	}
 	if item.State != database.QueuePreflight {
 		t.Fatalf("unexpected state %s", item.State)
+	}
+}
+
+func TestImportNZBEndpointReturns413AtImporterLimit(t *testing.T) {
+	queueSvc := queue.NewService(queue.NewMemoryRepository(), nzb.NewImporter(t.TempDir(), 4))
+	router := Router(statusStub{}, queueSvc, nil, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/nzbs/import", strings.NewReader("12345"))
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 
@@ -934,7 +960,7 @@ func TestWorkflowEndpoints(t *testing.T) {
 func TestSABAPIAddFileAliasAcceptsLowercaseFieldAndNzbname(t *testing.T) {
 	importCall := &sabImportCall{}
 	workflowSvc := workflowStub{importCall: importCall}
-	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, settingsStub{cfg: config.Settings{SABNZBD: config.SABNZBDConfig{APIKey: "sab-test-key"}}}, nil, nil, nil, nil)
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -955,7 +981,7 @@ func TestSABAPIAddFileAliasAcceptsLowercaseFieldAndNzbname(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/dav/api?category=movies", &body)
+	req := httptest.NewRequest(http.MethodPost, "/dav/api?category=movies&apikey=sab-test-key", &body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
@@ -979,9 +1005,9 @@ func TestSABAPIAddFileAliasAcceptsLowercaseFieldAndNzbname(t *testing.T) {
 
 func TestSABAPIHistoryAcceptsCategoryAlias(t *testing.T) {
 	repo := &sabRepoStub{}
-	handler := &sabHandler{repo: repo}
+	handler := &sabHandler{repo: repo, apiKey: "sab-test-key"}
 
-	req := httptest.NewRequest(http.MethodGet, "/dav/api?mode=history&category=movies", nil)
+	req := httptest.NewRequest(http.MethodGet, "/dav/api?mode=history&category=movies&apikey=sab-test-key", nil)
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 

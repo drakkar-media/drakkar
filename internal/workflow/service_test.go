@@ -1,9 +1,11 @@
 package workflow
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,12 +14,17 @@ import (
 	"github.com/drakkar-media/drakkar/internal/database"
 	"github.com/drakkar-media/drakkar/internal/hydra"
 	"github.com/drakkar-media/drakkar/internal/library"
+	"github.com/drakkar-media/drakkar/internal/nzb"
 	"github.com/drakkar-media/drakkar/internal/seerr"
 	"github.com/drakkar-media/drakkar/internal/tmdb"
 	"github.com/drakkar-media/drakkar/internal/tvdb"
 )
 
 type repoStub struct {
+	metaMu                    sync.RWMutex
+	movieMetaReady            chan struct{}
+	episodeMetaReady          chan struct{}
+	existingRequests          bool
 	selectCandidateGone       bool
 	persistedDispatchedURLsMu sync.Mutex
 	persistedDispatchedURLs   map[string]bool
@@ -83,13 +90,14 @@ func (r *repoStub) ListMediaRequests(ctx context.Context) ([]database.MediaReque
 }
 func (r *repoStub) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID int64, title string, year int) (int64, bool, error) {
 	r.movieCalls++
-	return 11, true, nil
+	return 11, !r.existingRequests, nil
 }
 func (r *repoStub) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbID, tmdbID int64, show string, year, season, episode int, episodeTitle string) (int64, bool, error) {
 	r.tvCalls++
-	return 12, true, nil
+	return 12, !r.existingRequests, nil
 }
 func (r *repoStub) EnrichMovieMetadata(ctx context.Context, libraryItemID, tmdbID int64, title string, year int, imdbID string) error {
+	r.metaMu.Lock()
 	r.movieMeta = struct {
 		libraryItemID int64
 		tmdbID        int64
@@ -97,9 +105,15 @@ func (r *repoStub) EnrichMovieMetadata(ctx context.Context, libraryItemID, tmdbI
 		year          int
 		imdbID        string
 	}{libraryItemID, tmdbID, title, year, imdbID}
+	ready := r.movieMetaReady
+	r.metaMu.Unlock()
+	if ready != nil {
+		ready <- struct{}{}
+	}
 	return nil
 }
 func (r *repoStub) EnrichEpisodeMetadata(ctx context.Context, libraryItemID, tmdbID int64, show string, year int, imdbID, episodeTitle string) error {
+	r.metaMu.Lock()
 	r.episodeMeta = struct {
 		libraryItemID int64
 		tmdbID        int64
@@ -108,10 +122,16 @@ func (r *repoStub) EnrichEpisodeMetadata(ctx context.Context, libraryItemID, tmd
 		imdbID        string
 		episodeTitle  string
 	}{libraryItemID, tmdbID, show, year, imdbID, episodeTitle}
+	ready := r.episodeMetaReady
+	r.metaMu.Unlock()
+	if ready != nil {
+		ready <- struct{}{}
+	}
 	return nil
 }
 
 func (r *repoStub) EnrichMovieFull(_ context.Context, _ int64, e database.MovieEnrichment) error {
+	r.metaMu.Lock()
 	r.movieMeta = struct {
 		libraryItemID int64
 		tmdbID        int64
@@ -119,10 +139,16 @@ func (r *repoStub) EnrichMovieFull(_ context.Context, _ int64, e database.MovieE
 		year          int
 		imdbID        string
 	}{0, e.TMDBID, e.Title, e.Year, e.IMDbID}
+	ready := r.movieMetaReady
+	r.metaMu.Unlock()
+	if ready != nil {
+		ready <- struct{}{}
+	}
 	return nil
 }
 
 func (r *repoStub) EnrichTVFull(_ context.Context, _ int64, episodeTitle string, e database.TVShowEnrichment) error {
+	r.metaMu.Lock()
 	r.episodeMeta = struct {
 		libraryItemID int64
 		tmdbID        int64
@@ -131,7 +157,31 @@ func (r *repoStub) EnrichTVFull(_ context.Context, _ int64, episodeTitle string,
 		imdbID        string
 		episodeTitle  string
 	}{0, e.TMDBID, e.ShowTitle, e.Year, e.IMDbID, episodeTitle}
+	ready := r.episodeMetaReady
+	r.metaMu.Unlock()
+	if ready != nil {
+		ready <- struct{}{}
+	}
 	return nil
+}
+
+func (r *repoStub) metadata() (movie struct {
+	libraryItemID int64
+	tmdbID        int64
+	title         string
+	year          int
+	imdbID        string
+}, episode struct {
+	libraryItemID int64
+	tmdbID        int64
+	show          string
+	year          int
+	imdbID        string
+	episodeTitle  string
+}) {
+	r.metaMu.RLock()
+	defer r.metaMu.RUnlock()
+	return r.movieMeta, r.episodeMeta
 }
 func (r *repoStub) DetectMovieSearchConflict(ctx context.Context, libraryItemID int64) (string, error) {
 	return r.conflict, nil
@@ -658,7 +708,7 @@ func (tmdbFillMissingRecentStub) TVSeason(_ context.Context, _ int64, _ int) (tm
 }
 
 func TestSyncRequests(t *testing.T) {
-	repo := &repoStub{}
+	repo := &repoStub{movieMetaReady: make(chan struct{}, 1), episodeMetaReady: make(chan struct{}, 1)}
 	service := NewService(repo, seerrStub{requests: []seerr.Request{
 		{ID: 1, Type: "movie", MediaTitle: "Dune", MediaYear: 2021, TMDBID: 438631},
 		{ID: 2, Type: "tv", MediaTitle: "Loki", MediaYear: 2021, TVDBID: 362472, TMDBID: 84958, SeasonNumber: 2, EpisodeNumber: 1},
@@ -672,18 +722,19 @@ func TestSyncRequests(t *testing.T) {
 	if result.Created != 2 || repo.movieCalls != 1 || repo.tvCalls != 1 {
 		t.Fatalf("unexpected sync result %+v repo=%+v", result, repo)
 	}
-	// Enrichment for new items runs in a goroutine — give it a moment.
-	time.Sleep(50 * time.Millisecond)
-	if repo.movieMeta.tmdbID != 438631 || repo.movieMeta.imdbID != "tt1160419" || repo.movieMeta.title != "Dune" {
-		t.Fatalf("unexpected movie metadata %+v", repo.movieMeta)
+	waitForSignal(t, repo.movieMetaReady)
+	waitForSignal(t, repo.episodeMetaReady)
+	movieMeta, episodeMeta := repo.metadata()
+	if movieMeta.tmdbID != 438631 || movieMeta.imdbID != "tt1160419" || movieMeta.title != "Dune" {
+		t.Fatalf("unexpected movie metadata %+v", movieMeta)
 	}
-	if repo.episodeMeta.tmdbID != 84958 || repo.episodeMeta.show != "Loki" || repo.episodeMeta.imdbID != "tt9140554" {
-		t.Fatalf("unexpected episode metadata %+v", repo.episodeMeta)
+	if episodeMeta.tmdbID != 84958 || episodeMeta.show != "Loki" || episodeMeta.imdbID != "tt9140554" {
+		t.Fatalf("unexpected episode metadata %+v", episodeMeta)
 	}
 }
 
 func TestSyncRequestsTVDBFallback(t *testing.T) {
-	repo := &repoStub{}
+	repo := &repoStub{episodeMetaReady: make(chan struct{}, 1)}
 	service := NewService(repo, seerrStub{requests: []seerr.Request{
 		{ID: 3, Type: "tv", MediaTitle: "The Bear", MediaYear: 2022, TVDBID: 412567, SeasonNumber: 1, EpisodeNumber: 1, EpisodeTitle: "System"},
 	}}, hydraStub{})
@@ -697,10 +748,92 @@ func TestSyncRequestsTVDBFallback(t *testing.T) {
 	if result.Created != 1 || repo.tvCalls != 1 {
 		t.Fatalf("unexpected sync result %+v repo=%+v", result, repo)
 	}
-	// Enrichment for new items runs in a goroutine — give it a moment.
-	time.Sleep(50 * time.Millisecond)
-	if repo.episodeMeta.tmdbID != 0 || repo.episodeMeta.show != "The Bear" || repo.episodeMeta.imdbID != "tt14452776" || repo.episodeMeta.year != 2022 {
-		t.Fatalf("unexpected episode metadata %+v", repo.episodeMeta)
+	waitForSignal(t, repo.episodeMetaReady)
+	_, episodeMeta := repo.metadata()
+	if episodeMeta.tmdbID != 0 || episodeMeta.show != "The Bear" || episodeMeta.imdbID != "tt14452776" || episodeMeta.year != 2022 {
+		t.Fatalf("unexpected episode metadata %+v", episodeMeta)
+	}
+}
+
+func TestSyncRequestsSkipsEnrichmentForExistingItems(t *testing.T) {
+	repo := &repoStub{
+		existingRequests: true,
+		movieMetaReady:   make(chan struct{}, 1),
+		episodeMetaReady: make(chan struct{}, 1),
+	}
+	service := NewService(repo, seerrStub{requests: []seerr.Request{
+		{ID: 1, Type: "movie", MediaTitle: "Dune", MediaYear: 2021, TMDBID: 438631},
+		{ID: 2, Type: "tv", MediaTitle: "Loki", MediaYear: 2021, TVDBID: 362472, TMDBID: 84958, SeasonNumber: 2, EpisodeNumber: 1},
+	}}, hydraStub{})
+	service.SetTMDBClient(tmdbStub{})
+
+	result, err := service.SyncRequests(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created != 0 || repo.movieCalls != 1 || repo.tvCalls != 1 {
+		t.Fatalf("unexpected sync result %+v repo=%+v", result, repo)
+	}
+	select {
+	case <-repo.movieMetaReady:
+		t.Fatal("existing movie was enriched")
+	case <-repo.episodeMetaReady:
+		t.Fatal("existing episode was enriched")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestSABPushIdempotencyKeyUsesContentAndMediaScope(t *testing.T) {
+	bodyA := []byte("first nzb")
+	bodyB := []byte("second nzb")
+	if sabPushIdempotencyKey(bodyA, "movie") == sabPushIdempotencyKey(bodyB, "movie") {
+		t.Fatal("different NZB bodies must not share a key")
+	}
+	if sabPushIdempotencyKey(bodyA, "movie") == sabPushIdempotencyKey(bodyA, "tv") {
+		t.Fatal("different media scopes must not share a key")
+	}
+	if sabPushIdempotencyKey(bodyA, " Movie ") != sabPushIdempotencyKey(bodyA, "movie") {
+		t.Fatal("media scope normalization must be stable")
+	}
+}
+
+type existingSABPushRepo struct {
+	repoStub
+}
+
+func (r *existingSABPushRepo) CreateImportedNZBIfAbsent(_ context.Context, _ database.ImportedNZB) (database.QueueSnapshot, bool, error) {
+	return database.QueueSnapshot{LibraryItemID: 42}, false, nil
+}
+
+func TestImportNZBFromPushDoesNotRestartExistingImport(t *testing.T) {
+	repo := &existingSABPushRepo{}
+	service := NewService(repo, nil, hydraStub{})
+	raw := []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Dune (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`)
+	nzoID, err := service.ImportNZBFromPush(context.Background(), bytes.NewReader(raw), "Dune.nzb", "movie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nzoID != "item-42" {
+		t.Fatalf("nzo_id = %q, want item-42", nzoID)
+	}
+}
+
+func TestImportNZBFromPushRejectsConfiguredUploadLimit(t *testing.T) {
+	service := NewService(&repoStub{}, nil, hydraStub{})
+	service.SetPushNZBUploadLimit(4)
+
+	_, err := service.ImportNZBFromPush(context.Background(), strings.NewReader("12345"), "large.nzb", "movie")
+	if !errors.Is(err, nzb.ErrUploadTooLarge) {
+		t.Fatalf("expected ErrUploadTooLarge, got %v", err)
+	}
+}
+
+func waitForSignal(t *testing.T, ready <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for background enrichment")
 	}
 }
 

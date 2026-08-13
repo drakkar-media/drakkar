@@ -344,7 +344,7 @@ h3 { font-size: clamp(1rem, 1.4vw, 1.25rem);  font-weight: 600; line-height: 1.2
   font-size: 13px; font-weight: 500; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; min-width: 0;
 }
-.settings-list-item-name :global(svg) { color: var(--primary); }
+.settings-list-item-name svg { color: var(--primary); }
 .settings-list-item-meta {
   font-size: 11px; color: var(--muted-foreground); font-family: 'JetBrains Mono', monospace;
 }

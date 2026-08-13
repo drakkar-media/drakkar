@@ -47,6 +47,7 @@ type Settings struct {
 	Database      DatabaseConfig      `json:"database"`
 	Valkey        ValkeyConfig        `json:"valkey"`
 	NZBHydra2     ServiceConfig       `json:"nzbhydra2"`
+	SABNZBD       SABNZBDConfig       `json:"sabnzbd"`
 	Seerr         ServiceConfig       `json:"seerr"`
 	Usenet        UsenetConfig        `json:"usenet"`
 	Metadata      MetadataConfig      `json:"metadata"`
@@ -245,6 +246,12 @@ type ServiceConfig struct {
 	SearchCacheTTLSeconds int    `json:"searchCacheTtlSeconds"`
 	FeedCacheTTLSeconds   int    `json:"feedCacheTtlSeconds"`
 	FeedMaxResults        int    `json:"feedMaxResults"`
+}
+
+// SABNZBDConfig secures the SABnzbd-compatible download-client API used by
+// Sonarr and Radarr. An empty key leaves those endpoints disabled.
+type SABNZBDConfig struct {
+	APIKey string `json:"apiKey"`
 }
 
 // UsenetConfig controls download concurrency and holds the list of
@@ -646,6 +653,9 @@ func RedactedSettings(cfg Settings) map[string]any {
 			"feedCacheTtlSeconds":   cfg.NZBHydra2.FeedCacheTTLSeconds,
 			"feedMaxResults":        cfg.NZBHydra2.FeedMaxResults,
 		},
+		"sabnzbd": map[string]any{
+			"apiKey": "***",
+		},
 		"seerr": map[string]any{
 			"url":    cfg.Seerr.URL,
 			"apiKey": "***",
@@ -727,6 +737,7 @@ func RedactSecrets(cfg Settings) Settings {
 	redacted.Database.Password = ""
 	redacted.Valkey.Password = ""
 	redacted.NZBHydra2.APIKey = ""
+	redacted.SABNZBD.APIKey = ""
 	redacted.Seerr.APIKey = ""
 	redacted.Metadata.TMDB.APIKey = ""
 	redacted.Metadata.TVDB.APIKey = ""
@@ -769,6 +780,9 @@ func MergeSecrets(current, incoming Settings) Settings {
 	}
 	if merged.NZBHydra2.APIKey == "" {
 		merged.NZBHydra2.APIKey = current.NZBHydra2.APIKey
+	}
+	if merged.SABNZBD.APIKey == "" {
+		merged.SABNZBD.APIKey = current.SABNZBD.APIKey
 	}
 	if merged.Seerr.APIKey == "" {
 		merged.Seerr.APIKey = current.Seerr.APIKey

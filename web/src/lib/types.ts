@@ -130,6 +130,7 @@ export type Status = {
   diskCacheLimitBytes: number;
   readAheadLimitBytes: number;
   memoryHotCacheBytes: number;
+  nzbUploadLimitBytes: number;
   backgroundQueueDepth: number;
 };
 
@@ -589,14 +590,14 @@ export type UsenetProvider = {
  * Complete backend configuration, as read from and written to
  * `/api/settings`.
  *
- * Mirrors the server-side settings struct; sensitive fields (passwords, API
- * keys, WireGuard config text) are returned to authenticated clients as-is
- * and are expected to be redacted/masked by the UI, not by this type.
+ * Mirrors the server-side settings struct. Sensitive fields are returned as
+ * empty strings and preserved server-side when an unchanged draft is saved.
  */
 export type FullSettings = {
   database: { host: string; port: number; name: string; username: string; password: string };
   valkey: { host: string; port: number; password: string };
   nzbhydra2: { url: string; apiKey: string; searchCacheTtlSeconds: number; feedCacheTtlSeconds: number; feedMaxResults: number };
+  sabnzbd: { apiKey: string };
   seerr: { url: string; apiKey: string; searchCacheTtlSeconds: number; feedCacheTtlSeconds: number; feedMaxResults: number };
   usenet: {
     maxDownloadConnections: number;

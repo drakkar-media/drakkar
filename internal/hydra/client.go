@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -36,8 +37,11 @@ var defaultSearchInterval time.Duration
 var ErrRateLimited = errors.New("nzbhydra2 rate limited")
 
 const (
-	searchPageSize = 100 // results per page — matches Radarr/Sonarr PageSize
-	searchMaxPages = 30  // max pages per request → 3,000 results cap (matches Radarr/Sonarr)
+	searchPageSize        = 100 // results per page — matches Radarr/Sonarr PageSize
+	searchMaxPages        = 30  // max pages per request → 3,000 results cap (matches Radarr/Sonarr)
+	defaultFeedMaxResults = 1200
+	searchCacheMaxEntries = 256
+	feedCacheMaxEntries   = 16
 )
 
 var (
@@ -67,10 +71,14 @@ var (
 //
 // Client is safe for concurrent use.
 type Client struct {
-	cfgMu      sync.RWMutex
-	baseURL    string
-	apiKey     string
-	httpClient atomic.Pointer[http.Client]
+	cfgMu           sync.RWMutex
+	baseURL         string
+	apiKey          string
+	cacheGeneration uint64
+	searchCacheTTL  time.Duration
+	feedCacheTTL    time.Duration
+	feedMaxResults  int
+	httpClient      atomic.Pointer[http.Client]
 
 	searchInterval time.Duration // 0 = no throttle (Sonarr/Radarr behaviour)
 
@@ -85,12 +93,9 @@ type Client struct {
 	cooldownUntil time.Time
 	rateLimitHits int
 
-	cacheMu        sync.Mutex
-	searchCacheTTL time.Duration
-	feedCacheTTL   time.Duration
-	feedMaxResults int
-	searchCache    map[string]cachedResults
-	feedCache      map[string]cachedResults
+	cacheMu     sync.Mutex
+	searchCache map[string]cachedResults
+	feedCache   map[string]cachedResults
 
 	// searchFlight/feedFlight coalesce concurrent Search/SearchRecent calls
 	// that share a cache key (e.g. two different episodes of the same show
@@ -113,6 +118,14 @@ type Client struct {
 type cachedResults struct {
 	results   []SearchResult
 	expiresAt time.Time
+	lastUsed  time.Time
+}
+
+type cacheConfig struct {
+	generation     uint64
+	searchTTL      time.Duration
+	feedTTL        time.Duration
+	feedMaxResults int
 }
 
 // hydraFlight deduplicates concurrent calls that share a key, so only one
@@ -204,18 +217,6 @@ type SearchRequest struct {
 // SetTransport afterward to route requests through a custom transport (e.g.
 // a privacy proxy).
 func NewClient(cfg config.ServiceConfig) *Client {
-	searchCacheTTL := time.Duration(cfg.SearchCacheTTLSeconds) * time.Second
-	if searchCacheTTL < 0 {
-		searchCacheTTL = 0
-	}
-	feedCacheTTL := time.Duration(cfg.FeedCacheTTLSeconds) * time.Second
-	if feedCacheTTL < 0 {
-		feedCacheTTL = 0
-	}
-	feedMaxResults := cfg.FeedMaxResults
-	if feedMaxResults <= 0 {
-		feedMaxResults = 1200
-	}
 	// 3 concurrent searches: each *arr app (Radarr, Sonarr, ...) independently
 	// enforces its own 2-second per-indexer rate limit (HttpIndexerBase.RateLimit),
 	// not a global one — running Radarr+Sonarr together against the same
@@ -225,18 +226,14 @@ func NewClient(cfg config.ServiceConfig) *Client {
 	// worker pool, not re-implement indexer rate limiting from scratch.
 	const maxConcurrentSearches = 3
 	c := &Client{
-		baseURL:        strings.TrimRight(cfg.URL, "/"),
-		apiKey:         cfg.APIKey,
 		searchInterval: defaultSearchInterval,
 		searchSem:      make(chan struct{}, maxConcurrentSearches),
-		searchCacheTTL: searchCacheTTL,
-		feedCacheTTL:   feedCacheTTL,
-		feedMaxResults: feedMaxResults,
 		searchCache:    make(map[string]cachedResults),
 		feedCache:      make(map[string]cachedResults),
 		searchFlight:   newHydraFlight(),
 		feedFlight:     newHydraFlight(),
 	}
+	c.SetConfig(cfg)
 	c.httpClient.Store(&http.Client{Timeout: 30 * time.Second})
 	return c
 }
@@ -247,12 +244,58 @@ func (c *Client) SetTransport(transport http.RoundTripper) {
 	c.httpClient.Store(&http.Client{Timeout: 30 * time.Second, Transport: transport})
 }
 
-// SetConfig updates the target URL/API key live, e.g. after a settings save.
+// SetConfig updates the upstream and cache policy live. Any policy change
+// invalidates existing entries and advances the cache generation so an
+// in-flight request using the old configuration cannot repopulate the cache.
 func (c *Client) SetConfig(cfg config.ServiceConfig) {
+	searchTTL := cacheTTL(cfg.SearchCacheTTLSeconds)
+	feedTTL := cacheTTL(cfg.FeedCacheTTLSeconds)
+	feedMaxResults := cfg.FeedMaxResults
+	if feedMaxResults <= 0 {
+		feedMaxResults = defaultFeedMaxResults
+	}
+	baseURL := strings.TrimRight(cfg.URL, "/")
+
 	c.cfgMu.Lock()
-	c.baseURL = strings.TrimRight(cfg.URL, "/")
+	changed := c.baseURL != baseURL ||
+		c.apiKey != cfg.APIKey ||
+		c.searchCacheTTL != searchTTL ||
+		c.feedCacheTTL != feedTTL ||
+		c.feedMaxResults != feedMaxResults
+	c.baseURL = baseURL
 	c.apiKey = cfg.APIKey
+	c.searchCacheTTL = searchTTL
+	c.feedCacheTTL = feedTTL
+	c.feedMaxResults = feedMaxResults
+	if changed {
+		c.cacheGeneration++
+		c.cacheMu.Lock()
+		clear(c.searchCache)
+		clear(c.feedCache)
+		c.cacheMu.Unlock()
+	}
 	c.cfgMu.Unlock()
+}
+
+func cacheTTL(seconds int) time.Duration {
+	if seconds <= 0 {
+		return 0
+	}
+	if int64(seconds) > math.MaxInt64/int64(time.Second) {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func (c *Client) getCacheConfig() cacheConfig {
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return cacheConfig{
+		generation:     c.cacheGeneration,
+		searchTTL:      c.searchCacheTTL,
+		feedTTL:        c.feedCacheTTL,
+		feedMaxResults: c.feedMaxResults,
+	}
 }
 
 func (c *Client) getBaseURL() string {
@@ -520,10 +563,11 @@ func (c *Client) Indexers(ctx context.Context) ([]string, error) {
 // for the same mediaType are coalesced via feedFlight so only one actually
 // reaches NZBHydra2.
 func (c *Client) SearchRecent(ctx context.Context, mediaType string) ([]SearchResult, error) {
-	if cached, ok := c.lookupFeedCache(mediaType); ok {
+	cacheCfg := c.getCacheConfig()
+	key := versionedCacheKey(cacheCfg.generation, strings.ToLower(strings.TrimSpace(mediaType)))
+	if cached, ok := c.lookupCache(c.feedCache, key); ok {
 		return cached, nil
 	}
-	key := strings.ToLower(strings.TrimSpace(mediaType))
 	return c.feedFlight.Do(ctx, key, func(ctx context.Context) ([]SearchResult, error) {
 		if err := c.throttle(ctx); err != nil {
 			return nil, err
@@ -535,7 +579,7 @@ func (c *Client) SearchRecent(ctx context.Context, mediaType string) ([]SearchRe
 		q := u.Query()
 		q.Set("t", "search")
 		q.Set("cat", recentCategory(mediaType))
-		q.Set("limit", fmt.Sprintf("%d", c.feedMaxResults))
+		q.Set("limit", fmt.Sprintf("%d", cacheCfg.feedMaxResults))
 		q.Set("extended", "1")
 		if apiKey := c.getAPIKey(); apiKey != "" {
 			q.Set("apikey", apiKey)
@@ -543,7 +587,7 @@ func (c *Client) SearchRecent(ctx context.Context, mediaType string) ([]SearchRe
 		u.RawQuery = q.Encode()
 		results, err := c.doSearchRequest(ctx, u)
 		if err == nil {
-			c.storeFeedCache(mediaType, results)
+			c.storeCache(c.feedCache, key, results, cacheCfg.feedTTL, feedCacheMaxEntries)
 		}
 		return results, err
 	})
@@ -585,7 +629,9 @@ func (c *Client) throttle(ctx context.Context) error {
 // page triggers the search throttle; subsequent pages are served from
 // NZBHydra2's internal cache and are fetched immediately.
 func (c *Client) Search(ctx context.Context, request SearchRequest) ([]SearchResult, error) {
-	if cached, ok := c.lookupSearchCache(request); ok {
+	cacheCfg := c.getCacheConfig()
+	key := versionedCacheKey(cacheCfg.generation, searchCacheKey(request))
+	if cached, ok := c.lookupCache(c.searchCache, key); ok {
 		return cached, nil
 	}
 
@@ -593,7 +639,6 @@ func (c *Client) Search(ctx context.Context, request SearchRequest) ([]SearchRes
 	// episodes of the same show issuing the same season-pack query) that all
 	// miss the cache above at once, so only one of them actually pages
 	// through NZBHydra2 — see the Client.searchFlight field comment.
-	key := searchCacheKey(request)
 	return c.searchFlight.Do(ctx, key, func(ctx context.Context) ([]SearchResult, error) {
 		u, err := c.apiURL()
 		if err != nil {
@@ -669,7 +714,7 @@ func (c *Client) Search(ctx context.Context, request SearchRequest) ([]SearchRes
 		}
 
 		if len(allResults) > 0 {
-			c.storeSearchCache(request, allResults)
+			c.storeCache(c.searchCache, key, allResults, cacheCfg.searchTTL, searchCacheMaxEntries)
 		}
 		return allResults, nil
 	})
@@ -742,22 +787,6 @@ func (c *Client) recordSuccess() {
 	}
 }
 
-func (c *Client) lookupSearchCache(request SearchRequest) ([]SearchResult, bool) {
-	return c.lookupCache(c.searchCache, searchCacheKey(request))
-}
-
-func (c *Client) storeSearchCache(request SearchRequest, results []SearchResult) {
-	c.storeCache(c.searchCache, searchCacheKey(request), results, c.searchCacheTTL)
-}
-
-func (c *Client) lookupFeedCache(mediaType string) ([]SearchResult, bool) {
-	return c.lookupCache(c.feedCache, strings.ToLower(strings.TrimSpace(mediaType)))
-}
-
-func (c *Client) storeFeedCache(mediaType string, results []SearchResult) {
-	c.storeCache(c.feedCache, strings.ToLower(strings.TrimSpace(mediaType)), results, c.feedCacheTTL)
-}
-
 func (c *Client) lookupCache(cache map[string]cachedResults, key string) ([]SearchResult, bool) {
 	c.cacheMu.Lock()
 	defer c.cacheMu.Unlock()
@@ -765,23 +794,48 @@ func (c *Client) lookupCache(cache map[string]cachedResults, key string) ([]Sear
 	if !ok {
 		return nil, false
 	}
-	if time.Now().After(entry.expiresAt) {
+	now := time.Now()
+	if !now.Before(entry.expiresAt) {
 		delete(cache, key)
 		return nil, false
 	}
+	entry.lastUsed = now
+	cache[key] = entry
 	return cloneResults(entry.results), true
 }
 
-func (c *Client) storeCache(cache map[string]cachedResults, key string, results []SearchResult, ttl time.Duration) {
-	if ttl <= 0 {
+func (c *Client) storeCache(cache map[string]cachedResults, key string, results []SearchResult, ttl time.Duration, maxEntries int) {
+	if ttl <= 0 || maxEntries <= 0 {
 		return
 	}
 	c.cacheMu.Lock()
 	defer c.cacheMu.Unlock()
+	now := time.Now()
+	for cachedKey, entry := range cache {
+		if !now.Before(entry.expiresAt) {
+			delete(cache, cachedKey)
+		}
+	}
+	if _, exists := cache[key]; !exists && len(cache) >= maxEntries {
+		var oldestKey string
+		var oldestTime time.Time
+		for cachedKey, entry := range cache {
+			if oldestKey == "" || entry.lastUsed.Before(oldestTime) {
+				oldestKey = cachedKey
+				oldestTime = entry.lastUsed
+			}
+		}
+		delete(cache, oldestKey)
+	}
 	cache[key] = cachedResults{
 		results:   cloneResults(results),
-		expiresAt: time.Now().Add(ttl),
+		expiresAt: now.Add(ttl),
+		lastUsed:  now,
 	}
+}
+
+func versionedCacheKey(generation uint64, key string) string {
+	return fmt.Sprintf("%d:%s", generation, key)
 }
 
 func cloneResults(results []SearchResult) []SearchResult {

@@ -765,6 +765,9 @@
         if (draft && !draft.jellyfin) {
           draft.jellyfin = { url: '', apiKey: '' };
         }
+        if (draft && !draft.sabnzbd) {
+          draft.sabnzbd = { apiKey: '' };
+        }
         if (draft && !draft.notifications) {
           draft.notifications = { discordWebhookUrl: '', genericWebhookUrl: '', onGrab: false, onAvailable: true, onFailed: false };
         }
@@ -1160,6 +1163,15 @@
               <label class="form-field">
                 <span>Feed Max Results</span>
                 <input type="number" bind:value={draft.nzbhydra2.feedMaxResults} min="0" />
+              </label>
+            </div>
+          </Panel>
+
+          <Panel title="SABnzbd API" subtitle="Download-client access for Sonarr and Radarr.">
+            <div class="form-grid">
+              <label class="form-field">
+                <span>API Key</span>
+                <input type="password" bind:value={draft.sabnzbd.apiKey} placeholder="••••••••" autocomplete="off" />
               </label>
             </div>
           </Panel>

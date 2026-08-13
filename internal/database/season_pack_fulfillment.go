@@ -88,8 +88,8 @@ func (db *DB) FindSeasonPackMatches(ctx context.Context, selectedReleaseID, trig
 	defer rows.Close()
 
 	type vfRow struct {
-		id, path, name string
-		intID          int64
+		path, name string
+		intID      int64
 	}
 	var vfs []vfRow
 	for rows.Next() {

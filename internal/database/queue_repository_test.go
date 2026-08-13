@@ -1,9 +1,90 @@
 package database
 
 import (
+	"context"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/drakkar-media/drakkar/internal/config"
 )
+
+func TestCreateImportedNZBConcurrentIdempotency(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	password, _ := u.User.Password()
+	db, err := Open(config.DatabaseConfig{
+		Host:     u.Hostname(),
+		Port:     port,
+		Name:     strings.TrimPrefix(u.Path, "/"),
+		Username: u.User.Username(),
+		Password: password,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	key := "queue-idempotency-test:" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	input := ImportedNZB{
+		FileName:       "concurrent.nzb",
+		XML:            []byte("<nzb/>"),
+		IdempotencyKey: key,
+	}
+
+	const callers = 2
+	start := make(chan struct{})
+	results := make([]QueueSnapshot, callers)
+	created := make([]bool, callers)
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			results[i], created[i], errs[i] = db.CreateImportedNZBIfAbsent(context.Background(), input)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+	}
+	if results[0].QueueItemID != results[1].QueueItemID {
+		t.Fatalf("concurrent retries created different queue items: %d and %d", results[0].QueueItemID, results[1].QueueItemID)
+	}
+	if created[0] == created[1] {
+		t.Fatalf("created flags = %v, want exactly one winner", created)
+	}
+	t.Cleanup(func() {
+		_, _ = db.SQL.ExecContext(context.Background(), `delete from library_items where id = $1`, results[0].LibraryItemID)
+	})
+	var count int
+	if err := db.SQL.QueryRowContext(context.Background(), `select count(*) from queue_items where idempotency_key = $1`, key).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("idempotency key has %d queue rows, want 1", count)
+	}
+}
 
 func TestFirstNormalizedWord(t *testing.T) {
 	cases := []struct {

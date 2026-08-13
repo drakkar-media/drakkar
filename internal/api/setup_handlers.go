@@ -51,7 +51,15 @@ func handleSetupComplete(repo UserRepository) http.HandlerFunc {
 			Username string `json:"username"`
 			Password string `json:"password"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Username == "" || body.Password == "" {
+		if err := decodeJSONBody(r, &body); err != nil {
+			if isRequestBodyTooLarge(err) {
+				respondError(w, http.StatusRequestEntityTooLarge, err)
+				return
+			}
+			http.Error(w, `{"error":"username and password required"}`, http.StatusBadRequest)
+			return
+		}
+		if body.Username == "" || body.Password == "" {
 			http.Error(w, `{"error":"username and password required"}`, http.StatusBadRequest)
 			return
 		}

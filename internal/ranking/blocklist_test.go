@@ -279,7 +279,7 @@ func TestKnownGoodReleasesAllowed(t *testing.T) {
 		{"Show.Name.S01E01.1080p.WEB-DL.DDP5.1.H.264-FLUX", "episode"},
 	}
 	for _, g := range good {
-		req := Requirements{Title: g.title, MediaType: g.mediaType}
+		var req Requirements
 		if g.mediaType == "episode" {
 			req = Requirements{Title: "Show Name", MediaType: "episode", SeasonNumber: 1, EpisodeNumber: 1, TrustSource: true}
 		} else {

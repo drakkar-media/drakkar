@@ -293,6 +293,94 @@ func TestSearchRecentDefaultDoesNotCache(t *testing.T) {
 	}
 }
 
+func TestSetConfigAppliesCachePolicyAndClearsEntries(t *testing.T) {
+	client := NewClient(config.ServiceConfig{
+		URL:                   "http://old.example/api",
+		APIKey:                "old-key",
+		SearchCacheTTLSeconds: 60,
+		FeedCacheTTLSeconds:   120,
+		FeedMaxResults:        25,
+	})
+	before := client.getCacheConfig()
+	searchKey := versionedCacheKey(before.generation, searchCacheKey(SearchRequest{Query: "Dune"}))
+	client.storeCache(client.searchCache, searchKey, []SearchResult{{Title: "old result"}}, before.searchTTL, searchCacheMaxEntries)
+	if _, ok := client.lookupCache(client.searchCache, searchKey); !ok {
+		t.Fatal("expected primed cache entry")
+	}
+
+	client.SetConfig(config.ServiceConfig{
+		URL:                   "http://new.example/api",
+		APIKey:                "new-key",
+		SearchCacheTTLSeconds: 5,
+		FeedCacheTTLSeconds:   10,
+		FeedMaxResults:        50,
+	})
+	after := client.getCacheConfig()
+	if after.generation == before.generation {
+		t.Fatal("cache generation did not advance")
+	}
+	if after.searchTTL != 5*time.Second || after.feedTTL != 10*time.Second || after.feedMaxResults != 50 {
+		t.Fatalf("cache policy was not applied: %+v", after)
+	}
+	if client.getBaseURL() != "http://new.example/api" || client.getAPIKey() != "new-key" {
+		t.Fatal("upstream configuration was not applied")
+	}
+	if _, ok := client.lookupCache(client.searchCache, searchKey); ok {
+		t.Fatal("upstream change retained an old cache entry")
+	}
+}
+
+func TestSetConfigUpdatesFeedResultLimit(t *testing.T) {
+	limits := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		limits <- r.URL.Query().Get("limit")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(config.ServiceConfig{URL: server.URL, FeedMaxResults: 10})
+	client.SetConfig(config.ServiceConfig{URL: server.URL, FeedMaxResults: 77})
+	if _, err := client.SearchRecent(context.Background(), "tv"); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-limits; got != "77" {
+		t.Fatalf("feed limit = %q, want 77", got)
+	}
+}
+
+func TestSearchCacheEvictsLeastRecentlyUsedAndPrunesExpired(t *testing.T) {
+	client := NewClient(config.ServiceConfig{})
+	now := time.Now()
+	client.cacheMu.Lock()
+	client.searchCache["expired"] = cachedResults{expiresAt: now.Add(-time.Second), lastUsed: now.Add(-time.Hour)}
+	for i := 0; i < searchCacheMaxEntries; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		client.searchCache[key] = cachedResults{
+			results:   []SearchResult{{Title: key}},
+			expiresAt: now.Add(time.Hour),
+			lastUsed:  now.Add(time.Duration(i) * time.Second),
+		}
+	}
+	client.cacheMu.Unlock()
+
+	client.storeCache(client.searchCache, "new", []SearchResult{{Title: "new"}}, time.Hour, searchCacheMaxEntries)
+	client.cacheMu.Lock()
+	defer client.cacheMu.Unlock()
+	if len(client.searchCache) != searchCacheMaxEntries {
+		t.Fatalf("cache has %d entries, want cap %d", len(client.searchCache), searchCacheMaxEntries)
+	}
+	if _, ok := client.searchCache["expired"]; ok {
+		t.Fatal("expired entry was not pruned")
+	}
+	if _, ok := client.searchCache["key-0"]; ok {
+		t.Fatal("least recently used entry was not evicted")
+	}
+	if _, ok := client.searchCache["new"]; !ok {
+		t.Fatal("new cache entry was not stored")
+	}
+}
+
 // TestSearchPaginates verifies that Search fetches subsequent pages when the
 // first page is full (100 results) and stops when a partial page is received.
 func TestSearchPaginates(t *testing.T) {

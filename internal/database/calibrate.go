@@ -94,10 +94,7 @@ func shouldValidateNZBSubject(subject string) bool {
 	case ".par2", ".sfv", ".nfo", ".jpg", ".jpeg", ".png":
 		return false
 	}
-	if isSampleFilename(base) {
-		return false
-	}
-	return true
+	return !isSampleFilename(base)
 }
 
 // parseNZBSubjectFilename extracts the filename from a Usenet subject line,

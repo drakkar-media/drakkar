@@ -20,6 +20,91 @@ type importedFileSegments struct {
 	nzbFileID int64
 }
 
+const queueSnapshotQuery = `
+	select
+		q.id,
+		q.library_item_id,
+		l.title,
+		q.state,
+		q.failure_reason,
+		q.idempotency_key,
+		q.selected_release_id,
+		n.id,
+		coalesce(n.file_name, ''),
+		coalesce((select count(*) from nzb_files nf where nf.nzb_document_id = n.id), 0),
+		coalesce((select sum(array_length(nf.message_ids, 1)) from nzb_files nf where nf.nzb_document_id = n.id), 0),
+		ep.season_number,
+		ep.episode_number,
+		q.on_hold,
+		q.dispatch_attempt_count,
+		q.dispatch_backoff_until,
+		q.created_at,
+		q.updated_at
+	from queue_items q
+	join library_items l on l.id = q.library_item_id
+	left join episodes ep on ep.id = l.episode_id
+	left join selected_releases sr on sr.id = q.selected_release_id
+	left join lateral (
+		select id, file_name
+		from nzb_documents
+		where selected_release_id = sr.id
+		order by id desc limit 1
+	) n on sr.id is not null`
+
+type queueSnapshotScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanQueueSnapshot(row queueSnapshotScanner) (QueueSnapshot, error) {
+	var item QueueSnapshot
+	var selectedRelease sql.NullInt64
+	var nzbDocument sql.NullInt64
+	var seasonNumber, episodeNumber sql.NullInt64
+	var backoffUntil sql.NullTime
+	if err := row.Scan(
+		&item.QueueItemID,
+		&item.LibraryItemID,
+		&item.LibraryTitle,
+		&item.State,
+		&item.FailureReason,
+		&item.IdempotencyKey,
+		&selectedRelease,
+		&nzbDocument,
+		&item.NZBFileName,
+		&item.NZBFileCount,
+		&item.NZBSegmentCount,
+		&seasonNumber,
+		&episodeNumber,
+		&item.OnHold,
+		&item.DispatchAttemptCount,
+		&backoffUntil,
+		&item.CreatedAt,
+		&item.UpdatedAt,
+	); err != nil {
+		return QueueSnapshot{}, err
+	}
+	if backoffUntil.Valid {
+		item.DispatchBackoffUntil = &backoffUntil.Time
+	}
+	if selectedRelease.Valid {
+		value := selectedRelease.Int64
+		item.SelectedRelease = &value
+	}
+	if nzbDocument.Valid {
+		value := nzbDocument.Int64
+		item.NZBDocumentID = &value
+	}
+	if seasonNumber.Valid {
+		value := int(seasonNumber.Int64)
+		item.SeasonNumber = &value
+	}
+	if episodeNumber.Valid {
+		value := int(episodeNumber.Int64)
+		item.EpisodeNumber = &value
+	}
+	return item, nil
+}
+
 // insertImportedFiles inserts one nzb_files row per imported file, plus a
 // virtual_files row for any that look like real playable media (skipping
 // samples/stubs). Shared by CreateImportedNZB and ImportSelectedReleaseNZB,
@@ -90,36 +175,8 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 			limit 200
 		),
 		ids as (select id from active union select id from recent_history)
-		select
-			q.id,
-			q.library_item_id,
-			l.title,
-			q.state,
-			q.failure_reason,
-			q.idempotency_key,
-			q.selected_release_id,
-			n.id,
-			coalesce(n.file_name, ''),
-			coalesce((select count(*) from nzb_files nf where nf.nzb_document_id = n.id), 0),
-			coalesce((select sum(array_length(nf.message_ids, 1)) from nzb_files nf where nf.nzb_document_id = n.id), 0),
-			ep.season_number,
-			ep.episode_number,
-			q.on_hold,
-			q.dispatch_attempt_count,
-			q.dispatch_backoff_until,
-			q.created_at,
-			q.updated_at
-		from queue_items q
-		join ids on ids.id = q.id
-		join library_items l on l.id = q.library_item_id
-		left join episodes ep on ep.id = l.episode_id
-		left join selected_releases sr on sr.id = q.selected_release_id
-		left join lateral (
-			select id, file_name
-			from nzb_documents
-			where selected_release_id = sr.id
-			order by id desc limit 1
-		) n on sr.id is not null
+	`+queueSnapshotQuery+`
+		where q.id in (select id from ids)
 		order by
 			q.on_hold asc,
 			case q.state
@@ -143,55 +200,23 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 
 	var out []QueueSnapshot
 	for rows.Next() {
-		var item QueueSnapshot
-		var selectedRelease sql.NullInt64
-		var nzbDocument sql.NullInt64
-		var seasonNumber, episodeNumber sql.NullInt64
-		var backoffUntil sql.NullTime
-		if err := rows.Scan(
-			&item.QueueItemID,
-			&item.LibraryItemID,
-			&item.LibraryTitle,
-			&item.State,
-			&item.FailureReason,
-			&item.IdempotencyKey,
-			&selectedRelease,
-			&nzbDocument,
-			&item.NZBFileName,
-			&item.NZBFileCount,
-			&item.NZBSegmentCount,
-			&seasonNumber,
-			&episodeNumber,
-			&item.OnHold,
-			&item.DispatchAttemptCount,
-			&backoffUntil,
-			&item.CreatedAt,
-			&item.UpdatedAt,
-		); err != nil {
+		item, err := scanQueueSnapshot(rows)
+		if err != nil {
 			return nil, err
-		}
-		if backoffUntil.Valid {
-			item.DispatchBackoffUntil = &backoffUntil.Time
-		}
-		if selectedRelease.Valid {
-			value := selectedRelease.Int64
-			item.SelectedRelease = &value
-		}
-		if nzbDocument.Valid {
-			value := nzbDocument.Int64
-			item.NZBDocumentID = &value
-		}
-		if seasonNumber.Valid {
-			value := int(seasonNumber.Int64)
-			item.SeasonNumber = &value
-		}
-		if episodeNumber.Valid {
-			value := int(episodeNumber.Int64)
-			item.EpisodeNumber = &value
 		}
 		out = append(out, item)
 	}
 	return out, rows.Err()
+}
+
+func (db *DB) queueSnapshotByIdempotencyKey(ctx context.Context, key string) (QueueSnapshot, error) {
+	return scanQueueSnapshot(db.SQL.QueryRowContext(ctx, queueSnapshotQuery+`
+		where q.idempotency_key = $1`, key))
+}
+
+func lockImportIdempotencyKey(ctx context.Context, tx *sql.Tx, key string) error {
+	_, err := tx.ExecContext(ctx, `select pg_advisory_xact_lock(hashtextextended($1, 0))`, key)
+	return err
 }
 
 // CreateImportedNZB records a manually-uploaded NZB as a brand-new library
@@ -200,11 +225,20 @@ func (db *DB) ListQueue(ctx context.Context) ([]QueueSnapshot, error) {
 // imported.IdempotencyKey: a repeat call returns the existing queue snapshot
 // instead of creating a duplicate.
 func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (QueueSnapshot, error) {
+	snapshot, _, err := db.CreateImportedNZBIfAbsent(ctx, imported)
+	return snapshot, err
+}
+
+// CreateImportedNZBIfAbsent has the same persistence contract as
+// CreateImportedNZB and also reports whether this call created the row. SAB
+// push imports use the flag to ensure only the winning concurrent request
+// starts the asynchronous publish chain.
+func (db *DB) CreateImportedNZBIfAbsent(ctx context.Context, imported ImportedNZB) (QueueSnapshot, bool, error) {
 	imported = db.applyImportPolicies(ctx, imported)
 	imported.Archives = inspectImportedArchives(ctx, imported.Archives, imported.Files, db.SegmentFetcher, imported.ArchivePassword)
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
-		return QueueSnapshot{}, err
+		return QueueSnapshot{}, false, err
 	}
 	defer func() {
 		if err != nil {
@@ -213,25 +247,20 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 	}()
 
 	var snapshot QueueSnapshot
+	if err = lockImportIdempotencyKey(ctx, tx, imported.IdempotencyKey); err != nil {
+		return QueueSnapshot{}, false, err
+	}
 	var existing bool
 	err = tx.QueryRowContext(ctx, `select exists(select 1 from queue_items where idempotency_key = $1)`, imported.IdempotencyKey).Scan(&existing)
 	if err != nil {
-		return QueueSnapshot{}, err
+		return QueueSnapshot{}, false, err
 	}
 	if existing {
 		if err := tx.Rollback(); err != nil {
-			return QueueSnapshot{}, err
+			return QueueSnapshot{}, false, err
 		}
-		items, err := db.ListQueue(ctx)
-		if err != nil {
-			return QueueSnapshot{}, err
-		}
-		for _, item := range items {
-			if item.IdempotencyKey == imported.IdempotencyKey {
-				return item, nil
-			}
-		}
-		return QueueSnapshot{}, errors.New("existing queue item not found after idempotency hit")
+		snapshot, err := db.queueSnapshotByIdempotencyKey(ctx, imported.IdempotencyKey)
+		return snapshot, false, err
 	}
 
 	mediaType := imported.MediaType
@@ -250,7 +279,7 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 		insert into library_items (media_type, title, quality_profile_id)
 		values ($1, $2, $3)
 		returning id`, mediaType, imported.FileName, profileID).Scan(&libraryItemID); err != nil {
-		return QueueSnapshot{}, err
+		return QueueSnapshot{}, false, err
 	}
 
 	var releaseCandidateID int64
@@ -258,7 +287,7 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 		insert into release_candidates (library_item_id, title, score, custom_format_score, selected)
 		values ($1, $2, 0, 0, true)
 		returning id`, libraryItemID, imported.FileName).Scan(&releaseCandidateID); err != nil {
-		return QueueSnapshot{}, err
+		return QueueSnapshot{}, false, err
 	}
 
 	var selectedReleaseID int64
@@ -266,7 +295,7 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 		insert into selected_releases (library_item_id, release_candidate_id)
 		values ($1, $2)
 		returning id`, libraryItemID, releaseCandidateID).Scan(&selectedReleaseID); err != nil {
-		return QueueSnapshot{}, err
+		return QueueSnapshot{}, false, err
 	}
 
 	var nzbDocumentID int64
@@ -276,15 +305,15 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 		returning id`, selectedReleaseID, imported.FileName, compressNZBXML(imported.XML),
 		sql.NullString{String: imported.ArchivePassword, Valid: imported.ArchivePassword != ""},
 	).Scan(&nzbDocumentID); err != nil {
-		return QueueSnapshot{}, err
+		return QueueSnapshot{}, false, err
 	}
 
 	fileSegments, err := insertImportedFiles(ctx, tx, selectedReleaseID, nzbDocumentID, imported.Files)
 	if err != nil {
-		return QueueSnapshot{}, err
+		return QueueSnapshot{}, false, err
 	}
 	if err = insertImportedArchives(ctx, tx, selectedReleaseID, imported.Archives, fileSegments); err != nil {
-		return QueueSnapshot{}, err
+		return QueueSnapshot{}, false, err
 	}
 
 	if err = tx.QueryRowContext(ctx, `
@@ -293,7 +322,7 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 		returning id, created_at, updated_at`,
 		libraryItemID, QueueIndexing, imported.IdempotencyKey, selectedReleaseID,
 	).Scan(&snapshot.QueueItemID, &snapshot.CreatedAt, &snapshot.UpdatedAt); err != nil {
-		return QueueSnapshot{}, err
+		return QueueSnapshot{}, false, err
 	}
 
 	snapshot.LibraryItemID = libraryItemID
@@ -307,9 +336,9 @@ func (db *DB) CreateImportedNZB(ctx context.Context, imported ImportedNZB) (Queu
 	snapshot.NZBSegmentCount = imported.SegmentCount
 
 	if err = tx.Commit(); err != nil {
-		return QueueSnapshot{}, err
+		return QueueSnapshot{}, false, err
 	}
-	return snapshot, nil
+	return snapshot, true, nil
 }
 
 // AttachImportedNZBToLibraryItem attaches a manually-uploaded NZB directly to
@@ -339,6 +368,9 @@ func (db *DB) AttachImportedNZBToLibraryItem(ctx context.Context, libraryItemID 
 	}
 
 	var existing bool
+	if err = lockImportIdempotencyKey(ctx, tx, imported.IdempotencyKey); err != nil {
+		return QueueSnapshot{}, err
+	}
 	if err = tx.QueryRowContext(ctx, `select exists(select 1 from queue_items where idempotency_key = $1)`, imported.IdempotencyKey).Scan(&existing); err != nil {
 		return QueueSnapshot{}, err
 	}
@@ -346,16 +378,7 @@ func (db *DB) AttachImportedNZBToLibraryItem(ctx context.Context, libraryItemID 
 		if err := tx.Rollback(); err != nil {
 			return QueueSnapshot{}, err
 		}
-		items, err := db.ListQueue(ctx)
-		if err != nil {
-			return QueueSnapshot{}, err
-		}
-		for _, item := range items {
-			if item.IdempotencyKey == imported.IdempotencyKey {
-				return item, nil
-			}
-		}
-		return QueueSnapshot{}, errors.New("existing queue item not found after idempotency hit")
+		return db.queueSnapshotByIdempotencyKey(ctx, imported.IdempotencyKey)
 	}
 
 	if err = preDeleteVFRByLibraryItem(ctx, tx, libraryItemID); err != nil {

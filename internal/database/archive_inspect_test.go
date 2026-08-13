@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -618,6 +619,21 @@ func TestInspect7zEntriesRejectsCompressedArchive(t *testing.T) {
 	}
 }
 
+func TestSevenZipEntryRejectsUint64FileSize(t *testing.T) {
+	inspector := &sevenZipInspector{}
+	file := &sevenzip.File{FileHeader: sevenzip.FileHeader{Name: "huge.mkv", UncompressedSize: math.MaxUint64}}
+	if _, err := inspector.entry(file, nil); !errors.Is(err, errArchiveHeadersInvalid) {
+		t.Fatalf("expected oversized 7z entry to be rejected, got %v", err)
+	}
+}
+
+func TestSevenZipFolderOffsetRejectsOverflow(t *testing.T) {
+	inspector := &sevenZipInspector{packPosition: math.MaxUint64}
+	if _, ok := inspector.folderOffset(0); ok {
+		t.Fatal("expected overflowing pack position to be rejected")
+	}
+}
+
 func TestSplitArchiveRangeAcrossVolumes(t *testing.T) {
 	ranges, err := splitArchiveRange(map[int]int64{
 		0: 100,
@@ -631,6 +647,42 @@ func TestSplitArchiveRangeAcrossVolumes(t *testing.T) {
 	}
 	if ranges[0].LengthBytes != 20 || ranges[1].EntryOffset != 20 || ranges[1].LengthBytes != 100 {
 		t.Fatalf("unexpected cross-volume mapping %+v", ranges)
+	}
+}
+
+func TestSplitArchiveRangeRejectsVolumeOffsetOverflow(t *testing.T) {
+	_, err := splitArchiveRange(map[int]int64{0: math.MaxInt64, 1: 1}, math.MaxInt64-1, 2)
+	if !errors.Is(err, errArchiveHeadersInvalid) {
+		t.Fatalf("expected overflowing volume offsets to be rejected, got %v", err)
+	}
+}
+
+func TestParseRAR4FileHeaderRejectsOversizedPackedSize(t *testing.T) {
+	name := "Movie.mkv"
+	body := make([]byte, 33+len(name))
+	body[18] = 0x30
+	binary.LittleEndian.PutUint16(body[19:21], uint16(len(name)))
+	binary.LittleEndian.PutUint32(body[25:29], 0x80000000)
+	copy(body[33:], name)
+
+	if _, _, err := parseRAR4FileHeader(body, 0x0100, 0, 0); !errors.Is(err, errArchiveHeadersInvalid) {
+		t.Fatalf("expected oversized RAR4 packed size to be rejected, got %v", err)
+	}
+}
+
+func TestInspectRAR4RejectsPackedOffsetOverflow(t *testing.T) {
+	name := "Movie.mkv"
+	body := make([]byte, 33+len(name))
+	binary.LittleEndian.PutUint32(body[0:4], math.MaxUint32)
+	binary.LittleEndian.PutUint32(body[4:8], 1)
+	body[18] = 0x30
+	binary.LittleEndian.PutUint16(body[19:21], uint16(len(name)))
+	binary.LittleEndian.PutUint32(body[25:29], 0x7fffffff)
+	copy(body[33:], name)
+	raw := append([]byte("Rar!\x1a\x07\x00"), rarBlock(0x74, 0x0100, body)...)
+
+	if _, err := inspectRAR4(raw); !errors.Is(err, errArchiveHeadersInvalid) {
+		t.Fatalf("expected overflowing RAR4 data offset to be rejected, got %v", err)
 	}
 }
 

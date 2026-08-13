@@ -162,10 +162,8 @@ func TestParseFileDescsPktLenExceedsAvailableData(t *testing.T) {
 
 // TestParseFileDescsPktLenIsHugeMaliciousValue guards the classic
 // hand-rolled-binary-parser trap: a corrupt/adversarial length field set to
-// the maximum uint64 value. int(uint64) reinterprets the bits, so this
-// becomes a large negative int, which the "pktLen < 64" check must catch --
-// if it didn't, "i+pktLen > len(data)" or a subsequent slice expression could
-// wrap/overflow and panic instead of gracefully skipping the packet.
+// the maximum uint64 value. The parser must compare the original uint64
+// against the remaining input before narrowing it to int.
 func TestParseFileDescsPktLenIsHugeMaliciousValue(t *testing.T) {
 	data := buildFileDescPacket(0x07, 1, "x")
 	binary.LittleEndian.PutUint64(data[8:16], math.MaxUint64)
@@ -173,6 +171,13 @@ func TestParseFileDescsPktLenIsHugeMaliciousValue(t *testing.T) {
 	got := ParseFileDescs(data) // must not panic
 	if len(got) != 0 {
 		t.Fatalf("expected 0 FileDescs for a maliciously huge length field, got %d", len(got))
+	}
+}
+
+func TestParseFileDescsRejectsFileLengthAboveInt64(t *testing.T) {
+	data := buildFileDescPacket(0x09, math.MaxUint64, "huge.mkv")
+	if got := ParseFileDescs(data); len(got) != 0 {
+		t.Fatalf("expected oversized file length to be rejected, got %+v", got)
 	}
 }
 

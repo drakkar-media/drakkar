@@ -71,7 +71,11 @@ func handleLogin(repo UserRepository) http.HandlerFunc {
 			Username string `json:"username"`
 			Password string `json:"password"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := decodeJSONBody(r, &body); err != nil {
+			if isRequestBodyTooLarge(err) {
+				respondError(w, http.StatusRequestEntityTooLarge, err)
+				return
+			}
 			http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
 			return
 		}
@@ -166,7 +170,15 @@ func handleCreateAPIToken(repo UserRepository) http.HandlerFunc {
 			Name      string `json:"name"`
 			ExpiresAt string `json:"expiresAt"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" {
+		if err := decodeJSONBody(r, &body); err != nil {
+			if isRequestBodyTooLarge(err) {
+				respondError(w, http.StatusRequestEntityTooLarge, err)
+				return
+			}
+			http.Error(w, `{"error":"name required"}`, http.StatusBadRequest)
+			return
+		}
+		if body.Name == "" {
 			http.Error(w, `{"error":"name required"}`, http.StatusBadRequest)
 			return
 		}
@@ -256,7 +268,15 @@ func handleCreateUser(repo UserRepository) http.HandlerFunc {
 			Password string `json:"password"`
 			Role     string `json:"role"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Username == "" || body.Password == "" {
+		if err := decodeJSONBody(r, &body); err != nil {
+			if isRequestBodyTooLarge(err) {
+				respondError(w, http.StatusRequestEntityTooLarge, err)
+				return
+			}
+			http.Error(w, `{"error":"username and password required"}`, http.StatusBadRequest)
+			return
+		}
+		if body.Username == "" || body.Password == "" {
 			http.Error(w, `{"error":"username and password required"}`, http.StatusBadRequest)
 			return
 		}
@@ -320,7 +340,15 @@ func handleChangePassword(repo UserRepository) http.HandlerFunc {
 		var body struct {
 			Password string `json:"password"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Password == "" {
+		if err := decodeJSONBody(r, &body); err != nil {
+			if isRequestBodyTooLarge(err) {
+				respondError(w, http.StatusRequestEntityTooLarge, err)
+				return
+			}
+			http.Error(w, `{"error":"password required"}`, http.StatusBadRequest)
+			return
+		}
+		if body.Password == "" {
 			http.Error(w, `{"error":"password required"}`, http.StatusBadRequest)
 			return
 		}
