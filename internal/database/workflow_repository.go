@@ -1624,6 +1624,7 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 	var (
 		existingSelectedReleaseID  int64
 		existingReleaseCandidateID int64
+		existingQueueState         QueueState
 		existingScore              int
 		hasExisting                bool
 	)
@@ -1640,13 +1641,13 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 		// of truth for which row is genuinely active (matches
 		// GetLatestSelectedReleaseSummaryByLibraryItem's own join pattern).
 		err = tx.QueryRowContext(ctx, `
-			select sr.id, sr.release_candidate_id, rc.score
+			select sr.id, sr.release_candidate_id, q.state, rc.score
 			from selected_releases sr
 			join queue_items q on q.library_item_id = sr.library_item_id
 			join release_candidates rc on rc.id = sr.release_candidate_id
 			where sr.library_item_id = $1 and q.selected_release_id = sr.id`,
 			libraryItemID,
-		).Scan(&existingSelectedReleaseID, &existingReleaseCandidateID, &existingScore)
+		).Scan(&existingSelectedReleaseID, &existingReleaseCandidateID, &existingQueueState, &existingScore)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
@@ -1785,8 +1786,9 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 		if stageUpgradeSelection {
 			if _, err = tx.ExecContext(ctx, `
 				update queue_items
-				set failure_reason = '', updated_at = now(), consecutive_failure_searches = 0
-				where library_item_id = $1`, libraryItemID); err != nil {
+				set state = $2, failure_reason = '', selected_release_id = $3,
+					updated_at = now(), consecutive_failure_searches = 0
+				where library_item_id = $1`, libraryItemID, existingQueueState, existingSelectedReleaseID); err != nil {
 				return nil, err
 			}
 		} else {
