@@ -329,6 +329,7 @@ type Status struct {
 	MemoryHotCacheBytes  int64          `json:"memoryHotCacheBytes"`
 	NZBUploadLimitBytes  int64          `json:"nzbUploadLimitBytes"`
 	BackgroundQueueDepth int            `json:"backgroundQueueDepth"`
+	requestSecurity      auth.RequestSecurityConfig
 }
 
 // Integrations reports the enabled/configured state of every external
@@ -391,8 +392,12 @@ func (b *EventBroker) Publish(event map[string]any) {
 // The returned chi.Router is safe to mount directly as an http.Handler.
 func Router(status StatusService, queue QueueService, workflowSvc WorkflowService, publication PublicationService, maintenance MaintenanceService, cacheSvc CacheService, subtitleSvc SubtitleService, blocklistSvc BlocklistService, probeSvc IntegrationProbeService, catalogSvc CatalogService, broker *EventBroker, healthRepo HealthRepository, streamsProvider StreamsProvider, profilesRepo ProfilesRepository, taskSchedules TaskScheduleProvider, policySvc PolicyService, plexClient *plex.Client, jellyfinClient *jellyfin.Client, settingsSvc SettingsService, privacyMgr *privacy.Manager, indexerLister IndexerLister, userRepo UserRepository, speedTestSvc SpeedTestService, metricsProvider ...MetricsProvider) chi.Router {
 	r := chi.NewRouter()
+	requestSecurity := auth.RequestSecurityConfig{}
+	if status != nil {
+		requestSecurity = status.Status().requestSecurity
+	}
 	r.Use(corsMiddleware)
-	r.Use(authMiddlewareFor(userRepo))
+	r.Use(authMiddlewareFor(userRepo, requestSecurity))
 	r.Use(requestBodyLimitMiddleware(status))
 	publishMutation := func(kind string, fields map[string]any) {
 		if broker == nil {
@@ -2619,8 +2624,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 	})
 
 	// ── Auth, setup and user management ─────────────────────────────────────────
-	mountSetupRoutes(r, userRepo)
-	mountAuthRoutes(r, userRepo)
+	mountSetupRoutes(r, userRepo, requestSecurity)
+	mountAuthRoutes(r, userRepo, requestSecurity)
 	mountUserRoutes(r, userRepo)
 
 	// OpenAPI spec and Scalar docs UI (public).
@@ -2635,7 +2640,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 // authMiddlewareFor builds the auth middleware using the user repo.
 // Public prefixes (setup, login/logout, webhooks, sabnzbd) pass through unauthenticated.
 // When repo is nil (e.g. in tests) all requests pass through unauthenticated.
-func authMiddlewareFor(repo UserRepository) func(http.Handler) http.Handler {
+func authMiddlewareFor(repo UserRepository, security auth.RequestSecurityConfig) func(http.Handler) http.Handler {
 	if repo == nil {
 		return func(next http.Handler) http.Handler { return next }
 	}
@@ -2650,7 +2655,7 @@ func authMiddlewareFor(repo UserRepository) func(http.Handler) http.Handler {
 		"/openapi.json",
 		"/docs",
 	}
-	return auth.Middleware(repo, exempt)
+	return auth.Middleware(repo, exempt, security)
 }
 
 // ServeHTTP streams events to a single SSE client for the lifetime of the
@@ -2868,6 +2873,10 @@ func StatusFromConfig(rt config.Runtime, cfg config.Settings, startedAt time.Tim
 		ReadAheadLimitBytes: rt.ReadAheadLimitBytes,
 		MemoryHotCacheBytes: rt.MemoryHotCacheMaxBytes,
 		NZBUploadLimitBytes: rt.NZBUploadLimitBytes,
+		requestSecurity: auth.RequestSecurityConfig{
+			ForceSecureCookies: rt.AuthCookieSecure,
+			TrustProxyHeaders:  rt.AuthTrustProxyHeaders,
+		},
 	}
 }
 

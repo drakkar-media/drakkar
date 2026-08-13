@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"time"
 )
 
@@ -61,6 +62,53 @@ func (db *DB) CreateUser(ctx context.Context, username, passwordHash, role strin
 		username, passwordHash, role,
 	).Scan(&u.ID, &u.Username, &u.Role, &u.CreatedAt)
 	return u, err
+}
+
+// CreateInitialAdmin creates the first account only while no users exist.
+//
+// A transaction-scoped advisory lock serializes this invariant across
+// processes. passwordHash must already contain a hashed credential. created is
+// false when another setup request created the first user while this call was
+// waiting.
+func (db *DB) CreateInitialAdmin(ctx context.Context, username, passwordHash string) (User, bool, error) {
+	// READ COMMITTED gives the existence query a fresh snapshot after waiting
+	// for a concurrent setup transaction to release the advisory lock.
+	tx, err := db.SQL.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return User{}, false, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx,
+		`select pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		"drakkar:users:first-admin",
+	); err != nil {
+		return User{}, false, err
+	}
+
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `select exists(select 1 from users)`).Scan(&exists); err != nil {
+		return User{}, false, err
+	}
+	if exists {
+		if err := tx.Commit(); err != nil {
+			return User{}, false, err
+		}
+		return User{}, false, nil
+	}
+
+	var user User
+	if err := tx.QueryRowContext(ctx,
+		`INSERT INTO users (username, password_hash, role) VALUES ($1, $2, 'admin')
+		 RETURNING id, username, role, created_at`,
+		username, passwordHash,
+	).Scan(&user.ID, &user.Username, &user.Role, &user.CreatedAt); err != nil {
+		return User{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return User{}, false, err
+	}
+	return user, true, nil
 }
 
 // GetUserByUsername looks up a user's credentials by username for login

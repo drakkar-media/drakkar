@@ -657,6 +657,8 @@ func TestLibraryEndpoints(t *testing.T) {
 
 func TestStatusFromConfigIncludesIntegrationReadiness(t *testing.T) {
 	rt := config.DefaultRuntime()
+	rt.AuthCookieSecure = true
+	rt.AuthTrustProxyHeaders = true
 	cfg := config.Settings{
 		Database: config.DatabaseConfig{Host: "postgres", Port: 5432, Name: "drakkar", Username: "drakkar", Password: "secret"},
 		Valkey:   config.ValkeyConfig{Host: "valkey", Port: 6379},
@@ -702,6 +704,9 @@ func TestStatusFromConfigIncludesIntegrationReadiness(t *testing.T) {
 	}
 	if status.Integrations.Usenet.Configured {
 		t.Fatalf("expected usenet unconfigured without host and credentials")
+	}
+	if !status.requestSecurity.ForceSecureCookies || !status.requestSecurity.TrustProxyHeaders {
+		t.Fatalf("auth request security not propagated: %+v", status.requestSecurity)
 	}
 }
 

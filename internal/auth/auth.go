@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -19,7 +21,33 @@ const (
 	// SessionExpiry is the lifetime of a newly created session, measured
 	// from creation time.
 	SessionExpiry = 30 * 24 * time.Hour
+	// MinPasswordBytes is the minimum accepted plaintext password length.
+	MinPasswordBytes = 8
+	// MaxPasswordBytes is bcrypt's maximum meaningful plaintext length.
+	MaxPasswordBytes = 72
 )
+
+var (
+	// ErrPasswordTooShort indicates that a password does not meet the minimum
+	// server-side length policy.
+	ErrPasswordTooShort = errors.New("password must be at least 8 bytes")
+	// ErrPasswordTooLong indicates that bcrypt would reject or truncate the
+	// supplied password.
+	ErrPasswordTooLong = errors.New("password must be at most 72 bytes")
+)
+
+// RequestSecurityConfig controls security decisions that depend on how an
+// HTTP request reached Drakkar.
+//
+// Proxy headers are ignored unless TrustProxyHeaders is explicitly enabled,
+// because direct clients can forge them. ForceSecureCookies supports TLS
+// termination configurations that do not forward the original scheme.
+type RequestSecurityConfig struct {
+	// ForceSecureCookies marks cookies Secure even when Drakkar sees plain HTTP.
+	ForceSecureCookies bool
+	// TrustProxyHeaders permits proxy-supplied scheme and client-IP headers.
+	TrustProxyHeaders bool
+}
 
 // Claims identifies the authenticated principal attached to a request
 // context, whether resolved from a session cookie or an API token.
@@ -62,29 +90,102 @@ func CheckPassword(hash, password string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
 }
 
+// ValidatePassword enforces the shared server-side password policy used by
+// setup, user creation, and password rotation.
+//
+// Length is measured in bytes because bcrypt accepts at most 72 bytes; no
+// character-class rules are imposed so long passphrases remain valid.
+func ValidatePassword(password string) error {
+	if len(password) < MinPasswordBytes {
+		return ErrPasswordTooShort
+	}
+	if len(password) > MaxPasswordBytes {
+		return ErrPasswordTooLong
+	}
+	return nil
+}
+
+// SecureCookie reports whether a response to r must mark session cookies
+// Secure. Direct TLS is always recognized; proxy scheme headers are honored
+// only when explicitly trusted.
+func (c RequestSecurityConfig) SecureCookie(r *http.Request) bool {
+	if c.ForceSecureCookies || (r != nil && r.TLS != nil) {
+		return true
+	}
+	if !c.TrustProxyHeaders || r == nil {
+		return false
+	}
+	proto, _, _ := strings.Cut(r.Header.Get("X-Forwarded-Proto"), ",")
+	return strings.EqualFold(strings.TrimSpace(proto), "https")
+}
+
+// ClientIP returns the address used to scope login throttling.
+//
+// X-Forwarded-For and X-Real-IP are considered only when proxy headers are
+// trusted. Invalid forwarded values fall back to the direct peer address.
+func (c RequestSecurityConfig) ClientIP(r *http.Request) string {
+	if r == nil {
+		return "unknown"
+	}
+	if c.TrustProxyHeaders {
+		for _, value := range strings.Split(r.Header.Get("X-Forwarded-For"), ",") {
+			if ip := normalizedIP(value); ip != "" {
+				return ip
+			}
+		}
+		if ip := normalizedIP(r.Header.Get("X-Real-IP")); ip != "" {
+			return ip
+		}
+	}
+	if ip := normalizedIP(r.RemoteAddr); ip != "" {
+		return ip
+	}
+	return "unknown"
+}
+
+func normalizedIP(value string) string {
+	value = strings.Trim(strings.TrimSpace(value), `"`)
+	if value == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	} else {
+		value = strings.Trim(value, "[]")
+	}
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+
 // SetSessionCookie writes the session cookie for token, expiring at expiry.
 // The cookie is HttpOnly and SameSite=Lax so it is inaccessible to page
-// scripts and is not sent on cross-site requests.
-func SetSessionCookie(w http.ResponseWriter, token string, expiry time.Time) {
+// scripts and is not sent on cross-site requests. secure must reflect the
+// external request scheme when TLS terminates at a trusted proxy.
+func SetSessionCookie(w http.ResponseWriter, token string, expiry time.Time, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
 		Value:    token,
 		Path:     "/",
 		Expires:  expiry,
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 }
 
 // ClearSessionCookie expires the session cookie immediately, logging the
 // client out.
-func ClearSessionCookie(w http.ResponseWriter) {
+func ClearSessionCookie(w http.ResponseWriter, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 }
@@ -128,7 +229,7 @@ func apiTokenFromRequest(r *http.Request) string {
 
 // Middleware validates the session cookie on all /api/* routes except the
 // given exempt prefixes. Non-API paths (static files, SPA routes) pass through.
-func Middleware(repo SessionLookup, exemptPrefixes []string) func(http.Handler) http.Handler {
+func Middleware(repo SessionLookup, exemptPrefixes []string, security RequestSecurityConfig) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Only gate API routes.
@@ -164,7 +265,7 @@ func Middleware(repo SessionLookup, exemptPrefixes []string) func(http.Handler) 
 			hash := HashToken(cookie.Value)
 			userID, username, role, expiresAt, err := repo.GetSessionByTokenHash(r.Context(), hash)
 			if err != nil || time.Now().After(expiresAt) {
-				ClearSessionCookie(w)
+				ClearSessionCookie(w, security.SecureCookie(r))
 				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 				return
 			}

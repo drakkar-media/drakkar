@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -332,6 +333,9 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	}
 	if env := os.Getenv("DRAKKAR_WEBDAV_ADDR"); env != "" {
 		rt.WebDAVAddress = env
+	}
+	if err := applyAuthRuntimeEnvironment(&rt); err != nil {
+		return err
 	}
 
 	cfg, err := config.LoadOrCreate(rt.SettingsPath)
@@ -1301,6 +1305,30 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+// applyAuthRuntimeEnvironment parses process-level auth transport settings.
+// Invalid booleans fail startup instead of silently weakening cookie or proxy
+// trust behavior through a misspelled value.
+func applyAuthRuntimeEnvironment(rt *config.Runtime) error {
+	for _, item := range []struct {
+		name   string
+		target *bool
+	}{
+		{name: "DRAKKAR_AUTH_COOKIE_SECURE", target: &rt.AuthCookieSecure},
+		{name: "DRAKKAR_AUTH_TRUST_PROXY_HEADERS", target: &rt.AuthTrustProxyHeaders},
+	} {
+		raw, present := os.LookupEnv(item.name)
+		if !present || strings.TrimSpace(raw) == "" {
+			continue
+		}
+		value, err := strconv.ParseBool(strings.TrimSpace(raw))
+		if err != nil {
+			return fmt.Errorf("parse %s: %w", item.name, err)
+		}
+		*item.target = value
+	}
+	return nil
 }
 
 // hostOf extracts the host[:port] portion of a URL, tolerating a bare

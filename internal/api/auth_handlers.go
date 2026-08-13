@@ -17,6 +17,7 @@ type UserRepository interface {
 	CountUsers(ctx context.Context) (int, error)
 	ListUsers(ctx context.Context) ([]database.User, error)
 	CreateUser(ctx context.Context, username, passwordHash, role string) (database.User, error)
+	CreateInitialAdmin(ctx context.Context, username, passwordHash string) (database.User, bool, error)
 	GetUserByUsername(ctx context.Context, username string) (id int64, passwordHash, role string, err error)
 	UpdateUserPassword(ctx context.Context, userID int64, passwordHash string) error
 	DeleteUser(ctx context.Context, id int64) error
@@ -44,9 +45,9 @@ func parseInt64PathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
 	return id, true
 }
 
-func mountAuthRoutes(r chi.Router, repo UserRepository) {
-	r.Post("/api/auth/login", handleLogin(repo))
-	r.Post("/api/auth/logout", handleLogout(repo))
+func mountAuthRoutes(r chi.Router, repo UserRepository, security auth.RequestSecurityConfig) {
+	r.Post("/api/auth/login", handleLogin(repo, newLoginThrottle(loginThrottleConfig{}), security))
+	r.Post("/api/auth/logout", handleLogout(repo, security))
 	r.Get("/api/auth/me", handleMe())
 	r.Get("/api/auth/tokens", handleListAPITokens(repo))
 	r.Post("/api/auth/tokens", handleCreateAPIToken(repo))
@@ -63,9 +64,10 @@ func mountUserRoutes(r chi.Router, repo UserRepository) {
 // handleLogin verifies a username/password pair, then issues a new session:
 // a random token is generated, only its hash is persisted, and the raw token
 // is set on the response as the session cookie with a lifetime of
-// auth.SessionExpiry. Responds 401 on any lookup failure or password
-// mismatch, without distinguishing the two.
-func handleLogin(repo UserRepository) http.HandlerFunc {
+// auth.SessionExpiry. Lookup failures perform equivalent bcrypt work and
+// return the same 401 as password mismatches. IP/account backoff and bounded
+// bcrypt concurrency reject excess attempts with 429 before expensive work.
+func handleLogin(repo UserRepository, throttle *loginThrottle, security auth.RequestSecurityConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			Username string `json:"username"`
@@ -79,11 +81,37 @@ func handleLogin(repo UserRepository) http.HandlerFunc {
 			http.Error(w, `{"error":"invalid request"}`, http.StatusBadRequest)
 			return
 		}
+		attempt, retryAfter := throttle.begin(security.ClientIP(r), body.Username)
+		if attempt == nil {
+			retrySeconds := int64((retryAfter + time.Second - 1) / time.Second)
+			if retrySeconds < 1 {
+				retrySeconds = 1
+			}
+			w.Header().Set("Retry-After", strconv.FormatInt(retrySeconds, 10))
+			respondJSON(w, http.StatusTooManyRequests, map[string]any{"error": "too many login attempts"})
+			return
+		}
+		credentialsValid := false
+		defer func() { attempt.finish(credentialsValid) }()
+
 		userID, passwordHash, role, err := repo.GetUserByUsername(r.Context(), body.Username)
-		if err != nil || !auth.CheckPassword(passwordHash, body.Password) {
+		passwordMatches := false
+		if err == nil && len(body.Password) <= auth.MaxPasswordBytes {
+			passwordMatches = auth.CheckPassword(passwordHash, body.Password)
+		} else {
+			// Unknown accounts and oversized passwords still pay one bcrypt cost,
+			// keeping account existence out of response timing.
+			passwordForWork := body.Password
+			if len(passwordForWork) > auth.MaxPasswordBytes {
+				passwordForWork = passwordForWork[:auth.MaxPasswordBytes]
+			}
+			_, _ = auth.HashPassword(passwordForWork)
+		}
+		if err != nil || !passwordMatches {
 			http.Error(w, `{"error":"invalid credentials"}`, http.StatusUnauthorized)
 			return
 		}
+		credentialsValid = true
 		token, hash, err := auth.GenerateToken()
 		if err != nil {
 			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
@@ -94,7 +122,7 @@ func handleLogin(repo UserRepository) http.HandlerFunc {
 			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
 			return
 		}
-		auth.SetSessionCookie(w, token, expiry)
+		auth.SetSessionCookie(w, token, expiry, security.SecureCookie(r))
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"username": body.Username,
@@ -106,13 +134,13 @@ func handleLogin(repo UserRepository) http.HandlerFunc {
 // handleLogout deletes the caller's server-side session (looked up by the
 // hashed cookie value) and clears the session cookie. Always succeeds, even
 // with no cookie or an already-expired/deleted session.
-func handleLogout(repo UserRepository) http.HandlerFunc {
+func handleLogout(repo UserRepository, security auth.RequestSecurityConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie(auth.CookieName)
 		if err == nil {
 			_ = repo.DeleteSession(r.Context(), auth.HashToken(cookie.Value))
 		}
-		auth.ClearSessionCookie(w)
+		auth.ClearSessionCookie(w, security.SecureCookie(r))
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
@@ -280,6 +308,10 @@ func handleCreateUser(repo UserRepository) http.HandlerFunc {
 			http.Error(w, `{"error":"username and password required"}`, http.StatusBadRequest)
 			return
 		}
+		if err := auth.ValidatePassword(body.Password); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
 		if body.Role == "" {
 			body.Role = "user"
 		}
@@ -350,6 +382,10 @@ func handleChangePassword(repo UserRepository) http.HandlerFunc {
 		}
 		if body.Password == "" {
 			http.Error(w, `{"error":"password required"}`, http.StatusBadRequest)
+			return
+		}
+		if err := auth.ValidatePassword(body.Password); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
 		}
 		hash, err := auth.HashPassword(body.Password)

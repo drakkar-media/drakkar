@@ -11,11 +11,16 @@ import (
 var zstdMagic = []byte{0x28, 0xB5, 0x2F, 0xFD}
 
 // nzbZstdEncoder and nzbZstdDecoder are package-level singletons reused across
-// every compress/decompress call rather than constructed per-call. Their
-// EncodeAll/DecodeAll methods are safe for concurrent use, so no locking is
-// required despite the shared state.
+// every compress/decompress call rather than constructed per-call. NZB writes
+// are infrequent, so the encoder serializes calls and uses lower-memory history
+// storage instead of retaining one full encoder per CPU. EncodeAll and
+// DecodeAll remain safe for concurrent callers.
 var (
-	nzbZstdEncoder, _ = zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+	nzbZstdEncoder, _ = zstd.NewWriter(nil,
+		zstd.WithEncoderLevel(zstd.SpeedDefault),
+		zstd.WithEncoderConcurrency(1),
+		zstd.WithLowerEncoderMem(true),
+	)
 	nzbZstdDecoder, _ = zstd.NewReader(nil)
 )
 

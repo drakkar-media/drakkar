@@ -23,7 +23,11 @@ func TestRequestBodyLimitUsesRouteSpecificCaps(t *testing.T) {
 		contentType string
 		want        int64
 	}{
-		{name: "default json", path: "/api/auth/login", want: defaultRequestBodyLimitBytes},
+		{name: "default json", path: "/api/webhooks/seerr", want: defaultRequestBodyLimitBytes},
+		{name: "login", path: "/api/auth/login", want: authRequestBodyLimitBytes},
+		{name: "setup", path: "/api/setup/complete", want: authRequestBodyLimitBytes},
+		{name: "create user", path: "/api/users", want: authRequestBodyLimitBytes},
+		{name: "change password", path: "/api/users/42/password", want: authRequestBodyLimitBytes},
 		{name: "settings", path: "/api/settings", want: bulkRequestBodyLimitBytes},
 		{name: "bulk import", path: "/api/custom-formats/import", want: bulkRequestBodyLimitBytes},
 		{name: "raw nzb", path: "/api/nzbs/import", want: nzbLimit},

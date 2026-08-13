@@ -9,9 +9,9 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-func mountSetupRoutes(r chi.Router, repo UserRepository) {
+func mountSetupRoutes(r chi.Router, repo UserRepository, security auth.RequestSecurityConfig) {
 	r.Get("/api/setup/status", handleSetupStatus(repo))
-	r.Post("/api/setup/complete", handleSetupComplete(repo))
+	r.Post("/api/setup/complete", handleSetupComplete(repo, security))
 }
 
 // handleSetupStatus reports whether first-run setup is still required (true
@@ -32,12 +32,13 @@ func handleSetupStatus(repo UserRepository) http.HandlerFunc {
 }
 
 // handleSetupComplete provisions the first admin account and immediately
-// logs it in via a session cookie. Gated on zero users existing, so once any
-// account has been created this always responds 409 and cannot be reused to
-// mint further admins.
-func handleSetupComplete(repo UserRepository) http.HandlerFunc {
+// logs it in via a session cookie. The repository serializes the final
+// zero-user check and insert so concurrent setup requests cannot mint multiple
+// admins.
+func handleSetupComplete(repo UserRepository, security auth.RequestSecurityConfig) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Only allowed when no users exist yet.
+		// Reject initialized systems before bcrypt; the atomic create below remains
+		// authoritative when concurrent first-run requests pass this fast path.
 		n, err := repo.CountUsers(r.Context())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -63,14 +64,22 @@ func handleSetupComplete(repo UserRepository) http.HandlerFunc {
 			http.Error(w, `{"error":"username and password required"}`, http.StatusBadRequest)
 			return
 		}
+		if err := auth.ValidatePassword(body.Password); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
 		hash, err := auth.HashPassword(body.Password)
 		if err != nil {
 			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
 			return
 		}
-		user, err := repo.CreateUser(r.Context(), body.Username, hash, "admin")
+		user, created, err := repo.CreateInitialAdmin(r.Context(), body.Username, hash)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !created {
+			http.Error(w, `{"error":"setup already complete"}`, http.StatusConflict)
 			return
 		}
 		// Log the admin in immediately.
@@ -84,7 +93,7 @@ func handleSetupComplete(repo UserRepository) http.HandlerFunc {
 			http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
 			return
 		}
-		auth.SetSessionCookie(w, token, expiry)
+		auth.SetSessionCookie(w, token, expiry, security.SecureCookie(r))
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
 		_ = json.NewEncoder(w).Encode(map[string]any{

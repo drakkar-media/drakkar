@@ -25,7 +25,9 @@
         body: JSON.stringify({ username, password }),
       });
       if (!res.ok) {
-        error = 'Invalid username or password.';
+        error = res.status === 429
+          ? 'Too many login attempts. Try again shortly.'
+          : 'Invalid username or password.';
         return;
       }
       await goto('/dashboard', { replaceState: true });

@@ -329,6 +329,8 @@ type Runtime struct {
 	SettingsPath           string
 	HTTPAddress            string
 	WebDAVAddress          string
+	AuthCookieSecure       bool
+	AuthTrustProxyHeaders  bool
 	FuseMountPath          string
 	MovieLibraryPath       string
 	TVLibraryPath          string

@@ -12,6 +12,7 @@ import (
 
 const (
 	defaultRequestBodyLimitBytes = int64(1 << 20)
+	authRequestBodyLimitBytes    = int64(8 << 10)
 	bulkRequestBodyLimitBytes    = int64(8 << 20)
 	subtitleUploadLimitBytes     = int64(2 << 20)
 	multipartOverheadBytes       = int64(1 << 20)
@@ -49,6 +50,11 @@ func configuredNZBUploadLimit(status StatusService) int64 {
 func requestBodyLimit(r *http.Request, nzbUploadLimit int64) int64 {
 	path := r.URL.Path
 	switch {
+	case path == "/api/auth/login",
+		path == "/api/setup/complete",
+		path == "/api/users",
+		strings.HasPrefix(path, "/api/users/") && strings.HasSuffix(path, "/password"):
+		return authRequestBodyLimitBytes
 	case isSABAPIPath(path):
 		if isMultipartRequest(r) {
 			return nzbUploadLimit + multipartOverheadBytes
