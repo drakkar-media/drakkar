@@ -320,9 +320,10 @@ type requestShowEnrichment struct {
 // requests are upserted. Provider identities are map keys so many new episodes
 // from one show share one lookup and one show-level repository update.
 type requestEnrichmentBatch struct {
-	movies   map[int64]requestMovieEnrichment
-	shows    map[requestShowEnrichmentKey]requestShowEnrichment
-	tvDetail map[int64]tvDetailResult
+	movies                map[int64]requestMovieEnrichment
+	shows                 map[requestShowEnrichmentKey]requestShowEnrichment
+	tvDetail              map[int64]tvDetailResult
+	createdLibraryItemIDs []int64
 }
 
 type tvDetailResult struct {
@@ -921,9 +922,8 @@ func (s *Service) ListRequests(ctx context.Context) ([]database.MediaRequestSumm
 // items via TMDB (syncSeasonRequest); movie and single-episode requests map
 // to one item each. Newly created items are collected into one lifecycle-owned
 // enrichment batch with fixed workers and one provider lookup per movie/show.
-// Search dispatch remains immediate while metadata arrives asynchronously.
-// Waking the pending-dispatch loop is deferred until after all requests are
-// processed, so a single sync pass triggers at most one wake.
+// That batch dispatches created items after metadata work completes, preventing
+// titleless Seerr payloads from racing the search title-safety guard.
 // Concurrent callers share the active pass; a waiting caller can cancel its
 // own wait without canceling the pass owned by the initiating caller.
 func (s *Service) SyncRequests(ctx context.Context) (result SyncResult, err error) {
@@ -1042,7 +1042,18 @@ func (b *requestEnrichmentBatch) tvDetails(ctx context.Context, client TMDBClien
 }
 
 func (b *requestEnrichmentBatch) empty() bool {
-	return b == nil || (len(b.movies) == 0 && len(b.shows) == 0)
+	return b == nil || (len(b.movies) == 0 && len(b.shows) == 0 && len(b.createdLibraryItemIDs) == 0)
+}
+
+func (b *requestEnrichmentBatch) addCreatedLibraryItems(ids ...int64) {
+	if b == nil {
+		return
+	}
+	for _, id := range ids {
+		if id > 0 {
+			b.createdLibraryItemIDs = append(b.createdLibraryItemIDs, id)
+		}
+	}
 }
 
 func (s *Service) syncRequests(ctx context.Context) (SyncResult, error) {
@@ -1063,6 +1074,7 @@ func (s *Service) syncRequests(ctx context.Context) (SyncResult, error) {
 			if created {
 				result.Created++
 				result.CreatedLibraryItemIDs = append(result.CreatedLibraryItemIDs, libraryItemID)
+				enrichment.addCreatedLibraryItems(libraryItemID)
 				s.logger.Info().Str("title", request.MediaTitle).Int("year", request.MediaYear).Int64("libraryItemId", libraryItemID).Msg("request: new movie requested")
 				enrichment.addMovie(libraryItemID, request.TMDBID)
 			}
@@ -1076,6 +1088,7 @@ func (s *Service) syncRequests(ctx context.Context) (SyncResult, error) {
 				}
 				result.Created += created
 				result.CreatedLibraryItemIDs = append(result.CreatedLibraryItemIDs, ids...)
+				enrichment.addCreatedLibraryItems(ids...)
 				if created > 0 {
 					s.logger.Info().Str("title", request.MediaTitle).Ints("seasons", request.Seasons).Int("episodesCreated", created).Msg("request: new season pack requested")
 				}
@@ -1098,13 +1111,11 @@ func (s *Service) syncRequests(ctx context.Context) (SyncResult, error) {
 			if created {
 				result.Created++
 				result.CreatedLibraryItemIDs = append(result.CreatedLibraryItemIDs, libraryItemID)
+				enrichment.addCreatedLibraryItems(libraryItemID)
 				s.logger.Info().Str("title", request.MediaTitle).Int("season", request.SeasonNumber).Int("episode", request.EpisodeNumber).Int64("libraryItemId", libraryItemID).Msg("request: new episode requested")
 				enrichment.addShow(libraryItemID, request.TMDBID, request.TVDBID, request.EpisodeTitle, nil)
 			}
 		}
-	}
-	if result.Created > 0 {
-		s.wakeDispatch()
 	}
 	return result, nil
 }
@@ -1202,10 +1213,19 @@ func (s *Service) startRequestEnrichmentBatch(batch *requestEnrichmentBatch) boo
 		return false
 	}
 	jobs := batch.jobs()
+	createdLibraryItemIDs := append([]int64(nil), batch.createdLibraryItemIDs...)
 	return s.startBackground("request-enrichment-batch", func(lifecycleCtx context.Context) {
 		ctx, cancel := context.WithTimeout(lifecycleCtx, requestEnrichmentBudget)
 		defer cancel()
 		s.runRequestEnrichmentJobs(ctx, jobs)
+		if lifecycleCtx.Err() != nil {
+			return
+		}
+		// Search must start after metadata work. Seerr can return an empty title
+		// for a newly approved item; dispatching first lets the title-safety guard
+		// mark that valid item failed milliseconds before enrichment persists it.
+		s.PushLibraryItemsToQueue(createdLibraryItemIDs, 0)
+		s.wakeDispatch()
 	})
 }
 

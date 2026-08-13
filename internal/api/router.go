@@ -1442,19 +1442,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 				"seen":         result.Seen,
 				"created":      result.Created,
 			})
-			// Items created from webhook get priority 0 (highest) so they
-			// jump ahead of normal monitoring items.
-			if result.Created > 0 {
-				if wq, ok := workflowSvc.(interface {
-					PushLibraryItemsToQueue(ids []int64, priority int)
-				}); ok {
-					wq.PushLibraryItemsToQueue(result.CreatedLibraryItemIDs, 0)
-				} else {
-					for _, id := range result.CreatedLibraryItemIDs {
-						workflowSvc.SearchLibrary(bgCtx, id) //nolint:errcheck
-					}
-				}
-			}
+			// SyncRequests' lifecycle-owned enrichment batch dispatches created
+			// items at priority 0 once metadata is safe for title verification.
 		}()
 	})
 	r.Get("/api/streams", func(w http.ResponseWriter, r *http.Request) {

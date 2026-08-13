@@ -1155,6 +1155,42 @@ func TestRequestEnrichmentBatchBoundsProviderConcurrency(t *testing.T) {
 	}
 }
 
+func TestSyncRequestsDispatchesCreatedItemsAfterEnrichment(t *testing.T) {
+	repo := &syncBatchRepo{}
+	client := &boundedMovieTMDB{
+		started: make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+	queue := newWorkQueueStub()
+	service := NewService(repo, seerrStub{requests: []seerr.Request{{
+		ID: 1, Type: "movie", TMDBID: 770001,
+	}}}, hydraStub{})
+	service.SetTMDBClient(client)
+	service.WorkQueue = queue
+	t.Cleanup(service.Close)
+
+	result, err := service.SyncRequests(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created != 1 {
+		t.Fatalf("created = %d, want 1", result.Created)
+	}
+	waitForSignal(t, client.started)
+	if depth := queue.Depth(context.Background()); depth != 0 {
+		t.Fatalf("queue depth before enrichment = %d, want 0", depth)
+	}
+
+	close(client.release)
+	deadline := time.Now().Add(time.Second)
+	for queue.Depth(context.Background()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if depth := queue.Depth(context.Background()); depth != 1 {
+		t.Fatalf("queue depth after enrichment = %d, want 1", depth)
+	}
+}
+
 func TestBackfillMetadataReportsFailuresAndUsesTypedKeys(t *testing.T) {
 	// Old arithmetic key: 1*1_000_000+2 collided with movie TMDB ID 1_000_002.
 	repo := &metadataOutcomeRepo{targets: []database.MetadataBackfillTarget{
