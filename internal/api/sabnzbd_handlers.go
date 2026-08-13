@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,7 +29,7 @@ type sabRepository interface {
 }
 
 type sabSecurityConfig struct {
-	apiKey              string
+	enabled             bool
 	trustedUpstreamURLs []string
 }
 
@@ -42,12 +41,15 @@ type sabHandler struct {
 	repo          sabRepository
 	fuseMountPath string
 	log           zerolog.Logger
-	// loadSecurity reads current settings for every request so key rotation and
-	// upstream changes apply without restarting Drakkar. apiKey and
+	// loadSecurity reads current settings for every request so enablement and
+	// upstream changes apply without restarting Drakkar. enabled and
 	// trustedUpstreamURLs support isolated handler tests.
 	loadSecurity        func(ctx context.Context) (sabSecurityConfig, error)
-	apiKey              string
+	enabled             bool
 	trustedUpstreamURLs []string
+	// authenticateToken validates SABnzbd's apikey against the same hashed API
+	// token store used by Seerr webhooks and normal Bearer authentication.
+	authenticateToken func(ctx context.Context, rawToken string) bool
 	// claimURLForFetch provides handleAddURL the exact same atomic per-URL
 	// fetch claim workflow.Service's own dispatch pipeline uses
 	// (Service.ClaimURLForFetch, shared by fetchIndexAndRelease/
@@ -78,14 +80,14 @@ func (h *sabHandler) securityConfig(ctx context.Context) (sabSecurityConfig, err
 	if h.loadSecurity != nil {
 		return h.loadSecurity(ctx)
 	}
-	return sabSecurityConfig{apiKey: h.apiKey, trustedUpstreamURLs: h.trustedUpstreamURLs}, nil
+	return sabSecurityConfig{enabled: h.enabled, trustedUpstreamURLs: h.trustedUpstreamURLs}, nil
 }
 
 // ServeHTTP implements the SABnzbd HTTP API: every operation is dispatched
 // by a single "mode" query/form parameter, matching SABnzbd's own endpoint
 // design so Sonarr/Radarr's SABnzbd download-client integration works
-// unmodified against Drakkar. Every request must present the configured key
-// via SABnzbd's "apikey" query parameter.
+// unmodified against Drakkar. When enabled, every request must present a
+// valid Drakkar API token via SABnzbd's "apikey" query parameter.
 func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	security, err := h.securityConfig(r.Context())
 	if err != nil {
@@ -93,13 +95,16 @@ func (h *sabHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{"status": false, "error": "SAB API authentication unavailable"})
 		return
 	}
-	configuredKey := security.apiKey
-	if strings.TrimSpace(configuredKey) == "" {
-		h.writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{"status": false, "error": "SAB API key is not configured"})
+	if !security.enabled {
+		h.writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{"status": false, "error": "SAB API is disabled"})
+		return
+	}
+	if h.authenticateToken == nil {
+		h.writeJSONStatus(w, http.StatusServiceUnavailable, map[string]any{"status": false, "error": "SAB API authentication unavailable"})
 		return
 	}
 	presentedKey := r.URL.Query().Get("apikey")
-	if subtle.ConstantTimeCompare([]byte(presentedKey), []byte(configuredKey)) != 1 {
+	if !h.authenticateToken(r.Context(), presentedKey) {
 		h.writeJSONStatus(w, http.StatusUnauthorized, map[string]any{"status": false, "error": "API Key Incorrect"})
 		return
 	}

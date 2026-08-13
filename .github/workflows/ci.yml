@@ -89,7 +89,7 @@ jobs:
 
       - name: Race tests
         run: |
-          go test -race ./internal/workflow -run 'TestSyncRequests|TestSABPushIdempotencyKey|TestImportNZBFromPush'
+          go test -race ./internal/workflow -run 'TestSyncRequests|TestRequestEnrichment|TestBackfillMetadata|TestSABPushIdempotencyKey|TestImportNZBFromPush'
           go test -race ./internal/hydra
 
       - name: Test (rapidyenc SIMD decoder build)

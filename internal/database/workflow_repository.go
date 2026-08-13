@@ -370,9 +370,9 @@ func (db *DB) EnrichMovieFull(ctx context.Context, libraryItemID int64, e MovieE
 	if len(e.RawTMDB) > 0 {
 		rawTMDB = e.RawTMDB
 	}
-	_, err := db.SQL.ExecContext(ctx, `
+	result, err := db.SQL.ExecContext(ctx, `
 		update movies m
-		set tmdb_id              = case when $2 > 0   then $2  else m.tmdb_id              end,
+		set tmdb_id              = case when $2::bigint > 0 then $2::bigint else m.tmdb_id end,
 		    title                = case when $3 <> ''  then $3  else m.title                end,
 		    original_title       = case when $4 <> ''  then $4  else m.original_title       end,
 		    release_year         = case when $5 > 0    then $5  else m.release_year         end,
@@ -412,14 +412,20 @@ func (db *DB) EnrichMovieFull(ctx context.Context, libraryItemID int64, e MovieE
 	if err != nil {
 		return err
 	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if rows == 0 {
+		return sql.ErrNoRows
+	}
 	if strings.TrimSpace(e.Title) != "" || len(e.AlternativeTitles) > 0 {
 		db.invalidateCatalogAmbiguityIndex()
 	}
-	if strings.TrimSpace(e.Title) == "" {
-		return nil
+	if strings.TrimSpace(e.Title) != "" {
+		if _, err = db.SQL.ExecContext(ctx, `update library_items set title = $2 where id = $1`, libraryItemID, e.Title); err != nil {
+			return err
+		}
 	}
-	_, err = db.SQL.ExecContext(ctx, `update library_items set title = $2 where id = $1`, libraryItemID, e.Title)
-	return err
+	return nil
 }
 
 // UpsertEpisodeRequest idempotently records an incoming Seerr TV episode
@@ -658,9 +664,9 @@ func (db *DB) EnrichTVFull(ctx context.Context, libraryItemID int64, episodeTitl
 	if len(e.RawTMDB) > 0 {
 		rawTMDB = e.RawTMDB
 	}
-	_, err := db.SQL.ExecContext(ctx, `
+	result, err := db.SQL.ExecContext(ctx, `
 		update tv_shows tv
-		set tmdb_id              = case when $2 > 0   then $2  else tv.tmdb_id              end,
+		set tmdb_id              = case when $2::bigint > 0 then $2::bigint else tv.tmdb_id end,
 		    title                = case when $3 <> ''  then $3  else tv.title                end,
 		    original_name        = case when $4 <> ''  then $4  else tv.original_name        end,
 		    release_year         = case when $5 > 0    then $5  else tv.release_year         end,
@@ -706,6 +712,11 @@ func (db *DB) EnrichTVFull(ctx context.Context, libraryItemID int64, episodeTitl
 	if err != nil {
 		return err
 	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr != nil {
+		return rowsErr
+	} else if rows == 0 {
+		return sql.ErrNoRows
+	}
 	if strings.TrimSpace(e.ShowTitle) != "" || len(e.AlternativeTitles) > 0 {
 		db.invalidateCatalogAmbiguityIndex()
 	}
@@ -721,28 +732,28 @@ func (db *DB) EnrichTVFull(ctx context.Context, libraryItemID int64, episodeTitl
 	if strings.TrimSpace(e.ShowTitle) == "" {
 		return nil
 	}
-	var (
-		seasonNumber  int
-		episodeNumber int
-	)
-	if err = db.SQL.QueryRowContext(ctx, `
-		select e.season_number, e.episode_number
-		from library_items li
-		join episodes e on e.id = li.episode_id
-		where li.id = $1`, libraryItemID,
-	).Scan(&seasonNumber, &episodeNumber); err != nil {
+	// Show metadata is fetched once per show. Keep every episode's denormalized
+	// library title synchronized instead of requiring one enrichment write per
+	// newly created episode.
+	if _, err = db.SQL.ExecContext(ctx, `
+		update library_items li
+		set title = case
+		    when ep.season_number > 0 and ep.episode_number > 0 then
+		        $2 || ' S' || lpad(ep.season_number::text, 2, '0') || 'E' || lpad(ep.episode_number::text, 2, '0')
+		    else $2
+		end
+		from episodes ep
+		where li.episode_id = ep.id
+		  and ep.tv_show_id = (
+		      select representative.tv_show_id
+		      from library_items representative_item
+		      join episodes representative on representative.id = representative_item.episode_id
+		      where representative_item.id = $1
+		  )`, libraryItemID, e.ShowTitle,
+	); err != nil {
 		return err
 	}
-	title := e.ShowTitle
-	if seasonNumber > 0 && episodeNumber > 0 {
-		title = fmt.Sprintf("%s S%02dE%02d", e.ShowTitle, seasonNumber, episodeNumber)
-	}
-	_, err = db.SQL.ExecContext(ctx, `
-		update library_items
-		set title = $2
-		where id = $1`, libraryItemID, title,
-	)
-	return err
+	return nil
 }
 
 // GetLibrarySearchInput assembles the movie/TV metadata a search pass needs
@@ -4041,6 +4052,20 @@ func nullTime(value time.Time) any {
 	return value
 }
 
+// MetadataRefreshStatus records whether the latest provider refresh applied,
+// failed, or was skipped because no provider was available.
+type MetadataRefreshStatus string
+
+const (
+	// MetadataRefreshSucceeded means provider data was fetched and persisted,
+	// including valid responses whose optional fields were empty.
+	MetadataRefreshSucceeded MetadataRefreshStatus = "success"
+	// MetadataRefreshFailed means a configured provider or persistence step failed.
+	MetadataRefreshFailed MetadataRefreshStatus = "failed"
+	// MetadataRefreshSkipped means no configured provider could serve the entity.
+	MetadataRefreshSkipped MetadataRefreshStatus = "skipped"
+)
+
 // MetadataBackfillTarget is one library item needing metadata re-enrichment.
 type MetadataBackfillTarget struct {
 	LibraryItemID int64
@@ -4048,6 +4073,54 @@ type MetadataBackfillTarget struct {
 	TMDBID        int64
 	TVDBID        int64
 	EpisodeTitle  string
+}
+
+// RecordMetadataRefreshOutcome persists the latest metadata attempt against
+// the movie or show backing libraryItemID. Successful outcomes clear prior
+// failure detail; failed/skipped outcomes remain eligible for a later retry.
+func (db *DB) RecordMetadataRefreshOutcome(ctx context.Context, libraryItemID int64, mediaType string, status MetadataRefreshStatus, detail string) error {
+	switch status {
+	case MetadataRefreshSucceeded, MetadataRefreshFailed, MetadataRefreshSkipped:
+	default:
+		return fmt.Errorf("unsupported metadata refresh status %q", status)
+	}
+
+	var (
+		result sql.Result
+		err    error
+	)
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "movie":
+		result, err = db.SQL.ExecContext(ctx, `
+			update movies m
+			set metadata_refresh_attempted_at = now(),
+			    metadata_refresh_status = $2,
+			    metadata_refresh_error = nullif($3, '')
+			from library_items li
+			where li.id = $1 and li.movie_id = m.id`, libraryItemID, string(status), strings.TrimSpace(detail))
+	case "episode", "tv":
+		result, err = db.SQL.ExecContext(ctx, `
+			update tv_shows tv
+			set metadata_refresh_attempted_at = now(),
+			    metadata_refresh_status = $2,
+			    metadata_refresh_error = nullif($3, '')
+			from library_items li
+			join episodes ep on ep.id = li.episode_id
+			where li.id = $1 and ep.tv_show_id = tv.id`, libraryItemID, string(status), strings.TrimSpace(detail))
+	default:
+		return fmt.Errorf("unsupported metadata media type %q", mediaType)
+	}
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // ListShowsWithMissingEpisodeAirDates returns one representative
@@ -4080,23 +4153,42 @@ func (db *DB) ListShowsWithMissingEpisodeAirDates(ctx context.Context) ([]int64,
 	return out, rows.Err()
 }
 
-// ListMetadataBackfillTargets returns library items whose movie/show rows are
-// missing newly-added metadata columns (tagline, release_date, etc.).
-// Deduplicated by TMDB ID so each show/movie is only returned once.
+// ListMetadataBackfillTargets returns movie/show rows missing optional metadata
+// that have never completed a provider refresh. A successful refresh is final
+// even when upstream legitimately returns an empty tagline or date; failed and
+// skipped attempts remain eligible for the next maintenance pass.
 func (db *DB) ListMetadataBackfillTargets(ctx context.Context) ([]MetadataBackfillTarget, error) {
 	rows, err := db.SQL.QueryContext(ctx, `
-		select li.id, 'movie', coalesce(m.tmdb_id,0), 0, ''
-		from library_items li
-		join movies m on m.id = li.movie_id
-		where m.tmdb_id > 0 and (m.tagline is null or m.release_date is null)
-		group by li.id, m.tmdb_id
-		union all
-		select min(li.id), 'episode', coalesce(tv.tmdb_id,0), coalesce(tv.tvdb_id,0), coalesce(min(ep.title),'')
-		from library_items li
-		join episodes ep on ep.id = li.episode_id
-		join tv_shows tv on tv.id = ep.tv_show_id
-		where tv.tmdb_id > 0 and (tv.tagline is null or tv.first_air_date is null)
-		group by tv.tmdb_id, tv.tvdb_id
+		select target.library_item_id, target.media_type, target.tmdb_id, target.tvdb_id, target.episode_title
+		from (
+			select min(li.id) as library_item_id,
+			       'movie'::text as media_type,
+			       coalesce(m.tmdb_id, 0) as tmdb_id,
+			       0::bigint as tvdb_id,
+			       ''::text as episode_title
+			from movies m
+			join library_items li on li.movie_id = m.id
+			where m.tmdb_id > 0
+			  and (m.tagline is null or m.release_date is null)
+			  and m.metadata_refresh_status is distinct from 'success'
+			group by m.id, m.tmdb_id
+
+			union all
+
+			select min(li.id),
+			       'episode'::text,
+			       coalesce(tv.tmdb_id, 0),
+			       coalesce(tv.tvdb_id, 0),
+			       coalesce(min(ep.title), '')
+			from tv_shows tv
+			join episodes ep on ep.tv_show_id = tv.id
+			join library_items li on li.episode_id = ep.id
+			where tv.tmdb_id > 0
+			  and (tv.tagline is null or tv.first_air_date is null)
+			  and tv.metadata_refresh_status is distinct from 'success'
+			group by tv.id, tv.tmdb_id, tv.tvdb_id
+		) target
+		order by target.media_type, target.tmdb_id, target.tvdb_id, target.library_item_id
 		limit 500`)
 	if err != nil {
 		return nil, err

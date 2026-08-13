@@ -460,11 +460,21 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		return filtered
 	}
 
-	// SABnzbd-compatible API endpoint — allows Radarr/Sonarr to use Drakkar as a download client.
+	// Keep SAB protocol routes registered so existing clients receive a clear
+	// disabled response while Servarr ownership semantics remain unresolved.
 	if workflowSvc != nil {
+		var authenticateSABToken func(context.Context, string) bool
+		if userRepo != nil {
+			authenticateSABToken = func(ctx context.Context, rawToken string) bool {
+				_, ok := auth.AuthenticateAPIToken(ctx, userRepo, rawToken)
+				return ok
+			}
+		}
 		sabH := &sabHandler{
-			importFn: workflowSvc.ImportNZBFromPush,
-			repo:     profilesRepo,
+			importFn:          workflowSvc.ImportNZBFromPush,
+			repo:              profilesRepo,
+			enabled:           false,
+			authenticateToken: authenticateSABToken,
 			fuseMountPath: func() string {
 				mp := status.Status().FuseMountPath
 				if mp == "" {
@@ -473,19 +483,6 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 				return mp
 			}(),
 			claimURLForFetch: workflowSvc.ClaimURLForFetch,
-			loadSecurity: func(ctx context.Context) (sabSecurityConfig, error) {
-				if settingsSvc == nil {
-					return sabSecurityConfig{}, errors.New("settings service unavailable")
-				}
-				cfg, err := settingsSvc.GetSettings(ctx)
-				if err != nil {
-					return sabSecurityConfig{}, err
-				}
-				return sabSecurityConfig{
-					apiKey:              cfg.SABNZBD.APIKey,
-					trustedUpstreamURLs: []string{cfg.NZBHydra2.URL},
-				}, nil
-			},
 		}
 		r.HandleFunc("/sabnzbd/api", sabH.ServeHTTP)
 		r.HandleFunc("/api/sabnzbd/api", sabH.ServeHTTP)
@@ -1398,8 +1395,8 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		// This endpoint is in the auth middleware's public-path exemption list
 		// (Seerr can't send a session cookie or the normal Bearer token flow),
 		// so it enforces its own auth here: a valid API token is required on
-		// every call, matching the "Generate API Token" flow in Settings →
-		// Seerr → Webhook setup. Without this, anyone who can reach this URL
+		// every call, matching the shared-token flow in Settings → Seerr →
+		// Webhook setup. Without this, anyone who can reach this URL
 		// could forge a webhook call and trigger a sync.
 		if userRepo != nil {
 			authz := strings.TrimSpace(r.Header.Get("Authorization"))
@@ -1407,8 +1404,12 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 				respondError(w, http.StatusUnauthorized, errors.New("missing webhook token"))
 				return
 			}
-			raw := strings.TrimPrefix(authz, "Bearer ")
-			if _, _, _, _, err := userRepo.GetAPITokenByHash(r.Context(), auth.HashToken(raw)); err != nil {
+			parts := strings.Fields(authz)
+			if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+				respondError(w, http.StatusUnauthorized, errors.New("invalid webhook token"))
+				return
+			}
+			if _, ok := auth.AuthenticateAPIToken(r.Context(), userRepo, parts[1]); !ok {
 				respondError(w, http.StatusUnauthorized, errors.New("invalid webhook token"))
 				return
 			}
@@ -1792,7 +1793,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 				slog.Error("backfill metadata background", "err", err)
 				return
 			}
-			publishMutation("library.backfill_metadata", map[string]any{"processedMovies": result.ProcessedMovies, "processedShows": result.ProcessedShows, "enriched": result.Enriched, "failed": result.Failed})
+			publishMutation("library.backfill_metadata", map[string]any{"processedMovies": result.ProcessedMovies, "processedShows": result.ProcessedShows, "enriched": result.Enriched, "failed": result.Failed, "skipped": result.Skipped})
 		}()
 		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
 	})

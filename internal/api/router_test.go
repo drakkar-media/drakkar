@@ -975,10 +975,15 @@ func TestWorkflowEndpoints(t *testing.T) {
 	}
 }
 
-func TestSABAPIAddFileAliasAcceptsLowercaseFieldAndNzbname(t *testing.T) {
+func TestSABAPIAddFileAcceptsLowercaseFieldAndNzbname(t *testing.T) {
 	importCall := &sabImportCall{}
-	workflowSvc := workflowStub{importCall: importCall}
-	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, settingsStub{cfg: config.Settings{SABNZBD: config.SABNZBDConfig{APIKey: "sab-test-key"}}}, nil, nil, nil, nil)
+	handler := &sabHandler{
+		enabled:           true,
+		authenticateToken: sabTestAuthenticator("sab-test-key"),
+		importFn: func(ctx context.Context, content io.Reader, filename, mediaType string) (string, error) {
+			return workflowStub{importCall: importCall}.ImportNZBFromPush(ctx, content, filename, mediaType)
+		},
+	}
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -1002,7 +1007,7 @@ func TestSABAPIAddFileAliasAcceptsLowercaseFieldAndNzbname(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/dav/api?category=movies&apikey=sab-test-key", &body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req)
+	handler.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
@@ -1021,9 +1026,26 @@ func TestSABAPIAddFileAliasAcceptsLowercaseFieldAndNzbname(t *testing.T) {
 	}
 }
 
+func TestRouterSABAPIAliasesRemainDisabled(t *testing.T) {
+	workflowSvc := workflowStub{importCall: &sabImportCall{}}
+	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, settingsStub{}, nil, nil, nil, nil)
+
+	for _, path := range []string{"/sabnzbd/api", "/api/sabnzbd/api", "/dav/api"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path+"?mode=version&apikey=unused", nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), `"error":"SAB API is disabled"`) {
+				t.Fatalf("expected disabled SAB response, got %d: %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
 func TestSABAPIHistoryAcceptsCategoryAlias(t *testing.T) {
 	repo := &sabRepoStub{}
-	handler := &sabHandler{repo: repo, apiKey: "sab-test-key"}
+	handler := &sabHandler{repo: repo, enabled: true, authenticateToken: sabTestAuthenticator("sab-test-key")}
 
 	req := httptest.NewRequest(http.MethodGet, "/dav/api?mode=history&category=movies&apikey=sab-test-key", nil)
 	rec := httptest.NewRecorder()

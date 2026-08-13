@@ -213,6 +213,26 @@ type SessionLookup interface {
 	TouchAPITokenUsed(ctx context.Context, tokenHash string) error
 }
 
+// AuthenticateAPIToken resolves an active API token and records its use.
+//
+// Callers that expose alternate token transports, such as webhook Bearer
+// headers or SABnzbd's apikey query parameter, use this function so expiry,
+// revocation, hashing, and audit behavior stay identical to normal API auth.
+// Invalid, missing, and expired tokens all return ok=false.
+func AuthenticateAPIToken(ctx context.Context, repo SessionLookup, rawToken string) (claims Claims, ok bool) {
+	rawToken = strings.TrimSpace(rawToken)
+	if repo == nil || rawToken == "" {
+		return Claims{}, false
+	}
+	hash := HashToken(rawToken)
+	userID, username, role, expiresAt, err := repo.GetAPITokenByHash(ctx, hash)
+	if err != nil || (expiresAt != nil && !time.Now().Before(*expiresAt)) {
+		return Claims{}, false
+	}
+	_ = repo.TouchAPITokenUsed(ctx, hash)
+	return Claims{UserID: userID, Username: username, Role: role}, true
+}
+
 // apiTokenFromRequest extracts a bearer-style API token from either the
 // X-Api-Key header or a "Bearer <token>" Authorization header, preferring
 // X-Api-Key when both are present. Returns "" when neither is set.
@@ -245,15 +265,8 @@ func Middleware(repo SessionLookup, exemptPrefixes []string, security RequestSec
 				}
 			}
 			if token := apiTokenFromRequest(r); token != "" {
-				hash := HashToken(token)
-				userID, username, role, expiresAt, err := repo.GetAPITokenByHash(r.Context(), hash)
-				if err == nil && (expiresAt == nil || time.Now().Before(*expiresAt)) {
-					_ = repo.TouchAPITokenUsed(r.Context(), hash)
-					next.ServeHTTP(w, r.WithContext(NewContext(r.Context(), Claims{
-						UserID:   userID,
-						Username: username,
-						Role:     role,
-					})))
+				if claims, ok := AuthenticateAPIToken(r.Context(), repo, token); ok {
+					next.ServeHTTP(w, r.WithContext(NewContext(r.Context(), claims)))
 					return
 				}
 			}

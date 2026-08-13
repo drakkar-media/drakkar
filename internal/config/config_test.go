@@ -27,12 +27,42 @@ func TestLoadRejectsUnknownField(t *testing.T) {
 	}
 }
 
+func TestLoadRemovesDeprecatedSABSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	if err := os.WriteFile(path, []byte(`{
+  "database":{"host":"postgres","port":5432,"name":"drakkar","username":"drakkar","password":"secret"},
+  "valkey":{"host":"valkey","port":6379,"password":""},
+  "nzbhydra2":{"url":"","apiKey":""},
+  "sabnzbd":{"apiKey":"legacy-secret"},
+  "seerr":{"url":"","apiKey":""},
+  "usenet":{"providers":[]},
+  "metadata":{"tmdb":{"apiKey":""},"tvdb":{"apiKey":""}},
+  "subtitles":{"enabled":false,"languages":["en"],"providers":{}}
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.LegacySABNZBD) != 0 {
+		t.Fatal("deprecated SAB settings must not survive loading")
+	}
+	migrated, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(migrated), `"sabnzbd"`) || strings.Contains(string(migrated), "legacy-secret") {
+		t.Fatalf("deprecated SAB settings remained on disk: %s", migrated)
+	}
+}
+
 func TestRedactedSettings(t *testing.T) {
 	out := RedactedSettings(Settings{
 		Database:  DatabaseConfig{Host: "postgres", Port: 5432, Name: "drakkar", Username: "drakkar", Password: "secret"},
 		Valkey:    ValkeyConfig{Host: "valkey", Port: 6379, Password: "secret"},
 		NZBHydra2: ServiceConfig{URL: "http://nzbhydra2:5076", APIKey: "abc"},
-		SABNZBD:   SABNZBDConfig{APIKey: "sab-secret"},
 		Seerr:     ServiceConfig{URL: "http://seerr:5055", APIKey: "def"},
 		Usenet: UsenetConfig{
 			MaxDownloadConnections: 15,
@@ -51,8 +81,8 @@ func TestRedactedSettings(t *testing.T) {
 	if out["metadata"].(map[string]any)["tmdb"].(map[string]any)["apiKey"] != "***" {
 		t.Fatal("tmdb api key not redacted")
 	}
-	if out["sabnzbd"].(map[string]any)["apiKey"] != "***" {
-		t.Fatal("sabnzbd api key not redacted")
+	if _, exists := out["sabnzbd"]; exists {
+		t.Fatal("deprecated SAB settings must not appear in status")
 	}
 	if out["subtitles"].(map[string]any)["providers"].(map[string]any)["subdl"].(map[string]any)["password"] != "***" {
 		t.Fatal("subtitle password not redacted")
@@ -99,7 +129,6 @@ func testSettingsWithSecrets() Settings {
 		Database:  DatabaseConfig{Host: "postgres", Password: "db-secret"},
 		Valkey:    ValkeyConfig{Host: "valkey", Password: "valkey-secret"},
 		NZBHydra2: ServiceConfig{URL: "http://hydra", APIKey: "hydra-key"},
-		SABNZBD:   SABNZBDConfig{APIKey: "sab-key"},
 		Seerr:     ServiceConfig{URL: "http://seerr", APIKey: "seerr-key"},
 		Usenet: UsenetConfig{
 			Providers: []UsenetProvider{
@@ -128,7 +157,7 @@ func TestRedactSecretsBlanksEveryCredential(t *testing.T) {
 	redacted := RedactSecrets(cfg)
 
 	if redacted.Database.Password != "" || redacted.Valkey.Password != "" ||
-		redacted.NZBHydra2.APIKey != "" || redacted.SABNZBD.APIKey != "" || redacted.Seerr.APIKey != "" ||
+		redacted.NZBHydra2.APIKey != "" || redacted.Seerr.APIKey != "" ||
 		redacted.Metadata.TMDB.APIKey != "" || redacted.Metadata.TVDB.APIKey != "" ||
 		redacted.Plex.Token != "" || redacted.Jellyfin.APIKey != "" {
 		t.Fatalf("expected all top-level secrets blanked, got %+v", redacted)
@@ -162,7 +191,7 @@ func TestMergeSecretsPreservesUntouchedFields(t *testing.T) {
 	merged := MergeSecrets(current, incoming)
 
 	if merged.Database.Password != "db-secret" || merged.Valkey.Password != "valkey-secret" ||
-		merged.NZBHydra2.APIKey != "hydra-key" || merged.SABNZBD.APIKey != "sab-key" || merged.Seerr.APIKey != "seerr-key" ||
+		merged.NZBHydra2.APIKey != "hydra-key" || merged.Seerr.APIKey != "seerr-key" ||
 		merged.Metadata.TMDB.APIKey != "tmdb-key" || merged.Metadata.TVDB.APIKey != "tvdb-key" ||
 		merged.Plex.Token != "plex-token" || merged.Jellyfin.APIKey != "jellyfin-key" {
 		t.Fatalf("expected untouched secrets preserved from current, got %+v", merged)
@@ -187,16 +216,12 @@ func TestMergeSecretsAppliesExplicitChange(t *testing.T) {
 	current := testSettingsWithSecrets()
 	incoming := RedactSecrets(current)
 	incoming.Database.Password = "rotated-secret"
-	incoming.SABNZBD.APIKey = "rotated-sab-key"
 	incoming.Usenet.Providers[0].Password = "rotated-provider-secret"
 
 	merged := MergeSecrets(current, incoming)
 
 	if merged.Database.Password != "rotated-secret" {
 		t.Fatalf("expected explicitly set secret to apply, got %q", merged.Database.Password)
-	}
-	if merged.SABNZBD.APIKey != "rotated-sab-key" {
-		t.Fatalf("expected explicitly set SAB API key to apply, got %q", merged.SABNZBD.APIKey)
 	}
 	if merged.Usenet.Providers[0].Password != "rotated-provider-secret" {
 		t.Fatalf("expected explicitly set provider secret to apply, got %q", merged.Usenet.Providers[0].Password)

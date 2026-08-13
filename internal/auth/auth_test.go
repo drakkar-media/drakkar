@@ -11,8 +11,9 @@ import (
 )
 
 type lookupStub struct {
-	apiTokenHash string
-	touchedHash  string
+	apiTokenHash      string
+	apiTokenExpiresAt *time.Time
+	touchedHash       string
 }
 
 func (l *lookupStub) GetSessionByTokenHash(ctx context.Context, tokenHash string) (userID int64, username, role string, expiresAt time.Time, err error) {
@@ -23,7 +24,7 @@ func (l *lookupStub) GetAPITokenByHash(ctx context.Context, tokenHash string) (u
 	if tokenHash != l.apiTokenHash {
 		return 0, "", "", nil, context.Canceled
 	}
-	return 42, "operator", "admin", nil, nil
+	return 42, "operator", "admin", l.apiTokenExpiresAt, nil
 }
 
 func (l *lookupStub) TouchAPITokenUsed(ctx context.Context, tokenHash string) error {
@@ -61,6 +62,25 @@ func TestMiddlewareAcceptsBearerAPIToken(t *testing.T) {
 	}
 	if repo.touchedHash != hashed {
 		t.Fatalf("expected touched hash %q, got %q", hashed, repo.touchedHash)
+	}
+}
+
+func TestAuthenticateAPITokenRejectsExpiredToken(t *testing.T) {
+	raw, hashed, err := GenerateToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired := time.Now().Add(-time.Second)
+	repo := &lookupStub{apiTokenHash: hashed, apiTokenExpiresAt: &expired}
+
+	if _, ok := AuthenticateAPIToken(context.Background(), repo, raw); ok {
+		t.Fatal("expected expired API token to be rejected")
+	}
+	if repo.touchedHash != "" {
+		t.Fatalf("expired token must not update last-used timestamp, got %q", repo.touchedHash)
+	}
+	if _, ok := AuthenticateAPIToken(context.Background(), nil, raw); ok {
+		t.Fatal("expected unavailable token repository to fail closed")
 	}
 }
 

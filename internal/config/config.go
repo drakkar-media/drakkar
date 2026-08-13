@@ -44,10 +44,12 @@ const (
 // on-disk (settings.json) and in-memory representation of every user-facing
 // setting, and is loaded via Load/LoadOrCreate and persisted via Save.
 type Settings struct {
-	Database      DatabaseConfig      `json:"database"`
-	Valkey        ValkeyConfig        `json:"valkey"`
-	NZBHydra2     ServiceConfig       `json:"nzbhydra2"`
-	SABNZBD       SABNZBDConfig       `json:"sabnzbd"`
+	Database  DatabaseConfig `json:"database"`
+	Valkey    ValkeyConfig   `json:"valkey"`
+	NZBHydra2 ServiceConfig  `json:"nzbhydra2"`
+	// LegacySABNZBD accepts pre-freeze settings long enough to remove them.
+	// Save always clears this migration-only field before serialization.
+	LegacySABNZBD json.RawMessage     `json:"sabnzbd,omitempty"`
 	Seerr         ServiceConfig       `json:"seerr"`
 	Usenet        UsenetConfig        `json:"usenet"`
 	Metadata      MetadataConfig      `json:"metadata"`
@@ -248,12 +250,6 @@ type ServiceConfig struct {
 	FeedMaxResults        int    `json:"feedMaxResults"`
 }
 
-// SABNZBDConfig secures the SABnzbd-compatible download-client API used by
-// Sonarr and Radarr. An empty key leaves those endpoints disabled.
-type SABNZBDConfig struct {
-	APIKey string `json:"apiKey"`
-}
-
 // UsenetConfig controls download concurrency and holds the list of
 // configured Usenet (NNTP) providers used for article retrieval.
 type UsenetConfig struct {
@@ -393,9 +389,16 @@ func Load(path string) (Settings, error) {
 	if err := dec.Decode(&cfg); err != nil {
 		return Settings{}, fmt.Errorf("parse settings: %w", err)
 	}
+	hadLegacySABSettings := len(cfg.LegacySABNZBD) > 0
+	cfg.LegacySABNZBD = nil
 	applyDefaults(&cfg)
 	if err := validate(cfg); err != nil {
 		return Settings{}, err
+	}
+	if hadLegacySABSettings {
+		if err := Save(path, cfg); err != nil {
+			return Settings{}, fmt.Errorf("remove deprecated sabnzbd settings: %w", err)
+		}
 	}
 	return cfg, nil
 }
@@ -610,6 +613,7 @@ func ValidatePaths(rt Runtime) error {
 
 // Save validates cfg and atomically writes it to path as indented JSON.
 func Save(path string, cfg Settings) error {
+	cfg.LegacySABNZBD = nil
 	applyDefaults(&cfg)
 	if err := validate(cfg); err != nil {
 		return fmt.Errorf("invalid settings: %w", err)
@@ -654,9 +658,6 @@ func RedactedSettings(cfg Settings) map[string]any {
 			"searchCacheTtlSeconds": cfg.NZBHydra2.SearchCacheTTLSeconds,
 			"feedCacheTtlSeconds":   cfg.NZBHydra2.FeedCacheTTLSeconds,
 			"feedMaxResults":        cfg.NZBHydra2.FeedMaxResults,
-		},
-		"sabnzbd": map[string]any{
-			"apiKey": "***",
 		},
 		"seerr": map[string]any{
 			"url":    cfg.Seerr.URL,
@@ -739,7 +740,7 @@ func RedactSecrets(cfg Settings) Settings {
 	redacted.Database.Password = ""
 	redacted.Valkey.Password = ""
 	redacted.NZBHydra2.APIKey = ""
-	redacted.SABNZBD.APIKey = ""
+	redacted.LegacySABNZBD = nil
 	redacted.Seerr.APIKey = ""
 	redacted.Metadata.TMDB.APIKey = ""
 	redacted.Metadata.TVDB.APIKey = ""
@@ -774,6 +775,7 @@ func RedactSecrets(cfg Settings) Settings {
 // value — no data is corrupted, the secret just needs re-entering.
 func MergeSecrets(current, incoming Settings) Settings {
 	merged := incoming
+	merged.LegacySABNZBD = nil
 	if merged.Database.Password == "" {
 		merged.Database.Password = current.Database.Password
 	}
@@ -782,9 +784,6 @@ func MergeSecrets(current, incoming Settings) Settings {
 	}
 	if merged.NZBHydra2.APIKey == "" {
 		merged.NZBHydra2.APIKey = current.NZBHydra2.APIKey
-	}
-	if merged.SABNZBD.APIKey == "" {
-		merged.SABNZBD.APIKey = current.SABNZBD.APIKey
 	}
 	if merged.Seerr.APIKey == "" {
 		merged.Seerr.APIKey = current.Seerr.APIKey

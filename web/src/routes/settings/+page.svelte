@@ -203,6 +203,31 @@
     setTimeout(() => { webhookTokenCopied = false; }, 2000);
   }
 
+  type SABCopyField =
+    | 'host'
+    | 'port'
+    | 'url-base'
+    | 'radarr-root'
+    | 'sonarr-root'
+    | 'docker-volume';
+  let sabCopiedField: SABCopyField | null = null;
+  $: sabHost = typeof window !== 'undefined' ? window.location.hostname : '';
+  $: sabPort = typeof window !== 'undefined'
+    ? window.location.port || (window.location.protocol === 'https:' ? '443' : '80')
+    : '';
+  const sabURLBase = '/sabnzbd';
+  const sabRadarrRootFolder = '/mnt/drakkar/media/movies';
+  const sabSonarrRootFolder = '/mnt/drakkar/media/tv';
+  const sabDockerVolume = '- /mnt/drakkar:/mnt/drakkar:rslave';
+
+  async function copySABField(field: SABCopyField, value: string) {
+    await copyToClipboard(value);
+    sabCopiedField = field;
+    setTimeout(() => {
+      if (sabCopiedField === field) sabCopiedField = null;
+    }, 2000);
+  }
+
   // ── Logs tab state ──────────────────────────────────────────────────────────
   type LogEntry = { level: string; service: string; message: string; time: string; raw: string };
   let logEntries: LogEntry[] = [];
@@ -765,9 +790,6 @@
         if (draft && !draft.jellyfin) {
           draft.jellyfin = { url: '', apiKey: '' };
         }
-        if (draft && !draft.sabnzbd) {
-          draft.sabnzbd = { apiKey: '' };
-        }
         if (draft && !draft.notifications) {
           draft.notifications = { discordWebhookUrl: '', genericWebhookUrl: '', onGrab: false, onAvailable: true, onFailed: false };
         }
@@ -1046,7 +1068,7 @@
     const backgroundTaskToasts: Record<string, (e: Record<string, unknown>) => string> = {
       'library.fill_missing_episodes': (e) => `Fill Missing Episodes complete: processed ${e.showsProcessed} shows, created ${e.itemsCreated} new items`,
       'cache.prune': (e) => `Prune Block Cache complete: deleted ${e.deletedFiles} files`,
-      'library.backfill_metadata': (e) => `Backfill Metadata complete: enriched ${e.enriched} items`,
+      'library.backfill_metadata': (e) => `Backfill Metadata complete: enriched ${e.enriched ?? 0}, failed ${e.failed ?? 0}, skipped ${e.skipped ?? 0}`,
       'library.push_library': (e) => `Push Library to Seerr complete: movies ${e.moviesPushed}, shows ${e.showsPushed}`,
       'library.search_upgrades': (e) => `Search Quality Upgrades complete: checked ${e.checked}, upgraded ${e.upgraded}, failed ${e.failed}`,
       'library.search_pending': (e) => `Backlog Search complete: processed ${e.processed}, searched ${e.searched}, selected ${e.selected}, failed ${e.failed}`,
@@ -1065,7 +1087,7 @@
     const backgroundTaskResultUpdates: Record<string, { taskId: string; detail: (e: Record<string, unknown>) => string }> = {
       'library.fill_missing_episodes': { taskId: 'fill_missing_episodes', detail: (e) => `processed ${e.showsProcessed} shows, created ${e.itemsCreated} items` },
       'cache.prune': { taskId: 'cache_prune', detail: (e) => `deleted ${e.deletedFiles} files` },
-      'library.backfill_metadata': { taskId: 'backfill_metadata', detail: (e) => `enriched ${e.enriched} items` },
+      'library.backfill_metadata': { taskId: 'backfill_metadata', detail: (e) => `enriched ${e.enriched ?? 0}, failed ${e.failed ?? 0}, skipped ${e.skipped ?? 0}` },
       'library.push_library': { taskId: 'seerr_push_library', detail: (e) => `movies ${e.moviesPushed}, shows ${e.showsPushed}` },
       'library.search_upgrades': { taskId: 'search_upgrades', detail: (e) => `checked ${e.checked}, upgraded ${e.upgraded}, failed ${e.failed}` },
       'library.search_pending': { taskId: 'backlog_search', detail: (e) => `processed ${e.processed}, searched ${e.searched}, selected ${e.selected}, failed ${e.failed}` },
@@ -1141,7 +1163,7 @@
     <!-- INTEGRATIONS -->
     {#if activeTab === 'integrations'}
       {#if draft}
-        <div class="grid-2">
+        <div class="grid-2 integration-pair">
           <Panel title="NZBHydra2" subtitle="Newznab aggregator for NZB indexing.">
             <div class="form-grid">
               <label class="form-field">
@@ -1163,15 +1185,6 @@
               <label class="form-field">
                 <span>Feed Max Results</span>
                 <input type="number" bind:value={draft.nzbhydra2.feedMaxResults} min="0" />
-              </label>
-            </div>
-          </Panel>
-
-          <Panel title="SABnzbd API" subtitle="Download-client access for Sonarr and Radarr.">
-            <div class="form-grid">
-              <label class="form-field">
-                <span>API Key</span>
-                <input type="password" bind:value={draft.sabnzbd.apiKey} placeholder="••••••••" autocomplete="off" />
               </label>
             </div>
           </Panel>
@@ -1242,7 +1255,7 @@
           </Panel>
         </div>
 
-        <div class="grid-2">
+        <div class="grid-2 integration-pair">
           <Panel title="Metadata" subtitle="TMDB and TVDB API keys, language and cache settings.">
             <div class="form-grid">
               <label class="form-field">
@@ -1314,34 +1327,148 @@
           </Panel>
         </div>
 
-        <Panel title="Default Quality Profiles" subtitle="Fallback profiles used when Seerr doesn't specify one.">
-          <div class="form-grid">
-            <label class="form-field">
-              <span>Default Movie Profile</span>
-              <Select.Root type="single" bind:value={draft.library.defaultMovieProfile}>
-                <Select.Trigger class="w-full">{profileOptionLabel(draft.library.defaultMovieProfile)}</Select.Trigger>
-                <Select.Content>
-                  <Select.Item value="">— none —</Select.Item>
-                  {#each profiles as p}
-                    <Select.Item value={p.name}>{p.name}{p.isDefault ? ' (default)' : ''}</Select.Item>
-                  {/each}
-                </Select.Content>
-              </Select.Root>
-            </label>
-            <label class="form-field">
-              <span>Default TV Profile</span>
-              <Select.Root type="single" bind:value={draft.library.defaultTvProfile}>
-                <Select.Trigger class="w-full">{profileOptionLabel(draft.library.defaultTvProfile)}</Select.Trigger>
-                <Select.Content>
-                  <Select.Item value="">— none —</Select.Item>
-                  {#each profiles as p}
-                    <Select.Item value={p.name}>{p.name}{p.isDefault ? ' (default)' : ''}</Select.Item>
-                  {/each}
-                </Select.Content>
-              </Select.Root>
-            </label>
-          </div>
-        </Panel>
+        <div class="grid-2 integration-pair">
+          <Panel title="SABnzbd API" subtitle="Optional download-client access for Sonarr and Radarr.">
+            <div class="sab-api-head">
+              <strong>SABnzbd-compatible endpoint</strong>
+              <label class="toggle-label">
+                <input id="sabnzbd-enabled" type="checkbox" disabled />
+                <span>disabled</span>
+              </label>
+            </div>
+            <div class="webhook-setup">
+              <div class="webhook-setup__header">
+                <Settings2 size={15} />
+                <span>Sonarr / Radarr setup (disabled)</span>
+              </div>
+              <p class="webhook-setup__desc">
+                SABnzbd access remains unavailable until Servarr ownership and zero-copy import behavior are finalized.
+                Setup values below are retained for later use.
+              </p>
+              <ol class="webhook-setup__steps">
+                <li>The endpoint cannot be enabled in this release</li>
+                <li>In Sonarr or Radarr, go to <strong>Settings → Download Clients</strong> and add <strong>SABnzbd</strong></li>
+                <li>Copy <strong>Host</strong> and <strong>Port</strong> below; enable SSL when Drakkar uses HTTPS</li>
+                <li>Enable <strong>Advanced</strong> to reveal <strong>URL Base</strong>, then copy the value below</li>
+                <li>Use category <code>tv</code> for Sonarr or <code>movies</code> for Radarr</li>
+                <li>Token generation and client access remain locked while this integration is disabled</li>
+                <li>Under <strong>Settings → Media Management → Root Folders</strong>, add the matching library path below</li>
+                <li>For same-host Docker Compose, add the volume entry below to both services and recreate their containers</li>
+              </ol>
+              <div class="sab-copy-fields">
+                <div class="sab-copy-field">
+                  <label class="webhook-token-label" for="sab-host">Host</label>
+                  <div class="webhook-url-row">
+                    <input id="sab-host" class="webhook-url sab-copy-input" type="text" value={sabHost} readonly />
+                    <button class="copy-btn" on:click={() => copySABField('host', sabHost)} title="Copy SABnzbd host">
+                      {#if sabCopiedField === 'host'}<Check size={14} />{:else}<Copy size={14} />{/if}
+                    </button>
+                  </div>
+                </div>
+                <div class="sab-copy-field">
+                  <label class="webhook-token-label" for="sab-port">Port</label>
+                  <div class="webhook-url-row">
+                    <input id="sab-port" class="webhook-url sab-copy-input" type="text" value={sabPort} readonly />
+                    <button class="copy-btn" on:click={() => copySABField('port', sabPort)} title="Copy SABnzbd port">
+                      {#if sabCopiedField === 'port'}<Check size={14} />{:else}<Copy size={14} />{/if}
+                    </button>
+                  </div>
+                </div>
+                <div class="sab-copy-field">
+                  <label class="webhook-token-label" for="sab-url-base">URL Base</label>
+                  <div class="webhook-url-row">
+                    <input id="sab-url-base" class="webhook-url sab-copy-input" type="text" value={sabURLBase} readonly />
+                    <button class="copy-btn" on:click={() => copySABField('url-base', sabURLBase)} title="Copy SABnzbd URL Base">
+                      {#if sabCopiedField === 'url-base'}<Check size={14} />{:else}<Copy size={14} />{/if}
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div class="webhook-token-section">
+                <div class="webhook-token-label">API token (required)</div>
+                <button class="copy-btn copy-btn--generate" disabled title="SABnzbd API is unavailable">
+                  Generate API Token
+                </button>
+              </div>
+              <div class="webhook-token-section">
+                <div class="webhook-token-label">Media Manager Root Folders</div>
+                <p class="webhook-setup__desc">
+                  Root Folders are library destinations, not SABnzbd completed-download paths. Add the matching path in
+                  <strong>Settings → Media Management → Root Folders</strong>.
+                </p>
+                <div class="sab-copy-fields">
+                  <div class="sab-copy-field">
+                    <label class="webhook-token-label" for="sab-radarr-root">Radarr Root Folder</label>
+                    <div class="webhook-url-row">
+                      <input id="sab-radarr-root" class="webhook-url sab-copy-input" type="text" value={sabRadarrRootFolder} readonly />
+                      <button class="copy-btn" on:click={() => copySABField('radarr-root', sabRadarrRootFolder)} title="Copy Radarr root folder">
+                        {#if sabCopiedField === 'radarr-root'}<Check size={14} />{:else}<Copy size={14} />{/if}
+                      </button>
+                    </div>
+                  </div>
+                  <div class="sab-copy-field">
+                    <label class="webhook-token-label" for="sab-sonarr-root">Sonarr Root Folder</label>
+                    <div class="webhook-url-row">
+                      <input id="sab-sonarr-root" class="webhook-url sab-copy-input" type="text" value={sabSonarrRootFolder} readonly />
+                      <button class="copy-btn" on:click={() => copySABField('sonarr-root', sabSonarrRootFolder)} title="Copy Sonarr root folder">
+                        {#if sabCopiedField === 'sonarr-root'}<Check size={14} />{:else}<Copy size={14} />{/if}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="webhook-token-section">
+                <div class="webhook-token-label">Docker Compose Volume</div>
+                <p class="webhook-setup__desc">
+                  On the same Docker host, add this entry under <code>volumes:</code> for both Sonarr and Radarr.
+                  Keeping the same container path exposes the library folders and absolute FUSE symlink targets.
+                </p>
+                <div class="sab-copy-field">
+                  <label class="webhook-token-label" for="sab-docker-volume">Volume entry (both services)</label>
+                  <div class="webhook-url-row">
+                    <input id="sab-docker-volume" class="webhook-url sab-copy-input" type="text" value={sabDockerVolume} readonly />
+                    <button class="copy-btn" on:click={() => copySABField('docker-volume', sabDockerVolume)} title="Copy Docker Compose volume">
+                      {#if sabCopiedField === 'docker-volume'}<Check size={14} />{:else}<Copy size={14} />{/if}
+                    </button>
+                  </div>
+                </div>
+                <p class="sab-path-note">
+                  <code>rslave</code> lets FUSE mount changes propagate into each container without propagating container mounts back to the host.
+                  Ensure the Sonarr/Radarr user can write its media folder and traverse the FUSE path.
+                </p>
+              </div>
+            </div>
+          </Panel>
+
+          <Panel title="Default Quality Profiles" subtitle="Fallback profiles used when Seerr doesn't specify one.">
+            <div class="form-grid">
+              <label class="form-field">
+                <span>Default Movie Profile</span>
+                <Select.Root type="single" bind:value={draft.library.defaultMovieProfile}>
+                  <Select.Trigger class="w-full">{profileOptionLabel(draft.library.defaultMovieProfile)}</Select.Trigger>
+                  <Select.Content>
+                    <Select.Item value="">— none —</Select.Item>
+                    {#each profiles as p}
+                      <Select.Item value={p.name}>{p.name}{p.isDefault ? ' (default)' : ''}</Select.Item>
+                    {/each}
+                  </Select.Content>
+                </Select.Root>
+              </label>
+              <label class="form-field">
+                <span>Default TV Profile</span>
+                <Select.Root type="single" bind:value={draft.library.defaultTvProfile}>
+                  <Select.Trigger class="w-full">{profileOptionLabel(draft.library.defaultTvProfile)}</Select.Trigger>
+                  <Select.Content>
+                    <Select.Item value="">— none —</Select.Item>
+                    {#each profiles as p}
+                      <Select.Item value={p.name}>{p.name}{p.isDefault ? ' (default)' : ''}</Select.Item>
+                    {/each}
+                  </Select.Content>
+                </Select.Root>
+              </label>
+            </div>
+          </Panel>
+        </div>
 
         <div class="actions-row">
           <Button kind="primary" on:click={saveSettings} disabled={isBusy('save-settings')}>
@@ -3604,6 +3731,25 @@
     width: 100%;
     min-height: 160px; resize: vertical;
     font-family: 'JetBrains Mono', monospace; font-size: 12px;
+  }
+
+  .integration-pair { align-items: stretch; }
+  .sab-api-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .sab-api-head strong { font-size: 13px; }
+  .sab-copy-fields { display: grid; gap: 12px; }
+  .sab-copy-field { min-width: 0; }
+  .sab-copy-field .webhook-token-label { display: block; margin-bottom: 6px; }
+  .sab-copy-input { cursor: text; }
+  .sab-path-note {
+    margin: 10px 0 0;
+    color: hsl(var(--muted-foreground));
+    font-size: 12px;
+    line-height: 1.55;
   }
 
   /* seerr webhook */

@@ -430,14 +430,10 @@ func TestRejectReleaseCandidateSerializesConcurrentRejection(t *testing.T) {
 // row lock (Postgres locks rows on any write, transactional or not), so a
 // test that merely holds the lock and calls MarkLibrarySearchFailed cannot
 // distinguish the old shape from the fix -- both block identically on the
-// first statement. The actual gap is *between* the two statements, which
-// requires precisely timing a third actor into a nanosecond-scale window
-// that goroutine scheduling alone won't reliably hit. So this test first
-// reproduces the old two-bare-statement shape directly (widening its gap
-// with a short sleep, the same proven technique used elsewhere in this file
-// for this class of bug) to confirm the window is real and would corrupt
-// state, then runs the identical concurrent-writer harness against the
-// actual, fixed MarkLibrarySearchFailed and confirms no corruption results.
+// first statement. The actual gap is *between* the two statements, so this
+// test reproduces the old shape directly and uses a completion barrier to
+// place a concurrent writer inside that gap. It then runs the same writer
+// against the fixed MarkLibrarySearchFailed and confirms no corruption.
 func TestMarkLibrarySearchFailedIsAtomicAcrossBothStatements(t *testing.T) {
 	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -451,8 +447,8 @@ func TestMarkLibrarySearchFailedIsAtomicAcrossBothStatements(t *testing.T) {
 	ctx := context.Background()
 	db := &DB{SQL: sqlDB}
 
-	// concurrentWriterInstallsFreshSelection waits a moment (targeting the
-	// legacy shape's widened gap), then installs a brand new
+	// concurrentWriterInstallsFreshSelection waits briefly so the fixed-shape
+	// subtest can enter its transaction, then installs a brand new
 	// selected_releases row for libID and points queue_items at it --
 	// exactly what FailSelectedReleaseAndPromoteNext does after a fetch
 	// failure promotes the next candidate.
@@ -489,13 +485,8 @@ func TestMarkLibrarySearchFailedIsAtomicAcrossBothStatements(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		installed := make(chan struct{})
-		go concurrentWriterInstallsFreshSelection(libID, rcID, installed)
-
 		// Replicates the pre-fix MarkLibrarySearchFailed body exactly: two
-		// bare, separately-autocommitted statements with a gap between them
-		// (widened here so the concurrent writer above reliably lands in it;
-		// the real pre-fix gap was nanosecond-scale but structurally identical).
+		// bare, separately-autocommitted statements with a gap between them.
 		if _, err := sqlDB.ExecContext(ctx, `
 			update queue_items
 			set state = $2, failure_reason = $3, selected_release_id = null, updated_at = now()
@@ -503,13 +494,16 @@ func TestMarkLibrarySearchFailedIsAtomicAcrossBothStatements(t *testing.T) {
 		); err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(150 * time.Millisecond) // the gap the fix closes
+		// Place the writer inside that gap deterministically. Waiting for its
+		// completion avoids relying on scheduler timing under loaded CI runners.
+		installed := make(chan struct{})
+		go concurrentWriterInstallsFreshSelection(libID, rcID, installed)
+		<-installed
 		if _, err := sqlDB.ExecContext(ctx, `
 			delete from selected_releases where library_item_id = $1`, libID,
 		); err != nil {
 			t.Fatal(err)
 		}
-		<-installed
 
 		var srCount int
 		if err := sqlDB.QueryRowContext(ctx, `select count(*) from selected_releases where library_item_id = $1`, libID).Scan(&srCount); err != nil {

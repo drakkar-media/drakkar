@@ -449,6 +449,9 @@ func (r *repoStub) ClearFailedQueueItems(_ context.Context) (int, error) { retur
 func (r *repoStub) ListMetadataBackfillTargets(_ context.Context) ([]database.MetadataBackfillTarget, error) {
 	return nil, nil
 }
+func (r *repoStub) RecordMetadataRefreshOutcome(_ context.Context, _ int64, _ string, _ database.MetadataRefreshStatus, _ string) error {
+	return nil
+}
 func (r *repoStub) ListShowsWithMissingEpisodes(_ context.Context) ([]database.ShowWithMissingEpisodes, error) {
 	return r.missingShows, nil
 }
@@ -683,6 +686,182 @@ func (tvdbStub) SeriesDetails(ctx context.Context, tvdbID int64) (tvdb.SeriesDet
 	return tvdb.SeriesDetails{Name: "The Bear", Year: 2022, IMDbID: "tt14452776"}, nil
 }
 
+type syncBatchRepo struct {
+	repoStub
+	nextLibraryItemID atomic.Int64
+	tvEnrichCalls     atomic.Int32
+	tvEnriched        chan struct{}
+}
+
+func (r *syncBatchRepo) UpsertMovieRequest(context.Context, string, int64, string, int) (int64, bool, error) {
+	return r.nextLibraryItemID.Add(1), true, nil
+}
+
+func (r *syncBatchRepo) UpsertEpisodeRequest(context.Context, string, int64, int64, string, int, int, int, string) (int64, bool, error) {
+	return r.nextLibraryItemID.Add(1), true, nil
+}
+
+func (r *syncBatchRepo) EnrichTVFull(context.Context, int64, string, database.TVShowEnrichment) error {
+	r.tvEnrichCalls.Add(1)
+	select {
+	case r.tvEnriched <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+type countingBatchTMDB struct {
+	tvCalls atomic.Int32
+}
+
+func (*countingBatchTMDB) Enabled() bool { return true }
+func (*countingBatchTMDB) MovieDetails(context.Context, int64) (tmdb.MovieDetails, error) {
+	return tmdb.MovieDetails{}, nil
+}
+func (c *countingBatchTMDB) TVDetails(context.Context, int64) (tmdb.TVDetails, error) {
+	c.tvCalls.Add(1)
+	return tmdb.TVDetails{Name: "Shared Show", Year: 2026}, nil
+}
+func (*countingBatchTMDB) TVSeasonNumbers(context.Context, int64) ([]int, error) {
+	return nil, nil
+}
+func (*countingBatchTMDB) TVSeason(context.Context, int64, int) (tmdb.TVSeason, error) {
+	return tmdb.TVSeason{}, nil
+}
+
+type blockingMovieTMDB struct {
+	started  chan struct{}
+	finished chan struct{}
+}
+
+func (*blockingMovieTMDB) Enabled() bool { return true }
+func (c *blockingMovieTMDB) MovieDetails(ctx context.Context, _ int64) (tmdb.MovieDetails, error) {
+	close(c.started)
+	<-ctx.Done()
+	close(c.finished)
+	return tmdb.MovieDetails{}, ctx.Err()
+}
+func (*blockingMovieTMDB) TVDetails(context.Context, int64) (tmdb.TVDetails, error) {
+	return tmdb.TVDetails{}, nil
+}
+func (*blockingMovieTMDB) TVSeasonNumbers(context.Context, int64) ([]int, error) {
+	return nil, nil
+}
+func (*blockingMovieTMDB) TVSeason(context.Context, int64, int) (tmdb.TVSeason, error) {
+	return tmdb.TVSeason{}, nil
+}
+
+type boundedMovieTMDB struct {
+	active  atomic.Int32
+	max     atomic.Int32
+	calls   atomic.Int32
+	started chan struct{}
+	release chan struct{}
+}
+
+func (*boundedMovieTMDB) Enabled() bool { return true }
+func (c *boundedMovieTMDB) MovieDetails(ctx context.Context, _ int64) (tmdb.MovieDetails, error) {
+	c.calls.Add(1)
+	active := c.active.Add(1)
+	defer c.active.Add(-1)
+	for {
+		current := c.max.Load()
+		if active <= current || c.max.CompareAndSwap(current, active) {
+			break
+		}
+	}
+	c.started <- struct{}{}
+	select {
+	case <-c.release:
+		return tmdb.MovieDetails{Title: "Bounded Movie"}, nil
+	case <-ctx.Done():
+		return tmdb.MovieDetails{}, ctx.Err()
+	}
+}
+func (*boundedMovieTMDB) TVDetails(context.Context, int64) (tmdb.TVDetails, error) {
+	return tmdb.TVDetails{}, nil
+}
+func (*boundedMovieTMDB) TVSeasonNumbers(context.Context, int64) ([]int, error) {
+	return nil, nil
+}
+func (*boundedMovieTMDB) TVSeason(context.Context, int64, int) (tmdb.TVSeason, error) {
+	return tmdb.TVSeason{}, nil
+}
+
+type metadataOutcomeRepo struct {
+	repoStub
+	targets      []database.MetadataBackfillTarget
+	outcomeReady chan struct{}
+	mu           sync.Mutex
+	movies       []int64
+	shows        []int64
+	outcome      []struct {
+		libraryItemID int64
+		status        database.MetadataRefreshStatus
+		detail        string
+	}
+}
+
+func (r *metadataOutcomeRepo) ListMetadataBackfillTargets(context.Context) ([]database.MetadataBackfillTarget, error) {
+	return append([]database.MetadataBackfillTarget(nil), r.targets...), nil
+}
+
+func (r *metadataOutcomeRepo) EnrichMovieFull(_ context.Context, libraryItemID int64, _ database.MovieEnrichment) error {
+	r.mu.Lock()
+	r.movies = append(r.movies, libraryItemID)
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *metadataOutcomeRepo) EnrichTVFull(_ context.Context, libraryItemID int64, _ string, _ database.TVShowEnrichment) error {
+	r.mu.Lock()
+	r.shows = append(r.shows, libraryItemID)
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *metadataOutcomeRepo) RecordMetadataRefreshOutcome(_ context.Context, libraryItemID int64, _ string, status database.MetadataRefreshStatus, detail string) error {
+	r.mu.Lock()
+	r.outcome = append(r.outcome, struct {
+		libraryItemID int64
+		status        database.MetadataRefreshStatus
+		detail        string
+	}{libraryItemID: libraryItemID, status: status, detail: detail})
+	ready := r.outcomeReady
+	r.mu.Unlock()
+	if ready != nil {
+		select {
+		case ready <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+
+type metadataOutcomeTMDB struct {
+	movieCalls atomic.Int32
+	tvCalls    atomic.Int32
+}
+
+func (*metadataOutcomeTMDB) Enabled() bool { return true }
+func (c *metadataOutcomeTMDB) MovieDetails(_ context.Context, tmdbID int64) (tmdb.MovieDetails, error) {
+	c.movieCalls.Add(1)
+	if tmdbID == 99 {
+		return tmdb.MovieDetails{}, errors.New("provider timeout")
+	}
+	return tmdb.MovieDetails{Title: "Backfill Movie"}, nil
+}
+func (c *metadataOutcomeTMDB) TVDetails(context.Context, int64) (tmdb.TVDetails, error) {
+	c.tvCalls.Add(1)
+	return tmdb.TVDetails{Name: "Backfill Show"}, nil
+}
+func (*metadataOutcomeTMDB) TVSeasonNumbers(context.Context, int64) ([]int, error) {
+	return nil, nil
+}
+func (*metadataOutcomeTMDB) TVSeason(context.Context, int64, int) (tmdb.TVSeason, error) {
+	return tmdb.TVSeason{}, nil
+}
+
 type tmdbFillMissingStub struct{}
 
 func (tmdbFillMissingStub) Enabled() bool { return true }
@@ -813,12 +992,16 @@ func TestSyncRequestsCoalescesOverlappingCalls(t *testing.T) {
 }
 
 func TestSyncRequestsTVDBFallback(t *testing.T) {
-	repo := &repoStub{episodeMetaReady: make(chan struct{}, 1)}
+	repo := &metadataOutcomeRepo{
+		repoStub:     repoStub{episodeMetaReady: make(chan struct{}, 1)},
+		outcomeReady: make(chan struct{}, 1),
+	}
 	service := NewService(repo, seerrStub{requests: []seerr.Request{
 		{ID: 3, Type: "tv", MediaTitle: "The Bear", MediaYear: 2022, TVDBID: 412567, SeasonNumber: 1, EpisodeNumber: 1, EpisodeTitle: "System"},
 	}}, hydraStub{})
 	service.SetTMDBClient(tmdbDisabledStub{})
 	service.SetTVDBClient(tvdbStub{})
+	t.Cleanup(service.Close)
 
 	result, err := service.SyncRequests(context.Background())
 	if err != nil {
@@ -828,9 +1011,15 @@ func TestSyncRequestsTVDBFallback(t *testing.T) {
 		t.Fatalf("unexpected sync result %+v repo=%+v", result, repo)
 	}
 	waitForSignal(t, repo.episodeMetaReady)
+	waitForSignal(t, repo.outcomeReady)
 	_, episodeMeta := repo.metadata()
 	if episodeMeta.tmdbID != 0 || episodeMeta.show != "The Bear" || episodeMeta.imdbID != "tt14452776" || episodeMeta.year != 2022 {
 		t.Fatalf("unexpected episode metadata %+v", episodeMeta)
+	}
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	if len(repo.outcome) != 1 || repo.outcome[0].status != database.MetadataRefreshSkipped {
+		t.Fatalf("TVDB-only fallback outcome = %+v, want skipped rich-metadata refresh", repo.outcome)
 	}
 }
 
@@ -859,6 +1048,179 @@ func TestSyncRequestsSkipsEnrichmentForExistingItems(t *testing.T) {
 	case <-repo.episodeMetaReady:
 		t.Fatal("existing episode was enriched")
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestSyncRequestsBatchesSameShowEnrichment(t *testing.T) {
+	repo := &syncBatchRepo{tvEnriched: make(chan struct{}, 1)}
+	requests := make([]seerr.Request, 12)
+	for i := range requests {
+		requests[i] = seerr.Request{
+			ID:            int64(i + 1),
+			Type:          "tv",
+			MediaTitle:    "Shared Show",
+			MediaYear:     2026,
+			TMDBID:        740001,
+			TVDBID:        840001,
+			SeasonNumber:  1,
+			EpisodeNumber: i + 1,
+			EpisodeTitle:  fmt.Sprintf("Episode %d", i+1),
+		}
+	}
+	client := &countingBatchTMDB{}
+	service := NewService(repo, seerrStub{requests: requests}, hydraStub{})
+	service.SetTMDBClient(client)
+	t.Cleanup(service.Close)
+
+	result, err := service.SyncRequests(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created != len(requests) {
+		t.Fatalf("created = %d, want %d", result.Created, len(requests))
+	}
+	waitForSignal(t, repo.tvEnriched)
+	service.Close()
+	if calls := client.tvCalls.Load(); calls != 1 {
+		t.Fatalf("same-show TMDB lookups = %d, want 1", calls)
+	}
+	if calls := repo.tvEnrichCalls.Load(); calls != 1 {
+		t.Fatalf("same-show repository enrichments = %d, want 1", calls)
+	}
+}
+
+func TestRequestEnrichmentStopsWithServiceLifecycle(t *testing.T) {
+	repo := &syncBatchRepo{tvEnriched: make(chan struct{}, 1)}
+	client := &blockingMovieTMDB{started: make(chan struct{}), finished: make(chan struct{})}
+	service := NewService(repo, seerrStub{requests: []seerr.Request{{
+		ID: 1, Type: "movie", MediaTitle: "Lifecycle Movie", MediaYear: 2026, TMDBID: 750001,
+	}}}, hydraStub{})
+	service.SetTMDBClient(client)
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	service.BindLifecycleContext(lifecycleCtx)
+
+	if _, err := service.SyncRequests(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitForSignal(t, client.started)
+	cancelLifecycle()
+	waitForSignal(t, client.finished)
+
+	closed := make(chan struct{})
+	go func() {
+		service.Close()
+		close(closed)
+	}()
+	waitForSignal(t, closed)
+}
+
+func TestRequestEnrichmentBatchBoundsProviderConcurrency(t *testing.T) {
+	const requestCount = 20
+	repo := &syncBatchRepo{tvEnriched: make(chan struct{}, 1)}
+	requests := make([]seerr.Request, requestCount)
+	for i := range requests {
+		requests[i] = seerr.Request{
+			ID: int64(i + 1), Type: "movie", MediaTitle: fmt.Sprintf("Movie %d", i+1),
+			MediaYear: 2026, TMDBID: int64(760000 + i),
+		}
+	}
+	client := &boundedMovieTMDB{
+		started: make(chan struct{}, requestCount),
+		release: make(chan struct{}),
+	}
+	service := NewService(repo, seerrStub{requests: requests}, hydraStub{})
+	service.SetTMDBClient(client)
+
+	if _, err := service.SyncRequests(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for range tmdbEnrichWorkers {
+		waitForSignal(t, client.started)
+	}
+	select {
+	case <-client.started:
+		t.Fatalf("more than %d provider calls started concurrently", tmdbEnrichWorkers)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(client.release)
+	for range requestCount - tmdbEnrichWorkers {
+		waitForSignal(t, client.started)
+	}
+	service.Close()
+	if calls := client.calls.Load(); calls != requestCount {
+		t.Fatalf("provider calls = %d, want %d", calls, requestCount)
+	}
+	if maximum := client.max.Load(); maximum != tmdbEnrichWorkers {
+		t.Fatalf("maximum provider concurrency = %d, want %d", maximum, tmdbEnrichWorkers)
+	}
+}
+
+func TestBackfillMetadataReportsFailuresAndUsesTypedKeys(t *testing.T) {
+	// Old arithmetic key: 1*1_000_000+2 collided with movie TMDB ID 1_000_002.
+	repo := &metadataOutcomeRepo{targets: []database.MetadataBackfillTarget{
+		{LibraryItemID: 11, MediaType: "movie", TMDBID: 1_000_002},
+		{LibraryItemID: 12, MediaType: "episode", TMDBID: 2, TVDBID: 1, EpisodeTitle: "Pilot"},
+		{LibraryItemID: 13, MediaType: "movie", TMDBID: 99},
+	}}
+	client := &metadataOutcomeTMDB{}
+	service := NewService(repo, nil, hydraStub{})
+	service.SetTMDBClient(client)
+	defer service.Close()
+
+	result, err := service.BackfillMetadata(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ProcessedMovies != 2 || result.ProcessedShows != 1 || result.Enriched != 2 || result.Failed != 1 || result.Skipped != 0 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	if calls := client.movieCalls.Load(); calls != 2 {
+		t.Fatalf("movie lookups = %d, want 2", calls)
+	}
+	if calls := client.tvCalls.Load(); calls != 1 {
+		t.Fatalf("show lookups = %d, want 1; typed key must not collide with movie", calls)
+	}
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	if len(repo.movies) != 1 || len(repo.shows) != 1 {
+		t.Fatalf("successful repository enrichments movies=%v shows=%v", repo.movies, repo.shows)
+	}
+	if len(repo.outcome) != 3 {
+		t.Fatalf("persisted outcomes = %+v, want two successes and one failure", repo.outcome)
+	}
+	statuses := make(map[int64]database.MetadataRefreshStatus, len(repo.outcome))
+	var failureDetail string
+	for _, outcome := range repo.outcome {
+		statuses[outcome.libraryItemID] = outcome.status
+		if outcome.libraryItemID == 13 {
+			failureDetail = outcome.detail
+		}
+	}
+	if statuses[11] != database.MetadataRefreshSucceeded || statuses[12] != database.MetadataRefreshSucceeded || statuses[13] != database.MetadataRefreshFailed || !strings.Contains(failureDetail, "provider timeout") {
+		t.Fatalf("unexpected persisted outcomes: %+v", repo.outcome)
+	}
+}
+
+func TestBackfillMetadataReportsProviderUnavailableAsSkipped(t *testing.T) {
+	repo := &metadataOutcomeRepo{targets: []database.MetadataBackfillTarget{
+		{LibraryItemID: 21, MediaType: "movie", TMDBID: 101},
+		{LibraryItemID: 22, MediaType: "episode", TMDBID: 102, TVDBID: 202},
+	}}
+	service := NewService(repo, nil, hydraStub{})
+	service.SetTMDBClient(tmdbDisabledStub{})
+	defer service.Close()
+
+	result, err := service.BackfillMetadata(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ProcessedMovies != 1 || result.ProcessedShows != 1 || result.Enriched != 0 || result.Failed != 0 || result.Skipped != 2 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+	repo.mu.Lock()
+	defer repo.mu.Unlock()
+	if len(repo.outcome) != 2 || repo.outcome[0].status != database.MetadataRefreshSkipped || repo.outcome[1].status != database.MetadataRefreshSkipped {
+		t.Fatalf("persisted outcomes = %+v, want two skips", repo.outcome)
 	}
 }
 

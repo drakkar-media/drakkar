@@ -101,6 +101,7 @@ type Repository interface {
 	ShouldAttemptSeasonPack(ctx context.Context, tvShowID int64, season int) (bool, error)
 	RecordSeasonPackAttempt(ctx context.Context, tvShowID int64, season int, outcome string) error
 	ListMetadataBackfillTargets(ctx context.Context) ([]database.MetadataBackfillTarget, error)
+	RecordMetadataRefreshOutcome(ctx context.Context, libraryItemID int64, mediaType string, status database.MetadataRefreshStatus, detail string) error
 	ListShowsWithMissingEpisodes(ctx context.Context) ([]database.ShowWithMissingEpisodes, error)
 	EnsureEpisodeLibraryItem(ctx context.Context, tvShowID int64, showTitle string, seasonNum, episodeNum int, episodeTitle, airDate string) (created bool, err error)
 	ListCustomFormats(ctx context.Context) ([]database.CustomFormat, error)
@@ -225,10 +226,18 @@ type Service struct {
 	// wait on it and the DB still avoids an unbounded fan-out.
 	calibrateSem chan struct{}
 
-	// tmdbEnrichSem bounds concurrent background TMDB enrichment goroutines
-	// spawned from SyncRequests/syncSeasonRequest, which otherwise fan out one
-	// goroutine per pending Seerr request with no cap on simultaneous TMDB calls.
+	// tmdbEnrichSem bounds provider calls across request-enrichment batches.
 	tmdbEnrichSem chan struct{}
+
+	// backgroundMu coordinates lifecycle-owned enrichment work. Close prevents
+	// new batches, cancels active provider calls, and waits before the repository
+	// can be closed by the application.
+	backgroundMu      sync.Mutex
+	backgroundCtx     context.Context
+	backgroundCancel  context.CancelFunc
+	backgroundWG      sync.WaitGroup
+	backgroundStarted bool
+	backgroundClosed  bool
 
 	// requestSyncMu guards activeRequestSync. Overlapping scheduler, webhook,
 	// and API syncs share one reconciliation pass instead of repeating Seerr,
@@ -287,6 +296,38 @@ type requestSyncCall struct {
 	done   chan struct{}
 	result SyncResult
 	err    error
+}
+
+type requestMovieEnrichment struct {
+	libraryItemID int64
+	tmdbID        int64
+}
+
+type requestShowEnrichmentKey struct {
+	provider string
+	id       int64
+}
+
+type requestShowEnrichment struct {
+	libraryItemID int64
+	tmdbID        int64
+	tvdbID        int64
+	episodeTitle  string
+	details       *tmdb.TVDetails
+}
+
+// requestEnrichmentBatch collects first-sighting metadata work while Seerr
+// requests are upserted. Provider identities are map keys so many new episodes
+// from one show share one lookup and one show-level repository update.
+type requestEnrichmentBatch struct {
+	movies   map[int64]requestMovieEnrichment
+	shows    map[requestShowEnrichmentKey]requestShowEnrichment
+	tvDetail map[int64]tvDetailResult
+}
+
+type tvDetailResult struct {
+	details tmdb.TVDetails
+	err     error
 }
 
 // SearchResult reports the outcome of a single library item's search: the
@@ -376,6 +417,7 @@ const (
 	asyncCalibrateBudget        = 2 * time.Minute
 	asyncCalibrateWorkers       = 2
 	tmdbEnrichWorkers           = 5
+	requestEnrichmentBudget     = 10 * time.Minute
 	// maxCandidateFailuresBeforeGiveUp bounds how many real NZB fetch
 	// attempts a single release_candidate gets before it's force-blocklisted
 	// as "too_many_failures", regardless of whether its specific failure
@@ -592,6 +634,7 @@ func (d *downloadDispatcher) hasWorkers() bool {
 // hooks, logger) are configured afterward via the Set* methods; the zero
 // values are safe defaults suitable for tests.
 func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service {
+	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
 	return &Service{
 		repo:               repo,
 		seerr:              seerr,
@@ -603,9 +646,79 @@ func NewService(repo Repository, seerr SeerrClient, hydra HydraClient) *Service 
 		dispatchC:          make(chan struct{}, 1),
 		calibrateSem:       make(chan struct{}, asyncCalibrateWorkers),
 		tmdbEnrichSem:      make(chan struct{}, tmdbEnrichWorkers),
+		backgroundCtx:      backgroundCtx,
+		backgroundCancel:   backgroundCancel,
 		recentURLHits:      make(map[string]time.Time),
 		searchAttempts:     make(map[string]searchAttemptRecord),
 	}
+}
+
+// BindLifecycleContext binds future background enrichment batches to parent.
+//
+// Callers must bind before request synchronization starts. Close remains the
+// final ownership barrier and waits for work that observed parent cancellation.
+func (s *Service) BindLifecycleContext(parent context.Context) {
+	if s == nil {
+		return
+	}
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	s.backgroundMu.Lock()
+	if s.backgroundStarted || s.backgroundClosed {
+		s.backgroundMu.Unlock()
+		cancel()
+		return
+	}
+	previousCancel := s.backgroundCancel
+	s.backgroundCtx = ctx
+	s.backgroundCancel = cancel
+	s.backgroundMu.Unlock()
+	if previousCancel != nil {
+		previousCancel()
+	}
+}
+
+// Close cancels lifecycle-owned enrichment and waits for every active batch.
+//
+// No new background batch can start after Close begins, so repository owners
+// may safely close database connections after this method returns.
+func (s *Service) Close() {
+	if s == nil {
+		return
+	}
+	s.backgroundMu.Lock()
+	if !s.backgroundClosed {
+		s.backgroundClosed = true
+		if s.backgroundCancel != nil {
+			s.backgroundCancel()
+		}
+	}
+	s.backgroundMu.Unlock()
+	s.backgroundWG.Wait()
+}
+
+func (s *Service) startBackground(name string, work func(context.Context)) bool {
+	if s == nil || work == nil {
+		return false
+	}
+	s.backgroundMu.Lock()
+	if s.backgroundClosed {
+		s.backgroundMu.Unlock()
+		return false
+	}
+	s.backgroundStarted = true
+	ctx := s.backgroundCtx
+	s.backgroundWG.Add(1)
+	s.backgroundMu.Unlock()
+
+	go func() {
+		defer s.backgroundWG.Done()
+		defer observability.Recover(name)
+		work(ctx)
+	}()
+	return true
 }
 
 // wakeDispatch sends a non-blocking signal to the pending-dispatch loop so it
@@ -806,11 +919,11 @@ func (s *Service) ListRequests(ctx context.Context) ([]database.MediaRequestSumm
 // SyncRequests pulls pending requests from Seerr and upserts a library item
 // for each. Season-level TV requests are expanded into per-episode library
 // items via TMDB (syncSeasonRequest); movie and single-episode requests map
-// to one item each. Metadata enrichment for newly created items runs in
-// background goroutines (bounded by tmdbEnrichSem) so it does not block the
-// sync loop -- items are queued for search immediately and metadata arrives
-// shortly after. Waking the pending-dispatch loop is deferred until after all
-// requests are processed, so a single sync pass triggers at most one wake.
+// to one item each. Newly created items are collected into one lifecycle-owned
+// enrichment batch with fixed workers and one provider lookup per movie/show.
+// Search dispatch remains immediate while metadata arrives asynchronously.
+// Waking the pending-dispatch loop is deferred until after all requests are
+// processed, so a single sync pass triggers at most one wake.
 // Concurrent callers share the active pass; a waiting caller can cancel its
 // own wait without canceling the pass owned by the initiating caller.
 func (s *Service) SyncRequests(ctx context.Context) (result SyncResult, err error) {
@@ -863,11 +976,82 @@ func cloneSyncResult(result SyncResult) SyncResult {
 	return result
 }
 
+func newRequestEnrichmentBatch() *requestEnrichmentBatch {
+	return &requestEnrichmentBatch{
+		movies:   make(map[int64]requestMovieEnrichment),
+		shows:    make(map[requestShowEnrichmentKey]requestShowEnrichment),
+		tvDetail: make(map[int64]tvDetailResult),
+	}
+}
+
+func (b *requestEnrichmentBatch) addMovie(libraryItemID, tmdbID int64) {
+	if b == nil || libraryItemID <= 0 || tmdbID <= 0 {
+		return
+	}
+	if _, exists := b.movies[tmdbID]; !exists {
+		b.movies[tmdbID] = requestMovieEnrichment{libraryItemID: libraryItemID, tmdbID: tmdbID}
+	}
+}
+
+func requestShowKey(tmdbID, tvdbID int64) (requestShowEnrichmentKey, bool) {
+	if tmdbID > 0 {
+		return requestShowEnrichmentKey{provider: "tmdb", id: tmdbID}, true
+	}
+	if tvdbID > 0 {
+		return requestShowEnrichmentKey{provider: "tvdb", id: tvdbID}, true
+	}
+	return requestShowEnrichmentKey{}, false
+}
+
+func (b *requestEnrichmentBatch) addShow(libraryItemID, tmdbID, tvdbID int64, episodeTitle string, details *tmdb.TVDetails) {
+	if b == nil || libraryItemID <= 0 {
+		return
+	}
+	key, ok := requestShowKey(tmdbID, tvdbID)
+	if !ok {
+		return
+	}
+	task, exists := b.shows[key]
+	if !exists {
+		task = requestShowEnrichment{
+			libraryItemID: libraryItemID,
+			tmdbID:        tmdbID,
+			tvdbID:        tvdbID,
+			episodeTitle:  episodeTitle,
+		}
+	} else if task.episodeTitle == "" && strings.TrimSpace(episodeTitle) != "" {
+		// Prefer a representative with an episode title so the same write can
+		// fill that title while updating show-level metadata.
+		task.libraryItemID = libraryItemID
+		task.episodeTitle = episodeTitle
+	}
+	if task.details == nil && details != nil {
+		copyDetails := *details
+		task.details = &copyDetails
+	}
+	b.shows[key] = task
+}
+
+func (b *requestEnrichmentBatch) tvDetails(ctx context.Context, client TMDBClient, tmdbID int64) (tmdb.TVDetails, error) {
+	if cached, ok := b.tvDetail[tmdbID]; ok {
+		return cached.details, cached.err
+	}
+	details, err := client.TVDetails(ctx, tmdbID)
+	b.tvDetail[tmdbID] = tvDetailResult{details: details, err: err}
+	return details, err
+}
+
+func (b *requestEnrichmentBatch) empty() bool {
+	return b == nil || (len(b.movies) == 0 && len(b.shows) == 0)
+}
+
 func (s *Service) syncRequests(ctx context.Context) (SyncResult, error) {
 	requests, err := s.seerr.PendingRequests(ctx)
 	if err != nil {
 		return SyncResult{}, err
 	}
+	enrichment := newRequestEnrichmentBatch()
+	defer s.startRequestEnrichmentBatch(enrichment)
 	result := SyncResult{Seen: len(requests)}
 	for _, request := range requests {
 		switch strings.ToLower(request.Type) {
@@ -876,28 +1060,16 @@ func (s *Service) syncRequests(ctx context.Context) (SyncResult, error) {
 			if err != nil {
 				return result, err
 			}
-			// Enrich in background so TMDB calls don't block the sync loop.
-			// New items get queued for search immediately; metadata arrives shortly after.
 			if created {
 				result.Created++
 				result.CreatedLibraryItemIDs = append(result.CreatedLibraryItemIDs, libraryItemID)
 				s.logger.Info().Str("title", request.MediaTitle).Int("year", request.MediaYear).Int64("libraryItemId", libraryItemID).Msg("request: new movie requested")
-				lid, tmdbID := libraryItemID, request.TMDBID
-				go func() {
-					defer observability.Recover("enrich-movie-request")
-					if s.tmdbEnrichSem != nil {
-						s.tmdbEnrichSem <- struct{}{}
-						defer func() { <-s.tmdbEnrichSem }()
-					}
-					enrichCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					defer cancel()
-					_ = s.enrichMovieRequest(enrichCtx, lid, tmdbID)
-				}()
+				enrichment.addMovie(libraryItemID, request.TMDBID)
 			}
 		case "tv":
 			if len(request.Seasons) > 0 {
 				// Season-level request: expand into per-episode library items via TMDB.
-				created, ids, err := s.syncSeasonRequest(ctx, request)
+				created, ids, err := s.syncSeasonRequest(ctx, request, enrichment)
 				if err != nil {
 					s.logger.Warn().Err(err).Int64("seerrID", request.ID).Msg("seerr sync: season request expand failed")
 					continue
@@ -927,17 +1099,7 @@ func (s *Service) syncRequests(ctx context.Context) (SyncResult, error) {
 				result.Created++
 				result.CreatedLibraryItemIDs = append(result.CreatedLibraryItemIDs, libraryItemID)
 				s.logger.Info().Str("title", request.MediaTitle).Int("season", request.SeasonNumber).Int("episode", request.EpisodeNumber).Int64("libraryItemId", libraryItemID).Msg("request: new episode requested")
-				lid, tmdbID, tvdbID, epTitle := libraryItemID, request.TMDBID, request.TVDBID, request.EpisodeTitle
-				go func() {
-					defer observability.Recover("enrich-episode-request")
-					if s.tmdbEnrichSem != nil {
-						s.tmdbEnrichSem <- struct{}{}
-						defer func() { <-s.tmdbEnrichSem }()
-					}
-					enrichCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					defer cancel()
-					_ = s.enrichEpisodeRequest(enrichCtx, lid, tmdbID, tvdbID, epTitle)
-				}()
+				enrichment.addShow(libraryItemID, request.TMDBID, request.TVDBID, request.EpisodeTitle, nil)
 			}
 		}
 	}
@@ -950,11 +1112,11 @@ func (s *Service) syncRequests(ctx context.Context) (SyncResult, error) {
 // syncSeasonRequest expands a Seerr season-level TV request into per-episode library items.
 // It fetches episode data from TMDB for each requested season and calls UpsertEpisodeRequest
 // for each episode, which is idempotent so re-runs are safe.
-func (s *Service) syncSeasonRequest(ctx context.Context, req seerr.Request) (int, []int64, error) {
+func (s *Service) syncSeasonRequest(ctx context.Context, req seerr.Request, enrichment *requestEnrichmentBatch) (int, []int64, error) {
 	if s.tmdb == nil {
 		return 0, nil, fmt.Errorf("tmdb client unavailable")
 	}
-	details, err := s.tmdb.TVDetails(ctx, req.TMDBID)
+	details, err := enrichment.tvDetails(ctx, s.tmdb, req.TMDBID)
 	if err != nil {
 		return 0, nil, fmt.Errorf("tmdb lookup failed: %w", err)
 	}
@@ -992,23 +1154,145 @@ func (s *Service) syncSeasonRequest(ctx context.Context, req seerr.Request) (int
 			if wasCreated {
 				created++
 				ids = append(ids, lid)
+				enrichment.addShow(lid, req.TMDBID, req.TVDBID, ep.Name, &details)
 			}
 		}
 	}
-	if created > 0 {
-		tmdbID, tvdbID := req.TMDBID, req.TVDBID
+	return created, ids, nil
+}
+
+type requestEnrichmentJob struct {
+	mediaType string
+	movie     requestMovieEnrichment
+	show      requestShowEnrichment
+}
+
+func (b *requestEnrichmentBatch) jobs() []requestEnrichmentJob {
+	jobs := make([]requestEnrichmentJob, 0, len(b.movies)+len(b.shows))
+	movieIDs := make([]int64, 0, len(b.movies))
+	for tmdbID := range b.movies {
+		movieIDs = append(movieIDs, tmdbID)
+	}
+	sort.Slice(movieIDs, func(i, j int) bool { return movieIDs[i] < movieIDs[j] })
+	for _, tmdbID := range movieIDs {
+		jobs = append(jobs, requestEnrichmentJob{mediaType: "movie", movie: b.movies[tmdbID]})
+	}
+
+	showKeys := make([]requestShowEnrichmentKey, 0, len(b.shows))
+	for key := range b.shows {
+		showKeys = append(showKeys, key)
+	}
+	sort.Slice(showKeys, func(i, j int) bool {
+		if showKeys[i].provider != showKeys[j].provider {
+			return showKeys[i].provider < showKeys[j].provider
+		}
+		return showKeys[i].id < showKeys[j].id
+	})
+	for _, key := range showKeys {
+		jobs = append(jobs, requestEnrichmentJob{mediaType: "episode", show: b.shows[key]})
+	}
+	return jobs
+}
+
+// startRequestEnrichmentBatch transfers one completed sync's metadata work to
+// the Service lifecycle. Fixed workers consume the batch, avoiding one
+// detached goroutine per newly created request.
+func (s *Service) startRequestEnrichmentBatch(batch *requestEnrichmentBatch) bool {
+	if batch.empty() {
+		return false
+	}
+	jobs := batch.jobs()
+	return s.startBackground("request-enrichment-batch", func(lifecycleCtx context.Context) {
+		ctx, cancel := context.WithTimeout(lifecycleCtx, requestEnrichmentBudget)
+		defer cancel()
+		s.runRequestEnrichmentJobs(ctx, jobs)
+	})
+}
+
+func (s *Service) runRequestEnrichmentJobs(ctx context.Context, jobs []requestEnrichmentJob) {
+	workerCount := min(tmdbEnrichWorkers, len(jobs))
+	if workerCount == 0 {
+		return
+	}
+	jobCh := make(chan requestEnrichmentJob)
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
 		go func() {
-			defer observability.Recover("enrich-episode-request")
-			if s.tmdbEnrichSem != nil {
-				s.tmdbEnrichSem <- struct{}{}
-				defer func() { <-s.tmdbEnrichSem }()
+			defer workers.Done()
+			for job := range jobCh {
+				if ctx.Err() != nil {
+					return
+				}
+				func() {
+					defer observability.Recover("request-enrichment-worker")
+					s.runRequestEnrichmentJob(ctx, job)
+				}()
 			}
-			enrichCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			_ = s.enrichEpisodeRequest(enrichCtx, ids[0], tmdbID, tvdbID, "")
 		}()
 	}
-	return created, ids, nil
+
+sendJobs:
+	for _, job := range jobs {
+		select {
+		case jobCh <- job:
+		case <-ctx.Done():
+			break sendJobs
+		}
+	}
+	close(jobCh)
+	workers.Wait()
+}
+
+func (s *Service) runRequestEnrichmentJob(ctx context.Context, job requestEnrichmentJob) {
+	if s.tmdbEnrichSem != nil {
+		select {
+		case s.tmdbEnrichSem <- struct{}{}:
+			defer func() { <-s.tmdbEnrichSem }()
+		case <-ctx.Done():
+			return
+		}
+	}
+
+	var (
+		libraryItemID int64
+		err           error
+	)
+	switch job.mediaType {
+	case "movie":
+		libraryItemID = job.movie.libraryItemID
+		err = s.enrichMovieRequest(ctx, libraryItemID, job.movie.tmdbID)
+	case "episode":
+		libraryItemID = job.show.libraryItemID
+		if job.show.details != nil {
+			err = s.persistTVMetadata(ctx, libraryItemID, job.show.episodeTitle, tvShowEnrichmentFromTMDB(job.show.tmdbID, *job.show.details))
+		} else {
+			err = s.enrichEpisodeRequest(ctx, libraryItemID, job.show.tmdbID, job.show.tvdbID, job.show.episodeTitle)
+		}
+	}
+	if err != nil {
+		_ = s.recordMetadataRefreshIssue(ctx, libraryItemID, job.mediaType, err)
+	}
+}
+
+func (s *Service) recordMetadataRefreshIssue(ctx context.Context, libraryItemID int64, mediaType string, enrichmentErr error) error {
+	if enrichmentErr == nil || ctx.Err() != nil {
+		return ctx.Err()
+	}
+	status := database.MetadataRefreshFailed
+	if errors.Is(enrichmentErr, errMetadataProviderUnavailable) {
+		status = database.MetadataRefreshSkipped
+	}
+	if err := s.repo.RecordMetadataRefreshOutcome(ctx, libraryItemID, mediaType, status, enrichmentErr.Error()); err != nil {
+		s.logger.Warn().Err(err).Int64("libraryItemId", libraryItemID).Str("mediaType", mediaType).Msg("metadata enrichment: outcome persistence failed")
+		return err
+	}
+	if status == database.MetadataRefreshSkipped {
+		s.logger.Debug().Int64("libraryItemId", libraryItemID).Str("mediaType", mediaType).Msg("metadata enrichment skipped: provider unavailable")
+		return nil
+	}
+	s.logger.Warn().Err(enrichmentErr).Int64("libraryItemId", libraryItemID).Str("mediaType", mediaType).Msg("metadata enrichment failed")
+	return nil
 }
 
 // ErrSeerrSyncPending is returned by CreateSeerrRequest/CreateSeerrSeasonRequest
@@ -1209,20 +1493,27 @@ func (s *Service) SyncPlexDetectedShows(ctx context.Context) (SyncPlexDetectedRe
 	return result, nil
 }
 
+var errMetadataProviderUnavailable = errors.New("metadata provider unavailable")
+
 // enrichMovieRequest fetches TMDB metadata for a movie and persists it against
-// the library item. It is best-effort: a disabled/unconfigured TMDB client or
-// a failed lookup is treated as a no-op (nil error) rather than surfaced,
-// since metadata enrichment must never block the request sync it runs
-// alongside.
+// the library item. Provider and persistence failures are returned so callers
+// can report and durably classify the attempt.
 func (s *Service) enrichMovieRequest(ctx context.Context, libraryItemID, tmdbID int64) error {
 	if s == nil || s.tmdb == nil || !s.tmdb.Enabled() || tmdbID <= 0 {
-		return nil
+		return errMetadataProviderUnavailable
 	}
 	item, err := s.tmdb.MovieDetails(ctx, tmdbID)
 	if err != nil {
-		return nil
+		return fmt.Errorf("tmdb movie %d: %w", tmdbID, err)
 	}
-	return s.repo.EnrichMovieFull(ctx, libraryItemID, database.MovieEnrichment{
+	if err := s.repo.EnrichMovieFull(ctx, libraryItemID, movieEnrichmentFromTMDB(tmdbID, item)); err != nil {
+		return err
+	}
+	return s.recordMetadataRefreshSuccess(ctx, libraryItemID, "movie")
+}
+
+func movieEnrichmentFromTMDB(tmdbID int64, item tmdb.MovieDetails) database.MovieEnrichment {
+	return database.MovieEnrichment{
 		TMDBID:              tmdbID,
 		Title:               item.Title,
 		OriginalTitle:       item.OriginalTitle,
@@ -1246,54 +1537,89 @@ func (s *Service) enrichMovieRequest(ctx context.Context, libraryItemID, tmdbID 
 		VoteCount:           item.VoteCount,
 		Budget:              item.Budget,
 		Revenue:             item.Revenue,
-	})
+	}
 }
 
 // enrichEpisodeRequest enriches an episode's library item metadata, preferring
 // TMDB when enabled and available; it falls back to TVDB only when TMDB is
 // disabled/unconfigured or its lookup fails.
 func (s *Service) enrichEpisodeRequest(ctx context.Context, libraryItemID, tmdbID, tvdbID int64, episodeTitle string) error {
+	var lookupErrors []error
 	if s != nil && s.tmdb != nil && s.tmdb.Enabled() && tmdbID > 0 {
 		item, err := s.tmdb.TVDetails(ctx, tmdbID)
 		if err == nil {
-			return s.repo.EnrichTVFull(ctx, libraryItemID, episodeTitle, database.TVShowEnrichment{
-				TMDBID:              tmdbID,
-				ShowTitle:           item.Name,
-				OriginalName:        item.OriginalName,
-				Year:                item.Year,
-				FirstAirDate:        item.FirstAirDate,
-				LastAirDate:         item.LastAirDate,
-				IMDbID:              item.IMDbID,
-				Overview:            item.Overview,
-				Tagline:             item.Tagline,
-				Status:              item.Status,
-				ContentRating:       item.ContentRating,
-				OriginalLanguage:    item.OriginalLanguage,
-				Network:             item.Network,
-				EpisodeRunTime:      item.EpisodeRunTime,
-				NumberOfSeasons:     item.NumberOfSeasons,
-				NumberOfEpisodes:    item.NumberOfEpisodes,
-				InProduction:        item.InProduction,
-				PosterURL:           item.PosterURL,
-				BackdropURL:         item.BackdropURL,
-				TrailerURL:          item.TrailerURL,
-				Genres:              item.Genres,
-				AlternativeTitles:   item.AlternativeTitles,
-				ProductionCompanies: item.ProductionCompanies,
-				Popularity:          item.Popularity,
-				VoteAverage:         item.VoteAverage,
-				VoteCount:           item.VoteCount,
-			})
+			return s.persistTVMetadata(ctx, libraryItemID, episodeTitle, tvShowEnrichmentFromTMDB(tmdbID, item))
 		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		lookupErrors = append(lookupErrors, fmt.Errorf("tmdb show %d: %w", tmdbID, err))
 	}
-	if s == nil || s.tvdb == nil || !s.tvdb.Enabled() || tvdbID <= 0 {
-		return nil
+	if s != nil && s.tvdb != nil && s.tvdb.Enabled() && tvdbID > 0 {
+		item, err := s.tvdb.SeriesDetails(ctx, tvdbID)
+		if err == nil {
+			if persistErr := s.repo.EnrichEpisodeMetadata(ctx, libraryItemID, tmdbID, item.Name, item.Year, item.IMDbID, episodeTitle); persistErr != nil {
+				return persistErr
+			}
+			if len(lookupErrors) > 0 {
+				return fmt.Errorf("TMDB rich metadata refresh failed; TVDB fallback applied: %w", errors.Join(lookupErrors...))
+			}
+			return fmt.Errorf("%w: TMDB rich metadata unavailable; TVDB fallback applied", errMetadataProviderUnavailable)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		lookupErrors = append(lookupErrors, fmt.Errorf("tvdb show %d: %w", tvdbID, err))
 	}
-	item, err := s.tvdb.SeriesDetails(ctx, tvdbID)
-	if err != nil {
-		return nil
+	if len(lookupErrors) == 0 {
+		return errMetadataProviderUnavailable
 	}
-	return s.repo.EnrichEpisodeMetadata(ctx, libraryItemID, tmdbID, item.Name, item.Year, item.IMDbID, episodeTitle)
+	return errors.Join(lookupErrors...)
+}
+
+func (s *Service) persistTVMetadata(ctx context.Context, libraryItemID int64, episodeTitle string, enrichment database.TVShowEnrichment) error {
+	if err := s.repo.EnrichTVFull(ctx, libraryItemID, episodeTitle, enrichment); err != nil {
+		return err
+	}
+	return s.recordMetadataRefreshSuccess(ctx, libraryItemID, "episode")
+}
+
+func (s *Service) recordMetadataRefreshSuccess(ctx context.Context, libraryItemID int64, mediaType string) error {
+	if err := s.repo.RecordMetadataRefreshOutcome(ctx, libraryItemID, mediaType, database.MetadataRefreshSucceeded, ""); err != nil {
+		return fmt.Errorf("record metadata refresh success: %w", err)
+	}
+	return nil
+}
+
+func tvShowEnrichmentFromTMDB(tmdbID int64, item tmdb.TVDetails) database.TVShowEnrichment {
+	return database.TVShowEnrichment{
+		TMDBID:              tmdbID,
+		ShowTitle:           item.Name,
+		OriginalName:        item.OriginalName,
+		Year:                item.Year,
+		FirstAirDate:        item.FirstAirDate,
+		LastAirDate:         item.LastAirDate,
+		IMDbID:              item.IMDbID,
+		Overview:            item.Overview,
+		Tagline:             item.Tagline,
+		Status:              item.Status,
+		ContentRating:       item.ContentRating,
+		OriginalLanguage:    item.OriginalLanguage,
+		Network:             item.Network,
+		EpisodeRunTime:      item.EpisodeRunTime,
+		NumberOfSeasons:     item.NumberOfSeasons,
+		NumberOfEpisodes:    item.NumberOfEpisodes,
+		InProduction:        item.InProduction,
+		PosterURL:           item.PosterURL,
+		BackdropURL:         item.BackdropURL,
+		TrailerURL:          item.TrailerURL,
+		Genres:              item.Genres,
+		AlternativeTitles:   item.AlternativeTitles,
+		ProductionCompanies: item.ProductionCompanies,
+		Popularity:          item.Popularity,
+		VoteAverage:         item.VoteAverage,
+		VoteCount:           item.VoteCount,
+	}
 }
 
 // PushPendingToQueue fetches all pending library items and pushes them to the
@@ -5341,14 +5667,22 @@ type BackfillMetadataResult struct {
 	ProcessedShows  int `json:"processedShows"`
 	Enriched        int `json:"enriched"`
 	Failed          int `json:"failed"`
+	Skipped         int `json:"skipped"`
 }
 
-// BackfillMetadata re-fetches TMDB metadata for all movies and TV shows that
-// already have a tmdb_id, filling newly-added columns (tagline, status,
-// content_rating, release_date, trailer_url, etc.). Safe to call repeatedly.
+type metadataBackfillKey struct {
+	mediaType string
+	tmdbID    int64
+	tvdbID    int64
+}
+
+// BackfillMetadata refreshes movies and shows missing optional metadata until
+// one provider response succeeds. Successful responses are not retried solely
+// because optional upstream fields remain empty; failures remain eligible and
+// are counted separately from provider-unavailable skips.
 func (s *Service) BackfillMetadata(ctx context.Context) (BackfillMetadataResult, error) {
-	if s == nil || s.repo == nil || s.tmdb == nil || !s.tmdb.Enabled() {
-		return BackfillMetadataResult{}, nil
+	if s == nil || s.repo == nil {
+		return BackfillMetadataResult{}, fmt.Errorf("metadata repository unavailable")
 	}
 	targets, err := s.repo.ListMetadataBackfillTargets(ctx)
 	if err != nil {
@@ -5356,36 +5690,44 @@ func (s *Service) BackfillMetadata(ctx context.Context) (BackfillMetadataResult,
 	}
 
 	var result BackfillMetadataResult
-	seen := map[int64]bool{}
-	for _, t := range targets { //nolint:govet
+	seen := make(map[metadataBackfillKey]struct{}, len(targets))
+	for _, t := range targets {
 		select {
 		case <-ctx.Done():
 			return result, ctx.Err()
 		default:
 		}
-		if t.MediaType == "movie" {
+		key := metadataBackfillKey{mediaType: t.MediaType, tmdbID: t.TMDBID, tvdbID: t.TVDBID}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		var enrichErr error
+		switch t.MediaType {
+		case "movie":
 			result.ProcessedMovies++
-			if seen[t.TMDBID] {
-				continue
-			}
-			seen[t.TMDBID] = true
-			if err := s.enrichMovieRequest(ctx, t.LibraryItemID, t.TMDBID); err != nil {
-				result.Failed++
-			} else {
-				result.Enriched++
-			}
-		} else {
+			enrichErr = s.enrichMovieRequest(ctx, t.LibraryItemID, t.TMDBID)
+		case "episode", "tv":
 			result.ProcessedShows++
-			key := t.TVDBID*1_000_000 + t.TMDBID
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			if err := s.enrichEpisodeRequest(ctx, t.LibraryItemID, t.TMDBID, t.TVDBID, t.EpisodeTitle); err != nil {
-				result.Failed++
-			} else {
-				result.Enriched++
-			}
+			enrichErr = s.enrichEpisodeRequest(ctx, t.LibraryItemID, t.TMDBID, t.TVDBID, t.EpisodeTitle)
+		default:
+			enrichErr = fmt.Errorf("unsupported metadata media type %q", t.MediaType)
+		}
+		if enrichErr == nil {
+			result.Enriched++
+			continue
+		}
+		if ctx.Err() != nil {
+			return result, ctx.Err()
+		}
+		if errors.Is(enrichErr, errMetadataProviderUnavailable) {
+			result.Skipped++
+		} else {
+			result.Failed++
+		}
+		if err := s.recordMetadataRefreshIssue(ctx, t.LibraryItemID, t.MediaType, enrichErr); err != nil {
+			return result, fmt.Errorf("record metadata refresh outcome for library item %d: %w", t.LibraryItemID, err)
 		}
 	}
 	return result, nil

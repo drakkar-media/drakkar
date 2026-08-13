@@ -17,6 +17,12 @@ import (
 	"github.com/rs/zerolog"
 )
 
+func sabTestAuthenticator(validToken string) func(context.Context, string) bool {
+	return func(_ context.Context, rawToken string) bool {
+		return rawToken == validToken
+	}
+}
+
 // TestHandleAddURLSkipsRecentlyDispatchedURL guards against a real gap found
 // in the 2026-07-17 exhaustive audit: the SABnzbd-compatible addurl endpoint
 // (used by Radarr/Sonarr as a download client) called fetchRemoteURL
@@ -29,7 +35,8 @@ import (
 func TestHandleAddURLSkipsRecentlyDispatchedURL(t *testing.T) {
 	fetchCalls := 0
 	h := &sabHandler{
-		apiKey: "sab-test-key",
+		enabled:           true,
+		authenticateToken: sabTestAuthenticator("sab-test-key"),
 		importFn: func(_ context.Context, _ io.Reader, _, _ string) (string, error) {
 			return "nzo-1", nil
 		},
@@ -69,7 +76,8 @@ func TestHandleAddURLClaimsURLBeforeFetching(t *testing.T) {
 	var claimedURL string
 	fetchCalls := 0
 	h := &sabHandler{
-		apiKey: "sab-test-key",
+		enabled:           true,
+		authenticateToken: sabTestAuthenticator("sab-test-key"),
 		importFn: func(_ context.Context, _ io.Reader, _, _ string) (string, error) {
 			return "nzo-1", nil
 		},
@@ -200,8 +208,9 @@ func TestSABAPIAuthenticationProtectsEveryOperation(t *testing.T) {
 			t.Run(operation.name+"/"+credential.name, func(t *testing.T) {
 				effects := &sabAuthEffects{}
 				h := &sabHandler{
-					apiKey: validKey,
-					repo:   &sabAuthRepository{effects: effects},
+					enabled:           true,
+					authenticateToken: sabTestAuthenticator(validKey),
+					repo:              &sabAuthRepository{effects: effects},
 					importFn: func(context.Context, io.Reader, string, string) (string, error) {
 						effects.imports++
 						return "item-42", nil
@@ -233,7 +242,7 @@ func TestSABAPIAuthenticationProtectsEveryOperation(t *testing.T) {
 	}
 }
 
-func TestSABAPIFailsClosedWithoutConfiguredKey(t *testing.T) {
+func TestSABAPIDisabledByDefault(t *testing.T) {
 	h := &sabHandler{}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/sabnzbd/api?mode=version", nil))
@@ -245,10 +254,23 @@ func TestSABAPIFailsClosedWithoutConfiguredKey(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
 		t.Fatalf("expected valid JSON response, got %q: %v", rec.Body.String(), err)
 	}
+	if response["error"] != "SAB API is disabled" {
+		t.Fatalf("unexpected disabled response: %+v", response)
+	}
+}
+
+func TestSABAPIFailsClosedWithoutTokenValidator(t *testing.T) {
+	h := &sabHandler{enabled: true}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/sabnzbd/api?mode=version", nil))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected status 503, got %d: %s", rec.Code, rec.Body.String())
+	}
 }
 
 func TestSABAPIErrorMessagesAreJSONEncoded(t *testing.T) {
-	h := &sabHandler{apiKey: "sab-test-key"}
+	h := &sabHandler{enabled: true, authenticateToken: sabTestAuthenticator("sab-test-key")}
 	req := httptest.NewRequest(http.MethodGet, "/sabnzbd/api?"+url.Values{
 		"mode":   {`invalid"mode`},
 		"apikey": {"sab-test-key"},
@@ -267,7 +289,8 @@ func TestSABAPIErrorMessagesAreJSONEncoded(t *testing.T) {
 
 func TestSABAPIUploadLimitReturns413(t *testing.T) {
 	h := &sabHandler{
-		apiKey: "sab-test-key",
+		enabled:           true,
+		authenticateToken: sabTestAuthenticator("sab-test-key"),
 		importFn: func(context.Context, io.Reader, string, string) (string, error) {
 			return "", nzb.ErrUploadTooLarge
 		},

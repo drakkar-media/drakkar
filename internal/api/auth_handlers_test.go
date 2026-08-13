@@ -31,6 +31,9 @@ type authUserRepoStub struct {
 	updatePasswordCalls     int
 	createSessionCalls      int
 	createdPasswordHash     string
+	apiTokenHash            string
+	apiTokenExpiresAt       *time.Time
+	touchedAPITokenHash     string
 }
 
 func (s *authUserRepoStub) CountUsers(context.Context) (int, error) {
@@ -98,11 +101,17 @@ func (s *authUserRepoStub) CreateAPIToken(context.Context, int64, string, string
 	return database.APIToken{}, nil
 }
 
-func (s *authUserRepoStub) GetAPITokenByHash(context.Context, string) (int64, string, string, *time.Time, error) {
-	return 0, "", "", nil, sql.ErrNoRows
+func (s *authUserRepoStub) GetAPITokenByHash(_ context.Context, tokenHash string) (int64, string, string, *time.Time, error) {
+	if tokenHash == "" || tokenHash != s.apiTokenHash {
+		return 0, "", "", nil, sql.ErrNoRows
+	}
+	return 1, "admin", "admin", s.apiTokenExpiresAt, nil
 }
 
-func (s *authUserRepoStub) TouchAPITokenUsed(context.Context, string) error { return nil }
+func (s *authUserRepoStub) TouchAPITokenUsed(_ context.Context, tokenHash string) error {
+	s.touchedAPITokenHash = tokenHash
+	return nil
+}
 
 func (s *authUserRepoStub) DeleteAPIToken(context.Context, int64, int64) error { return nil }
 

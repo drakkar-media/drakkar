@@ -452,6 +452,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// NZBHydra2's own host rather than the real indexer), which is the same
 	// LAN-host case as search above; SetLocalHost below carves that out too.
 	workflowSvc := workflow.NewService(db, seerrClient, hydraClient)
+	workflowSvc.BindLifecycleContext(ctx)
+	defer workflowSvc.Close()
 	nzbFetcher := workflow.NewHTTPNZBFetcher(privacyMgr.HTTPClient(60*time.Second), &http.Client{Timeout: 60 * time.Second})
 	nzbFetcher.SetExcludedIndexers(cfg.Privacy.ExcludedIndexers)
 	nzbFetcher.SetLocalHost(hostOf(cfg.NZBHydra2.URL))
@@ -1257,6 +1259,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			Int("processedShows", result.ProcessedShows).
 			Int("enriched", result.Enriched).
 			Int("failed", result.Failed).
+			Int("skipped", result.Skipped).
 			Msg("metadata backfill complete")
 	})
 
