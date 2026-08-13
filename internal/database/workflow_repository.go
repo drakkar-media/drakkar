@@ -4475,24 +4475,16 @@ func (db *DB) EnsureEpisodeLibraryItemsBatch(ctx context.Context, tvShowID int64
 			ON CONFLICT (tv_show_id, season_number, episode_number) DO UPDATE
 			  SET title    = CASE WHEN excluded.title != '' THEN excluded.title ELSE episodes.title END,
 			      air_date = CASE WHEN excluded.air_date IS NOT NULL THEN excluded.air_date ELSE episodes.air_date END
-			RETURNING id
-		),
-		episode_rows AS (
-			SELECT e.id, e.season_number, e.episode_number
-			FROM episodes e
-			JOIN input i
-			  ON i.season_number = e.season_number
-			 AND i.episode_number = e.episode_number
-			WHERE e.tv_show_id = $1
+			RETURNING id, season_number, episode_number
 		),
 		inserted_library AS (
 			INSERT INTO library_items (media_type, episode_id, title, quality_profile_id)
 			SELECT
 				'episode',
 				er.id,
-				format('%s S%02sE%02s', $2, er.season_number, er.episode_number),
+				format('%s S%02sE%02s', $2::text, er.season_number, er.episode_number),
 				$4::bigint
-			FROM episode_rows er
+			FROM upserted_episodes er
 			ON CONFLICT (episode_id) WHERE episode_id IS NOT NULL DO NOTHING
 			RETURNING id, episode_id
 		),
@@ -4503,7 +4495,7 @@ func (db *DB) EnsureEpisodeLibraryItemsBatch(ctx context.Context, tvShowID int64
 				'requested',
 				format('tmdb-ep-%s-%s-%s', $1::bigint, e.season_number, e.episode_number)
 			FROM inserted_library il
-			JOIN episodes e ON e.id = il.episode_id
+			JOIN upserted_episodes e ON e.id = il.episode_id
 			ON CONFLICT (library_item_id) DO UPDATE SET
 				state      = CASE WHEN queue_items.state = 'failed' THEN 'requested' ELSE queue_items.state END,
 				updated_at = CASE WHEN queue_items.state = 'failed' THEN now() ELSE queue_items.updated_at END
