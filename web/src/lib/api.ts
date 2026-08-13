@@ -43,7 +43,10 @@ import type {
   SubtitleProfile,
   ReleaseActionResult,
   DeletedCount,
-  QueuedResult
+  QueuedResult,
+  MediaDeletionResult,
+  BackupInfo,
+  RestoreStatus
 } from '$lib/types';
 
 function baseURL() {
@@ -195,6 +198,8 @@ export const api = {
     request<{ libraryItemId: number; candidateCount: number; selectedReleaseId?: number; items: ReleaseItem[] }>(`/api/library/${libraryItemID}/replacements`, { method: 'POST' }),
   resetLibraryItem: (libraryItemID: number) =>
     request<{ libraryItemId: number }>(`/api/library/${libraryItemID}/reset`, { method: 'POST' }),
+  deleteMedia: (libraryItemID: number) =>
+    request<MediaDeletionResult>(`/api/library/${libraryItemID}`, { method: 'DELETE' }),
   republishLibrary: (libraryItemID: number) =>
     request<{ status: string; libraryItemId: number }>(`/api/library/${libraryItemID}/republish`, { method: 'POST' }),
   restoreRejectedLibrary: (libraryItemID: number) =>
@@ -464,6 +469,22 @@ export const api = {
     }),
   prioritizeTVShowMissing: (tvShowId: number) =>
     request<QueuedResult>(`/api/tv-shows/${tvShowId}/prioritize-missing`, { method: 'POST' }),
+  backups: () => request<{ items: BackupInfo[] }>('/api/system/backups'),
+  createBackup: () => request<BackupInfo>('/api/system/backups', { method: 'POST' }),
+  uploadBackup: (file: File) => {
+    const form = new FormData();
+    form.set('backup', file);
+    return request<BackupInfo>('/api/system/backups/upload', { method: 'POST', body: form });
+  },
+  deleteBackup: (name: string) => request<void>(`/api/system/backups/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  restoreBackup: (name: string) =>
+    request<RestoreStatus>(`/api/system/backups/${encodeURIComponent(name)}/restore`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirmation: name })
+    }),
+  restoreStatus: () => request<RestoreStatus>('/api/system/restore-status'),
+  backupDownloadURL: (name: string) => `${baseURL()}/api/system/backups/${encodeURIComponent(name)}/download`,
   // Auth
   me: () => request<User>('/api/auth/me'),
   // Uses a raw fetch rather than request(): logging out must always clear

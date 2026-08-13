@@ -206,6 +206,16 @@ func (q *dynamicWorkQueue) Push(ctx context.Context, libraryItemID int64, priori
 	}
 }
 
+func (q *dynamicWorkQueue) Remove(ctx context.Context, libraryItemID int64) error {
+	q.mu.RLock()
+	inner := q.inner
+	q.mu.RUnlock()
+	if inner == nil {
+		return nil
+	}
+	return inner.Remove(ctx, libraryItemID)
+}
+
 func (q *dynamicWorkQueue) Depth(ctx context.Context) int64 {
 	q.mu.RLock()
 	inner := q.inner

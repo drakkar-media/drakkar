@@ -118,6 +118,9 @@ type Repository interface {
 	ListTVShowTmdbIDsWithSeasons(ctx context.Context) ([]database.TVShowSeerrInfo, error)
 	ListPublishedDirectNzbSegments(ctx context.Context) ([]database.PublishedDirectNzbSegment, error)
 	TouchQueueItemSearched(ctx context.Context, libraryItemID int64) error
+	DeleteMediaByLibraryItem(ctx context.Context, libraryItemID int64) (database.MediaDeletionRecord, error)
+	ListPendingMediaCleanupJobs(ctx context.Context, limit int) ([]database.MediaCleanupJob, error)
+	RecordMediaCleanupAttempt(ctx context.Context, jobID int64, cleanupErr error) error
 }
 
 // SeerrClient is the subset of Seerr/Overseerr operations the workflow
@@ -128,6 +131,26 @@ type SeerrClient interface {
 	CreateTVSeasonRequest(ctx context.Context, tmdbID int64, seasons []int) error
 	CreateTVSeasonRequestNoWait(ctx context.Context, tmdbID int64, seasons []int) error
 	PartialTVItems(ctx context.Context) ([]seerr.PartialTVItem, error)
+}
+
+type seerrMediaRemover interface {
+	Enabled() bool
+	RemoveMedia(ctx context.Context, mediaType string, tmdbID int64, externalIDs []string) (seerr.RemoveMediaResult, error)
+}
+
+// PlexMediaClient defines account-watchlist removal and server-library refresh
+// operations used after a destructive Drakkar media deletion.
+type PlexMediaClient interface {
+	Enabled() bool
+	RemoveFromWatchlist(ctx context.Context, mediaType string, tmdbID int64) (bool, error)
+	RefreshPathAuto(ctx context.Context, preferredSectionKey, filePath string) error
+}
+
+// JellyfinMediaClient defines the library refresh needed after Drakkar removes
+// media symlinks. Jellyfin has no native watchlist equivalent to clear.
+type JellyfinMediaClient interface {
+	Enabled() bool
+	RefreshLibraries(ctx context.Context) error
 }
 
 // HydraClient is the subset of NZBHydra2 search operations the workflow
@@ -167,11 +190,15 @@ type Service struct {
 	// earlyChecker is called with a single message ID immediately after NZB parsing,
 	// before archive inspection and DB import. A non-nil error rejects the candidate
 	// fast, avoiding expensive segment downloads for expired releases.
-	earlyChecker   func(context.Context, string) error
-	articleChecker func(ctx context.Context, messageID string) error
-	queuePolicy    QueuePolicyProvider
-	indexerLimits  IndexerLimits
-	logger         zerolog.Logger
+	earlyChecker     func(context.Context, string) error
+	articleChecker   func(ctx context.Context, messageID string) error
+	queuePolicy      QueuePolicyProvider
+	indexerLimits    IndexerLimits
+	logger           zerolog.Logger
+	plexMedia        PlexMediaClient
+	jellyfinMedia    JellyfinMediaClient
+	movieLibraryRoot string
+	tvLibraryRoot    string
 	// WorkQueue accepts individual library item IDs for immediate dispatch.
 	// Push items here from webhooks or sync to bypass the 30-min tick.
 	WorkQueue WorkQueuer
@@ -206,6 +233,7 @@ type Service struct {
 	// library item ID (O-05). Keyed by int64 library item ID.
 	searchInflight    sync.Map
 	calibrateInflight sync.Map
+	cleanupInflight   sync.Map
 	recentURLMu       sync.Mutex
 	recentURLHits     map[string]time.Time
 	searchAttemptMu   sync.Mutex
@@ -244,6 +272,11 @@ type Service struct {
 	// database, and detached enrichment work.
 	requestSyncMu     sync.Mutex
 	activeRequestSync *requestSyncCall
+
+	// mediaMutationMu serializes Seerr reconciliation, automated request
+	// creation, and destructive cleanup so no pass can apply a stale upstream
+	// snapshot after deletion.
+	mediaMutationMu sync.Mutex
 }
 
 // WorkQueueStatus reports whether the BullMQ work queue is paused and how
@@ -762,6 +795,15 @@ func (s *Service) SetTVDBClient(client TVDBClient) {
 	s.tvdb = client
 }
 
+// SetMediaRemovalClients configures optional media-server cleanup clients and
+// the owned library roots used to bound destructive filesystem removal.
+func (s *Service) SetMediaRemovalClients(plexClient PlexMediaClient, jellyfinClient JellyfinMediaClient, movieLibraryRoot, tvLibraryRoot string) {
+	s.plexMedia = plexClient
+	s.jellyfinMedia = jellyfinClient
+	s.movieLibraryRoot = filepath.Clean(movieLibraryRoot)
+	s.tvLibraryRoot = filepath.Clean(tvLibraryRoot)
+}
+
 // SetPostImportHook registers a callback invoked after a selected release's
 // NZB has been imported and the queue item created, letting callers trigger
 // downstream processing (e.g. download dispatch) without this package
@@ -968,6 +1010,8 @@ func (s *Service) SyncRequests(ctx context.Context) (result SyncResult, err erro
 		}
 	}()
 
+	s.mediaMutationMu.Lock()
+	defer s.mediaMutationMu.Unlock()
 	return s.syncRequests(ctx)
 }
 
@@ -1472,6 +1516,8 @@ func (s *Service) SyncPlexDetectedShows(ctx context.Context) (SyncPlexDetectedRe
 	if s == nil || s.seerr == nil {
 		return SyncPlexDetectedResult{}, fmt.Errorf("seerr client unavailable")
 	}
+	s.mediaMutationMu.Lock()
+	defer s.mediaMutationMu.Unlock()
 
 	partialItems, err := s.seerr.PartialTVItems(ctx)
 	if err != nil {
@@ -1505,7 +1551,7 @@ func (s *Service) SyncPlexDetectedShows(ctx context.Context) (SyncPlexDetectedRe
 
 	// Import the newly created requests immediately.
 	if result.Requested > 0 {
-		if _, syncErr := s.SyncRequests(ctx); syncErr != nil {
+		if _, syncErr := s.syncRequests(ctx); syncErr != nil {
 			s.logger.Warn().Err(syncErr).Msg("sync plex detected: SyncRequests after request creation failed")
 		}
 	}
@@ -6129,6 +6175,253 @@ func (s *Service) ResetLibraryItem(ctx context.Context, libraryItemID int64) err
 		}
 	}
 	return s.repo.ResetLibraryItemState(ctx, libraryItemID)
+}
+
+// MediaDeletionResult summarizes a destructive movie/show removal. For TV,
+// LibraryItemsDeleted includes every episode. CleanupPending means local data
+// is gone but a durable job will retry one or more external integrations.
+type MediaDeletionResult struct {
+	MediaType             string   `json:"mediaType"`
+	Title                 string   `json:"title"`
+	LibraryItemsDeleted   int      `json:"libraryItemsDeleted"`
+	RequestsDeleted       int64    `json:"requestsDeleted"`
+	SymlinksDeleted       int      `json:"symlinksDeleted"`
+	SubtitlesDeleted      int      `json:"subtitlesDeleted"`
+	SeerrRequestsDeleted  int      `json:"seerrRequestsDeleted"`
+	SeerrWatchlistRemoved bool     `json:"seerrWatchlistRemoved"`
+	PlexWatchlistRemoved  bool     `json:"plexWatchlistRemoved"`
+	CleanupPending        bool     `json:"cleanupPending"`
+	Warnings              []string `json:"warnings,omitempty"`
+}
+
+// MediaCleanupRetryResult reports one durable external-cleanup retry pass.
+type MediaCleanupRetryResult struct {
+	Processed int
+	Completed int
+	Failed    int
+}
+
+type mediaCleanupOutcome struct {
+	seerrRequestsDeleted  int
+	seerrWatchlistRemoved bool
+	plexWatchlistRemoved  bool
+	symlinksDeleted       int
+	subtitlesDeleted      int
+}
+
+// DeleteMedia removes a movie or complete TV show from Drakkar, cancels its
+// active downloads, deletes tracked media/subtitle files, and attempts Seerr,
+// Plex, and Jellyfin cleanup. External failures remain durable and retryable.
+func (s *Service) DeleteMedia(ctx context.Context, libraryItemID int64) (MediaDeletionResult, error) {
+	s.mediaMutationMu.Lock()
+	defer s.mediaMutationMu.Unlock()
+
+	record, err := s.repo.DeleteMediaByLibraryItem(ctx, libraryItemID)
+	if err != nil {
+		return MediaDeletionResult{}, err
+	}
+	for _, selectedReleaseID := range record.SelectedReleaseIDs {
+		if s.downloader != nil {
+			s.downloader.cancel(selectedReleaseID)
+		}
+	}
+
+	result := MediaDeletionResult{
+		MediaType:           record.CleanupJob.MediaType,
+		Title:               record.CleanupJob.Title,
+		LibraryItemsDeleted: len(record.LibraryItemIDs),
+		RequestsDeleted:     record.RequestsDeleted,
+	}
+	if s.WorkQueue != nil {
+		for _, id := range record.LibraryItemIDs {
+			if err := s.WorkQueue.Remove(ctx, id); err != nil {
+				result.Warnings = append(result.Warnings, fmt.Sprintf("remove search job for library item %d: %v", id, err))
+			}
+		}
+	}
+	outcome, cleanupErr, claimed := s.processMediaCleanupJob(ctx, record.CleanupJob)
+	result.SeerrRequestsDeleted = outcome.seerrRequestsDeleted
+	result.SeerrWatchlistRemoved = outcome.seerrWatchlistRemoved
+	result.PlexWatchlistRemoved = outcome.plexWatchlistRemoved
+	result.SymlinksDeleted = outcome.symlinksDeleted
+	result.SubtitlesDeleted = outcome.subtitlesDeleted
+	if !claimed || cleanupErr != nil {
+		result.CleanupPending = true
+		if cleanupErr != nil {
+			result.Warnings = append(result.Warnings, cleanupErr.Error())
+		}
+	}
+	return result, nil
+}
+
+// RetryPendingMediaCleanup retries due Seerr/Plex/Jellyfin cleanup jobs left
+// by prior deletions. Jobs use idempotent upstream operations and persisted
+// exponential backoff, so restarts cannot lose unfinished work.
+func (s *Service) RetryPendingMediaCleanup(ctx context.Context) (MediaCleanupRetryResult, error) {
+	s.mediaMutationMu.Lock()
+	defer s.mediaMutationMu.Unlock()
+
+	jobs, err := s.repo.ListPendingMediaCleanupJobs(ctx, 25)
+	if err != nil {
+		return MediaCleanupRetryResult{}, err
+	}
+	result := MediaCleanupRetryResult{}
+	for _, job := range jobs {
+		_, cleanupErr, claimed := s.processMediaCleanupJob(ctx, job)
+		if !claimed {
+			continue
+		}
+		result.Processed++
+		if cleanupErr != nil {
+			result.Failed++
+			s.logger.Warn().Int64("cleanupJobId", job.ID).Err(cleanupErr).Msg("media cleanup retry failed")
+		} else {
+			result.Completed++
+		}
+	}
+	return result, nil
+}
+
+func (s *Service) processMediaCleanupJob(ctx context.Context, job database.MediaCleanupJob) (mediaCleanupOutcome, error, bool) {
+	if _, loaded := s.cleanupInflight.LoadOrStore(job.ID, struct{}{}); loaded {
+		return mediaCleanupOutcome{}, nil, false
+	}
+	defer s.cleanupInflight.Delete(job.ID)
+
+	var (
+		outcome mediaCleanupOutcome
+		errs    []error
+	)
+	localOutcome, localErr := s.removeDeletedMediaFiles(job)
+	outcome.symlinksDeleted = localOutcome.symlinksDeleted
+	outcome.subtitlesDeleted = localOutcome.subtitlesDeleted
+	if localErr != nil {
+		errs = append(errs, localErr)
+	}
+	if remover, ok := s.seerr.(seerrMediaRemover); ok && remover.Enabled() {
+		removed, err := remover.RemoveMedia(ctx, job.MediaType, job.TMDBID, job.ExternalRequestIDs)
+		outcome.seerrRequestsDeleted = removed.RequestsDeleted
+		outcome.seerrWatchlistRemoved = removed.WatchlistRemoved
+		if err != nil {
+			errs = append(errs, fmt.Errorf("seerr cleanup: %w", err))
+		}
+	}
+	if s.plexMedia != nil && s.plexMedia.Enabled() {
+		removed, err := s.plexMedia.RemoveFromWatchlist(ctx, job.MediaType, job.TMDBID)
+		outcome.plexWatchlistRemoved = removed
+		if err != nil {
+			errs = append(errs, fmt.Errorf("plex watchlist cleanup: %w", err))
+		}
+		for _, dir := range uniqueParentDirectories(job.LibraryPaths) {
+			if err := s.plexMedia.RefreshPathAuto(ctx, "", dir); err != nil {
+				errs = append(errs, fmt.Errorf("plex library refresh %s: %w", dir, err))
+			}
+		}
+	}
+	if s.jellyfinMedia != nil && s.jellyfinMedia.Enabled() {
+		if err := s.jellyfinMedia.RefreshLibraries(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("jellyfin library refresh: %w", err))
+		}
+	}
+	cleanupErr := errors.Join(errs...)
+	if err := s.repo.RecordMediaCleanupAttempt(ctx, job.ID, cleanupErr); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("record cleanup result: %w", err))
+	}
+	return outcome, cleanupErr, true
+}
+
+func (s *Service) removeDeletedMediaFiles(job database.MediaCleanupJob) (mediaCleanupOutcome, error) {
+	root := s.movieLibraryRoot
+	if job.MediaType == "tv" {
+		root = s.tvLibraryRoot
+	}
+	var (
+		outcome mediaCleanupOutcome
+		errs    []error
+	)
+	for _, path := range job.LibraryPaths {
+		removed, err := removeOwnedPath(path, root, true)
+		if err != nil {
+			errs = append(errs, err)
+		} else if removed {
+			outcome.symlinksDeleted++
+		}
+	}
+	for _, path := range job.SubtitlePaths {
+		removed, err := removeOwnedPath(path, root, false)
+		if err != nil {
+			errs = append(errs, err)
+		} else if removed {
+			outcome.subtitlesDeleted++
+		}
+	}
+	paths := append(append([]string{}, job.LibraryPaths...), job.SubtitlePaths...)
+	removeEmptyMediaDirectories(paths, root)
+	return outcome, errors.Join(errs...)
+}
+
+func removeOwnedPath(path, root string, requireSymlink bool) (bool, error) {
+	path = filepath.Clean(strings.TrimSpace(path))
+	root = filepath.Clean(strings.TrimSpace(root))
+	if !pathWithinRoot(path, root) {
+		return false, fmt.Errorf("refusing to remove path outside library root: %s", path)
+	}
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("remove %s: %w", path, err)
+	}
+	if requireSymlink && info.Mode()&os.ModeSymlink == 0 {
+		return false, fmt.Errorf("refusing to remove non-symlink publication: %s", path)
+	}
+	if err := os.Remove(path); err != nil {
+		return false, fmt.Errorf("remove %s: %w", path, err)
+	}
+	return true, nil
+}
+
+func pathWithinRoot(path, root string) bool {
+	if path == "." || root == "." || path == root {
+		return false
+	}
+	rel, err := filepath.Rel(root, path)
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func uniqueParentDirectories(paths []string) []string {
+	seen := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		path = filepath.Clean(strings.TrimSpace(path))
+		if path != "." && path != "" {
+			seen[filepath.Dir(path)] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for dir := range seen {
+		out = append(out, dir)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func removeEmptyMediaDirectories(paths []string, root string) {
+	root = filepath.Clean(strings.TrimSpace(root))
+	dirs := uniqueParentDirectories(paths)
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+	seen := make(map[string]struct{})
+	for _, start := range dirs {
+		for dir := start; pathWithinRoot(dir, root); dir = filepath.Dir(dir) {
+			if _, ok := seen[dir]; ok {
+				continue
+			}
+			seen[dir] = struct{}{}
+			if err := os.Remove(dir); err != nil && !os.IsNotExist(err) {
+				break
+			}
+		}
+	}
 }
 
 // FailAndBlocklistRelease blocklists the given selected release (so it is never

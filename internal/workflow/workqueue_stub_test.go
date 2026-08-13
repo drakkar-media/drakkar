@@ -30,6 +30,13 @@ func (s *workQueueStub) Depth(_ context.Context) int64 {
 	return int64(len(s.items))
 }
 
+func (s *workQueueStub) Remove(_ context.Context, libraryItemID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.items, libraryItemID)
+	return nil
+}
+
 func (s *workQueueStub) Pause(_ context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

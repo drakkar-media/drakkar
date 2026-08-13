@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -79,6 +80,15 @@ func NewClient(cfg config.ServiceConfig) *Client {
 // Name identifies this client for use in service-health and probe reporting.
 func (c *Client) Name() string {
 	return "seerr"
+}
+
+// Enabled reports whether Seerr has both a base URL and API key configured.
+func (c *Client) Enabled() bool {
+	if c == nil {
+		return false
+	}
+	cfg := c.cfg.Load()
+	return cfg != nil && strings.TrimSpace(cfg.baseURL) != "" && strings.TrimSpace(cfg.apiKey) != ""
 }
 
 // Probe checks connectivity to Seerr by calling its status endpoint. It is
@@ -190,6 +200,109 @@ type requestListPayload struct {
 			Status       int `json:"status"`
 		} `json:"seasons"`
 	} `json:"results"`
+}
+
+// RemoveMediaResult summarizes request and watchlist cleanup performed in
+// Seerr for one movie or TV show.
+type RemoveMediaResult struct {
+	RequestsDeleted  int
+	WatchlistRemoved bool
+}
+
+// RemoveMedia deletes every Seerr request matching mediaType/tmdbID plus any
+// request IDs already linked by Drakkar, then removes the current Seerr user's
+// matching watchlist entry. Missing requests/watchlist entries are treated as
+// success so durable cleanup retries remain idempotent.
+func (c *Client) RemoveMedia(ctx context.Context, mediaType string, tmdbID int64, externalIDs []string) (RemoveMediaResult, error) {
+	if !c.Enabled() {
+		return RemoveMediaResult{}, nil
+	}
+	mediaType = strings.ToLower(strings.TrimSpace(mediaType))
+	if mediaType == "episode" || mediaType == "show" {
+		mediaType = "tv"
+	}
+
+	requestIDs := make(map[int64]struct{})
+	for _, externalID := range externalIDs {
+		base := strings.SplitN(strings.TrimSpace(externalID), "-", 2)[0]
+		if id, err := strconv.ParseInt(base, 10, 64); err == nil && id > 0 {
+			requestIDs[id] = struct{}{}
+		}
+	}
+
+	var errs []error
+	if tmdbID > 0 {
+		const pageSize = 5000
+		for skip := 0; ; skip += pageSize {
+			payload, err := c.fetchRequestPage(ctx, skip, pageSize)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("discover matching requests: %w", err))
+				break
+			}
+			for _, item := range payload.Results {
+				if strings.EqualFold(item.Type, mediaType) && item.Media.TMDBID == tmdbID {
+					requestIDs[item.ID] = struct{}{}
+				}
+			}
+			if payload.PageInfo.Results <= skip+pageSize || len(payload.Results) == 0 {
+				break
+			}
+		}
+	}
+
+	ids := make([]int64, 0, len(requestIDs))
+	for id := range requestIDs {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	result := RemoveMediaResult{}
+	for _, id := range ids {
+		removed, err := c.deletePath(ctx, fmt.Sprintf("/api/v1/request/%d", id), "delete request")
+		if err != nil {
+			errs = append(errs, fmt.Errorf("request %d: %w", id, err))
+			continue
+		}
+		if removed {
+			result.RequestsDeleted++
+		}
+	}
+
+	if tmdbID > 0 && (mediaType == "movie" || mediaType == "tv") {
+		watchlistPath := fmt.Sprintf("/api/v1/watchlist/%d?mediaType=%s", tmdbID, url.QueryEscape(mediaType))
+		removed, err := c.deletePath(ctx, watchlistPath, "delete watchlist item")
+		if err != nil {
+			errs = append(errs, err)
+		} else {
+			result.WatchlistRemoved = removed
+		}
+	}
+	return result, errors.Join(errs...)
+}
+
+func (c *Client) deletePath(ctx context.Context, requestPath, operation string) (bool, error) {
+	cfg := c.cfg.Load()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, cfg.baseURL+requestPath, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("X-Api-Key", cfg.apiKey)
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		return false, readErr
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, classifySeerrHTTPError(operation, resp.StatusCode, body)
+	}
+	return true, nil
 }
 
 func (c *Client) fetchRequestPage(ctx context.Context, skip, take int) (requestListPayload, error) {

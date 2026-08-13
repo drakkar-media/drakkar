@@ -5,6 +5,8 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
+FROM postgres:16-bookworm AS postgres-tools
+
 FROM golang:1.26-bookworm AS build
 WORKDIR /src
 COPY go.mod go.sum ./
@@ -24,6 +26,7 @@ COPY --from=frontend /web/build ./internal/frontend/build
 # that plain read-ahead parallelism tuning couldn't fix.
 ENV CGO_ENABLED=1
 RUN go build -tags rapidyenc -o /out/drakkar ./cmd/drakkar
+RUN go build -o /out/drakkar-restore ./cmd/drakkar-restore
 
 FROM debian:bookworm-slim
 # wget is used by the container healthcheck (docker-compose.yml) -- alpine's
@@ -39,10 +42,19 @@ FROM debian:bookworm-slim
 # the only realistic way to get a robust, well-tested container-probing
 # tool without hand-rolling MKV/EBML parsing.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates fuse3 par2 p7zip-full tzdata libstdc++6 wget ffmpeg \
+    ca-certificates fuse3 par2 p7zip-full tzdata libstdc++6 wget ffmpeg libpq5 \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+COPY --from=postgres-tools /usr/lib/postgresql/16/bin/pg_dump /usr/local/bin/pg_dump
+COPY --from=postgres-tools /usr/lib/postgresql/16/bin/pg_restore /usr/local/bin/pg_restore
+COPY --from=postgres-tools /usr/lib/postgresql/16/bin/psql /usr/local/bin/psql
+COPY --from=postgres-tools /usr/lib/postgresql/16/bin/dropdb /usr/local/bin/dropdb
+COPY --from=postgres-tools /usr/lib/postgresql/16/bin/createdb /usr/local/bin/createdb
 COPY --from=build /out/drakkar /app/drakkar
+COPY --from=build /out/drakkar-restore /app/drakkar-restore
 COPY --from=build /src/migrations /app/migrations
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod 0755 /app/docker-entrypoint.sh
+RUN pg_dump --version | grep -q '16\.' && pg_restore --version | grep -q '16\.'
 EXPOSE 8080
-ENTRYPOINT ["/app/drakkar"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]

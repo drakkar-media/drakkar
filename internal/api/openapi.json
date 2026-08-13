@@ -1097,6 +1097,35 @@
         }
       }
     },
+    "/api/library/{id}": {
+      "delete": {
+        "tags": [
+          "Library"
+        ],
+        "summary": "Delete a movie or complete TV show and related requests (admin-only)",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deletion and external-cleanup result"
+          },
+          "403": {
+            "description": "Admin role required"
+          },
+          "404": {
+            "description": "Library item not found"
+          }
+        }
+      }
+    },
     "/api/library/{id}/details": {
       "get": {
         "tags": [
@@ -2311,6 +2340,170 @@
         "responses": {
           "200": {
             "description": "Deleted"
+          }
+        }
+      }
+    },
+    "/api/system/backups": {
+      "get": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "List settings/database backups (admin-only)",
+        "responses": {
+          "200": {
+            "description": "Backup metadata list"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Create a settings/database backup (admin-only)",
+        "responses": {
+          "201": {
+            "description": "Created backup metadata"
+          }
+        }
+      }
+    },
+    "/api/system/backups/upload": {
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Import and validate a backup bundle (admin-only)",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "backup": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                },
+                "required": [
+                  "backup"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Imported backup metadata"
+          }
+        }
+      }
+    },
+    "/api/system/backups/{name}": {
+      "delete": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Delete a backup bundle (admin-only)",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Backup deleted"
+          }
+        }
+      }
+    },
+    "/api/system/backups/{name}/download": {
+      "get": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Download a validated backup bundle (admin-only)",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Uncompressed tar backup",
+            "content": {
+              "application/x-tar": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/system/backups/{name}/restore": {
+      "post": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Stage a validated backup for restore and restart (admin-only)",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "confirmation": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "confirmation"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Restore scheduled"
+          }
+        }
+      }
+    },
+    "/api/system/restore-status": {
+      "get": {
+        "tags": [
+          "Settings"
+        ],
+        "summary": "Get latest restore state (admin-only)",
+        "responses": {
+          "200": {
+            "description": "Restore status"
           }
         }
       }

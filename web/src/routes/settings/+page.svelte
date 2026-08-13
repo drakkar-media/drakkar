@@ -53,6 +53,7 @@
   import ShieldCheck from '@lucide/svelte/icons/shield-check';
   import Upload from '@lucide/svelte/icons/upload';
   import Button from '$lib/components/Button.svelte';
+  import BackupRestorePanel from '$lib/components/BackupRestorePanel.svelte';
   import PageHeader from '$lib/components/PageHeader.svelte';
   import Pagination from '$lib/components/Pagination.svelte';
   import Panel from '$lib/components/Panel.svelte';
@@ -3354,6 +3355,8 @@
             <div class="empty">Loading…</div>
           {/if}
         </Panel>
+
+        <BackupRestorePanel />
       </div>
     {/if}
 

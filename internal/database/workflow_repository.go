@@ -259,6 +259,13 @@ func (db *DB) UpsertMovieRequest(ctx context.Context, externalID string, tmdbID 
 		}
 		locked = true
 	}
+	blocked, err := mediaCleanupBlocksRequest(ctx, tx, "movie", externalID, tmdbID)
+	if err != nil {
+		return 0, false, err
+	}
+	if blocked {
+		return 0, false, nil
+	}
 
 	var movieID int64
 	movieCreated := false
@@ -517,6 +524,13 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 		}
 		locked = true
 	}
+	blocked, err := mediaCleanupBlocksRequest(ctx, tx, "tv", externalID, tmdbID)
+	if err != nil {
+		return 0, false, err
+	}
+	if blocked {
+		return 0, false, nil
+	}
 
 	var showID int64
 	var existingTmdbID int64
@@ -603,6 +617,25 @@ func (db *DB) UpsertEpisodeRequest(ctx context.Context, externalID string, tvdbI
 		db.invalidateCatalogAmbiguityIndex()
 	}
 	return libraryItemID, true, nil
+}
+
+// mediaCleanupBlocksRequest prevents stale Seerr snapshots from recreating
+// media while deletion cleanup is pending. Completed jobs only block request
+// IDs deleted with that job, allowing a later intentional request for the same
+// TMDB item to use its new Seerr ID normally.
+func mediaCleanupBlocksRequest(ctx context.Context, tx *sql.Tx, mediaType, externalID string, tmdbID int64) (bool, error) {
+	var blocked bool
+	err := tx.QueryRowContext(ctx, `
+		select exists (
+			select 1
+			from media_cleanup_jobs
+			where media_type = $1
+			  and (
+			      $2 = any(external_request_ids)
+			      or (completed_at is null and $3::bigint > 0 and tmdb_id = $3::bigint)
+			  )
+		)`, mediaType, externalID, tmdbID).Scan(&blocked)
+	return blocked, err
 }
 
 // TVShowEnrichment carries all enrichable TV show fields from TMDB/TVDB/Seerr.

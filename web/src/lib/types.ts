@@ -540,6 +540,38 @@ export type ReleaseActionResult = {
 // policies, subtitle profiles).
 export type DeletedCount = { deleted: number };
 
+/** Summarizes local deletion plus durable external cleanup state. */
+export type MediaDeletionResult = {
+  mediaType: string;
+  title: string;
+  libraryItemsDeleted: number;
+  requestsDeleted: number;
+  symlinksDeleted: number;
+  subtitlesDeleted: number;
+  seerrRequestsDeleted: number;
+  seerrWatchlistRemoved: boolean;
+  plexWatchlistRemoved: boolean;
+  cleanupPending: boolean;
+  warnings?: string[];
+};
+
+/** Describes one validated settings/database backup bundle. */
+export type BackupInfo = {
+  name: string;
+  createdAt: string;
+  sizeBytes: number;
+  drakkarVersion: string;
+};
+
+/** Tracks staged restore progress across its required process restart. */
+export type RestoreStatus = {
+  state: 'idle' | 'scheduled' | 'restoring' | 'rebuilding' | 'completed' | 'failed' | 'rolled_back' | 'fatal';
+  backupName?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  error?: string;
+};
+
 export type SpeedTestResult = {
   fileName: string;
   fileSizeBytes: number;

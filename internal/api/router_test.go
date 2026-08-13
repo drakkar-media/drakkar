@@ -46,8 +46,43 @@ type workflowStub struct {
 	retry      workflow.QueueRetryResult
 	queueAct   workflow.QueueManageResult
 	queueBulk  workflow.BulkQueueRetryResult
+	deletion   workflow.MediaDeletionResult
+	deleteErr  error
 	importCall *sabImportCall
 	claimURL   func(rawURL string) bool
+}
+
+func TestDeleteMediaRequiresAdminAndReturnsCleanupResult(t *testing.T) {
+	workflowSvc := workflowStub{deletion: workflow.MediaDeletionResult{
+		MediaType:             "tv",
+		Title:                 "Example Show",
+		LibraryItemsDeleted:   12,
+		RequestsDeleted:       2,
+		SeerrWatchlistRemoved: true,
+		PlexWatchlistRemoved:  true,
+	}}
+	router := Router(statusStub{}, nil, workflowSvc, nil, nil, nil, nil, nil, nil, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+
+	forbidden := httptest.NewRecorder()
+	router.ServeHTTP(forbidden, httptest.NewRequest(http.MethodDelete, "/api/library/42", nil))
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf("non-admin delete status = %d, want %d", forbidden.Code, http.StatusForbidden)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/library/42", nil)
+	req = req.WithContext(auth.NewContext(req.Context(), auth.Claims{Role: "admin"}))
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("admin delete status = %d: %s", response.Code, response.Body.String())
+	}
+	var result workflow.MediaDeletionResult
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.MediaType != "tv" || result.LibraryItemsDeleted != 12 || !result.PlexWatchlistRemoved {
+		t.Fatalf("unexpected delete response: %+v", result)
+	}
 }
 
 type sabImportCall struct {
@@ -209,6 +244,9 @@ func (w workflowStub) ManualSearch(_ context.Context, _ string) ([]workflow.Manu
 	return nil, nil
 }
 func (w workflowStub) ResetLibraryItem(_ context.Context, _ int64) error { return nil }
+func (w workflowStub) DeleteMedia(_ context.Context, _ int64) (workflow.MediaDeletionResult, error) {
+	return w.deletion, w.deleteErr
+}
 func (w workflowStub) ResetOrphanedAvailableItems(_ context.Context) (workflow.ResetOrphanedAvailableItemsResult, error) {
 	return workflow.ResetOrphanedAvailableItemsResult{}, nil
 }

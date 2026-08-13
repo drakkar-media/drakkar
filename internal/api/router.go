@@ -191,6 +191,7 @@ type WorkflowService interface {
 	ManualImport(ctx context.Context, libraryItemID int64, title, externalURL, indexerName, resolution string, sizeBytes int64, score int) (workflow.ReleaseActionResult, error)
 	ImportNZBFromPush(ctx context.Context, content io.Reader, filename, mediaType string) (string, error)
 	ResetLibraryItem(ctx context.Context, libraryItemID int64) error
+	DeleteMedia(ctx context.Context, libraryItemID int64) (workflow.MediaDeletionResult, error)
 	ResetOrphanedAvailableItems(ctx context.Context) (workflow.ResetOrphanedAvailableItemsResult, error)
 	PushMissingLibraryItemsToSeerr(ctx context.Context) (workflow.PushMissingToSeerrResult, error)
 	SyncPlexDetectedShows(ctx context.Context) (workflow.SyncPlexDetectedResult, error)
@@ -1626,6 +1627,31 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		publishMutation("library.reset", map[string]any{"libraryItemId": id})
 		respondJSON(w, http.StatusOK, map[string]any{"libraryItemId": id})
 	})
+	r.Delete("/api/library/{id}", requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+		if workflowSvc == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("workflow service not configured"))
+			return
+		}
+		id, ok := parseInt64URLParam(w, r, "id")
+		if !ok {
+			return
+		}
+		result, err := workflowSvc.DeleteMedia(r.Context(), id)
+		if errors.Is(err, sql.ErrNoRows) {
+			respondError(w, http.StatusNotFound, err)
+			return
+		}
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		publishMutation("library.media_deleted", map[string]any{
+			"libraryItemId": id,
+			"mediaType":     result.MediaType,
+			"title":         result.Title,
+		})
+		respondJSON(w, http.StatusOK, result)
+	}))
 	r.Post("/api/releases/{id}/select", func(w http.ResponseWriter, r *http.Request) {
 		if workflowSvc == nil {
 			respondError(w, http.StatusNotImplemented, errors.New("workflow unavailable"))
@@ -2612,6 +2638,9 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		publishMutation("tv_show.monitoring_mode", map[string]any{"tvShowId": id, "mode": body.Mode})
 		respondJSON(w, http.StatusOK, map[string]any{"tvShowId": id, "mode": body.Mode})
 	})
+	if backupService, ok := settingsSvc.(SystemBackupService); ok {
+		registerSystemBackupRoutes(r, backupService)
+	}
 
 	// ── Auth, setup and user management ─────────────────────────────────────────
 	mountSetupRoutes(r, userRepo, requestSecurity)

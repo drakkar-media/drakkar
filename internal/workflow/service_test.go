@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -83,6 +85,10 @@ type repoStub struct {
 	missingShows        []database.ShowWithMissingEpisodes
 	batchCreatedIDs     []int64
 	batchCreatedBatches int
+	mediaDeletion       database.MediaDeletionRecord
+	mediaDeletionErr    error
+	mediaCleanupJobs    []database.MediaCleanupJob
+	mediaCleanupResults []error
 }
 
 func (r *repoStub) ListMediaRequests(ctx context.Context) ([]database.MediaRequestSummary, error) {
@@ -517,6 +523,16 @@ func (r *repoStub) ListPublishedDirectNzbSegments(_ context.Context) ([]database
 func (r *repoStub) TouchQueueItemSearched(_ context.Context, _ int64) error {
 	return nil
 }
+func (r *repoStub) DeleteMediaByLibraryItem(_ context.Context, _ int64) (database.MediaDeletionRecord, error) {
+	return r.mediaDeletion, r.mediaDeletionErr
+}
+func (r *repoStub) ListPendingMediaCleanupJobs(_ context.Context, _ int) ([]database.MediaCleanupJob, error) {
+	return r.mediaCleanupJobs, nil
+}
+func (r *repoStub) RecordMediaCleanupAttempt(_ context.Context, _ int64, cleanupErr error) error {
+	r.mediaCleanupResults = append(r.mediaCleanupResults, cleanupErr)
+	return nil
+}
 func (r *repoStub) CalibrateNZBOffsets(ctx context.Context, id int64) error {
 	if r.calibrateFn != nil {
 		return r.calibrateFn(ctx, id)
@@ -537,6 +553,42 @@ func (s seerrStub) CreateTVSeasonRequestNoWait(_ context.Context, _ int64, _ []i
 	return nil
 }
 func (s seerrStub) PartialTVItems(_ context.Context) ([]seerr.PartialTVItem, error) { return nil, nil }
+
+type cleanupSeerrStub struct {
+	seerrStub
+	calls int
+}
+
+func (s *cleanupSeerrStub) Enabled() bool { return true }
+func (s *cleanupSeerrStub) RemoveMedia(_ context.Context, _ string, _ int64, _ []string) (seerr.RemoveMediaResult, error) {
+	s.calls++
+	return seerr.RemoveMediaResult{RequestsDeleted: 2, WatchlistRemoved: true}, nil
+}
+
+type cleanupPlexStub struct {
+	removeCalls  int
+	refreshPaths []string
+}
+
+func (s *cleanupPlexStub) Enabled() bool { return true }
+func (s *cleanupPlexStub) RemoveFromWatchlist(_ context.Context, _ string, _ int64) (bool, error) {
+	s.removeCalls++
+	return true, nil
+}
+func (s *cleanupPlexStub) RefreshPathAuto(_ context.Context, _ string, path string) error {
+	s.refreshPaths = append(s.refreshPaths, path)
+	return nil
+}
+
+type cleanupJellyfinStub struct {
+	refreshCalls int
+}
+
+func (s *cleanupJellyfinStub) Enabled() bool { return true }
+func (s *cleanupJellyfinStub) RefreshLibraries(_ context.Context) error {
+	s.refreshCalls++
+	return nil
+}
 
 type blockingSeerrStub struct {
 	seerrStub
@@ -4407,5 +4459,101 @@ func TestSearchLibraryTreatsNewItemAsNonUpgradeSearch(t *testing.T) {
 	}
 	if result.SelectedReleaseID == nil {
 		t.Fatalf("expected the fresh candidate to be selected normally, got %+v", result)
+	}
+}
+
+func TestDeleteMediaRemovesTrackedFilesAndExternalRecords(t *testing.T) {
+	repo := &repoStub{}
+	seerrClient := &cleanupSeerrStub{}
+	plexClient := &cleanupPlexStub{}
+	jellyfinClient := &cleanupJellyfinStub{}
+	movieRoot := filepath.Join(t.TempDir(), "movies")
+	tvRoot := filepath.Join(t.TempDir(), "tv")
+	mediaDir := filepath.Join(movieRoot, "Example (2024)")
+	if err := os.MkdirAll(mediaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	symlinkPath := filepath.Join(mediaDir, "Example (2024).mkv")
+	if err := os.Symlink("/virtual/example.mkv", symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+	subtitlePath := filepath.Join(mediaDir, "Example (2024).en.srt")
+	if err := os.WriteFile(subtitlePath, []byte("subtitle"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	job := database.MediaCleanupJob{
+		ID:                 9,
+		MediaType:          "movie",
+		TMDBID:             123,
+		Title:              "Example",
+		ExternalRequestIDs: []string{"41", "42"},
+		LibraryPaths:       []string{symlinkPath},
+		SubtitlePaths:      []string{subtitlePath},
+	}
+	repo.mediaDeletion = database.MediaDeletionRecord{
+		CleanupJob:      job,
+		LibraryItemIDs:  []int64{7},
+		SymlinkPaths:    job.LibraryPaths,
+		SubtitlePaths:   job.SubtitlePaths,
+		RequestsDeleted: 2,
+	}
+
+	service := NewService(repo, seerrClient, nil)
+	defer service.Close()
+	service.SetMediaRemovalClients(plexClient, jellyfinClient, movieRoot, tvRoot)
+	result, err := service.DeleteMedia(context.Background(), 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CleanupPending || result.SymlinksDeleted != 1 || result.SubtitlesDeleted != 1 {
+		t.Fatalf("unexpected deletion result: %+v", result)
+	}
+	if result.SeerrRequestsDeleted != 2 || !result.SeerrWatchlistRemoved || !result.PlexWatchlistRemoved {
+		t.Fatalf("external cleanup missing: %+v", result)
+	}
+	if seerrClient.calls != 1 || plexClient.removeCalls != 1 || len(plexClient.refreshPaths) != 1 || jellyfinClient.refreshCalls != 1 {
+		t.Fatalf("unexpected integration calls: seerr=%d plex=%d paths=%v jellyfin=%d", seerrClient.calls, plexClient.removeCalls, plexClient.refreshPaths, jellyfinClient.refreshCalls)
+	}
+	if len(repo.mediaCleanupResults) != 1 || repo.mediaCleanupResults[0] != nil {
+		t.Fatalf("cleanup job was not completed: %+v", repo.mediaCleanupResults)
+	}
+	for _, path := range []string{symlinkPath, subtitlePath} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("tracked file still exists at %s: %v", path, err)
+		}
+	}
+}
+
+func TestRetryPendingMediaCleanupRefusesRegularPublication(t *testing.T) {
+	repo := &repoStub{}
+	movieRoot := filepath.Join(t.TempDir(), "movies")
+	if err := os.MkdirAll(movieRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mediaPath := filepath.Join(movieRoot, "real-file.mkv")
+	if err := os.WriteFile(mediaPath, []byte("media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	repo.mediaCleanupJobs = []database.MediaCleanupJob{{
+		ID:           10,
+		MediaType:    "movie",
+		LibraryPaths: []string{mediaPath},
+	}}
+
+	service := NewService(repo, seerrStub{}, nil)
+	defer service.Close()
+	service.SetMediaRemovalClients(nil, nil, movieRoot, filepath.Join(t.TempDir(), "tv"))
+	result, err := service.RetryPendingMediaCleanup(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Processed != 1 || result.Failed != 1 || result.Completed != 0 {
+		t.Fatalf("unexpected retry result: %+v", result)
+	}
+	if len(repo.mediaCleanupResults) != 1 || repo.mediaCleanupResults[0] == nil {
+		t.Fatalf("unsafe path did not keep cleanup pending: %+v", repo.mediaCleanupResults)
+	}
+	if _, err := os.Stat(mediaPath); err != nil {
+		t.Fatalf("regular publication was removed: %v", err)
 	}
 }

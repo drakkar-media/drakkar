@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	// registers /debug/pprof/* on http.DefaultServeMux; only ever served on
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"log/slog"
@@ -46,6 +48,7 @@ import (
 	"github.com/drakkar-media/drakkar/internal/stream"
 	"github.com/drakkar-media/drakkar/internal/subdl"
 	"github.com/drakkar-media/drakkar/internal/subtitles"
+	"github.com/drakkar-media/drakkar/internal/systembackup"
 	"github.com/drakkar-media/drakkar/internal/tmdb"
 	"github.com/drakkar-media/drakkar/internal/tvdb"
 	"github.com/drakkar-media/drakkar/internal/workflow"
@@ -153,6 +156,7 @@ type runtimeStatus struct {
 type fileSettingsService struct {
 	path    string
 	mu      sync.Mutex
+	backup  *systembackup.Service
 	applier interface {
 		ApplySettings(ctx context.Context, cfg config.Settings) error
 	}
@@ -205,6 +209,80 @@ func (s *fileSettingsService) UpdateSettings(_ context.Context, cfg config.Setti
 		return config.Settings{}, saveErr
 	}
 	return loaded, nil
+}
+
+// ListBackups returns completed server-side settings/database bundles.
+func (s *fileSettingsService) ListBackups(ctx context.Context) ([]systembackup.BackupInfo, error) {
+	backup, err := s.backupService()
+	if err != nil {
+		return nil, err
+	}
+	return backup.List(ctx)
+}
+
+// CreateBackup creates a new settings/database bundle.
+func (s *fileSettingsService) CreateBackup(ctx context.Context) (systembackup.BackupInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	backup, err := s.backupService()
+	if err != nil {
+		return systembackup.BackupInfo{}, err
+	}
+	return backup.Create(ctx)
+}
+
+// WriteBackupArchive streams a named bundle to dst.
+func (s *fileSettingsService) WriteBackupArchive(ctx context.Context, name string, dst io.Writer) error {
+	backup, err := s.backupService()
+	if err != nil {
+		return err
+	}
+	return backup.WriteArchive(ctx, name, dst)
+}
+
+// ImportBackupArchive validates and installs an uploaded bundle.
+func (s *fileSettingsService) ImportBackupArchive(ctx context.Context, src io.Reader) (systembackup.BackupInfo, error) {
+	backup, err := s.backupService()
+	if err != nil {
+		return systembackup.BackupInfo{}, err
+	}
+	return backup.ImportArchive(ctx, src)
+}
+
+// DeleteBackup removes a completed bundle.
+func (s *fileSettingsService) DeleteBackup(ctx context.Context, name string) error {
+	backup, err := s.backupService()
+	if err != nil {
+		return err
+	}
+	return backup.Delete(ctx, name)
+}
+
+// StageBackupRestore validates a bundle and schedules pre-start restoration.
+func (s *fileSettingsService) StageBackupRestore(ctx context.Context, name string) (systembackup.RestoreStatus, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	backup, err := s.backupService()
+	if err != nil {
+		return systembackup.RestoreStatus{}, err
+	}
+	return backup.StageRestore(ctx, name)
+}
+
+// BackupRestoreStatus returns the latest persisted restore outcome.
+func (s *fileSettingsService) BackupRestoreStatus(ctx context.Context) (systembackup.RestoreStatus, error) {
+	backup, err := s.backupService()
+	if err != nil {
+		return systembackup.RestoreStatus{}, err
+	}
+	return backup.Status(ctx)
+}
+
+func (s *fileSettingsService) backupService() (*systembackup.Service, error) {
+	if s.backup == nil {
+		return nil, errors.New("system backup service unavailable")
+	}
+	return s.backup, nil
 }
 
 // taskScheduleStatusService reports the API's task-schedule view: the
@@ -580,6 +658,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	probeSvc := probe.NewService(probeProviders...)
 	plexClient := plex.NewClient(cfg.Plex.URL, cfg.Plex.Token)
 	jellyfinClient := jellyfin.NewClient(cfg.Jellyfin.URL, cfg.Jellyfin.APIKey)
+	workflowSvc.SetMediaRemovalClients(plexClient, jellyfinClient, rt.MovieLibraryPath, rt.TVLibraryPath)
 	// notifyMediaServers refreshes Plex/Jellyfin for a single library item.
 	// Retries the Plex call a couple of times -- a brief Plex restart/network
 	// blip shouldn't permanently strand an item unnoticed, since nothing else
@@ -743,7 +822,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		readAhead:      db.ReadAhead,
 	}
 
-	server := newBoundedHTTPServer(rt.HTTPAddress, api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, jellyfinClient, &fileSettingsService{path: rt.SettingsPath, applier: liveSettings}, privacyMgr, hydraClient, db, db, metricsColl))
+	backupSvc := systembackup.NewService(rt.SettingsPath, func() {
+		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+	})
+	settingsService := &fileSettingsService{path: rt.SettingsPath, applier: liveSettings, backup: backupSvc}
+	server := newBoundedHTTPServer(rt.HTTPAddress, api.Router(statusSvc, queueSvc, workflowSvc, publicationSvc, maintenanceSvc, cacheSvc, subtitleSvc, blocklistSvc, probeSvc, catalogSvc, broker, db, db.ReadAhead, db, taskScheduleSvc, policySvc, plexClient, jellyfinClient, settingsService, privacyMgr, hydraClient, db, db, metricsColl))
 
 	// Reset queue items that were left in transitional states by a previous crash.
 	if n, err := db.ResetStuckQueueItems(ctx); err != nil {
@@ -827,6 +910,11 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	runQueueHousekeeping := func() {
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		defer cancel()
+		if cleanup, cleanupErr := workflowSvc.RetryPendingMediaCleanup(ctx); cleanupErr != nil {
+			logger.Error().Err(cleanupErr).Msg("monitoring: media cleanup retry error")
+		} else if cleanup.Processed > 0 {
+			logger.Info().Int("completed", cleanup.Completed).Int("failed", cleanup.Failed).Msg("monitoring: media cleanup retry complete")
+		}
 		n, err := db.ResetStaleQueueItems(ctx, 10*time.Minute, 90*time.Minute, 45*time.Minute)
 		if err != nil {
 			logger.Error().Err(err).Msg("monitoring: stale reset error")
@@ -1291,8 +1379,49 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}
 	}()
 	go func() {
-		if err := publicationSvc.RebuildPublications(ctx); err != nil {
-			logger.Error().Err(err).Msg("rebuild publications failed")
+		restoreMarker := filepath.Join(filepath.Dir(rt.SettingsPath), "restore", "rebuild-publications.json")
+		_, markerErr := os.Stat(restoreMarker)
+		if errors.Is(markerErr, os.ErrNotExist) {
+			if err := publicationSvc.RebuildPublications(ctx); err != nil {
+				logger.Error().Err(err).Msg("rebuild publications failed")
+			}
+			return
+		}
+		if markerErr != nil {
+			logger.Error().Err(markerErr).Msg("restore: could not inspect publication rebuild marker")
+			return
+		}
+
+		// A restore clears publication rows before startup. Keep rebuilding every
+		// recoverable selected release until all links and media-server scans
+		// succeed; only then may restore status become completed.
+		for {
+			rebuildErr := publicationSvc.RebuildPublications(ctx)
+			result, pendingErr := publicationSvc.RepublishPendingLibrary(ctx)
+			if rebuildErr == nil && pendingErr == nil && result.Failed == 0 {
+				if plexClient.Enabled() {
+					rebuildErr = plexClient.RefreshSection(ctx, "")
+				}
+				if rebuildErr == nil && jellyfinClient.Enabled() {
+					rebuildErr = jellyfinClient.RefreshLibraries(ctx)
+				}
+				if rebuildErr == nil {
+					if err := systembackup.CompletePublicationRebuild(rt.SettingsPath); err == nil {
+						logger.Info().Int("republished", result.Republished).Msg("restore: symlinks rebuilt and media servers refreshed")
+						return
+					} else {
+						rebuildErr = err
+					}
+				}
+			}
+			logger.Error().Err(errors.Join(rebuildErr, pendingErr)).Int("failed", result.Failed).Msg("restore: publication rebuild incomplete; retrying")
+			timer := time.NewTimer(time.Minute)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 		}
 	}()
 	select {

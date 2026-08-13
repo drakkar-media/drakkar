@@ -379,6 +379,17 @@ func DefaultRuntime() Runtime {
 //     exist (see LoadOrCreate, which handles that case).
 //   - returns a parse or validation error otherwise.
 func Load(path string) (Settings, error) {
+	return load(path, true)
+}
+
+// LoadSnapshot reads, defaults, and validates a settings file without
+// rewriting legacy fields. It is intended for immutable backup snapshots and
+// other validation paths where reading must not change source bytes.
+func LoadSnapshot(path string) (Settings, error) {
+	return load(path, false)
+}
+
+func load(path string, persistMigrations bool) (Settings, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return Settings{}, fmt.Errorf("read settings: %w", err)
@@ -395,7 +406,7 @@ func Load(path string) (Settings, error) {
 	if err := validate(cfg); err != nil {
 		return Settings{}, err
 	}
-	if hadLegacySABSettings {
+	if hadLegacySABSettings && persistMigrations {
 		if err := Save(path, cfg); err != nil {
 			return Settings{}, fmt.Errorf("remove deprecated sabnzbd settings: %w", err)
 		}

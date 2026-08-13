@@ -4,6 +4,7 @@ package plex
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -30,6 +31,7 @@ type plexEndpoint struct {
 type Client struct {
 	endpoint   atomic.Pointer[plexEndpoint]
 	httpClient *http.Client
+	cloudURL   string
 }
 
 // SetConfig atomically replaces the server URL and token used by subsequent
@@ -60,7 +62,10 @@ type TestResult struct {
 // with the given token. Either value may be empty; use SetConfig later to
 // supply them once available, and Enabled to check readiness before use.
 func NewClient(serverURL, token string) *Client {
-	c := &Client{httpClient: &http.Client{Timeout: 15 * time.Second}}
+	c := &Client{
+		httpClient: &http.Client{Timeout: 15 * time.Second},
+		cloudURL:   "https://discover.provider.plex.tv",
+	}
 	c.SetConfig(serverURL, token)
 	return c
 }
@@ -231,6 +236,162 @@ func (c *Client) RefreshPath(ctx context.Context, sectionKey, filePath string) e
 	}
 	endpoint := fmt.Sprintf("/library/sections/%s/refresh?path=%s", sectionKey, url.QueryEscape(filePath))
 	return c.get(ctx, endpoint, nil)
+}
+
+// RemoveFromWatchlist removes a movie or show identified by its TMDB ID from
+// the Plex account watchlist associated with the configured token. Plex's
+// cloud API requires its own rating key, so the method resolves watchlist
+// entries through their provider metadata before issuing the idempotent
+// remove action.
+func (c *Client) RemoveFromWatchlist(ctx context.Context, mediaType string, tmdbID int64) (bool, error) {
+	if !c.Enabled() || tmdbID <= 0 {
+		return false, nil
+	}
+	wantedType := strings.ToLower(strings.TrimSpace(mediaType))
+	if wantedType == "tv" || wantedType == "episode" {
+		wantedType = "show"
+	}
+	if wantedType != "movie" && wantedType != "show" {
+		return false, fmt.Errorf("plex watchlist: unsupported media type %q", mediaType)
+	}
+
+	const pageSize = 100
+	for offset := 0; ; offset += pageSize {
+		path := fmt.Sprintf(
+			"/library/sections/watchlist/all?X-Plex-Container-Start=%d&X-Plex-Container-Size=%d",
+			offset, pageSize,
+		)
+		var page plexWatchlistPage
+		status, err := c.cloudRequest(ctx, http.MethodGet, path, &page)
+		if err != nil {
+			return false, fmt.Errorf("plex watchlist list: %w", err)
+		}
+		if status == http.StatusNotFound {
+			return false, nil
+		}
+		for _, item := range page.MediaContainer.Metadata {
+			matches, err := c.watchlistItemMatches(ctx, item.RatingKey, wantedType, tmdbID)
+			if err != nil {
+				return false, err
+			}
+			if !matches {
+				continue
+			}
+			removePath := "/actions/removeFromWatchlist?ratingKey=" + url.QueryEscape(item.RatingKey)
+			status, err := c.cloudRequest(ctx, http.MethodPut, removePath, nil)
+			if err != nil {
+				return false, fmt.Errorf("plex watchlist remove: %w", err)
+			}
+			if status == http.StatusNotFound {
+				return false, nil
+			}
+			return true, nil
+		}
+		if len(page.MediaContainer.Metadata) == 0 || offset+pageSize >= page.MediaContainer.TotalSize {
+			return false, nil
+		}
+	}
+}
+
+type plexWatchlistPage struct {
+	MediaContainer struct {
+		TotalSize int `json:"totalSize"`
+		Metadata  []struct {
+			RatingKey string `json:"ratingKey"`
+		} `json:"Metadata"`
+	} `json:"MediaContainer"`
+}
+
+type plexCloudMetadata struct {
+	MediaContainer struct {
+		Metadata []struct {
+			Type string `json:"type"`
+			Guid []struct {
+				ID string `json:"id"`
+			} `json:"Guid"`
+		} `json:"Metadata"`
+		Video []struct {
+			Type string `json:"type"`
+			Guid []struct {
+				ID string `json:"id"`
+			} `json:"Guid"`
+		} `json:"Video"`
+	} `json:"MediaContainer"`
+}
+
+func (c *Client) watchlistItemMatches(ctx context.Context, ratingKey, wantedType string, tmdbID int64) (bool, error) {
+	var payload plexCloudMetadata
+	status, err := c.cloudRequest(ctx, http.MethodGet, "/library/metadata/"+url.PathEscape(ratingKey), &payload)
+	if err != nil {
+		return false, fmt.Errorf("plex watchlist metadata %s: %w", ratingKey, err)
+	}
+	if status == http.StatusNotFound {
+		return false, nil
+	}
+	type guidItem struct {
+		mediaType string
+		guids     []string
+	}
+	items := make([]guidItem, 0, len(payload.MediaContainer.Metadata)+len(payload.MediaContainer.Video))
+	for _, item := range payload.MediaContainer.Metadata {
+		entry := guidItem{mediaType: item.Type}
+		for _, guid := range item.Guid {
+			entry.guids = append(entry.guids, guid.ID)
+		}
+		items = append(items, entry)
+	}
+	for _, item := range payload.MediaContainer.Video {
+		entry := guidItem{mediaType: item.Type}
+		for _, guid := range item.Guid {
+			entry.guids = append(entry.guids, guid.ID)
+		}
+		items = append(items, entry)
+	}
+	needle := fmt.Sprintf("tmdb://%d", tmdbID)
+	for _, item := range items {
+		if !strings.EqualFold(item.mediaType, wantedType) {
+			continue
+		}
+		for _, guid := range item.guids {
+			if strings.EqualFold(guid, needle) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func (c *Client) cloudRequest(ctx context.Context, method, requestPath string, out any) (int, error) {
+	e := c.getEndpoint()
+	cloudURL := strings.TrimRight(c.cloudURL, "/")
+	if cloudURL == "" {
+		cloudURL = "https://discover.provider.plex.tv"
+	}
+	req, err := http.NewRequestWithContext(ctx, method, cloudURL+requestPath, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-Plex-Token", e.token)
+	req.Header.Set("X-Plex-Product", "Drakkar")
+	req.Header.Set("X-Plex-Client-Identifier", "drakkar")
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return resp.StatusCode, nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return resp.StatusCode, fmt.Errorf("plex cloud HTTP %d", resp.StatusCode)
+	}
+	if out != nil {
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return resp.StatusCode, err
+		}
+	}
+	return resp.StatusCode, nil
 }
 
 func (c *Client) refreshSection(ctx context.Context, sectionKey string) error {

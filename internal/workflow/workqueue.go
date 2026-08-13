@@ -16,11 +16,23 @@ const bullmqQueueName = "drakkar:search"
 // is backed by BullMQ/Redis; tests can provide a lightweight stub.
 type WorkQueuer interface {
 	Push(ctx context.Context, libraryItemID int64, priority int)
+	Remove(ctx context.Context, libraryItemID int64) error
 	Depth(ctx context.Context) int64
 	Pause(ctx context.Context) error
 	Resume(ctx context.Context) error
 	IsPaused(ctx context.Context) (bool, error)
 	Start(ctx context.Context, fn func(ctx context.Context, libraryItemID int64)) error
+}
+
+// Remove deletes a queued search job for libraryItemID. A locked active job
+// cannot be removed by BullMQ; it is allowed to finish against the now-missing
+// database row and its remove-on-complete policy clears it afterward.
+func (q *WorkQueue) Remove(ctx context.Context, libraryItemID int64) error {
+	err := q.queue.Remove(ctx, fmt.Sprintf("%d", libraryItemID), false)
+	if errors.Is(err, gobullmq.ErrJobLocked) {
+		return nil
+	}
+	return err
 }
 
 type searchJob struct {

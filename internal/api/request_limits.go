@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/drakkar-media/drakkar/internal/config"
+	"github.com/drakkar-media/drakkar/internal/systembackup"
 )
 
 const (
@@ -75,6 +76,8 @@ func requestBodyLimit(r *http.Request, nzbUploadLimit int64) int64 {
 		path == "/api/custom-formats/import",
 		path == "/api/release-block-rules/import":
 		return bulkRequestBodyLimitBytes
+	case path == "/api/system/backups/upload":
+		return systembackup.MaxArchiveBytes + multipartOverheadBytes
 	default:
 		return defaultRequestBodyLimitBytes
 	}

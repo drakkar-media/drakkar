@@ -11,7 +11,7 @@
    * events rather than polling.
    */
   import { page } from '$app/state';
-  import { afterNavigate } from '$app/navigation';
+  import { afterNavigate, goto } from '$app/navigation';
   import Search from '@lucide/svelte/icons/search';
   import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
   import Languages from '@lucide/svelte/icons/languages';
@@ -471,6 +471,18 @@
     });
   }
 
+  async function deleteMedia() {
+    if (!libraryMatch) return;
+    const isShow = !!localDetail?.tvShowId;
+    const scope = isShow ? 'the show, every episode, request, symlink, subtitle, and release record' : 'the movie, request, symlink, subtitle, and release record';
+    if (!confirm(`Delete "${detail?.title ?? 'this media'}"?\n\nThis permanently removes ${scope} from Drakkar and cleans matching Seerr/Plex watchlist data.`)) return;
+    await runAction(() => api.deleteMedia(libraryMatch!.id), {
+      setWorking: (value) => setBusy('delete-media', value),
+      successMessage: (result) => result.cleanupPending ? 'Media deleted; external cleanup will retry automatically' : 'Media and related requests deleted',
+      afterSuccess: async () => { await goto('/library'); }
+    });
+  }
+
   async function runRepublish() {
     if (!libraryMatch) return;
     await runAction(() => api.republishLibrary(libraryMatch!.id), {
@@ -622,8 +634,12 @@
                 Republish
               </Button>
               <Button kind="ghost" on:click={() => resetItem(libraryMatch!.id, detail?.title ?? 'this item')} disabled={isBusy(`reset-${libraryMatch.id}`)}>
-                <Trash2 size={15} />
+                <RotateCcw size={15} />
                 Reset
+              </Button>
+              <Button kind="danger" on:click={deleteMedia} disabled={isBusy('delete-media')}>
+                <Trash2 size={15} />
+                Delete
               </Button>
             {/if}
             <a class="inline-flex h-8 items-center justify-center rounded-lg bg-secondary px-2.5 text-sm font-medium text-secondary-foreground no-underline transition-colors hover:bg-secondary/80" href="/search">Back To Search</a>
@@ -1139,4 +1155,3 @@
     </div>
   </div>
 {/if}
-

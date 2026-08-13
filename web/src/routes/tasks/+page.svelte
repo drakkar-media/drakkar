@@ -21,6 +21,7 @@
   import PageHeader from '$lib/components/PageHeader.svelte';
   import Panel from '$lib/components/Panel.svelte';
   import Button from '$lib/components/Button.svelte';
+  import BackupRestorePanel from '$lib/components/BackupRestorePanel.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
   import * as Table from '$lib/components/ui/table/index.js';
   import { toastError, toastSuccess } from '$lib/toast';
@@ -286,3 +287,7 @@
     </Table.Body>
   </Table.Root>
 </Panel>
+
+<div class="mt-5">
+  <BackupRestorePanel />
+</div>

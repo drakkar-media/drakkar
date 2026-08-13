@@ -95,3 +95,64 @@ func TestPendingRequestsClassifiesCloudflareHTML(t *testing.T) {
 		t.Fatalf("unexpected error %q", got)
 	}
 }
+
+func TestRemoveMediaDeletesLinkedAndDiscoveredRequests(t *testing.T) {
+	var deleted []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Api-Key") != "secret" {
+			http.Error(w, "missing API key", http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/request":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"pageInfo":{"results":3,"pageSize":5000,"page":1},"results":[{"id":18,"type":"tv","media":{"tmdbId":900}},{"id":19,"type":"tv","media":{"tmdbId":901}},{"id":20,"type":"movie","media":{"tmdbId":900}}]}`))
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/v1/request/"):
+			deleted = append(deleted, r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/watchlist/900":
+			if r.URL.Query().Get("mediaType") != "tv" {
+				http.Error(w, "wrong media type", http.StatusBadRequest)
+				return
+			}
+			deleted = append(deleted, r.URL.RequestURI())
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(config.ServiceConfig{URL: server.URL, APIKey: "secret"})
+	result, err := client.RemoveMedia(context.Background(), "episode", 900, []string{"17-s1e1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequestsDeleted != 2 || !result.WatchlistRemoved {
+		t.Fatalf("unexpected cleanup result: %+v", result)
+	}
+	want := []string{"/api/v1/request/17", "/api/v1/request/18", "/api/v1/watchlist/900?mediaType=tv"}
+	if strings.Join(deleted, ",") != strings.Join(want, ",") {
+		t.Fatalf("unexpected delete calls: %v", deleted)
+	}
+}
+
+func TestRemoveMediaTreatsMissingUpstreamDataAsSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"pageInfo":{"results":0},"results":[]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	client := NewClient(config.ServiceConfig{URL: server.URL, APIKey: "secret"})
+	result, err := client.RemoveMedia(context.Background(), "movie", 12, []string{"77"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.RequestsDeleted != 0 || result.WatchlistRemoved {
+		t.Fatalf("unexpected cleanup result: %+v", result)
+	}
+}
