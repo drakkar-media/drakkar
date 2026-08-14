@@ -3026,6 +3026,14 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		return nil, nil
 	}
 
+	if _, err = tx.ExecContext(ctx, `
+		update library_items
+		set available = false
+		where id = $1`, libraryItemID,
+	); err != nil {
+		return nil, fmt.Errorf("fail/mark-unavailable (li=%d): %w", libraryItemID, err)
+	}
+
 	// Buffer candidate metadata, close its rows, then look up only the derived
 	// blocklist keys. Closing rows before the lookup and later writes matters:
 	// pgx holds the connection lock for an active result reader.

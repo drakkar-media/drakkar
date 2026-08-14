@@ -329,3 +329,37 @@ func TestFailSelectedReleaseAndPromoteNextSkipsBlocklistedSibling(t *testing.T) 
 		t.Fatal("expected blocklisted candidate to be marked rejected")
 	}
 }
+
+func TestFailSelectedReleaseAndPromoteNextMarksActiveItemUnavailable(t *testing.T) {
+	db, sqlDB, ctx := openBlocklistTestDB(t)
+	libID := setupRaceTestLibraryItem(t, ctx, sqlDB, "fail-active-available", "selected")
+	t.Cleanup(func() {
+		_, _ = sqlDB.ExecContext(context.Background(), `delete from library_items where id = $1`, libID)
+	})
+	if _, err := sqlDB.ExecContext(ctx, `update library_items set available = true where id = $1`, libID); err != nil {
+		t.Fatal(err)
+	}
+	_, selectedReleaseID := attachSelectedBlocklistTestCandidate(t, ctx, sqlDB, libID, "fail-active-available")
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into release_candidates (library_item_id, title, external_url, indexer_name, score)
+		values ($1, 'Replacement Release', 'fail-active-available-replacement-url', 'test-indexer', 100)`, libID,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := db.FailSelectedReleaseAndPromoteNext(ctx, selectedReleaseID, "strict health: broken media")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary == nil {
+		t.Fatal("expected replacement candidate to be promoted")
+	}
+
+	var available bool
+	if err := sqlDB.QueryRowContext(ctx, `select available from library_items where id = $1`, libID).Scan(&available); err != nil {
+		t.Fatal(err)
+	}
+	if available {
+		t.Fatal("expected item to be unavailable until the replacement is published")
+	}
+}
