@@ -1,6 +1,6 @@
 module github.com/drakkar-media/drakkar
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/bodgit/sevenzip v1.5.1
