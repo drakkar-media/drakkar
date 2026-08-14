@@ -151,6 +151,12 @@ func isTransientHealthCheckErr(err error) bool {
 		return false
 	}
 	if errors.Is(err, errContainerHeaderUnreadable) {
+		lower := strings.ToLower(msg)
+		if strings.Contains(lower, "range outside file") ||
+			strings.Contains(lower, "short fetch") ||
+			strings.Contains(lower, "read header: eof") {
+			return false
+		}
 		return true
 	}
 	return strings.Contains(msg, "i/o timeout") || strings.Contains(msg, "provider circuit open")

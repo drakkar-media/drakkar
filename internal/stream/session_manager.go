@@ -25,10 +25,13 @@ import (
 // whether the ceiling is actually the provider's own account-level
 // bandwidth cap (in which case this won't help).
 const (
-	defaultMaxReadAheadParallelism  = 4
-	absoluteMaxReadAheadParallelism = 60
-	minReadAheadParallelism         = 1
-	defaultArticleBufferSize        = 40
+	defaultMaxReadAheadParallelism        = 4
+	absoluteMaxReadAheadParallelism       = 60
+	minReadAheadParallelism               = 1
+	defaultArticleBufferSize              = 40
+	highBitrateFileSizeThreshold    int64 = 2 << 30
+	highBitrateMinReadAheadBytes    int64 = 128 << 20
+	highBitrateMaxArticleBufferSize       = 256
 
 	// readAheadRampWindows is how many read-ahead windows a session ramps up
 	// over before reaching its full per-stream parallelism share. Added
@@ -455,7 +458,7 @@ func (m *ReadAheadManager) schedule(sessionID string, offset int64) {
 	if remaining := spans[len(spans)-1].End - offset; remaining < window {
 		window = remaining
 	}
-	articleLimit := m.articleLimit
+	articleLimit := adaptiveArticleLimit(spans, offset, window, m.articleLimit, session.meta.FileSizeBytes >= highBitrateFileSizeThreshold)
 	ranges, err := resolveRange(spans, offset, window, articleLimit)
 	if err != nil || len(ranges) == 0 {
 		m.mu.Unlock()
@@ -543,4 +546,43 @@ func (m *ReadAheadManager) schedule(sessionID string, offset int64) {
 		}
 		m.mu.Unlock()
 	}()
+}
+
+func adaptiveArticleLimit(spans []SegmentSpan, offset, window int64, configuredLimit int, highBitrate bool) int {
+	if configuredLimit <= 0 {
+		configuredLimit = defaultArticleBufferSize
+	}
+	if !highBitrate || window <= 0 || configuredLimit >= highBitrateMaxArticleBufferSize {
+		return configuredLimit
+	}
+	target := highBitrateMinReadAheadBytes
+	if window < target {
+		target = window
+	}
+	requestEnd := offset + target
+	if requestEnd < offset {
+		return configuredLimit
+	}
+	count := 0
+	cursor := offset
+	for _, span := range spans {
+		if span.End <= cursor {
+			continue
+		}
+		if span.Start > cursor {
+			break
+		}
+		count++
+		if span.End >= requestEnd || count >= highBitrateMaxArticleBufferSize {
+			break
+		}
+		cursor = span.End
+	}
+	if count < configuredLimit {
+		return configuredLimit
+	}
+	if count > highBitrateMaxArticleBufferSize {
+		return highBitrateMaxArticleBufferSize
+	}
+	return count
 }

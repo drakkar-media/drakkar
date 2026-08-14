@@ -3,6 +3,9 @@ package app
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
+	"io"
 	"os"
 	"testing"
 
@@ -93,4 +96,19 @@ func TestReadContainerHeaderDirectReadsFromBackendNotFilesystem(t *testing.T) {
 			t.Fatalf("expected a definitive rejection (real bytes read, wrong magic number), not a transient/retryable error, got: %v", err)
 		}
 	})
+}
+
+func TestContainerHeaderBackendEOFIsDefinitiveHealthFailure(t *testing.T) {
+	err := fmt.Errorf("%w: read header: %w", errContainerHeaderUnreadable, io.EOF)
+	if isTransientHealthCheckErr(err) {
+		t.Fatalf("expected backend EOF to be definitive after header retries, got transient: %v", err)
+	}
+	err = fmt.Errorf("%w: read header: range outside file", errContainerHeaderUnreadable)
+	if isTransientHealthCheckErr(err) {
+		t.Fatalf("expected backend range outside file to be definitive after header retries, got transient: %v", err)
+	}
+	err = fmt.Errorf("%w: %w", errContainerHeaderUnreadable, context.Canceled)
+	if !errors.Is(err, errContainerHeaderUnreadable) || !isTransientHealthCheckErr(err) {
+		t.Fatalf("expected cancellation to remain transient, got: %v", err)
+	}
 }

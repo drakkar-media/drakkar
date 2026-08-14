@@ -401,6 +401,29 @@ func TestReadAheadManagerCapsArticleBuffer(t *testing.T) {
 	}
 }
 
+func TestAdaptiveArticleLimitExpandsLargeStreams(t *testing.T) {
+	const spanSize = int64(398336)
+	spans := make([]SegmentSpan, 500)
+	for i := range spans {
+		spans[i] = SegmentSpan{
+			SegmentID: int64(i + 1),
+			MessageID: fmt.Sprintf("<msg%d>", i+1),
+			Start:     int64(i) * spanSize,
+			End:       int64(i+1) * spanSize,
+		}
+	}
+	got := adaptiveArticleLimit(spans, 0, 512<<20, 40, true)
+	if got <= 40 {
+		t.Fatalf("expected large stream article limit above configured 40, got %d", got)
+	}
+	if got > highBitrateMaxArticleBufferSize {
+		t.Fatalf("expected article limit capped at %d, got %d", highBitrateMaxArticleBufferSize, got)
+	}
+	if got := adaptiveArticleLimit(spans, 0, 512<<20, 40, false); got != 40 {
+		t.Fatalf("expected normal stream to keep configured 40 article limit, got %d", got)
+	}
+}
+
 // TestRegisterMetaStopsStaleSessionForSameVirtualFile guards a real
 // production incident (2026-08-10): a seek opens a brand-new WebDAV
 // GET/Range request (and thus a brand-new session) while the old one is
