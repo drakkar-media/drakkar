@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"strconv"
 	"testing"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -114,5 +115,86 @@ func TestTrendingLibraryStateMergesMovieAndTV(t *testing.T) {
 	}
 	if tvCards[0].Available {
 		t.Error("expected tracked TV card (episode not yet available) to report Available=false")
+	}
+}
+
+func TestTVCardsPreferOfficialEpisodeTotalOverGhostRows(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &database.DB{SQL: sqlDB}
+	svc := NewService(db, nil)
+
+	var tvShowID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into tv_shows (title, tmdb_id, number_of_episodes)
+		values ('ghost-row-complete-show', 990001004, 2)
+		returning id`,
+	).Scan(&tvShowID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from tv_shows where id = $1`, tvShowID)
+
+	for episodeNumber := 1; episodeNumber <= 3; episodeNumber++ {
+		var episodeID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into episodes (tv_show_id, season_number, episode_number, title)
+			values ($1, 1, $2, $3)
+			returning id`, tvShowID, episodeNumber, "episode",
+		).Scan(&episodeID); err != nil {
+			t.Fatal(err)
+		}
+		available := episodeNumber <= 2
+		state := database.QueueAvailable
+		failureReason := ""
+		if !available {
+			state = database.QueueFailed
+			failureReason = "no_releases"
+		}
+		var libID int64
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into library_items (media_type, title, episode_id, available)
+			values ('episode', 'ghost-row-complete-show', $1, $2)
+			returning id`, episodeID, available,
+		).Scan(&libID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqlDB.ExecContext(ctx, `
+			insert into queue_items (library_item_id, state, failure_reason, idempotency_key)
+			values ($1, $2, $3, $4)`, libID, state, failureReason, "ghost-row-complete-show-"+strconv.Itoa(episodeNumber),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cards, err := svc.ListLibraryCards(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *MediaCard
+	for i := range cards {
+		if cards[i].TVShowID == tvShowID {
+			found = &cards[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("expected complete show card")
+	}
+	if !found.Available {
+		t.Fatalf("expected show to remain available despite failed ghost row, got queue state %q", found.QueueState)
+	}
+	if found.AvailableCount != 2 || found.MissingCount != 0 {
+		t.Fatalf("expected 2/2 availability, got available=%d missing=%d", found.AvailableCount, found.MissingCount)
+	}
+	if found.QueueState != string(database.QueueAvailable) {
+		t.Fatalf("expected queue state available, got %q", found.QueueState)
 	}
 }

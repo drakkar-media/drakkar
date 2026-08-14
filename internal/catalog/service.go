@@ -466,9 +466,9 @@ func (s *Service) movieCards(ctx context.Context) ([]MediaCard, error) {
 // across all of a show's episode-level library_items and queue_items rows.
 // availableEpisodes/totalEpisodes drive the "x/y episodes" badge, preferring
 // TMDB's number_of_episodes as the total when known since our own tracked
-// episode rows may be incomplete; queueRank picks the single most relevant
-// queue state across all of a show's episodes (an active download outranks a
-// failure, which outranks a pending request).
+// episode rows may be incomplete or polluted by old ghost rows; queueRank picks
+// the single most relevant queue state across all of a show's episodes (an
+// active download outranks a failure, which outranks a pending request).
 func (s *Service) tvCards(ctx context.Context) ([]MediaCard, error) {
 	rows, err := s.db.SQL.QueryContext(ctx, `
 		select
@@ -484,13 +484,14 @@ func (s *Service) tvCards(ctx context.Context) ([]MediaCard, error) {
 			coalesce(tv.poster_url, ''),
 			coalesce(tv.backdrop_url, ''),
 			-- available_episodes: specific episodes we have in the library.
-			-- total_episodes: use TMDB's number_of_episodes from tv_shows (the real total),
-			-- falling back to our tracked count when TMDB count is not available.
+			-- total_episodes: use TMDB's number_of_episodes from tv_shows
+			-- when known, falling back to our tracked count only when
+			-- metadata has no official total.
 			count(distinct case when li.available and e.season_number > 0 and e.episode_number > 0 then li.id end) as available_episodes,
-			greatest(
-			    count(distinct case when e.season_number > 0 and e.episode_number > 0 then li.id end),
-			    coalesce(max(tv.number_of_episodes), 0)
-			) as total_episodes,
+			case
+			    when coalesce(max(tv.number_of_episodes), 0) > 0 then coalesce(max(tv.number_of_episodes), 0)
+			    else count(distinct case when e.season_number > 0 and e.episode_number > 0 then li.id end)
+			end as total_episodes,
 			max(q.selected_release_id) as selected_release_id,
 			max(
 				case
@@ -546,11 +547,10 @@ func (s *Service) tvCards(ctx context.Context) ([]MediaCard, error) {
 			value := selected.Int64
 			item.SelectedReleaseID = &value
 		}
-		item.AvailableCount = availableEpisodes
-		item.MissingCount = totalEpisodes - availableEpisodes
+		applyEpisodeCounts(&item, availableEpisodes, totalEpisodes)
 		if totalEpisodes > 0 {
 			// We have specific season/episode items — use their count
-			item.Available = availableEpisodes == totalEpisodes
+			item.Available = item.AvailableCount == totalEpisodes
 		} else {
 			// Only a whole-show placeholder exists — fall back to its available flag
 			item.Available = queueRank == 0 && item.SelectedReleaseID != nil
@@ -629,10 +629,10 @@ func (s *Service) trendingLibraryState(ctx context.Context, mediaType string, tm
 			tv.tmdb_id,
 			max(li.requested_at),
 			count(distinct case when li.available and e.season_number > 0 and e.episode_number > 0 then li.id end),
-			greatest(
-			    count(distinct case when e.season_number > 0 and e.episode_number > 0 then li.id end),
-			    coalesce(max(tv.number_of_episodes), 0)
-			),
+			case
+			    when coalesce(max(tv.number_of_episodes), 0) > 0 then coalesce(max(tv.number_of_episodes), 0)
+			    else count(distinct case when e.season_number > 0 and e.episode_number > 0 then li.id end)
+			end,
 			max(q.selected_release_id),
 			max(
 				case
@@ -669,10 +669,9 @@ func (s *Service) trendingLibraryState(ctx context.Context, mediaType string, tm
 			value := selected.Int64
 			item.SelectedReleaseID = &value
 		}
-		item.AvailableCount = availableEpisodes
-		item.MissingCount = totalEpisodes - availableEpisodes
+		applyEpisodeCounts(&item, availableEpisodes, totalEpisodes)
 		if totalEpisodes > 0 {
-			item.Available = availableEpisodes == totalEpisodes
+			item.Available = item.AvailableCount == totalEpisodes
 		} else {
 			item.Available = queueRank == 0 && item.SelectedReleaseID != nil
 		}
@@ -680,6 +679,18 @@ func (s *Service) trendingLibraryState(ctx context.Context, mediaType string, tm
 		out[tmdbID] = item
 	}
 	return out, rows.Err()
+}
+
+func applyEpisodeCounts(item *MediaCard, availableEpisodes, totalEpisodes int) {
+	if totalEpisodes > 0 && availableEpisodes > totalEpisodes {
+		availableEpisodes = totalEpisodes
+	}
+	missingEpisodes := totalEpisodes - availableEpisodes
+	if missingEpisodes < 0 {
+		missingEpisodes = 0
+	}
+	item.AvailableCount = availableEpisodes
+	item.MissingCount = missingEpisodes
 }
 
 // mergeTrendingLibraryState overlays local library state onto TMDB-sourced
