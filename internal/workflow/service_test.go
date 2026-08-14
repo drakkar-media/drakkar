@@ -3086,6 +3086,31 @@ func TestShouldDispatchSelectedTargetBlocksRecentlyDispatchedSameURL(t *testing.
 	}
 }
 
+func TestClaimURLForFetchPersistedCollisionDoesNotExtendMemoryCooldown(t *testing.T) {
+	ctx := context.Background()
+	rawURL := "http://example/persisted-collision.nzb"
+	repo := &repoStub{persistedDispatchedURLs: map[string]bool{rawURL: true}}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+	if !service.ClaimURLForFetch(ctx, rawURL) {
+		t.Fatal("expected persisted collision to skip fetch")
+	}
+
+	repo.persistedDispatchedURLsMu.Lock()
+	delete(repo.persistedDispatchedURLs, rawURL)
+	repo.persistedDispatchedURLsMu.Unlock()
+
+	target := database.PendingLibrarySearchTarget{
+		LibraryItemID:     42,
+		SelectedReleaseID: 303,
+		ExternalURL:       rawURL,
+		State:             database.QueueSelected,
+		UpdatedAt:         time.Now(),
+	}
+	if !service.shouldDispatchSelectedTarget(target, time.Now()) {
+		t.Fatal("expected dispatch once persisted guard expires; in-memory guard must not be polluted by skipped fetch")
+	}
+}
+
 // TestShouldDispatchSelectedTargetAppliesPerItemBackoffOnRepeatedFailure
 // guards the 2026-08-10 production fix: promoteNextAfterFailure gives a
 // failing item a brand new selected_release_id (and therefore a brand new,

@@ -2085,6 +2085,24 @@ func (s *Service) claimURLInMemory(rawURL string, now time.Time) bool {
 	return hit
 }
 
+func (s *Service) markURLDispatchedInMemory(rawURL string, now time.Time) {
+	if s == nil {
+		return
+	}
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return
+	}
+	s.recentURLMu.Lock()
+	defer s.recentURLMu.Unlock()
+	s.recentURLHits[rawURL] = now
+	for url, hitAt := range s.recentURLHits {
+		if now.Sub(hitAt) >= selectedURLCooldown {
+			delete(s.recentURLHits, url)
+		}
+	}
+}
+
 // ClaimURLForFetch is the single choke point every NZB fetch call site (in
 // this package or outside it, e.g. the SABnzbd-compatible addurl endpoint)
 // must go through immediately before issuing the real network fetch. It
@@ -2115,15 +2133,23 @@ func (s *Service) claimURLInMemory(rawURL string, now time.Time) bool {
 // have its own, in-memory-only, equally non-atomic pair of calls).
 func (s *Service) ClaimURLForFetch(ctx context.Context, rawURL string) bool {
 	now := time.Now()
-	if s.claimURLInMemory(rawURL, now) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return false
+	}
+	if s.peekRecentlyDispatchedURL(rawURL, now) {
 		return true
 	}
 	claimed, err := s.repo.ClaimURLDispatchPersisted(ctx, rawURL, selectedURLCooldown)
 	if err != nil {
 		s.logger.Warn().Err(err).Str("url", rawURL).Msg("persisted URL-dispatch claim failed — falling back to in-memory cooldown only")
-		return false
+		return s.claimURLInMemory(rawURL, now)
 	}
-	return !claimed
+	if !claimed {
+		return true
+	}
+	s.markURLDispatchedInMemory(rawURL, now)
+	return false
 }
 
 // searchRequestFingerprint builds a stable dedup key for a single library
