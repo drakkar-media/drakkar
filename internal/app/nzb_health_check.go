@@ -357,6 +357,8 @@ func runDeepHealthCandidates(ctx context.Context, db *database.DB, workflowSvc *
 					continue
 				}
 				err = fmt.Errorf("invalid video container: %w", magicErr)
+			} else if probeErr := validatePlayableContainerDirect(ctx, db, c.VirtualFileID); probeErr != nil {
+				err = fmt.Errorf("invalid video container: %w", probeErr)
 			} else {
 				logger.Debug().Int64("libraryItemId", c.LibraryItemID).Str("title", c.Title).
 					Msg("health check: passed — segments and container valid")
@@ -645,6 +647,7 @@ func readContainerHeader(path string) error {
 // enough to stay a bounded background-priority read rather than a
 // meaningful fraction of the file.
 const decodeIssuesProbeBytes = 48 * 1024 * 1024
+const playableContainerMinProbeBytes = 16 * 1024 * 1024
 
 // checkDecodeIssuesAdvisory is a best-effort, ADVISORY-ONLY health-check
 // addition: none of Drakkar's existing checks (yEnc/CRC segment validation,
@@ -675,6 +678,56 @@ func checkDecodeIssuesAdvisory(ctx context.Context, db *database.DB, logger zero
 		Str("title", c.Title).
 		Strs("decodeIssues", issues).
 		Msg("health check: ffmpeg reported possible decode issues (advisory only -- not blocklisting)")
+}
+
+func validatePlayableContainerDirect(ctx context.Context, db *database.DB, virtualFileID int64) error {
+	vf, err := db.OpenVirtualMediaFile(ctx, virtualFileID)
+	if err != nil {
+		return err
+	}
+	if vf.Size() <= 0 {
+		return nil
+	}
+	readLimit := int64(decodeIssuesProbeBytes)
+	if vf.Size() < readLimit {
+		readLimit = vf.Size()
+	}
+	minRequired := int64(playableContainerMinProbeBytes)
+	if readLimit < minRequired {
+		minRequired = readLimit
+	}
+	data := make([]byte, readLimit)
+	var read int64
+	for read < readLimit {
+		n, readErr := vf.ReadAt(ctx, data[read:], read)
+		if n > 0 {
+			read += int64(n)
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) && read >= minRequired {
+				break
+			}
+			if errors.Is(readErr, io.EOF) {
+				return fmt.Errorf("playable prefix too short: read %d bytes, need %d", read, minRequired)
+			}
+			return readErr
+		}
+		if n == 0 {
+			return fmt.Errorf("playable prefix stalled after %d bytes", read)
+		}
+	}
+	data = data[:read]
+	probe, err := mediaprobe.ProbeContainer(ctx, data)
+	if err != nil {
+		return fmt.Errorf("ffprobe failed: %w", err)
+	}
+	if probe.VideoStreams == 0 {
+		return errors.New("ffprobe found no video stream")
+	}
+	if probe.DurationSeconds <= 0 {
+		return errors.New("ffprobe found no container duration")
+	}
+	return nil
 }
 
 // readContainerHeaderDirect validates the same leading-bytes magic-number

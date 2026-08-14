@@ -30,6 +30,8 @@ type SegmentChecker interface {
 
 type segmentPair struct{ first, last string }
 
+const maxTrustedDirectNZBShrinkPercent = 10
+
 // loadNZBFirstLastSegmentPairs returns a single representative pair — the
 // first segment of the first qualifying file and the last segment of the
 // last qualifying file — rather than one pair per file. Checking every
@@ -711,7 +713,7 @@ func (db *DB) rescaleFileSegments(ctx context.Context, nzbFileID, actualFirstSiz
 
 	// Update the inline segment sizes stored in nzb_files.
 	// COALESCE guards against array_length returning NULL for an empty array.
-	var segmentCount int64
+	var segmentCount, declaredFileSize int64
 	if err = tx.QueryRowContext(ctx, `
 		UPDATE nzb_files
 		SET decoded_segment_size = $2,
@@ -720,18 +722,19 @@ func (db *DB) rescaleFileSegments(ctx context.Context, nzbFileID, actualFirstSiz
 		RETURNING case
 			when message_id_count > 0 then message_id_count
 			else coalesce(array_length(message_ids, 1), 0)
-		end`,
+		end,
+		coalesce(file_size_bytes, 0)`,
 		nzbFileID, actualFirstSize, actualLastSize,
-	).Scan(&segmentCount); err != nil {
+	).Scan(&segmentCount, &declaredFileSize); err != nil {
 		return err
 	}
 
 	// Recompute virtual_files.size_bytes for direct_nzb entries backed by this
-	// nzb_file.  The total decoded size is:
-	//   (segmentCount - 1) * actualFirstSize + actualLastSize
-	// This exactly mirrors what computeSpans produces.
+	// nzb_file, but refuse implausibly large shrink corrections. A bad shrink is
+	// worse than a mild overestimate because it makes WebDAV advertise a
+	// permanently truncated file.
 	if segmentCount > 0 {
-		totalSize := (segmentCount-1)*actualFirstSize + actualLastSize
+		totalSize := calibratedDirectNZBSize(declaredFileSize, segmentCount, actualFirstSize, actualLastSize)
 		if _, err = tx.ExecContext(ctx, `
 			UPDATE virtual_files
 			SET size_bytes = $2
@@ -755,6 +758,26 @@ func (db *DB) rescaleFileSegments(ctx context.Context, nzbFileID, actualFirstSiz
 	// Flush the in-memory VF cache so the next open picks up the new sizes.
 	db.InvalidateVFCacheForNZBFile(nzbFileID)
 	return nil
+}
+
+func calibratedDirectNZBSize(declaredFileSize, segmentCount, actualFirstSize, actualLastSize int64) int64 {
+	if segmentCount <= 0 {
+		return 0
+	}
+	totalSize := (segmentCount-1)*actualFirstSize + actualLastSize
+	if declaredFileSize <= 0 || totalSize <= 0 {
+		return totalSize
+	}
+	minTrusted := declaredFileSize * (100 - maxTrustedDirectNZBShrinkPercent) / 100
+	if totalSize < minTrusted {
+		slog.Warn("calibrate: refusing suspicious direct NZB shrink",
+			"declared_size", declaredFileSize,
+			"calibrated_size", totalSize,
+			"segment_count", segmentCount,
+			"max_shrink_percent", maxTrustedDirectNZBShrinkPercent)
+		return declaredFileSize
+	}
+	return totalSize
 }
 
 // PublishedDirectNzbSegment holds the identifiers needed to validate and reset

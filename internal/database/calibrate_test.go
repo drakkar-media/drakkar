@@ -242,3 +242,27 @@ func TestIsArticlePermanentlyMissingCachedMiss(t *testing.T) {
 		t.Fatal("expected a cached-missing article (reported via the Is(error) bool contract) to be treated as permanent")
 	}
 }
+
+func TestCalibratedDirectNZBSizeRefusesSuspiciousShrink(t *testing.T) {
+	const declared = int64(563869886)
+	got := calibratedDirectNZBSize(declared, 786, 398336, 662768)
+	if got != declared {
+		t.Fatalf("expected suspicious Sheriff-like shrink to keep declared size %d, got %d", declared, got)
+	}
+}
+
+func TestCalibratedDirectNZBSizeAcceptsSmallCorrection(t *testing.T) {
+	const declared = int64(1_000_000)
+	got := calibratedDirectNZBSize(declared, 10, 98_000, 90_000)
+	want := int64(972_000)
+	if got != want {
+		t.Fatalf("expected trusted calibrated size %d, got %d", want, got)
+	}
+}
+
+func TestCalibratedDirectNZBSizeUsesSampleWhenNoDeclaredSize(t *testing.T) {
+	got := calibratedDirectNZBSize(0, 3, 100, 50)
+	if got != 250 {
+		t.Fatalf("expected sampled size 250 with no declared size, got %d", got)
+	}
+}

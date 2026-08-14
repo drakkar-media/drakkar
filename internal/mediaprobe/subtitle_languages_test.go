@@ -19,7 +19,7 @@ func TestNormalizeToISO6391(t *testing.T) {
 		{"nld", "nl"}, // ISO 639-2 terminologic form for Dutch
 		{"fre", "fr"},
 		{"ger", "de"},
-		{"und", ""},   // Matroska's "undetermined" sentinel
+		{"und", ""}, // Matroska's "undetermined" sentinel
 		{"", ""},
 		{"not-a-real-language-code", ""},
 	}
@@ -71,6 +71,12 @@ func TestProbeContainerReturnsDurationAlongsideLanguages(t *testing.T) {
 	}
 	if len(probe.SubtitleLanguages) != 1 || probe.SubtitleLanguages[0] != "en" {
 		t.Fatalf("SubtitleLanguages = %v, want [en]", probe.SubtitleLanguages)
+	}
+	if probe.VideoStreams != 1 {
+		t.Fatalf("VideoStreams = %d, want 1", probe.VideoStreams)
+	}
+	if probe.AudioStreams != 0 {
+		t.Fatalf("AudioStreams = %d, want 0", probe.AudioStreams)
 	}
 	// buildFixtureMKV encodes a 1-second clip -- allow slack for
 	// container/muxing rounding rather than asserting an exact value.

@@ -48,6 +48,12 @@ func DetectSubtitleLanguages(ctx context.Context, data []byte) ([]string, error)
 // ContainerProbe is everything Drakkar's best-effort container inspection
 // currently extracts from a single ffprobe run over a media prefix.
 type ContainerProbe struct {
+	// VideoStreams and AudioStreams count playable media streams found by
+	// ffprobe. A file can have valid container magic while still being an
+	// unplayable stub if no video stream is present.
+	VideoStreams int
+	AudioStreams int
+
 	// SubtitleLanguages are the distinct ISO 639-1 codes of embedded
 	// subtitle streams -- see DetectSubtitleLanguages's doc comment.
 	SubtitleLanguages []string
@@ -84,7 +90,18 @@ func ProbeContainer(ctx context.Context, data []byte) (ContainerProbe, error) {
 	}
 	seen := make(map[string]struct{}, len(result.Streams))
 	for _, s := range result.Streams {
-		if s == nil || s.CodecType != "subtitle" {
+		if s == nil {
+			continue
+		}
+		switch s.CodecType {
+		case "video":
+			out.VideoStreams++
+			continue
+		case "audio":
+			out.AudioStreams++
+			continue
+		case "subtitle":
+		default:
 			continue
 		}
 		code := normalizeToISO6391(s.Tags.Language)
