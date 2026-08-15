@@ -62,6 +62,149 @@ func setupWorkingLibraryItem(t *testing.T, ctx context.Context, sqlDB *sql.DB, t
 	return libID, selectedReleaseID, releaseCandidateID, virtualFileID
 }
 
+func setupMissingLibraryItemWithCutoff(t *testing.T, ctx context.Context, sqlDB *sql.DB, title, cutoff string) (libID, profileID int64) {
+	t.Helper()
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into quality_profiles (name, resolutions, cutoff_resolution)
+		values ($1, array['2160p','1080p','720p'], $2)
+		returning id`, title+" profile", cutoff,
+	).Scan(&profileID); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available, quality_profile_id)
+		values ('movie', $1, false, $2)
+		returning id`, title, profileID,
+	).Scan(&libID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into queue_items (library_item_id, state, idempotency_key)
+		values ($1, 'requested', $2)`, libID, title,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = sqlDB.ExecContext(context.Background(), `delete from library_items where id = $1`, libID)
+		_, _ = sqlDB.ExecContext(context.Background(), `delete from quality_profiles where id = $1`, profileID)
+	})
+	return libID, profileID
+}
+
+func selectedCandidateResolution(t *testing.T, ctx context.Context, sqlDB *sql.DB, selectedReleaseID int64) string {
+	t.Helper()
+	var resolution string
+	if err := sqlDB.QueryRowContext(ctx, `
+		select rc.resolution
+		from selected_releases sr
+		join release_candidates rc on rc.id = sr.release_candidate_id
+		where sr.id = $1`, selectedReleaseID,
+	).Scan(&resolution); err != nil {
+		t.Fatal(err)
+	}
+	return resolution
+}
+
+func TestReplaceSearchCandidatesPrefersCutoffQualityOverHigherScoredFallback(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	libID, _ := setupMissingLibraryItemWithCutoff(t, ctx, sqlDB, "cutoff-prefers-1080", "1080p")
+	selectedReleaseID, err := db.ReplaceSearchCandidates(ctx, libID, []SearchCandidateRecord{
+		{Title: "Below Cutoff But Slightly Higher Score", Score: 1045, Resolution: "720p", ExternalURL: "http://example/720.nzb"},
+		{Title: "At Cutoff Lower Score", Score: 1039, Resolution: "1080p", ExternalURL: "http://example/1080.nzb"},
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selectedReleaseID == nil {
+		t.Fatal("expected a selected release")
+	}
+	if got := selectedCandidateResolution(t, ctx, sqlDB, *selectedReleaseID); got != "1080p" {
+		t.Fatalf("expected cutoff-quality 1080p candidate to beat higher-scored 720p fallback, got %q", got)
+	}
+}
+
+func TestFailSelectedReleasePromotesCutoffQualityBeforeBelowCutoffFallback(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	libID, _ := setupMissingLibraryItemWithCutoff(t, ctx, sqlDB, "cutoff-promote-1080", "1080p")
+	selectedReleaseID, err := db.ReplaceSearchCandidates(ctx, libID, []SearchCandidateRecord{
+		{Title: "Initial Broken Candidate", Score: 1100, Resolution: "2160p", ExternalURL: "http://example/broken.nzb"},
+		{Title: "Below Cutoff Higher Score", Score: 1045, Resolution: "720p", ExternalURL: "http://example/next-720.nzb"},
+		{Title: "At Cutoff Lower Score", Score: 1039, Resolution: "1080p", ExternalURL: "http://example/next-1080.nzb"},
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selectedReleaseID == nil {
+		t.Fatal("expected initial selected release")
+	}
+	next, err := db.FailSelectedReleaseAndPromoteNext(ctx, *selectedReleaseID, "archive_headers_invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next == nil {
+		t.Fatal("expected next candidate")
+	}
+	if got := selectedCandidateResolution(t, ctx, sqlDB, next.SelectedReleaseID); got != "1080p" {
+		t.Fatalf("expected failure promotion to prefer 1080p before 720p, got %q (%s)", got, next.Title)
+	}
+}
+
+func TestPromoteExistingCandidatePrefersCutoffQualityBeforeBelowCutoffFallback(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	libID, _ := setupMissingLibraryItemWithCutoff(t, ctx, sqlDB, "cutoff-promote-existing-1080", "1080p")
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into release_candidates (library_item_id, title, score, resolution, external_url)
+		values
+		    ($1, 'Below Cutoff Higher Score', 1045, '720p', 'http://example/existing-720.nzb'),
+		    ($1, 'At Cutoff Lower Score', 1039, '1080p', 'http://example/existing-1080.nzb')`, libID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	selectedReleaseID, err := db.PromoteExistingCandidate(ctx, libID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selectedReleaseID == nil {
+		t.Fatal("expected existing candidate promotion")
+	}
+	if got := selectedCandidateResolution(t, ctx, sqlDB, *selectedReleaseID); got != "1080p" {
+		t.Fatalf("expected existing promotion to prefer 1080p before 720p, got %q", got)
+	}
+}
+
 // TestReplaceSearchCandidatesUpgradeSearchPreservesWorkingReleaseWhenNothingBetter
 // guards the 2026-07-19 production fix: an upgrade search that finds nothing
 // genuinely better than the current release must leave the existing

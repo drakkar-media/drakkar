@@ -448,7 +448,7 @@ const (
 	busyInlineFallbackDepth      = 1
 	fastLaneInlineFallbackDepth  = 3
 	busyQueueDepthThreshold      = 150
-	selectedURLCooldown          = 30 * time.Minute
+	selectedURLCooldown          = 5 * time.Minute
 	defaultSearchRequestCooldown = 20 * time.Minute
 	asyncCalibrateBudget         = 2 * time.Minute
 	asyncCalibrateWorkers        = 2
@@ -3450,7 +3450,7 @@ func (s *Service) fetchAndBuildImportedNZB(ctx context.Context, current database
 		// re-fetching or promoting to the next candidate; the current
 		// selection is likely fine, we just don't need to hammer it again.
 		// Debug level: this is the expected, common case for every retry
-		// inside the 30-minute cooldown, not a fault.
+		// inside the short duplicate-fetch cooldown, not a fault.
 		s.logger.Debug().Int64("selectedReleaseId", current.SelectedReleaseID).Str("url", current.ExternalURL).Msg("download job: URL already claimed within cooldown — skipping")
 		return nil, nil, nil
 	}

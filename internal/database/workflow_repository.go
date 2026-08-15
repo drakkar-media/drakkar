@@ -1609,6 +1609,79 @@ func (db *DB) InsertManualReleaseCandidate(ctx context.Context, libraryItemID in
 	return id, err
 }
 
+// cutoffResolutionForLibraryItem resolves the item's active cutoff, falling
+// back to the default profile when the library row has no explicit profile.
+func cutoffResolutionForLibraryItem(ctx context.Context, q sqlRowQuerier, libraryItemID int64) (string, error) {
+	var cutoff string
+	err := q.QueryRowContext(ctx, `
+		select coalesce(item_profile.cutoff_resolution, default_profile.cutoff_resolution, '')
+		from library_items li
+		left join quality_profiles item_profile on item_profile.id = li.quality_profile_id
+		left join lateral (
+			select cutoff_resolution
+			from quality_profiles
+			where is_default
+			order by id asc
+			limit 1
+		) default_profile on true
+		where li.id = $1`, libraryItemID,
+	).Scan(&cutoff)
+	return strings.TrimSpace(cutoff), err
+}
+
+// orderCandidatesByCutoff keeps score ordering within each band, but prevents
+// below-cutoff fallbacks from winning before any cutoff-or-better candidate has
+// had a chance to prove itself.
+func orderCandidatesByCutoff(candidates []SearchCandidateRecord, cutoffResolution string) []SearchCandidateRecord {
+	cutoffRank := ranking.ResolutionRank(cutoffResolution)
+	if cutoffRank == 0 || len(candidates) < 2 {
+		return candidates
+	}
+	ordered := append([]SearchCandidateRecord(nil), candidates...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		leftAtCutoff := ranking.ResolutionRank(ordered[i].Resolution) >= cutoffRank
+		rightAtCutoff := ranking.ResolutionRank(ordered[j].Resolution) >= cutoffRank
+		if leftAtCutoff != rightAtCutoff {
+			return leftAtCutoff
+		}
+		return false
+	})
+	return ordered
+}
+
+// cutoffPriorityOrderSQL mirrors orderCandidatesByCutoff for promotion paths
+// that choose from already-persisted release_candidates rows.
+func cutoffPriorityOrderSQL(candidateAlias string) string {
+	candidateRank := resolutionRankSQL(candidateAlias + ".resolution")
+	cutoffRank := resolutionRankSQL(`coalesce(item_profile.cutoff_resolution, default_profile.cutoff_resolution, '')`)
+	return fmt.Sprintf(`(
+			select case
+				when %s > 0 and %s > 0 and %s < %s then 1
+				else 0
+			end
+			from library_items li
+			left join quality_profiles item_profile on item_profile.id = li.quality_profile_id
+			left join lateral (
+				select cutoff_resolution
+				from quality_profiles
+				where is_default
+				order by id asc
+				limit 1
+			) default_profile on true
+			where li.id = %s.library_item_id
+		)`, cutoffRank, candidateRank, candidateRank, cutoffRank, candidateAlias)
+}
+
+func resolutionRankSQL(expr string) string {
+	return fmt.Sprintf(`case lower(trim(coalesce(%s, '')))
+		when '2160p' then 4
+		when '1080p' then 3
+		when '720p' then 2
+		when '480p' then 1
+		else 0
+	end`, expr)
+}
+
 // ReplaceSearchCandidates records a fresh batch of search candidates for a
 // library item and selects the best non-rejected one, if any. upgradeSearch
 // must be true only for a re-search of an item that may already have a
@@ -1722,6 +1795,11 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 	if err != nil {
 		return nil, err
 	}
+	cutoffResolution, err := cutoffResolutionForLibraryItem(ctx, tx, libraryItemID)
+	if err != nil {
+		return nil, err
+	}
+	candidates = orderCandidatesByCutoff(candidates, cutoffResolution)
 
 	var selectedReleaseID *int64
 	selectedAssigned := false
@@ -1890,14 +1968,16 @@ func (db *DB) PromoteExistingCandidate(ctx context.Context, libraryItemID int64)
 	// candidate" function that filtered only on rejected=false, so an
 	// already-blocklisted sibling candidate (same content, different
 	// indexer/URL) could be promoted and re-fetched here.
-	releaseCandidateIDOpt, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, `
+	releaseCandidateIDOpt, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, fmt.Sprintf(`
 		select rc.id, rc.title, coalesce(rc.external_url, ''), coalesce(rc.indexer_name, ''), coalesce(rc.size_bytes, 0), coalesce(rc.posted_at, to_timestamp(0))
 		from release_candidates rc
 		where rc.library_item_id = $1
 		  and rc.rejected = false
 		  and rc.selected = false
 		  and not exists (select 1 from selected_releases sr where sr.release_candidate_id = rc.id)
-		order by rc.score desc, rc.id asc`, libraryItemID)
+		order by %s,
+		         rc.score desc,
+		         rc.id asc`, cutoffPriorityOrderSQL("rc")), libraryItemID)
 	if err != nil {
 		return nil, err
 	}
@@ -2485,8 +2565,12 @@ func (db *DB) promoteRetryCandidate(ctx context.Context, libraryItemID int64, ex
 		query += ` and rc.id <> $2`
 		args = append(args, excludeReleaseCandidateID)
 	}
-	query += `
-		order by rc.failure_count asc, rc.score desc, rc.created_at asc, rc.id asc`
+	query += fmt.Sprintf(`
+		order by rc.failure_count asc,
+		         %s,
+		         rc.score desc,
+		         rc.created_at asc,
+		         rc.id asc`, cutoffPriorityOrderSQL("rc"))
 	releaseCandidateIDOpt, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, query, args...)
 	if err != nil {
 		return nil, err
@@ -2622,7 +2706,7 @@ func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int
 		return nil, err
 	}
 
-	nextCandidateID, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, `
+	nextCandidateID, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, fmt.Sprintf(`
 		select rc.id, rc.title, coalesce(rc.external_url, ''), coalesce(rc.indexer_name, ''), coalesce(rc.size_bytes, 0), coalesce(rc.posted_at, to_timestamp(0))
 		from release_candidates rc
 		where rc.library_item_id = $1
@@ -2631,10 +2715,11 @@ func (db *DB) RejectReleaseCandidate(ctx context.Context, releaseCandidateID int
 		  and rc.id <> $2
 		  and not exists (select 1 from selected_releases sr where sr.release_candidate_id = rc.id)
 		order by rc.failure_count asc,
+		         %s,
 		         rc.score desc,
 		         rc.posted_at desc nulls last,
 		         rc.created_at asc,
-		         rc.id asc`, libraryItemID, releaseCandidateID)
+		         rc.id asc`, cutoffPriorityOrderSQL("rc")), libraryItemID, releaseCandidateID)
 	if err != nil {
 		return nil, err
 	}
@@ -3037,7 +3122,7 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 	// Buffer candidate metadata, close its rows, then look up only the derived
 	// blocklist keys. Closing rows before the lookup and later writes matters:
 	// pgx holds the connection lock for an active result reader.
-	nextCandidateID, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, `
+	nextCandidateID, blockedEntries, err := scanNextViableCandidate(ctx, tx, scopeKey, fmt.Sprintf(`
 		select rc.id, rc.title, coalesce(rc.external_url, ''), coalesce(rc.indexer_name, ''), coalesce(rc.size_bytes, 0), coalesce(rc.posted_at, to_timestamp(0))
 		from release_candidates rc
 		where rc.library_item_id = $1
@@ -3046,10 +3131,11 @@ func (db *DB) FailSelectedReleaseAndPromoteNext(ctx context.Context, selectedRel
 		  and rc.id <> $2
 		  and not exists (select 1 from selected_releases sr where sr.release_candidate_id = rc.id)
 		order by rc.failure_count asc,
+		         %s,
 		         rc.score desc,
 		         rc.posted_at desc nulls last,
 		         rc.created_at asc,
-		         rc.id asc`, libraryItemID, releaseCandidateID)
+		         rc.id asc`, cutoffPriorityOrderSQL("rc")), libraryItemID, releaseCandidateID)
 	if err != nil {
 		return nil, err
 	}
