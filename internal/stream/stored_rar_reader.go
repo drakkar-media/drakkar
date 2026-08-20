@@ -186,6 +186,30 @@ func (r *StoredRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 				continue
 			}
 		}
+		if err2 == nil && len(block) == expected && hasActual && requestEnd == span.End {
+			// The fetch fully satisfied the request, but that alone doesn't
+			// rule out an UNDER-estimate: the assumed span may simply not
+			// have asked for enough (a short fetch, the only other trigger
+			// for realignSpan above, can never happen in that case). Cross-
+			// check the fetcher's real measurement of this segment's
+			// boundaries -- confirmed live 2026-08-20 (a 2160p HEVC release
+			// embedded in a stored RAR volume): when the true decoded
+			// payload for a segment is LARGER than its estimated span, the
+			// span kept its old, too-short length forever, since nothing
+			// here ever asked for more than that estimate allowed and the
+			// fetch always came back fully satisfied. Reads past that point
+			// resolved against the NEXT segment's own DecodedStart/
+			// SegmentByteStart instead of the true remaining tail of this
+			// one -- bytes spliced in from the wrong segment, decoded as a
+			// block of corrupted pixels severe enough to desync playback
+			// until a fresh keyframe read (a seek) recovered it. block
+			// already holds the correct bytes for this request regardless
+			// of the correction, so grow the span for future iterations and
+			// fall through to consume it normally rather than re-fetching.
+			if available := actualSpan.End - actualSpan.Start - span.SegmentByteStart; available > span.End-span.Start {
+				r.realignSpan(span.SegmentID, actualSpan)
+			}
+		}
 		if err2 != nil {
 			return written, err2
 		}
@@ -215,12 +239,35 @@ func (r *StoredRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 
 // realignSpan corrects the span identified by segmentID using the fetcher's
 // real measurement of that NNTP article's decoded boundaries, then shifts
-// every later span's VF-relative position by the resulting delta. Only ever
-// shrinks a span (never grows it beyond its original length): the confirmed
-// failure mode is an over-estimate, and letting a span grow would risk
-// overlapping the VF-space range already assigned to the next span. Reports
-// whether a correction was actually made (false if segmentID wasn't found,
-// e.g. a concurrent realignment already ran).
+// every later span's VF-relative position by the resulting delta. Corrects
+// in either direction, mirroring DirectNzbReader.realignSpans: the
+// segment's true decoded size, only known once actually fetched, can be
+// either smaller OR larger than the estimate used to build the span.
+// old.SegmentByteStart (the RAR volume-header skip, a fixed quantity set at
+// NZB-build time from the volume header's own byte length) is independent
+// of the segment's total decoded size in either direction, so it remains
+// valid regardless of which way this correction goes.
+//
+// Confirmed live 2026-08-20 (a 2160p HEVC release embedded in a stored RAR
+// volume): this used to clamp newLen down to available but never let it
+// grow past the original estimate ("the confirmed failure mode is an
+// over-estimate" -- true for
+// whatever incident originally motivated that clamp, but not a guarantee
+// for every release). For an UNDER-estimated segment, the span kept its
+// old, too-short length, so ReadAt calls past that point resolved against
+// the NEXT segment's own DecodedStart/SegmentByteStart instead of the true
+// remaining tail of the current one -- bytes spliced in from the wrong
+// segment at that exact position, decoded as a block of corrupted pixels,
+// severe enough to desync the HEVC bitstream until a fresh keyframe read
+// (a seek) recovered it. Growing shifts every later span by the same
+// +delta the shrink path already used for a negative delta, preserving
+// contiguity identically in either direction (spans[index].End ==
+// spans[index+1].Start still holds after a uniform shift, regardless of
+// delta's sign) -- there is no overlap risk the shift logic doesn't
+// already handle.
+//
+// Reports whether a correction was actually made (false if segmentID
+// wasn't found, e.g. a concurrent realignment already ran).
 func (r *StoredRarReader) realignSpan(segmentID int64, actual SegmentSpan) bool {
 	r.stateMu.Lock()
 	defer r.stateMu.Unlock()
@@ -240,10 +287,7 @@ func (r *StoredRarReader) realignSpan(segmentID int64, actual SegmentSpan) bool 
 	if available < 0 {
 		available = 0
 	}
-	newLen := old.End - old.Start
-	if available < newLen {
-		newLen = available
-	}
+	newLen := available
 	if old.DecodedStart == actual.Start && old.End-old.Start == newLen {
 		return false // nothing to correct; avoid an infinite retry loop
 	}

@@ -1355,7 +1355,7 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int, releas
 		    -- consecutive_failure_searches is permanently stuck at 0, so this
 		    -- cooldown can never escalate past its base 1-hour tier no matter how
 		    -- many times the item has already failed -- confirmed live 2026-08-12:
-		    -- dozens of The Big Bang Theory episodes, each already pushed by the
+		    -- dozens of TV episodes across several shows, each already pushed by the
 		    -- *other*, correctly-escalating dispatch_attempt_count/dispatch_backoff_until
 		    -- mechanism (internal/workflow/service.go's dispatchBackoff) out to a
 		    -- 6-to-24-hour pause, were still getting re-searched here roughly

@@ -43,18 +43,18 @@ const (
 	// window's fetch count jumps by a lot in one instant, and a share
 	// that's already small has nothing meaningful to spike from.
 	//
-	// Originally added while chasing a live A/V-sync-delay report on Venom:
-	// Let There Be Carnage (2026-08-09): visible block/stutter artifacts
-	// right at stream start, immediately followed by a persistent desync
-	// that only a seek (not pause/resume) fixed -- the signature of a
-	// genuine data-delivery hiccup at open, not a per-file decode bug (both
-	// the RAR header-skip detection and the yEnc segment-length calibration
-	// for this exact release were independently verified correct against
-	// the real fetched bytes). A live repro caught every priority tier
-	// (interactive, read-ahead, AND the health-check's own background
-	// probe) going slow simultaneously, together with unrelated titles'
-	// health-check probes failing in the same few seconds -- the same
-	// signature this codebase's health-check pacing comment already
+	// Originally added while chasing a live A/V-sync-delay report on a
+	// high-bitrate 2160p stream (2026-08-09): visible block/stutter
+	// artifacts right at stream start, immediately followed by a persistent
+	// desync that only a seek (not pause/resume) fixed -- the signature of
+	// a genuine data-delivery hiccup at open, not a per-file decode bug
+	// (both the RAR header-skip detection and the yEnc segment-length
+	// calibration for this exact release were independently verified
+	// correct against the real fetched bytes). A live repro caught every
+	// priority tier (interactive, read-ahead, AND the health-check's own
+	// background probe) going slow simultaneously, together with unrelated
+	// titles' health-check probes failing in the same few seconds -- the
+	// same signature this codebase's health-check pacing comment already
 	// attributes to provider-side rate limiting triggered by aggregate
 	// connection/request load. A single stream jumping straight from 0 to
 	// its full parallelism share (routinely ~20 connections) in one
@@ -63,20 +63,20 @@ const (
 	//
 	// Originally only applied to a session's first few windows (tracked via
 	// a per-session window counter, reset on Seek). Confirmed live
-	// (2026-08-20, Outer Banks S05E01, ~1h45m into an uninterrupted playback
-	// session): 20 concurrent read-ahead fetches -- exactly that session's
-	// full parallelism share -- all timed out simultaneously at the 30s
-	// ceiling against the sole configured provider, immediately followed by
-	// a genuine connection reset and, seconds later, a 7.3s stall on the
-	// interactive-priority lane itself (the felt playback freeze). The
-	// session had been open far longer than the handful of windows the old
-	// per-session ramp covered -- every window past the first few had
-	// already been bursting to full share instantly for over an hour,
-	// retriggering the exact throttle signature the ramp was built to
-	// avoid, on a roughly 2-minute cycle (windowBytes/2 of playback) for the
-	// rest of any sufficiently long stream. The ramp now applies to every
-	// window unconditionally instead of just a session's first few, since
-	// the provider has no way to know (or care) whether a burst is a
+	// (2026-08-20, another 2160p stream, ~1h45m into an uninterrupted
+	// playback session): 20 concurrent read-ahead fetches -- exactly that
+	// session's full parallelism share -- all timed out simultaneously at
+	// the 30s ceiling against the sole configured provider, immediately
+	// followed by a genuine connection reset and, seconds later, a 7.3s
+	// stall on the interactive-priority lane itself (the felt playback
+	// freeze). The session had been open far longer than the handful of
+	// windows the old per-session ramp covered -- every window past the
+	// first few had already been bursting to full share instantly for over
+	// an hour, retriggering the exact throttle signature the ramp was built
+	// to avoid, on a roughly 2-minute cycle (windowBytes/2 of playback) for
+	// the rest of any sufficiently long stream. The ramp now applies to
+	// every window unconditionally instead of just a session's first few,
+	// since the provider has no way to know (or care) whether a burst is a
 	// stream's 1st window or its 50th.
 	readAheadRampFloor = 8
 
@@ -290,8 +290,8 @@ func (m *ReadAheadManager) Register(sessionID string, spans []SegmentSpan, fetch
 // connection -- it opens a brand-new GET/Range request while the old one
 // may still be lingering (see deadlineResponseWriter in internal/dav for
 // why that lingering can itself take a while to resolve). Read-ahead
-// cancellation alone wasn't enough: confirmed live (2026-08-10, Venom: Let
-// There Be Carnage) that the old session's actual foreground Read loop kept
+// cancellation alone wasn't enough: confirmed live (2026-08-10, another
+// high-bitrate stream) that the old session's actual foreground Read loop kept
 // running for as long as its client (rclone) kept draining it -- up to
 // ~163s of real, no-longer-needed data transfer, holding NNTP connection
 // budget the new seek's fetch was waiting on the whole time. meta.Cancel,

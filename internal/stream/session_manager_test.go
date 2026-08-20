@@ -230,13 +230,13 @@ func TestSetConnectionBudgetScalesWithStreamingBudget(t *testing.T) {
 }
 
 // TestReadAheadManagerRampsUpParallelismEveryWindow guards the fix for a
-// live streaming stall (2026-08-20, Outer Banks S05E01, confirmed ~1h45m
+// live streaming stall (2026-08-20, a 2160p stream, confirmed ~1h45m
 // into an uninterrupted playback session): 20 concurrent read-ahead
 // fetches -- exactly that session's full parallelism share -- all timed out
 // simultaneously against the sole configured provider, immediately followed
 // by a genuine connection reset and a stall on the interactive lane itself
 // (the felt playback freeze). The ramp originally added for a similar 2026
-// -08-09 incident (Venom: Let There Be Carnage) only applied to a session's
+// -08-09 incident (another high-bitrate stream) only applied to a session's
 // first few windows (tracked via a per-session counter, reset on Seek);
 // every window after that burst straight to full parallelism in one
 // instant, retriggering the exact provider-throttle signature the ramp was

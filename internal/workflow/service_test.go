@@ -3402,8 +3402,8 @@ func TestRetryFailedQueue(t *testing.T) {
 // loop failed instantly afterward with the transient reason "context
 // canceled" -- which is never blocklisted, so the exact same candidate got
 // reselected and re-cancelled on every subsequent housekeeping cycle,
-// forever (confirmed live: dozens of The Big Bang Theory episodes stuck
-// this way, the library's missing count climbing instead of shrinking).
+// forever (confirmed live: dozens of TV episodes stuck this way, the
+// library's missing count climbing instead of shrinking).
 // The fix gives each target its own context, detached from the batch-level
 // one, and stops STARTING new work once the batch-level context is already
 // done rather than plowing on and recording a wave of bogus per-item

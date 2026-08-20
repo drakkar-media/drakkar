@@ -106,6 +106,60 @@ func TestStoredRarReaderRealignsLastSegmentEstimate(t *testing.T) {
 	}
 }
 
+// TestStoredRarReaderRealignsUnderEstimatedSegment guards the production
+// fix for the OTHER direction of the same estimate-vs-reality gap
+// TestStoredRarReaderRealignsLastSegmentEstimate covers: a segment whose
+// real decoded content is LARGER than the estimate used to build its span,
+// not smaller. Confirmed live 2026-08-20 (a 2160p HEVC release embedded in
+// a stored RAR volume): realignSpan used to clamp corrections to
+// shrink-only, so an under-estimated segment
+// kept its old, too-short VF-space length -- reads past that point resolved
+// against the NEXT segment's own DecodedStart/SegmentByteStart instead of
+// the true remaining tail of the current one, splicing in bytes from the
+// wrong segment at that exact position (decoded as a block of corrupted
+// pixels, severe enough to desync playback until a fresh seek recovered
+// it).
+//
+// Segment 1 is declared as 10 bytes (VF span 0..10) but its real decoded
+// content is 12 bytes -- realignSpan must grow the span to 0..12 and shift
+// segment 2 forward to start at 12 (not the old estimate of 10), so a read
+// spanning the original boundary returns segment 1's true tail bytes
+// followed by segment 2's real content, not a premature splice.
+func TestStoredRarReaderRealignsUnderEstimatedSegment(t *testing.T) {
+	reader := NewStoredRarReader("Movie.mkv", 20, []SegmentSpan{
+		{SegmentID: 1, MessageID: "<seg1>", Start: 0, End: 10, DecodedStart: 0, SegmentByteStart: 0},
+		{SegmentID: 2, MessageID: "<seg2>", Start: 10, End: 20, DecodedStart: 10, SegmentByteStart: 0},
+	}, awareFetcherStub{
+		data: map[int64][]byte{
+			1: []byte("AAAAAAAAAAAA"), // 12 real bytes, more than the estimated 10-byte span
+			2: []byte("BBBBBBBBBB"),   // 10 bytes -- matches its own estimate exactly
+		},
+		info: map[int64]SegmentSpan{
+			1: {SegmentID: 1, MessageID: "<seg1>", Start: 0, End: 12},
+			2: {SegmentID: 2, MessageID: "<seg2>", Start: 10, End: 20},
+		},
+	}, nil)
+
+	// Spans the original (wrong) boundary at VF offset 10: bytes 8-11 are
+	// segment 1's true tail (all 'A's, including the 2 bytes past the old
+	// estimate), bytes 12-13 are segment 2's real content starting at its
+	// corrected offset.
+	buf := make([]byte, 6)
+	n, err := reader.ReadAt(context.Background(), buf, 8)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 6 {
+		t.Fatalf("expected 6 bytes, got %d", n)
+	}
+	if got := string(buf); got != "AAAABB" {
+		t.Fatalf("expected segment 1's grown tail spliced correctly with segment 2's real start, got %q", got)
+	}
+	if got := reader.Size(); got != 22 {
+		t.Fatalf("expected reader.Size() corrected to 22 (segment 1 grew by 2), got %d", got)
+	}
+}
+
 // TestStoredRarReaderStateRemainsStableAfterRealign guards the immutable
 // copy-on-write state contract: a state obtained before realignment must
 // retain its original backing data after the corrected version is published.
