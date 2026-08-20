@@ -33,48 +33,63 @@ const (
 	highBitrateMinReadAheadBytes    int64 = 128 << 20
 	highBitrateMaxArticleBufferSize       = 256
 
-	// readAheadRampWindows is how many read-ahead windows a session ramps up
-	// over before reaching its full per-stream parallelism share. Added
-	// while chasing a live A/V-sync-delay report on Venom: Let There Be
-	// Carnage (2026-08-09): visible block/stutter artifacts right at stream
-	// start, immediately followed by a persistent desync that only a seek
-	// (not a pause/resume) fixed -- the signature of a genuine data-delivery
-	// hiccup at open, not a per-file decode bug (both the RAR header-skip
-	// detection and the yEnc segment-length calibration for this exact
-	// release were independently verified correct against the real fetched
-	// bytes). A live repro caught every priority tier (interactive,
-	// read-ahead, AND the health-check's own background probe) going slow
-	// simultaneously, together with unrelated titles' health-check probes
-	// failing in the same few seconds -- the same signature this codebase's
-	// health-check pacing comment already attributes to provider-side rate
-	// limiting triggered by aggregate connection/request load. A single
-	// stream jumping straight from 0 to its full parallelism share
-	// (routinely ~20 connections) in one instant, right at the moment
-	// read-ahead first fills its window, is exactly the kind of spike that
-	// can trip that kind of throttling. Ramping the first few windows up
-	// gradually doesn't lower the eventual ceiling (full parallelism is
-	// reached within readAheadRampWindows real reads, typically well under
-	// a second of playback), it just avoids bursting to it in one instant.
-	readAheadRampWindows = 4
-
-	// readAheadRampFloor is the concurrency a session's very first read-ahead
-	// window starts at -- and, critically, the ramp never kicks in at all
-	// when the stream's own full share is already at or below this (e.g. a
+	// readAheadRampFloor is the concurrency every read-ahead window starts
+	// at immediately -- launches beyond this floor, up to the window's full
+	// parallelism share, are staggered by readAheadRampStaggerInterval
+	// instead of firing in the same instant. The ramp is a no-op whenever
+	// the stream's own full share is already at or below this floor (e.g. a
 	// low connection budget, or many concurrent streams splitting a modest
-	// total). The spike this ramp exists to avoid only happens when a
-	// single window's fetch count jumps by a lot in one instant; a share
+	// total): the burst this ramp exists to avoid only happens when a
+	// window's fetch count jumps by a lot in one instant, and a share
 	// that's already small has nothing meaningful to spike from.
 	//
-	// Raised from 4 to 8 (2026-08-11): a floor of 4 was too conservative for
-	// higher-bitrate content -- confirmed live on "Landman" S01E01 (1080p
-	// WebRip), which stalled consistently ~15-16s into playback, right
-	// around when 4 windows at floor parallelism finish ramping to full
-	// share. 4 concurrent connections just isn't enough to keep the
-	// read-ahead buffer ahead of playback consumption for this bitrate
-	// during that window. 8 still ramps gradually (still avoids an instant
-	// full-speed burst, the original problem this const was added for) but
-	// starts high enough to actually keep up with more demanding content.
+	// Originally added while chasing a live A/V-sync-delay report on Venom:
+	// Let There Be Carnage (2026-08-09): visible block/stutter artifacts
+	// right at stream start, immediately followed by a persistent desync
+	// that only a seek (not pause/resume) fixed -- the signature of a
+	// genuine data-delivery hiccup at open, not a per-file decode bug (both
+	// the RAR header-skip detection and the yEnc segment-length calibration
+	// for this exact release were independently verified correct against
+	// the real fetched bytes). A live repro caught every priority tier
+	// (interactive, read-ahead, AND the health-check's own background
+	// probe) going slow simultaneously, together with unrelated titles'
+	// health-check probes failing in the same few seconds -- the same
+	// signature this codebase's health-check pacing comment already
+	// attributes to provider-side rate limiting triggered by aggregate
+	// connection/request load. A single stream jumping straight from 0 to
+	// its full parallelism share (routinely ~20 connections) in one
+	// instant, right at the moment read-ahead first fills its window, is
+	// exactly the kind of spike that can trip that kind of throttling.
+	//
+	// Originally only applied to a session's first few windows (tracked via
+	// a per-session window counter, reset on Seek). Confirmed live
+	// (2026-08-20, Outer Banks S05E01, ~1h45m into an uninterrupted playback
+	// session): 20 concurrent read-ahead fetches -- exactly that session's
+	// full parallelism share -- all timed out simultaneously at the 30s
+	// ceiling against the sole configured provider, immediately followed by
+	// a genuine connection reset and, seconds later, a 7.3s stall on the
+	// interactive-priority lane itself (the felt playback freeze). The
+	// session had been open far longer than the handful of windows the old
+	// per-session ramp covered -- every window past the first few had
+	// already been bursting to full share instantly for over an hour,
+	// retriggering the exact throttle signature the ramp was built to
+	// avoid, on a roughly 2-minute cycle (windowBytes/2 of playback) for the
+	// rest of any sufficiently long stream. The ramp now applies to every
+	// window unconditionally instead of just a session's first few, since
+	// the provider has no way to know (or care) whether a burst is a
+	// stream's 1st window or its 50th.
 	readAheadRampFloor = 8
+
+	// readAheadRampStaggerInterval paces launches beyond readAheadRampFloor
+	// within a single window: one additional concurrent fetch is allowed to
+	// start every interval until the window's full parallelism share is
+	// reached, rather than all of them firing in the same instant. At the
+	// absoluteMaxReadAheadParallelism ceiling (60), ramping from floor to
+	// full costs (60-8)*readAheadRampStaggerInterval =~ 2.6s -- negligible
+	// against a window that covers tens of seconds to minutes of playback,
+	// but enough to no longer present as a single simultaneous burst to the
+	// provider.
+	readAheadRampStaggerInterval = 50 * time.Millisecond
 )
 
 // FetchPriority orders competing segment fetches so interactive playback
@@ -153,16 +168,15 @@ type SessionSnapshot struct {
 }
 
 type readAheadSession struct {
-	spans          []SegmentSpan
-	fetcher        PrioritySegmentFetcher
-	cancel         context.CancelFunc
-	meta           SessionMeta
-	currentOffset  int64
-	windowsStarted int
-	windowStart    int64
-	rescheduleAt   int64
-	windowValid    bool
-	generation     uint64
+	spans         []SegmentSpan
+	fetcher       PrioritySegmentFetcher
+	cancel        context.CancelFunc
+	meta          SessionMeta
+	currentOffset int64
+	windowStart   int64
+	rescheduleAt  int64
+	windowValid   bool
+	generation    uint64
 }
 
 // NewReadAheadManager creates a ReadAheadManager that prefetches up to
@@ -353,7 +367,7 @@ func (m *ReadAheadManager) NotifyRead(sessionID string, offset int64) {
 }
 
 // Seek cancels sessionID's in-flight read-ahead window without scheduling a
-// replacement, and resets its ramp-up progress.
+// replacement.
 //
 // A new window is deliberately not started here: the interactive ReadAt that
 // follows a seek fetches at PriorityInteractive (100), and starting a new
@@ -361,16 +375,10 @@ func (m *ReadAheadManager) NotifyRead(sessionID string, offset int64) {
 // goroutines that compete with that fetch for the same connection budget at
 // the worst possible moment. NotifyRead, called by the FUSE handle right
 // after the interactive read returns, schedules the next window from the
-// correct post-seek offset instead.
-//
-// Resetting windowsStarted here closes a real gap confirmed live
-// (2026-08-10, reproduced independently on two unrelated titles): the ramp
-// only reset on a brand-new session (see Register), so a seek partway
-// through an already-playing, already-ramped-up session jumped straight to
-// its full parallelism share for a region of the file nothing has fetched
-// yet -- the exact instant burst the ramp exists to avoid, just triggered by
-// a seek instead of a fresh open. A seek lands on unfetched territory just
-// as surely as a new session does, so it deserves the same gradual start.
+// correct post-seek offset instead. That next window ramps up gradually like
+// every other window (see readAheadRampFloor) since it lands on unfetched
+// territory just as surely as a new session does -- no separate ramp-reset
+// bookkeeping is needed here now that every window ramps unconditionally.
 func (m *ReadAheadManager) Seek(sessionID string, offset int64) {
 	metrics.M.ReadAheadCancellations.Add(1)
 	if m == nil || sessionID == "" {
@@ -383,7 +391,6 @@ func (m *ReadAheadManager) Seek(sessionID string, offset int64) {
 			session.cancel()
 			session.cancel = nil
 		}
-		session.windowsStarted = 0
 		session.windowValid = false
 		session.generation++
 	}
@@ -467,10 +474,6 @@ func (m *ReadAheadManager) schedule(sessionID string, offset int64) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	session.cancel = cancel
-	if session.windowsStarted < readAheadRampWindows {
-		session.windowsStarted++
-	}
-	windowIndex := session.windowsStarted
 	windowEnd := ranges[len(ranges)-1].RangeEnd
 	rescheduleAt := offset + (windowEnd-offset)/2
 	if rescheduleAt <= offset {
@@ -496,25 +499,33 @@ func (m *ReadAheadManager) schedule(sessionID string, offset int64) {
 		if parallelism < minReadAheadParallelism {
 			parallelism = minReadAheadParallelism
 		}
-		// Ramp up gradually over this session's first few windows instead of
-		// bursting straight to its full share the instant read-ahead starts
-		// filling its window -- see readAheadRampWindows/readAheadRampFloor's
-		// doc comments. A no-op whenever the full share is already at or
-		// below the floor.
-		if windowIndex < readAheadRampWindows && parallelism > readAheadRampFloor {
-			ramped := readAheadRampFloor + (parallelism-readAheadRampFloor)*windowIndex/readAheadRampWindows
-			if ramped < readAheadRampFloor {
-				ramped = readAheadRampFloor
-			}
-			if ramped < parallelism {
-				parallelism = ramped
-			}
-		}
 		sem := make(chan struct{}, parallelism)
 		var wg sync.WaitGroup
 		var fetchFailed atomic.Bool
+		var stagger *time.Ticker
+		if parallelism > readAheadRampFloor {
+			stagger = time.NewTicker(readAheadRampStaggerInterval)
+			defer stagger.Stop()
+		}
 	readAhead:
-		for _, segment := range ranges {
+		for i, segment := range ranges {
+			// Every window ramps up gradually instead of bursting straight to
+			// its full parallelism share in one instant -- see
+			// readAheadRampFloor's doc comment. Only paces the initial climb
+			// from floor to the window's full parallelism share (i <
+			// parallelism); once that many concurrent fetches have been
+			// launched, later replacement launches are gated purely by sem
+			// (a slot freeing up) same as before, so sustained steady-state
+			// throughput for windows with more segments than parallelism is
+			// unaffected. A no-op entirely whenever the full share is already
+			// at or below the floor (stagger is nil in that case).
+			if stagger != nil && i >= readAheadRampFloor && i < parallelism {
+				select {
+				case <-ctx.Done():
+					break readAhead
+				case <-stagger.C:
+				}
+			}
 			select {
 			case <-ctx.Done():
 				break readAhead

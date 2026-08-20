@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"os"
 	"testing"
 
@@ -65,5 +66,80 @@ func TestResetLibraryItemStateCreatesQueueItemWhenNoneExists(t *testing.T) {
 	}
 	if state != string(QueueRequested) {
 		t.Fatalf("expected state 'requested', got %q", state)
+	}
+}
+
+// TestResetLibraryItemStateClearsSearchCooldowns guards a live production
+// gap (confirmed 2026-08-20): ResetLibraryItemState reset the selection and
+// queue state, but left last_searched_at, consecutive_failure_searches, and
+// dispatch_attempt_count/dispatch_backoff_until untouched on an existing
+// queue_items row. An item that had escalated consecutive_failure_searches
+// to 10+ (the 7-day cooldown tier used by both
+// ListPendingLibrarySearchTargets and ListFailedQueueRetryTargets) with a
+// recent last_searched_at stayed silently throttled for up to 7 days after
+// a user-triggered reset -- despite both of those functions' own doc
+// comments promising the item re-enters the search cycle "as if newly
+// added". Confirmed via direct code reading, not yet observed live in this
+// exact form (unlike the sibling queue_items-row-missing gap this file's
+// other test guards), but the mechanism is the same class of bug.
+func TestResetLibraryItemStateClearsSearchCooldowns(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	var libID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('episode', 'reset-clears-cooldowns-check', true)
+		returning id`).Scan(&libID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into queue_items (
+			library_item_id, state, idempotency_key,
+			last_searched_at, consecutive_failure_searches,
+			dispatch_attempt_count, dispatch_backoff_until
+		) values ($1, $2, $3, now(), 12, 30, now() + interval '24 hours')`,
+		libID, QueueFailed, fmt.Sprintf("reset-cooldowns-check-%d", libID),
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.ResetLibraryItemState(ctx, libID); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		lastSearchedAt                    sql.NullTime
+		failureSearches, dispatchAttempts int
+		backoffUntil                      sql.NullTime
+	)
+	if err := sqlDB.QueryRowContext(ctx, `
+		select last_searched_at, consecutive_failure_searches, dispatch_attempt_count, dispatch_backoff_until
+		from queue_items where library_item_id = $1`, libID,
+	).Scan(&lastSearchedAt, &failureSearches, &dispatchAttempts, &backoffUntil); err != nil {
+		t.Fatal(err)
+	}
+	if lastSearchedAt.Valid {
+		t.Fatalf("expected last_searched_at to be cleared, got %v", lastSearchedAt.Time)
+	}
+	if failureSearches != 0 {
+		t.Fatalf("expected consecutive_failure_searches reset to 0, got %d", failureSearches)
+	}
+	if dispatchAttempts != 0 {
+		t.Fatalf("expected dispatch_attempt_count reset to 0, got %d", dispatchAttempts)
+	}
+	if backoffUntil.Valid {
+		t.Fatalf("expected dispatch_backoff_until to be cleared, got %v", backoffUntil.Time)
 	}
 }

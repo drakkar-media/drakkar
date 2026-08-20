@@ -122,7 +122,13 @@ func (s *Service) RemoveBrokenMediaSymlinks(ctx context.Context) (Result, error)
 // RemoveOrphanedCompletedSymlinks deletes symlink_publication records whose
 // on-disk symlink no longer exists at all (e.g. removed manually or by an
 // external process), so the database doesn't keep tracking a publication
-// that no longer has any corresponding library entry.
+// that no longer has any corresponding library entry. Only a genuine
+// os.IsNotExist counts as "no longer exists" -- any other Lstat error (e.g. a
+// transient filesystem hiccup) is skipped and retried on the next run,
+// mirroring the same fix already applied to its sibling
+// RemoveBrokenMediaSymlinks, which ran back-to-back with this function
+// (runStorageMaintenance, internal/app/app.go) and had been silently
+// deleting rows for still-valid symlinks on any non-not-found stat error.
 func (s *Service) RemoveOrphanedCompletedSymlinks(ctx context.Context) (Result, error) {
 	records, err := s.repo.ListSymlinkPublicationRecords(ctx)
 	if err != nil {
@@ -130,7 +136,11 @@ func (s *Service) RemoveOrphanedCompletedSymlinks(ctx context.Context) (Result, 
 	}
 	result := Result{TaskName: "orphaned-completed-symlinks", ScannedRows: len(records)}
 	for _, record := range records {
-		if _, err := os.Lstat(record.LibraryPath); err == nil {
+		_, err := os.Lstat(record.LibraryPath)
+		if err == nil {
+			continue
+		}
+		if !os.IsNotExist(err) {
 			continue
 		}
 		if err := s.repo.DeleteSymlinkPublication(ctx, record.ID); err != nil {

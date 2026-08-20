@@ -4134,6 +4134,17 @@ func (db *DB) RequeueSelectedRelease(ctx context.Context, queueItemID int64) err
 // and marks the library item as unavailable so it re-enters the normal search cycle.
 // It does NOT touch symlink_publications or the filesystem — the caller is responsible
 // for removing symlinks before calling this.
+//
+// Also clears last_searched_at, consecutive_failure_searches,
+// dispatch_attempt_count, and dispatch_backoff_until on the existing row.
+// Confirmed live 2026-08-20: without this, an item that had escalated any of
+// these cooldowns (e.g. consecutive_failure_searches >= 10, gating a 7-day
+// search cooldown per ListPendingLibrarySearchTargets/
+// ListFailedQueueRetryTargets) stayed throttled for up to 7 days after a
+// user-triggered reset that's documented -- and expected -- to make the item
+// re-enter the search cycle immediately, "as if newly added". A brand-new
+// queue_items row (the no-existing-row branch below) already starts at these
+// same fresh defaults, so only the existing-row UPDATE path needs this.
 func (db *DB) ResetLibraryItemState(ctx context.Context, libraryItemID int64) error {
 	tx, err := db.SQL.BeginTx(ctx, nil)
 	if err != nil {
@@ -4212,7 +4223,9 @@ func (db *DB) ResetLibraryItemState(ctx context.Context, libraryItemID int64) er
 
 	if _, err = tx.ExecContext(ctx, `
 		UPDATE queue_items
-		SET state = $2, failure_reason = '', selected_release_id = NULL, updated_at = now()
+		SET state = $2, failure_reason = '', selected_release_id = NULL, updated_at = now(),
+		    last_searched_at = NULL, consecutive_failure_searches = 0,
+		    dispatch_attempt_count = 0, dispatch_backoff_until = NULL
 		WHERE id = $1`, queueItemID, QueueRequested,
 	); err != nil {
 		return err

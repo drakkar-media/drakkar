@@ -17,6 +17,7 @@ import (
 	"github.com/drakkar-media/drakkar/internal/hydra"
 	"github.com/drakkar-media/drakkar/internal/library"
 	"github.com/drakkar-media/drakkar/internal/nzb"
+	"github.com/drakkar-media/drakkar/internal/policy"
 	"github.com/drakkar-media/drakkar/internal/seerr"
 	"github.com/drakkar-media/drakkar/internal/tmdb"
 	"github.com/drakkar-media/drakkar/internal/tvdb"
@@ -3433,6 +3434,101 @@ func TestRetryFailedQueueStopsCleanlyOnceBatchContextExpires(t *testing.T) {
 	}
 	if len(repo.requeued) != 0 {
 		t.Fatalf("expected no requeue calls once the batch context is already done, got %+v", repo.requeued)
+	}
+}
+
+// TestSearchRecentPendingStopsCleanlyOnceBatchContextExpires guards the same
+// class of bug as TestRetryFailedQueueStopsCleanlyOnceBatchContextExpires,
+// found in this function via a 2026-08-20 codebase audit: every target in
+// SearchRecentPending's loop shared ONE context across the whole batch, all
+// the way down through fetchAndImportSelectedRelease's fetch/import chain.
+// One slow/cancelled item would surface the transient "context canceled"
+// reason for every remaining target too -- a reason that's never
+// blocklisted, so the same candidate would be reselected and re-cancelled
+// on every subsequent scheduled pass, forever, mirroring the exact
+// RetryFailedQueue incident. The fix gives each target its own context,
+// detached from the batch-level one, and stops STARTING new work once the
+// batch-level context is already done. This test passes an already-canceled
+// context and confirms SearchRecentPending stops before processing
+// anything, instead of marking every target Failed.
+func TestSearchRecentPendingStopsCleanlyOnceBatchContextExpires(t *testing.T) {
+	// Mirrors TestSearchRecentPendingMovieSelectsWithoutActiveHydraSearch's
+	// setup exactly -- a target that would fully process, search, and select
+	// given a live context -- so an already-canceled context is the only
+	// variable, and the old code's total indifference to ctx.Err() would
+	// otherwise let this target sail through to Selected=1 regardless.
+	repo := &repoStub{
+		pending: []database.PendingLibrarySearchTarget{{LibraryItemID: 42}},
+		searchInput: database.LibrarySearchInput{
+			LibraryItemID: 42,
+			MediaType:     "movie",
+			Title:         "Dune",
+			IMDbID:        "tt1160419",
+			MovieYear:     2021,
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{
+		recent: map[string][]hydra.SearchResult{
+			"movie": {
+				{Title: "Dune.2021.1080p.WEB-DL.x265-GRP", Link: "http://example/nzb", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+			},
+		},
+	})
+	service.fetcher = fetcherStub{
+		fileName: "dune.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Dune (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate the batch-level deadline already having lapsed
+
+	result, err := service.SearchRecentPending(ctx, "movie")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Failed != 0 {
+		t.Fatalf("expected zero bogus per-item failures once the batch context is already done, got %+v", result)
+	}
+	if result.Processed != 0 || result.Searched != 0 || result.Selected != 0 {
+		t.Fatalf("expected no target to be started once the batch context is already done, got %+v", result)
+	}
+}
+
+// TestManageQueueItemsStopsCleanlyOnceBatchContextExpires guards the same
+// class of bug as TestRetryFailedQueueStopsCleanlyOnceBatchContextExpires
+// and TestSearchRecentPendingStopsCleanlyOnceBatchContextExpires, found in
+// this function via a 2026-08-20 codebase audit: ManageQueueItems is
+// reachable synchronously from POST /api/queue/bulk-action (r.Context()),
+// and shared ONE context across every item in the batch, all the way down
+// through manageQueueItemWithSettings's ClearQueueSelectedRelease call (and,
+// for QueueActionRemoveBlocklistAndSearch, a real SearchLibrary indexer
+// round-trip). A large batch outliving the client's own timeout or an
+// intervening reverse-proxy's read timeout would cancel r.Context()
+// mid-batch, and every remaining item would then fail for a reason that has
+// nothing to do with the item itself. This test passes an already-canceled
+// context and confirms ManageQueueItems stops before processing anything,
+// instead of marking every item Failed.
+func TestManageQueueItemsStopsCleanlyOnceBatchContextExpires(t *testing.T) {
+	repo := &repoStub{
+		retryTarget: database.QueueRetryTarget{QueueItemID: 55, LibraryItemID: 42},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // simulate the batch-level deadline already having lapsed
+
+	result, err := service.ManageQueueItems(ctx, []int64{55, 56}, string(policy.QueueActionRemove))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Failed != 0 {
+		t.Fatalf("expected zero bogus per-item failures once the batch context is already done, got %+v", result)
+	}
+	if len(result.ProcessedQueues) != 0 {
+		t.Fatalf("expected no items to be started once the batch context is already done, got %+v", result)
+	}
+	if len(repo.skipped) != 0 {
+		t.Fatalf("expected no ClearQueueSelectedRelease calls once the batch context is already done, got %v", repo.skipped)
 	}
 }
 

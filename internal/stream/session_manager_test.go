@@ -229,27 +229,27 @@ func TestSetConnectionBudgetScalesWithStreamingBudget(t *testing.T) {
 	}
 }
 
-// TestReadAheadManagerRampsUpParallelismOverFirstWindows guards the fix for
-// a live A/V-sync-delay report (2026-08-09, Venom: Let There Be Carnage):
-// visible block/stutter artifacts right at stream start, then a persistent
-// desync only a seek (not pause/resume) fixed. A live repro caught every
-// priority tier -- interactive, read-ahead, and the health-check's own
-// background probe -- going slow simultaneously, alongside unrelated titles'
-// health-check probes failing in the same few seconds, matching this
-// codebase's own documented signature for provider-side rate limiting
-// triggered by aggregate connection/request load. A single stream jumping
-// straight from 0 to its full parallelism share (routinely ~20 connections)
-// in one instant, right when read-ahead first fills its window, is exactly
-// the kind of spike that can trip it. This proves the first few windows ramp
-// up gradually (readAheadRampFloor, then increasing) instead of bursting
-// straight to the full share, while still reaching the full share within
-// readAheadRampWindows.
-func TestReadAheadManagerRampsUpParallelismOverFirstWindows(t *testing.T) {
+// TestReadAheadManagerRampsUpParallelismEveryWindow guards the fix for a
+// live streaming stall (2026-08-20, Outer Banks S05E01, confirmed ~1h45m
+// into an uninterrupted playback session): 20 concurrent read-ahead
+// fetches -- exactly that session's full parallelism share -- all timed out
+// simultaneously against the sole configured provider, immediately followed
+// by a genuine connection reset and a stall on the interactive lane itself
+// (the felt playback freeze). The ramp originally added for a similar 2026
+// -08-09 incident (Venom: Let There Be Carnage) only applied to a session's
+// first few windows (tracked via a per-session counter, reset on Seek);
+// every window after that burst straight to full parallelism in one
+// instant, retriggering the exact provider-throttle signature the ramp was
+// built to avoid, on a roughly 2-minute cycle for the rest of any
+// sufficiently long stream. This proves EVERY window ramps gradually now --
+// checked once early in the session and repeatedly many windows deep, well
+// past the old fix's session-lifetime cutoff of 4.
+func TestReadAheadManagerRampsUpParallelismEveryWindow(t *testing.T) {
 	manager := NewReadAheadManager(1 << 20)
 	manager.SetConnectionBudget(25, 80) // full per-stream share = 20
 	manager.SetArticleBufferSize(30)
 
-	spans := make([]SegmentSpan, 80)
+	spans := make([]SegmentSpan, 800)
 	for i := range spans {
 		spans[i] = SegmentSpan{SegmentID: int64(i + 1), MessageID: fmt.Sprintf("<msg%d>", i+1), Start: int64(i) * 64, End: int64(i+1) * 64}
 	}
@@ -259,49 +259,67 @@ func TestReadAheadManagerRampsUpParallelismOverFirstWindows(t *testing.T) {
 	defer manager.Stop("stream-ramp")
 
 	// priorityFetcherStub sends to calls then blocks on ctx.Done() forever,
-	// so once a window's semaphore fills, no further calls arrive until the
-	// next NotifyRead cancels it -- draining until a short quiet gap gives an
-	// exact count of that window's concurrent fetches.
-	drainConcurrentCalls := func() int {
-		count := 0
+	// so once a window's semaphore (sized to the full parallelism share)
+	// fills, no further calls arrive until the next NotifyRead cancels it --
+	// draining until a quiet gap well above the 50ms stagger interval but
+	// well below the reschedule cadence gives every call's arrival time.
+	drainWithTimestamps := func() []time.Time {
+		var arrivals []time.Time
 		for {
 			select {
 			case <-fetcher.calls:
-				count++
+				arrivals = append(arrivals, time.Now())
 			case <-time.After(150 * time.Millisecond):
-				return count
+				return arrivals
 			}
 		}
 	}
 
-	wantByWindow := []int{11, 14, 17, 20} // floor 8 + (20-8)*windowIndex/4, then full from window 4
-	for i, want := range wantByWindow {
-		// A 30-article window covers 1,920 bytes, so each 960-byte advance
-		// crosses its midpoint and starts one genuinely new window.
-		manager.NotifyRead("stream-ramp", int64(i)*960)
-		if got := drainConcurrentCalls(); got != want {
-			t.Fatalf("window %d: expected %d concurrent fetches, got %d", i+1, want, got)
+	checkWindowRamps := func(label string) {
+		t.Helper()
+		arrivals := drainWithTimestamps()
+		if len(arrivals) != 20 {
+			t.Fatalf("%s: expected 20 concurrent fetches (full parallelism share), got %d", label, len(arrivals))
 		}
+		// The initial floor batch (readAheadRampFloor=8) launches
+		// unstaggered -- essentially at once.
+		floorSpan := arrivals[readAheadRampFloor-1].Sub(arrivals[0])
+		if floorSpan > 50*time.Millisecond {
+			t.Fatalf("%s: floor batch (first %d) took %s to arrive, expected near-instant", label, readAheadRampFloor, floorSpan)
+		}
+		// The climb from the floor to the full 20 must be staggered, not
+		// instant -- this is the actual fix. 12 more launches at
+		// readAheadRampStaggerInterval (50ms) apart should take ~600ms;
+		// require at least a bit over half that so a slow CI box doesn't
+		// flake, while still clearly distinguishing from the old
+		// near-instant-burst behavior this test guards against.
+		rampSpan := arrivals[len(arrivals)-1].Sub(arrivals[readAheadRampFloor-1])
+		if rampSpan < 350*time.Millisecond {
+			t.Fatalf("%s: ramp from floor to full parallelism took only %s, expected a staggered climb of several hundred ms (bug: bursting to full share in one instant)", label, rampSpan)
+		}
+	}
+
+	// A 30-article window covers 1,920 bytes, so each 960-byte advance
+	// crosses its midpoint and starts one genuinely new window.
+	for i := range 8 {
+		manager.NotifyRead("stream-ramp", int64(i)*960)
+		checkWindowRamps(fmt.Sprintf("window %d", i+1))
 	}
 }
 
-// TestReadAheadManagerSeekResetsRamp guards a gap in the ramp-up fix above,
-// confirmed live (2026-08-10) independently on two unrelated titles: play
-// from the start always worked, but seeking to a specific timestamp
-// afterward consistently hung. The ramp only reset on a brand-new session
-// (Register), so a session that had already played sequentially long enough
-// to reach its full parallelism share, then seeked to a distant, entirely
-// unfetched part of the file, burst straight to that full share for the new
-// region anyway -- the exact instant spike the ramp exists to prevent, just
-// triggered by a seek instead of a fresh open. A seek must restart the ramp,
-// since it lands on unfetched territory just as surely as a new session
-// does.
-func TestReadAheadManagerSeekResetsRamp(t *testing.T) {
+// TestReadAheadManagerSeekStartsRampedWindow guards the seek path
+// specifically: a seek cancels the in-flight window without immediately
+// scheduling a replacement (NotifyRead does that once the interactive read
+// following the seek reports its landing offset), and that replacement
+// window must ramp up gradually like any other window -- it lands on
+// unfetched territory just as surely as a new session or a routine
+// mid-playback reschedule does.
+func TestReadAheadManagerSeekStartsRampedWindow(t *testing.T) {
 	manager := NewReadAheadManager(1 << 20)
 	manager.SetConnectionBudget(25, 80) // full per-stream share = 20
 	manager.SetArticleBufferSize(30)
 
-	spans := make([]SegmentSpan, 80)
+	spans := make([]SegmentSpan, 800)
 	for i := range spans {
 		spans[i] = SegmentSpan{SegmentID: int64(i + 1), MessageID: fmt.Sprintf("<msg%d>", i+1), Start: int64(i) * 64, End: int64(i+1) * 64}
 	}
@@ -310,35 +328,36 @@ func TestReadAheadManagerSeekResetsRamp(t *testing.T) {
 	manager.Register("stream-seek-ramp", spans, fetcher)
 	defer manager.Stop("stream-seek-ramp")
 
-	drainConcurrentCalls := func() int {
-		count := 0
+	drainWithTimestamps := func() []time.Time {
+		var arrivals []time.Time
 		for {
 			select {
 			case <-fetcher.calls:
-				count++
+				arrivals = append(arrivals, time.Now())
 			case <-time.After(150 * time.Millisecond):
-				return count
+				return arrivals
 			}
 		}
 	}
 
-	// Play sequentially through all 4 ramp windows to reach full parallelism.
+	// Play sequentially through several windows first.
 	for i := range 4 {
 		manager.NotifyRead("stream-seek-ramp", int64(i)*960)
-		drainConcurrentCalls()
-	}
-	if got := drainConcurrentCalls(); got != 0 {
-		t.Fatalf("setup: expected the ramp-up loop to have drained everything, got %d extra", got)
+		drainWithTimestamps()
 	}
 
-	// Now seek to a distant, never-fetched part of the file. Without the
-	// reset, this next window would burst straight to the full share (20)
-	// instead of restarting the ramp near the floor (8 + (20-8)*1/4 = 11 for
-	// this window, the first of the restarted ramp).
-	manager.Seek("stream-seek-ramp", 0)
-	manager.NotifyRead("stream-seek-ramp", 0)
-	if got := drainConcurrentCalls(); got != 11 {
-		t.Fatalf("expected the window right after a seek to ramp back down to 11, got %d", got)
+	// Seek to a distant, never-fetched part of the file (still within the
+	// 800*64=51,200-byte span coverage), then land there (mirroring the
+	// FUSE handle's real NotifyRead-after-seek sequence).
+	manager.Seek("stream-seek-ramp", 40_000)
+	manager.NotifyRead("stream-seek-ramp", 40_000)
+	arrivals := drainWithTimestamps()
+	if len(arrivals) != 20 {
+		t.Fatalf("expected the window right after a seek to reach the full 20-fetch parallelism share, got %d", len(arrivals))
+	}
+	rampSpan := arrivals[len(arrivals)-1].Sub(arrivals[readAheadRampFloor-1])
+	if rampSpan < 350*time.Millisecond {
+		t.Fatalf("expected the window right after a seek to ramp gradually, got a %s climb from floor to full share (bug: bursting straight to full share)", rampSpan)
 	}
 }
 

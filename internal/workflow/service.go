@@ -454,6 +454,15 @@ const (
 	asyncCalibrateWorkers        = 2
 	tmdbEnrichWorkers            = 5
 	requestEnrichmentBudget      = 10 * time.Minute
+	// perItemRetryBudget bounds a single target's worth of work in a batch
+	// loop over independent queue items (DB updates plus, for
+	// Hydra-eligible actions, a real SearchLibrary call: indexer round-trip
+	// + ranking against however many candidates come back -- one item in
+	// production carried 2,759). Each target gets its OWN timeout, detached
+	// from the batch-level context, rather than sharing one deadline across
+	// the whole batch -- shared by RetryFailedQueue and ManageQueueItems,
+	// which do the same shape of per-item work.
+	perItemRetryBudget = 2 * time.Minute
 	// maxCandidateFailuresBeforeGiveUp bounds how many real NZB fetch
 	// attempts a single release_candidate gets before it's force-blocklisted
 	// as "too_many_failures", regardless of whether its specific failure
@@ -2363,72 +2372,103 @@ func (s *Service) SearchRecentPending(ctx context.Context, mediaType string) (Bu
 	if err != nil {
 		return BulkSearchResult{}, err
 	}
+	// perRecentItemBudget bounds a single target's worth of work below: DB
+	// reads/writes plus, once a candidate is selected, a full
+	// fetchAndImportSelectedRelease chain (fetch, import, and possibly
+	// preflight/publish) -- the same 10-minute ceiling already used
+	// elsewhere in this file for that same chain. Each target gets its own
+	// context, detached from ctx (see the loop comment below for why),
+	// rather than sharing one deadline across the whole batch.
+	const perRecentItemBudget = 10 * time.Minute
+
 	result := BulkSearchResult{}
 	for _, target := range targets {
-		input, err := s.repo.GetLibrarySearchInput(ctx, target.LibraryItemID)
-		if err != nil {
-			continue
+		// Once the caller's ctx (e.g. a scheduled task's own batch-level
+		// budget) is exhausted, stop STARTING new work -- remaining targets
+		// are simply picked up on the next scheduled pass, same as
+		// RetryFailedQueue's identical guard.
+		if ctx.Err() != nil {
+			break
 		}
-		if reason, err := s.repo.DetectMovieSearchConflict(ctx, target.LibraryItemID); err == nil && strings.TrimSpace(reason) != "" {
-			_ = s.repo.MarkLibrarySearchFailed(ctx, target.LibraryItemID, reason)
-			result.Failed++
-			result.FailedItems = append(result.FailedItems, target.LibraryItemID)
-			continue
-		} else if err != nil {
-			result.Failed++
-			result.FailedItems = append(result.FailedItems, target.LibraryItemID)
-			continue
-		}
-		if !matchesRecentMediaType(input, mediaType) {
-			continue
-		}
-		result.Processed++
-		result.ProcessedItems = append(result.ProcessedItems, target.LibraryItemID)
-		history, err := s.repo.LookupCandidateHistory(ctx, target.LibraryItemID)
-		if err != nil {
-			result.Failed++
-			result.FailedItems = append(result.FailedItems, target.LibraryItemID)
-			continue
-		}
-		profilePrefs := s.profilePreferencesForItem(ctx, target.LibraryItemID, input.MediaType)
-		candidates := buildSearchCandidates(recent, searchRequirements(input), history, profilePrefs, s.indexerLimits, s.loadIndexerPolicyMap(ctx))
-		// Only store candidates when at least one matches this show's title.
-		// If the recent feed has no match (all wrong_title), skip rather than
-		// replacing existing valid candidates with a batch of rejections.
-		if !hasNonRejectedCandidate(candidates) {
-			continue
-		}
-		// O-05: skip if another goroutine (a manual search, backlog_search,
-		// or queue_housekeeping retry) is already searching/selecting for
-		// this item -- the same per-item guard SearchLibrary uses. Without
-		// it, this RSS-recent-feed cycle could race one of those, each
-		// independently selecting and fetching a different candidate's URL
-		// for the same library item.
-		if _, loaded := s.searchInflight.LoadOrStore(target.LibraryItemID, struct{}{}); loaded {
-			continue
-		}
-		selectedReleaseID, err := s.repo.ReplaceSearchCandidates(ctx, target.LibraryItemID, candidates, false)
-		if err != nil {
+		func() {
+			// Real production pattern already confirmed in RetryFailedQueue
+			// (2026-08-12): sharing ctx across every target in a loop means
+			// one slow/cancelled item (a season pack fetch+import can run
+			// long) takes every sibling down with it the instant the shared
+			// deadline lapses, each surfacing the same soft "context
+			// canceled" failure that's never blocklisted -- so the same
+			// candidate gets reselected and re-cancelled every cycle,
+			// forever. Giving each target its own context, detached from
+			// ctx, means a slow/cancelled item can only ever fail on its
+			// own terms.
+			itemCtx, cancel := context.WithTimeout(context.Background(), perRecentItemBudget)
+			defer cancel()
+
+			input, err := s.repo.GetLibrarySearchInput(itemCtx, target.LibraryItemID)
+			if err != nil {
+				return
+			}
+			if reason, err := s.repo.DetectMovieSearchConflict(itemCtx, target.LibraryItemID); err == nil && strings.TrimSpace(reason) != "" {
+				_ = s.repo.MarkLibrarySearchFailed(itemCtx, target.LibraryItemID, reason)
+				result.Failed++
+				result.FailedItems = append(result.FailedItems, target.LibraryItemID)
+				return
+			} else if err != nil {
+				result.Failed++
+				result.FailedItems = append(result.FailedItems, target.LibraryItemID)
+				return
+			}
+			if !matchesRecentMediaType(input, mediaType) {
+				return
+			}
+			result.Processed++
+			result.ProcessedItems = append(result.ProcessedItems, target.LibraryItemID)
+			history, err := s.repo.LookupCandidateHistory(itemCtx, target.LibraryItemID)
+			if err != nil {
+				result.Failed++
+				result.FailedItems = append(result.FailedItems, target.LibraryItemID)
+				return
+			}
+			profilePrefs := s.profilePreferencesForItem(itemCtx, target.LibraryItemID, input.MediaType)
+			candidates := buildSearchCandidates(recent, searchRequirements(input), history, profilePrefs, s.indexerLimits, s.loadIndexerPolicyMap(itemCtx))
+			// Only store candidates when at least one matches this show's title.
+			// If the recent feed has no match (all wrong_title), skip rather than
+			// replacing existing valid candidates with a batch of rejections.
+			if !hasNonRejectedCandidate(candidates) {
+				return
+			}
+			// O-05: skip if another goroutine (a manual search, backlog_search,
+			// or queue_housekeeping retry) is already searching/selecting for
+			// this item -- the same per-item guard SearchLibrary uses. Without
+			// it, this RSS-recent-feed cycle could race one of those, each
+			// independently selecting and fetching a different candidate's URL
+			// for the same library item.
+			if _, loaded := s.searchInflight.LoadOrStore(target.LibraryItemID, struct{}{}); loaded {
+				return
+			}
+			selectedReleaseID, err := s.repo.ReplaceSearchCandidates(itemCtx, target.LibraryItemID, candidates, false)
+			if err != nil {
+				s.searchInflight.Delete(target.LibraryItemID)
+				result.Failed++
+				result.FailedItems = append(result.FailedItems, target.LibraryItemID)
+				return
+			}
+			result.Searched++
+			if selectedReleaseID == nil {
+				s.searchInflight.Delete(target.LibraryItemID)
+				return
+			}
+			finalSelected, err := s.fetchAndImportSelectedRelease(itemCtx, *selectedReleaseID)
 			s.searchInflight.Delete(target.LibraryItemID)
-			result.Failed++
-			result.FailedItems = append(result.FailedItems, target.LibraryItemID)
-			continue
-		}
-		result.Searched++
-		if selectedReleaseID == nil {
-			s.searchInflight.Delete(target.LibraryItemID)
-			continue
-		}
-		finalSelected, err := s.fetchAndImportSelectedRelease(ctx, *selectedReleaseID)
-		s.searchInflight.Delete(target.LibraryItemID)
-		if err != nil {
-			result.Failed++
-			result.FailedItems = append(result.FailedItems, target.LibraryItemID)
-			continue
-		}
-		if finalSelected != nil {
-			result.Selected++
-		}
+			if err != nil {
+				result.Failed++
+				result.FailedItems = append(result.FailedItems, target.LibraryItemID)
+				return
+			}
+			if finalSelected != nil {
+				result.Selected++
+			}
+		}()
 	}
 	return result, nil
 }
@@ -2543,14 +2583,6 @@ func (s *Service) RetryFailedQueue(ctx context.Context) (BulkQueueRetryResult, e
 
 	const maxHydraCalls = 100
 	hydraCallCount := 0
-
-	// perItemRetryBudget bounds a single target's worth of work inside the
-	// loop below (DB updates plus, for Hydra-eligible actions, a real
-	// SearchLibrary call: indexer round-trip + ranking against however many
-	// candidates come back -- one item in production carried 2,759). Each
-	// target gets its OWN timeout, detached from ctx (see the loop comment
-	// for why), rather than sharing one deadline across the whole batch.
-	const perItemRetryBudget = 2 * time.Minute
 
 	result := BulkQueueRetryResult{Processed: len(targets)}
 	for _, target := range targets {
@@ -5040,8 +5072,29 @@ func (s *Service) ManageQueueItems(ctx context.Context, queueItemIDs []int64, ac
 	}
 	result := BulkQueueRetryResult{Processed: len(queueItemIDs)}
 	for _, queueItemID := range queueItemIDs {
+		// This is reachable synchronously from POST /api/queue/bulk-action
+		// (r.Context()), so ctx can end early either from the caller's own
+		// deadline or the HTTP client/an intervening proxy giving up on a
+		// large batch. Once that happens, stop STARTING new work -- same
+		// guard as RetryFailedQueue/SearchRecentPending -- rather than
+		// marking every remaining item Failed for a reason that has nothing
+		// to do with the item itself.
+		if ctx.Err() != nil {
+			break
+		}
 		result.ProcessedQueues = append(result.ProcessedQueues, queueItemID)
-		item, err := s.manageQueueItemWithSettings(ctx, queueItemID, action, settings)
+		// Same class of bug already fixed in RetryFailedQueue/
+		// SearchRecentPending: sharing ctx across every item in this loop
+		// means one slow item (queueActionRemoveBlocklistAndSearch calls
+		// SearchLibrary, a real indexer round-trip + ranking) can exhaust
+		// the batch deadline mid-search and take every remaining item down
+		// with it, each surfacing the same soft "context canceled" failure.
+		// Each item gets its own budget, detached from ctx, matching
+		// RetryFailedQueue's identical perItemRetryBudget for the same
+		// SearchLibrary-shaped work.
+		itemCtx, cancel := context.WithTimeout(context.Background(), perItemRetryBudget)
+		item, err := s.manageQueueItemWithSettings(itemCtx, queueItemID, action, settings)
+		cancel()
 		if err != nil {
 			result.Failed++
 			result.FailedQueues = append(result.FailedQueues, queueItemID)

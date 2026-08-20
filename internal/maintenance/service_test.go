@@ -121,6 +121,38 @@ func TestRemoveOrphanedCompletedSymlinks(t *testing.T) {
 	}
 }
 
+// TestRemoveOrphanedCompletedSymlinksSkipsTransientLstatError guards against
+// treating a non-ENOENT Lstat error on the symlink's own path (e.g. a
+// transient filesystem hiccup) as proof it's gone -- the same anti-pattern
+// already fixed in the sibling RemoveBrokenMediaSymlinks. Simulated here via
+// an ENOTDIR (a parent path component is a regular file), which -- unlike
+// permission bits -- is enforced for root too.
+func TestRemoveOrphanedCompletedSymlinksSkipsTransientLstatError(t *testing.T) {
+	root := t.TempDir()
+	notADir := filepath.Join(root, "not-a-dir")
+	if err := os.WriteFile(notADir, []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(notADir, "published.mkv")
+
+	repo := &repoStub{
+		records: []database.SymlinkPublicationRecord{{ID: 15, LibraryPath: link, TargetPath: "/target"}},
+	}
+	rt := config.DefaultRuntime()
+	service := NewService(repo, rt)
+
+	result, err := service.RemoveOrphanedCompletedSymlinks(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.DeletedRows != 0 {
+		t.Fatalf("expected transient Lstat error to be skipped, got %+v", result)
+	}
+	if len(repo.deleted) != 0 {
+		t.Fatalf("expected no publication rows deleted, got %v", repo.deleted)
+	}
+}
+
 func TestRemoveOrphanedContent(t *testing.T) {
 	root := t.TempDir()
 	movies := filepath.Join(root, "movies")
