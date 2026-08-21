@@ -210,6 +210,49 @@ func TestEnrichBlocklistSignaturePopulatesMetadataFromMatchingCandidate(t *testi
 	}
 }
 
+// TestEnrichBlocklistSignatureCapsUnboundedScanForManualEntryShape guards a
+// real gap: a manual-entry blocklist item's release_signature key can have
+// blank indexer/size/date fields, which makes every clause in
+// enrichBlocklistSignature's WHERE vacuously true -- without a LIMIT, this
+// scans the entire release_candidates table (once per blocklist row needing
+// enrichment, on every page render). This seeds a genuine match at the
+// OLDEST id, then enough newer decoy rows to push it past
+// enrichBlocklistSignatureScanLimit, and asserts it is NOT found -- proving
+// the query is actually bounded rather than an unbounded scan that would
+// eventually reach it regardless of decoy count.
+func TestEnrichBlocklistSignatureCapsUnboundedScanForManualEntryShape(t *testing.T) {
+	db, sqlDB, ctx := openBlocklistTestDB(t)
+
+	libID := setupRaceTestLibraryItem(t, ctx, sqlDB, "blocklist-enrich-signature-cap", "selected")
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, libID)
+
+	const realTitle = "Old Real Match Movie 2024"
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into release_candidates (library_item_id, title) values ($1, $2)`, libID, realTitle,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	decoyTitles := make([]string, enrichBlocklistSignatureScanLimit)
+	for i := range decoyTitles {
+		decoyTitles[i] = fmt.Sprintf("Decoy Release %d", i)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into release_candidates (library_item_id, title)
+		select $1, t from unnest($2::text[]) as u(t)`, libID, decoyTitles,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	item := &BlocklistItemSummary{}
+	if err := db.enrichBlocklistSignature(ctx, item, NormalizeReleaseTitle(realTitle), "", -1, nil); err != nil {
+		t.Fatal(err)
+	}
+	if item.ReleaseTitle != "" {
+		t.Fatalf("expected the older-than-the-cap match to be missed (proving the scan is bounded), but found %q", item.ReleaseTitle)
+	}
+}
+
 func TestListBlocklistItemsPagedExcludesExpiredAndFiltersByReason(t *testing.T) {
 	db, sqlDB, ctx := openBlocklistTestDB(t)
 
@@ -414,7 +457,7 @@ func TestBlocklistStatsCollapsesEmbeddedMessageIDsAnywhereInReason(t *testing.T)
 	db, sqlDB, ctx := openBlocklistTestDB(t)
 
 	msgA, err := db.CreateBlocklistItem(ctx, BlocklistMutation{
-		Key: "external_url:http://example/msgid-a.nzb",
+		Key:    "external_url:http://example/msgid-a.nzb",
 		Reason: "fetch decoded article aaaa1111@news.example.com: yenc crc mismatch",
 	})
 	if err != nil {
@@ -423,7 +466,7 @@ func TestBlocklistStatsCollapsesEmbeddedMessageIDsAnywhereInReason(t *testing.T)
 	defer sqlDB.ExecContext(ctx, `delete from blocklist_items where id = $1`, msgA.ID)
 
 	msgB, err := db.CreateBlocklistItem(ctx, BlocklistMutation{
-		Key: "external_url:http://example/msgid-b.nzb",
+		Key:    "external_url:http://example/msgid-b.nzb",
 		Reason: "fetch decoded article bbbb2222@reader.example.net: yenc crc mismatch",
 	})
 	if err != nil {

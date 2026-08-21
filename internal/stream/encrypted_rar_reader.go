@@ -23,10 +23,11 @@ import (
 // what is and isn't independently verified about RAR5's per-file
 // encryption layout.
 //
-// The first read that reaches byte 0 of the file verifies the decrypted
-// output against the container's own magic number (rarcrypto.
-// VerifyContainerHeader) before returning ANY bytes -- see verifyOnce's
-// doc comment for why this is mandatory, not optional.
+// The first ReadAt of any offset verifies the decrypted output against the
+// container's own magic number (rarcrypto.VerifyContainerHeader) before
+// returning ANY bytes -- see ensureVerified's doc comment for why this is
+// mandatory, not optional, and why it must run regardless of which offset
+// is actually requested first.
 type EncryptedRarReader struct {
 	inner VirtualMediaFile
 	key   [rarcrypto.KeySize]byte
@@ -55,6 +56,9 @@ func (r *EncryptedRarReader) Size() int64  { return r.inner.Size() }
 func (r *EncryptedRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) (int, error) {
 	if len(dst) == 0 {
 		return 0, nil
+	}
+	if err := r.ensureVerified(ctx); err != nil {
+		return 0, err
 	}
 	const blockSize = rarcrypto.BlockSize
 	alignedOffset := offset - offset%blockSize
@@ -96,12 +100,6 @@ func (r *EncryptedRarReader) ReadAt(ctx context.Context, dst []byte, offset int6
 		return 0, decErr
 	}
 
-	if alignedOffset == 0 {
-		if verifyErr := r.verify(plaintext); verifyErr != nil {
-			return 0, verifyErr
-		}
-	}
-
 	avail := int64(len(plaintext)) - lead
 	if avail <= 0 {
 		return 0, io.EOF
@@ -119,18 +117,48 @@ func (r *EncryptedRarReader) ReadAt(ctx context.Context, dst []byte, offset int6
 	return int(toCopy), nil
 }
 
-// verify runs rarcrypto.VerifyContainerHeader against plaintext (which must
-// start at the file's own byte 0) exactly once per reader, caching the
-// result -- every ReadAt that reaches offset 0 shares this same check
-// rather than re-verifying on every call. AES-CBC decryption with a wrong
-// key/IV "succeeds" and silently produces incorrect plaintext -- there is
-// no other signal that anything is wrong -- so this is the only thing
-// standing between a wrong key and confidently serving corrupted bytes to
-// a real player. A sticky failure is returned on every subsequent read
-// too, not just the first.
-func (r *EncryptedRarReader) verify(plaintextFromZero []byte) error {
+// ensureVerified fetches and decrypts this file's own byte-0 block (using
+// r.iv directly -- no CBC chaining input needed, it genuinely is the first
+// block) and checks it against the container's own magic number
+// (rarcrypto.VerifyContainerHeader), exactly once per reader, caching the
+// result. Called unconditionally at the top of every ReadAt, regardless of
+// what offset the caller actually requests.
+//
+// AES-CBC decryption with a wrong key/IV "succeeds" and silently produces
+// plausible-looking incorrect plaintext -- there is no other signal that
+// anything is wrong -- so this is the only thing standing between a wrong
+// key and confidently serving corrupted bytes to a real player.
+//
+// Confirmed live 2026-08-20: this previously only ran as a side effect of a
+// request that happened to touch alignedOffset==0 in ReadAt's own decrypt
+// path. Nothing guarantees any read ever touches offset 0 -- a resumed
+// stream continuing from a saved position, a player seeking its
+// moov/Cues table before reading from the start, or a chunked/parallel VFS
+// read that happens to fetch a later chunk first would never trigger
+// verification at all, for the entire session. Fetching byte 0 explicitly
+// and unconditionally (a small, one-time extra read per file open, cached
+// via sync.Once exactly like before) closes that gap regardless of
+// whatever access pattern a real client uses. A sticky failure is returned
+// on every subsequent read too, not just the first.
+func (r *EncryptedRarReader) ensureVerified(ctx context.Context) error {
 	r.verifyOnce.Do(func() {
-		r.verifyErr = rarcrypto.VerifyContainerHeader(plaintextFromZero)
+		const blockSize = rarcrypto.BlockSize
+		buf := make([]byte, blockSize)
+		n, err := r.inner.ReadAt(ctx, buf, 0)
+		if err != nil && err != io.EOF {
+			r.verifyErr = err
+			return
+		}
+		if n < blockSize {
+			r.verifyErr = io.ErrUnexpectedEOF
+			return
+		}
+		plaintext, decErr := rarcrypto.DecryptBlockAligned(buf, r.key, r.iv)
+		if decErr != nil {
+			r.verifyErr = decErr
+			return
+		}
+		r.verifyErr = rarcrypto.VerifyContainerHeader(plaintext)
 	})
 	return r.verifyErr
 }

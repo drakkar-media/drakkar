@@ -17,6 +17,7 @@ import (
 	"github.com/drakkar-media/drakkar/internal/database"
 	"github.com/drakkar-media/drakkar/internal/stream"
 	"golang.org/x/net/webdav"
+	"golang.org/x/sync/singleflight"
 )
 
 func init() {
@@ -138,9 +139,25 @@ type contentFS struct {
 	treeMu     sync.Mutex
 	cachedTree *treeNode
 	cachedAt   time.Time
+	treeGroup  singleflight.Group
 	// cacheTTL overrides defaultCompletedTreeCacheTTL when non-zero; only set
 	// directly in tests so they don't need real multi-second sleeps.
 	cacheTTL time.Duration
+
+	contentMu       sync.Mutex
+	cachedContent   *contentMountIndex
+	contentCachedAt time.Time
+	contentGroup    singleflight.Group
+	// contentCacheTTL overrides defaultCompletedTreeCacheTTL when non-zero;
+	// only set directly in tests so they don't need real multi-second sleeps.
+	contentCacheTTL time.Duration
+}
+
+// contentMountIndex is a point-in-time snapshot of every virtual file across
+// every release, indexed by release ID for O(1) per-release lookups without
+// a separate database round trip.
+type contentMountIndex struct {
+	byRelease map[int64][]database.ContentMountEntry
 }
 
 // defaultCompletedTreeCacheTTL bounds how stale the /completed-symlinks tree
@@ -162,6 +179,15 @@ const defaultCompletedTreeCacheTTL = 10 * time.Second
 
 // getTree returns the current /completed-symlinks tree, rebuilding it from
 // the database at most once per cache TTL rather than on every call.
+//
+// The rebuild itself runs behind treeGroup (singleflight), not just the
+// cache swap: without it, every caller that arrived after the TTL expired --
+// e.g. the whole burst of Stat/Readdir calls a Plex library scan or rclone
+// dir-cache refresh issues back to back -- ran its own full
+// ListSymlinkPublications query and buildTree pass concurrently, all
+// rebuilding the exact same tree. singleflight collapses that burst into one
+// real rebuild; every other concurrent caller just waits for it and shares
+// its result.
 func (f *contentFS) getTree(ctx context.Context) (*treeNode, error) {
 	ttl := f.cacheTTL
 	if ttl <= 0 {
@@ -175,17 +201,79 @@ func (f *contentFS) getTree(ctx context.Context) (*treeNode, error) {
 	}
 	f.treeMu.Unlock()
 
-	pubs, err := f.db.ListSymlinkPublications(ctx)
+	v, err, _ := f.treeGroup.Do("tree", func() (any, error) {
+		pubs, err := f.db.ListSymlinkPublications(ctx)
+		if err != nil {
+			return nil, err
+		}
+		tree := f.buildTree(pubs)
+
+		f.treeMu.Lock()
+		f.cachedTree = tree
+		f.cachedAt = time.Now()
+		f.treeMu.Unlock()
+		return tree, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	tree := f.buildTree(pubs)
+	return v.(*treeNode), nil
+}
 
-	f.treeMu.Lock()
-	f.cachedTree = tree
-	f.cachedAt = time.Now()
-	f.treeMu.Unlock()
-	return tree, nil
+// getContentIndex returns the current /content/releases index, rebuilding it
+// from the database at most once per cache TTL rather than on every call --
+// mirrors getTree's exact caching shape for the same reason.
+//
+// Confirmed live 2026-08-20: unlike /completed-symlinks, /content/releases
+// had no caching at all. Opening "/content/releases/" ran an unfiltered
+// ListContentMountEntries scan over every virtual_files row in the library
+// just to enumerate distinct release IDs; opening "/content/releases/{id}/"
+// or "/content/releases/{id}/{filename}" (via either Stat or OpenFile, each
+// independently) issued a fresh ListContentMountEntriesForRelease query with
+// no caching at all -- an N+1 pattern with no TTL to absorb repeats. A
+// single recursive PROPFIND walk of the releases tree -- exactly what
+// rclone's dir-cache refresh and a media-server library scan both do
+// continuously -- cost one full-table query plus one query per release
+// every single time. Indexing the one full-table fetch by release ID here
+// serves every per-release lookup from memory too, eliminating the N+1
+// entirely rather than just caching its existing shape.
+// getContentIndex's rebuild runs behind contentGroup (singleflight) for the
+// same reason as getTree's treeGroup: without it, every caller past cache
+// expiry issued its own concurrent ListContentMountEntries scan and index
+// build instead of sharing one.
+func (f *contentFS) getContentIndex(ctx context.Context) (*contentMountIndex, error) {
+	ttl := f.contentCacheTTL
+	if ttl <= 0 {
+		ttl = defaultCompletedTreeCacheTTL
+	}
+	f.contentMu.Lock()
+	if f.cachedContent != nil && time.Since(f.contentCachedAt) < ttl {
+		idx := f.cachedContent
+		f.contentMu.Unlock()
+		return idx, nil
+	}
+	f.contentMu.Unlock()
+
+	v, err, _ := f.contentGroup.Do("content", func() (any, error) {
+		entries, err := f.db.ListContentMountEntries(ctx)
+		if err != nil {
+			return nil, err
+		}
+		idx := &contentMountIndex{byRelease: make(map[int64][]database.ContentMountEntry)}
+		for _, e := range entries {
+			idx.byRelease[e.SelectedReleaseID] = append(idx.byRelease[e.SelectedReleaseID], e)
+		}
+
+		f.contentMu.Lock()
+		f.cachedContent = idx
+		f.contentCachedAt = time.Now()
+		f.contentMu.Unlock()
+		return idx, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return v.(*contentMountIndex), nil
 }
 
 // parsedPath is the result of decomposing a WebDAV path.
@@ -504,6 +592,10 @@ func (f *contentFS) statContent(ctx context.Context, rest string) (os.FileInfo, 
 	rest = strings.TrimPrefix(rest, "releases/")
 	rest = strings.Trim(rest, "/")
 
+	idx, err := f.getContentIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
 	slash := strings.IndexByte(rest, '/')
 	if slash < 0 {
 		// /content/releases/{id}
@@ -511,11 +603,7 @@ func (f *contentFS) statContent(ctx context.Context, rest string) (os.FileInfo, 
 		if err != nil {
 			return nil, os.ErrNotExist
 		}
-		entries, err := f.db.ListContentMountEntriesForRelease(ctx, rid)
-		if err != nil {
-			return nil, err
-		}
-		if len(entries) == 0 {
+		if len(idx.byRelease[rid]) == 0 {
 			return nil, os.ErrNotExist
 		}
 		return &dirInfo{name: rest}, nil
@@ -526,11 +614,7 @@ func (f *contentFS) statContent(ctx context.Context, rest string) (os.FileInfo, 
 		return nil, os.ErrNotExist
 	}
 	filename := rest[slash+1:]
-	entries, err := f.db.ListContentMountEntriesForRelease(ctx, rid)
-	if err != nil {
-		return nil, err
-	}
-	for _, e := range entries {
+	for _, e := range idx.byRelease[rid] {
 		if e.FileName == filename {
 			return &fileInfo{name: e.FileName, size: e.SizeBytes}, nil
 		}
@@ -589,19 +673,15 @@ func (f *contentFS) openContent(ctx context.Context, rest string) (webdav.File, 
 			children: []os.FileInfo{&dirInfo{name: "releases"}},
 		}, nil
 	}
+	idx, err := f.getContentIndex(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if rest == "releases" {
 		// /content/releases/ → list all release IDs
-		entries, err := f.db.ListContentMountEntries(ctx)
-		if err != nil {
-			return nil, err
-		}
-		seen := make(map[int64]bool)
 		var kids []os.FileInfo
-		for _, e := range entries {
-			if !seen[e.SelectedReleaseID] {
-				seen[e.SelectedReleaseID] = true
-				kids = append(kids, &dirInfo{name: strconv.FormatInt(e.SelectedReleaseID, 10)})
-			}
+		for rid := range idx.byRelease {
+			kids = append(kids, &dirInfo{name: strconv.FormatInt(rid, 10)})
 		}
 		return &dirFile{fi: &dirInfo{name: "releases"}, children: kids}, nil
 	}
@@ -618,12 +698,8 @@ func (f *contentFS) openContent(ctx context.Context, rest string) (webdav.File, 
 		if err != nil {
 			return nil, os.ErrNotExist
 		}
-		entries, err := f.db.ListContentMountEntriesForRelease(ctx, rid)
-		if err != nil {
-			return nil, err
-		}
 		var kids []os.FileInfo
-		for _, e := range entries {
+		for _, e := range idx.byRelease[rid] {
 			kids = append(kids, &fileInfo{name: e.FileName, size: e.SizeBytes})
 		}
 		if len(kids) == 0 {
@@ -640,11 +716,7 @@ func (f *contentFS) openContent(ctx context.Context, rest string) (webdav.File, 
 		return nil, os.ErrNotExist
 	}
 	filename := rest[slash+1:]
-	entries, err := f.db.ListContentMountEntriesForRelease(ctx, rid)
-	if err != nil {
-		return nil, err
-	}
-	for _, e := range entries {
+	for _, e := range idx.byRelease[rid] {
 		if e.FileName == filename {
 			return &virtualFile{
 				ctx:           ctx,

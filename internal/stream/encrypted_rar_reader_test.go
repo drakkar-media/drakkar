@@ -120,6 +120,78 @@ func TestEncryptedRarReaderRejectsWrongKey(t *testing.T) {
 	}
 }
 
+// TestEncryptedRarReaderRejectsWrongKeyWhenFirstReadIsNotAtOffsetZero is the
+// direct regression test for the actual gap confirmed live 2026-08-20:
+// verification previously only ran as a side effect of a request that
+// happened to touch byte offset 0 -- nothing guaranteed that ever happened.
+// A session whose first ReadAt lands at a nonzero offset (a resumed stream,
+// a player seeking its metadata table before reading from the start, a
+// chunked VFS read fetching a later chunk first) must still verify the
+// wrong key and fail, not silently serve unverified plaintext for the rest
+// of the session.
+func TestEncryptedRarReaderRejectsWrongKeyWhenFirstReadIsNotAtOffsetZero(t *testing.T) {
+	key, iv := testKeyIV()
+	_, inner := buildEncryptedFixture(t, key, iv, rarcrypto.BlockSize*8)
+
+	wrongKey := key
+	wrongKey[0] ^= 0xFF
+	r := NewEncryptedRarReader(inner, wrongKey, iv)
+
+	// First read of the session deliberately does NOT touch offset 0.
+	offset := int64(rarcrypto.BlockSize*3 + 5)
+	dst := make([]byte, 20)
+	_, err := r.ReadAt(context.Background(), dst, offset)
+	if err == nil {
+		t.Fatal("expected verification to catch the wrong key even though the first read was mid-file, not at offset 0")
+	}
+}
+
+// TestEncryptedRarReaderVerifiesExactlyOnceAcrossOffsets guards that
+// verification -- now decoupled from whichever offset a read happens to
+// request -- still only ever fetches/decrypts byte 0 once per reader, not
+// once per distinct offset read.
+func TestEncryptedRarReaderVerifiesExactlyOnceAcrossOffsets(t *testing.T) {
+	key, iv := testKeyIV()
+	plaintext, innerFile := buildEncryptedFixture(t, key, iv, rarcrypto.BlockSize*8)
+	counting := &countingReadAtFile{VirtualMediaFile: innerFile}
+	r := NewEncryptedRarReader(counting, key, iv)
+
+	// Read from several different, non-zero offsets -- none of these
+	// requests offset 0 itself, so the only offset-0 read should be
+	// ensureVerified's own dedicated, one-time fetch.
+	for _, offset := range []int64{int64(rarcrypto.BlockSize * 5), int64(rarcrypto.BlockSize*2 + 3), int64(rarcrypto.BlockSize * 6)} {
+		dst := make([]byte, rarcrypto.BlockSize)
+		length := int64(len(dst))
+		if offset+length > int64(len(plaintext)) {
+			length = int64(len(plaintext)) - offset
+		}
+		if _, err := r.ReadAt(context.Background(), dst[:length], offset); err != nil && err != io.EOF {
+			t.Fatalf("unexpected error reading offset %d: %v", offset, err)
+		}
+	}
+
+	if got := counting.zeroOffsetReads; got != 1 {
+		t.Fatalf("expected exactly 1 read at offset 0 (the dedicated verification fetch) across %d total ReadAt calls at varying offsets, got %d", counting.totalReads, got)
+	}
+}
+
+// countingReadAtFile wraps a VirtualMediaFile and counts how many ReadAt
+// calls land at offset 0 specifically, to prove ensureVerified's fetch runs
+// exactly once regardless of how many other offsets are read.
+type countingReadAtFile struct {
+	VirtualMediaFile
+	zeroOffsetReads int
+	totalReads      int
+}
+
+func (c *countingReadAtFile) ReadAt(ctx context.Context, dst []byte, offset int64) (int, error) {
+	c.totalReads++
+	if offset == 0 {
+		c.zeroOffsetReads++
+	}
+	return c.VirtualMediaFile.ReadAt(ctx, dst, offset)
+}
+
 // TestEncryptedRarReaderVerificationIsStickyAndCached guards that a failed
 // verification is remembered (never re-attempts a decrypt that already
 // proved wrong) and that a SUCCESSFUL verification also only runs once,

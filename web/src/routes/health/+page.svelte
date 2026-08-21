@@ -61,13 +61,17 @@
   async function load() {
     loading = true;
     try {
+      // loadEntries() doesn't depend on summary/consistency -- it only reads
+      // the local filter/page state -- so it's fired alongside them instead
+      // of after, rather than paying their round-trip time twice in a row.
+      // It has its own internal try/catch, so its result here is unused.
       const [nextSummary, nextConsistency] = await Promise.all([
         api.healthSummary(),
-        api.healthConsistency()
+        api.healthConsistency(),
+        loadEntries()
       ]);
       summary = nextSummary;
       consistency = nextConsistency.items ?? [];
-      await loadEntries();
     } catch (err) {
       toastError(err instanceof Error ? err.message : String(err));
     } finally {

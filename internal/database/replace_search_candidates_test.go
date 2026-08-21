@@ -412,6 +412,111 @@ func TestReplaceSearchCandidatesNonUpgradeSearchStillReplacesUnconditionally(t *
 	}
 }
 
+// TestReplaceSearchCandidatesBatchInsertPreservesPerRowArraysAndOrder guards
+// the batched multi-row INSERT introduced to replace one round trip per
+// candidate: explanations and compatibility_warnings are themselves arrays,
+// one per release_candidates row, and a naive unnest($n::text[][]) parameter
+// flattens every row's array together instead of keeping them separate. This
+// asserts every candidate's own distinct arrays land on its own row, not
+// merged or shifted onto a neighbor.
+func TestReplaceSearchCandidatesBatchInsertPreservesPerRowArraysAndOrder(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// t.Cleanup, not defer, so this closes AFTER setupMissingLibraryItemWithCutoff's
+	// own t.Cleanup-registered deletes run (cleanups fire in LIFO order, after the
+	// test function's own defers) -- a bare defer here closes sqlDB first, silently
+	// no-oping that cleanup's deletes and leaking rows into the next test run.
+	t.Cleanup(func() { sqlDB.Close() })
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	libID, _ := setupMissingLibraryItemWithCutoff(t, ctx, sqlDB, "batch-insert-arrays", "1080p")
+
+	candidates := []SearchCandidateRecord{
+		{Title: "Candidate A", Score: 10, Resolution: "1080p", Rejected: true, RejectReason: "too small",
+			Explanations: []string{"a-explain-1", "a-explain-2"}, CompatibilityWarnings: []string{"a-warn"}},
+		{Title: "Candidate B", Score: 20, Resolution: "1080p",
+			Explanations: []string{"b-explain"}, CompatibilityWarnings: nil},
+		{Title: "Candidate C", Score: 1050, Resolution: "1080p",
+			Explanations: nil, CompatibilityWarnings: []string{"c-warn-1", "c-warn-2", "c-warn-3"}},
+	}
+	selectedReleaseID, err := db.ReplaceSearchCandidates(ctx, libID, candidates, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selectedReleaseID == nil {
+		t.Fatal("expected a selected release")
+	}
+
+	rows, err := sqlDB.QueryContext(ctx, `
+		select title, explanations, compatibility_warnings
+		from release_candidates
+		where library_item_id = $1
+		order by title`, libID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	got := map[string][2][]string{}
+	for rows.Next() {
+		var title string
+		var explanations, compatWarnings []string
+		if err := rows.Scan(&title, pgTextArrayScan(&explanations), pgTextArrayScan(&compatWarnings)); err != nil {
+			t.Fatal(err)
+		}
+		got[title] = [2][]string{explanations, compatWarnings}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	wantExplanations := map[string][]string{
+		"Candidate A": {"a-explain-1", "a-explain-2"},
+		"Candidate B": {"b-explain"},
+		"Candidate C": {},
+	}
+	wantCompatWarnings := map[string][]string{
+		"Candidate A": {"a-warn"},
+		"Candidate B": {},
+		"Candidate C": {"c-warn-1", "c-warn-2", "c-warn-3"},
+	}
+	for title, want := range wantExplanations {
+		gotRow, ok := got[title]
+		if !ok {
+			t.Fatalf("%s: no release_candidates row found", title)
+		}
+		if !stringSlicesEqual(gotRow[0], want) {
+			t.Errorf("%s: explanations = %v, want %v", title, gotRow[0], want)
+		}
+		if !stringSlicesEqual(gotRow[1], wantCompatWarnings[title]) {
+			t.Errorf("%s: compatibility_warnings = %v, want %v", title, gotRow[1], wantCompatWarnings[title])
+		}
+	}
+
+	if got := selectedCandidateResolution(t, ctx, sqlDB, *selectedReleaseID); got != "1080p" {
+		t.Fatalf("expected Candidate C (highest score, not rejected) to be selected, got resolution %q", got)
+	}
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // TestReplaceSearchCandidatesUpgradeSearchIgnoresStaleDuplicateSelectedRelease
 // guards a real production data-integrity gap found live (2026-07-19): 138
 // library items currently carry a stale, orphaned second selected_releases

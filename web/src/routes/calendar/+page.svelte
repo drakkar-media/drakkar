@@ -18,6 +18,7 @@
   import Button from '$lib/components/Button.svelte';
   import { api } from '$lib/api';
   import { toastError } from '$lib/toast';
+  import { trapFocus } from '$lib/trapFocus';
 
   type Entry = {
     id: number; libraryItemId: number; type: string; title: string;
@@ -228,7 +229,7 @@
           on:keydown={(e) => e.key === 'Escape' && (monthPickerOpen = false)}
           role="button" tabindex="-1" aria-label="Close month picker"
         ></div>
-        <div class="absolute left-1/2 top-[calc(100%+8px)] z-50 w-64 -translate-x-1/2 rounded-2xl border border-border bg-card p-3 shadow-[0_20px_50px_hsl(0_0%_0%/0.45)]" role="dialog" aria-label="Choose month and year">
+        <div class="absolute left-1/2 top-[calc(100%+8px)] z-50 w-64 -translate-x-1/2 rounded-2xl border border-border bg-card p-3 shadow-[0_20px_50px_hsl(0_0%_0%/0.45)]" role="dialog" aria-label="Choose month and year" tabindex="-1" use:trapFocus>
           <div class="mb-2 flex items-center justify-between gap-2">
             <button class="grid size-8 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-white/[0.08] hover:text-foreground" on:click={() => (pickerYear -= 1)} aria-label="Previous year"><ChevronLeft size={16} /></button>
             <span class="text-sm font-bold">{pickerYear}</span>
@@ -347,7 +348,7 @@
     tabindex="0"
     aria-label="Close day list dialog"
   >
-    <div class="flex max-h-[80vh] w-full max-w-105 flex-col overflow-hidden rounded-[28px] border border-white/10 bg-card shadow-[0_40px_80px_hsl(0_0%_0%/0.5)]" role="dialog" aria-modal="true" tabindex="-1">
+    <div class="flex max-h-[80vh] w-full max-w-105 flex-col overflow-hidden rounded-[28px] border border-white/10 bg-card shadow-[0_40px_80px_hsl(0_0%_0%/0.5)]" role="dialog" aria-modal="true" tabindex="-1" use:trapFocus>
       <div class="flex items-start justify-between gap-3 border-b border-white/[0.08] p-5.5 pb-4">
         <div class="min-w-0 flex-1">
           <h2 class="text-[1.1rem] font-bold leading-tight">{longDate(d.date)}</h2>
@@ -390,7 +391,7 @@
     tabindex="0"
     aria-label="Close details dialog"
   >
-    <div class="w-full max-w-130 overflow-hidden rounded-[28px] border border-white/10 bg-card shadow-[0_40px_80px_hsl(0_0%_0%/0.5)]" role="dialog" aria-modal="true" tabindex="-1">
+    <div class="w-full max-w-130 overflow-hidden rounded-[28px] border border-white/10 bg-card shadow-[0_40px_80px_hsl(0_0%_0%/0.5)]" role="dialog" aria-modal="true" tabindex="-1" use:trapFocus>
       <div class="flex max-sm:flex-col">
         {#if s.posterUrl}
           <img class="hidden w-35 shrink-0 border-r border-white/[0.08] object-cover object-top sm:block" src={s.posterUrl} alt={s.title} loading="lazy" />

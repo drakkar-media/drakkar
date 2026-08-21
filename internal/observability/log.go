@@ -162,15 +162,29 @@ func (r *rotatingFile) rotate() error {
 		}
 		_ = os.Rename(backupPath(r.path, i), backupPath(r.path, i+1))
 	}
-	if err := os.Rename(r.path, backupPath(r.path, 1)); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
+	renameErr := os.Rename(r.path, backupPath(r.path, 1))
+	// Reopen r.path unconditionally, even if the rename above failed --
+	// r.f was already closed above, so returning early here without ever
+	// reopening left every future Write silently failing forever (r.f stuck
+	// on a closed handle). If the rename failed, r.path still holds the
+	// old, over-size content and this just resumes appending to it, exactly
+	// like the "rotation failure is non-fatal" comment in Write already
+	// promises; if it succeeded, this creates the fresh post-rotation file.
+	f, openErr := os.OpenFile(r.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if openErr != nil {
+		if renameErr != nil {
+			return renameErr
+		}
+		return openErr
 	}
 	r.f = f
 	r.size = 0
+	if renameErr != nil {
+		if info, err := f.Stat(); err == nil {
+			r.size = info.Size()
+		}
+		return renameErr
+	}
 	return nil
 }
 

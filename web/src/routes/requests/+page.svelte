@@ -193,7 +193,7 @@
         <span>Queue</span>
         <span>Created</span>
       </div>
-      {#each requests as item}
+      {#each requests as item (item.id)}
         <div class="grid grid-cols-[minmax(0,2fr)_minmax(0,1fr)_minmax(180px,1fr)_130px_minmax(0,1fr)] items-center gap-3 rounded-2xl border border-border bg-muted/20 p-3.5 max-md:grid-cols-1 max-md:gap-2">
           <span><strong class="block">{item.title || item.externalId}</strong></span>
           <span>{item.requestType} · {item.mediaType}</span>

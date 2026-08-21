@@ -44,6 +44,10 @@ func (s *maintenanceOpsService) RemoveOrphanedContent(ctx context.Context) (main
 	return s.base.RemoveOrphanedContent(ctx)
 }
 
+func (s *maintenanceOpsService) RunSymlinkMaintenance(ctx context.Context) (broken, orphanedCompleted, orphanedContent maintenance.Result, err error) {
+	return s.base.RunSymlinkMaintenance(ctx)
+}
+
 func (s *maintenanceOpsService) PruneStaleReleaseCandidates(ctx context.Context) (maintenance.Result, error) {
 	return s.base.PruneStaleReleaseCandidates(ctx)
 }
@@ -302,6 +306,15 @@ func runDeepHealthCandidates(ctx context.Context, db *database.DB, workflowSvc *
 			// Timeout/throttle/connection errors don't prove the release is
 			// bad — blocklisting on these caused good releases to be dropped
 			// during provider hiccups. Leave it for the next scheduled pass.
+			//
+			// Still bump last_checked_at (not health_ok -- this check
+			// couldn't actually confirm either verdict): ListDeepHealthCandidates
+			// orders by last_checked_at ASC NULLS FIRST, so a candidate that
+			// reliably hits this transient branch every attempt would
+			// otherwise never get any timestamp recorded and stay
+			// permanently first in line, ahead of every other, genuinely
+			// untried candidate, every single scheduled pass.
+			_ = db.TouchHealthCheckTimestamp(ctx, c.PublicationID)
 			logger.Warn().
 				Int64("libraryItemId", c.LibraryItemID).
 				Str("title", c.Title).
@@ -348,6 +361,10 @@ func runDeepHealthCandidates(ctx context.Context, db *database.DB, workflowSvc *
 							magicErr = retryErr
 						}
 					}
+					// See the matching comment on the StrictCheckFirstSegments
+					// transient branch above for why last_checked_at (not
+					// health_ok) is bumped here too.
+					_ = db.TouchHealthCheckTimestamp(ctx, c.PublicationID)
 					logger.Warn().
 						Int64("libraryItemId", c.LibraryItemID).
 						Str("title", c.Title).

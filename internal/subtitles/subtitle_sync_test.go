@@ -28,6 +28,34 @@ func TestMaxSubtitleTimestampMsEmptyBody(t *testing.T) {
 	}
 }
 
+// TestMaxSubtitleTimestampMsDoesNotOverflowOnPathologicallyLongHoursDigits
+// guards a real gap: the timestamp regex's hours group used to allow an
+// unbounded run of digits. A malformed cue with a very long digit run
+// before the hours separator overflows strconv.ParseInt's int64 range in
+// parseSubtitleTimestampMs, whose error is discarded -- the parsed hours
+// value silently becomes garbage (via Go's signed-integer wraparound on the
+// subsequent multiply), which can even go negative, corrupting the whole
+// "largest timestamp in this subtitle" result used to detect/correct a
+// framerate mismatch.
+func TestMaxSubtitleTimestampMsDoesNotOverflowOnPathologicallyLongHoursDigits(t *testing.T) {
+	// Deliberately the ONLY timestamp in the body -- maxSubtitleTimestampMs
+	// takes the max across every match found, starting from 0. With the old
+	// unbounded regex, ParseInt clamps an out-of-range hours string to
+	// math.MaxInt64, and math.MaxInt64*3_600_000 wraps (two's complement) to
+	// exactly -3_600_000 every time regardless of digit count -- which never
+	// beats the initial max of 0, so the timestamp is silently dropped
+	// entirely rather than merely miscalculated. With the fix, the hours
+	// group can only ever capture up to 4 digits ("9999" from the tail of
+	// the run), giving the correct bounded value below instead of 0.
+	malformed := strings.Repeat("9", 30) + ":00:00,000"
+	body := []byte(malformed + "\n")
+	got := maxSubtitleTimestampMs(body)
+	const want = int64(9999) * 3_600_000
+	if got != want {
+		t.Fatalf("maxSubtitleTimestampMs = %d, want %d (got 0 means the malformed cue's timestamp was silently dropped)", got, want)
+	}
+}
+
 func TestRescaleSubtitleTimestampsPreservesSeparatorAndScales(t *testing.T) {
 	scaled := rescaleSubtitleTimestamps([]byte(sampleSRT), 2.0)
 	got := string(scaled)
@@ -66,6 +94,32 @@ func TestMatchKnownFramerateRatio(t *testing.T) {
 				t.Fatalf("matchKnownFramerateRatio(%v) ok = %v, want %v", tc.measured, ok, tc.wantOK)
 			}
 		})
+	}
+}
+
+// TestMatchKnownFramerateRatioPicksClosestNotFirst is the direct regression
+// test for the gap confirmed live 2026-08-20: matchKnownFramerateRatio's own
+// doc comment promises the CLOSEST known ratio, but it used to return
+// whichever candidate was checked first in knownFramerateRatios' fixed list
+// order. 25/23.976 (~=1.042708) and 25/24 (~=1.041667) are only ~0.00104
+// apart -- closer to each other than 2x framerateRatioTolerance (0.005) --
+// so their tolerance windows overlap heavily. A measurement landing in that
+// overlap, genuinely closer to 25/24, must resolve to 25/24, not to
+// 25/23.976 merely because that entry happens to come first in the list.
+func TestMatchKnownFramerateRatioPicksClosestNotFirst(t *testing.T) {
+	trueRatio := 25.0 / 24.0
+	// Genuine measurement noise (a subtitle's last cue landing a moment
+	// before the video's real end, per this function's own doc comment) --
+	// small enough that 25/24 is still unambiguously the closer of the two
+	// overlapping candidates.
+	measured := trueRatio + 0.0002
+
+	got, ok := matchKnownFramerateRatio(measured)
+	if !ok {
+		t.Fatalf("matchKnownFramerateRatio(%v): expected a match, got none", measured)
+	}
+	if got != trueRatio {
+		t.Fatalf("matchKnownFramerateRatio(%v) = %v, want the closer ratio %v (25/24), not a farther one merely checked earlier in the list", measured, got, trueRatio)
 	}
 }
 

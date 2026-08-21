@@ -8,6 +8,7 @@
    * reused across /discover/movie ↔ /discover/tv navigations.
    */
   import { page } from '$app/state';
+  import { afterNavigate } from '$app/navigation';
   import PosterCard from '$lib/components/PosterCard.svelte';
   import { api } from '$lib/api';
   import { detailsHref } from '$lib/detailsHref';
@@ -85,13 +86,21 @@
 
   // Re-run the initial load when navigating between mediaType route values,
   // since SvelteKit reuses this component instance rather than remounting it.
-  $: {
-    const nextKey = page.params.mediaType ?? 'movie';
+  // Reading page.params from a $: block does not reliably re-run on
+  // client-side navigation in this app -- same root cause fixed in
+  // +layout.svelte, AppShell.svelte, the details page, and the search page.
+  // afterNavigate + a plain reassignment, plus an eager synchronous read for
+  // the very first load (afterNavigate does not fire for that one), is the
+  // reliable alternative used there too.
+  routeKey = page.params.mediaType ?? 'movie';
+  void loadInitial();
+  afterNavigate((nav) => {
+    const nextKey = nav.to?.params?.mediaType ?? 'movie';
     if (nextKey !== routeKey) {
       routeKey = nextKey;
       void loadInitial();
     }
-  }
+  });
 </script>
 
 <svelte:head><title>{mediaType === 'movie' ? 'Trending Movies' : 'Trending TV'} — Drakkar</title></svelte:head>

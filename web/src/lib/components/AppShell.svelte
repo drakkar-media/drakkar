@@ -36,6 +36,9 @@
   let searchBusy = false;
   let searchToken = 0;
   let debounceTimer: number | undefined;
+  // Index into flatSuggestions (below) of the arrow-key-highlighted option,
+  // -1 when nothing is highlighted.
+  let highlightedIndex = -1;
   let currentUser: User | null = null;
   let appVersion = '';
   let notifOpen = false;
@@ -86,6 +89,35 @@
   function openSuggestion(item: DiscoverMediaItem) {
     searchOpen = false;
     void goto(detailsHref(item));
+  }
+
+  function suggestionId(index: number) {
+    return `global-search-option-${index}`;
+  }
+
+  // Flat, arrow-key-navigable view of the visible suggestions -- movies then
+  // TV shows, in the same order they're rendered below (each capped at 5).
+  $: flatSuggestions = suggestions ? [...suggestions.movies.slice(0, 5), ...suggestions.tv.slice(0, 5)] : [];
+  // Reset the highlight whenever the option list itself changes (new
+  // keystroke, new results), so a stale index from a longer previous list
+  // doesn't point past the end or highlight an unrelated option.
+  $: flatSuggestions, (highlightedIndex = -1);
+
+  function onSearchKeydown(event: KeyboardEvent) {
+    if (!searchOpen || flatSuggestions.length === 0) return;
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      highlightedIndex = Math.min(flatSuggestions.length - 1, highlightedIndex + 1);
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      highlightedIndex = Math.max(-1, highlightedIndex - 1);
+    } else if (event.key === 'Enter' && highlightedIndex >= 0) {
+      event.preventDefault();
+      openSuggestion(flatSuggestions[highlightedIndex]);
+    } else if (event.key === 'Escape') {
+      searchOpen = false;
+      highlightedIndex = -1;
+    }
   }
 
   async function runSuggest(query: string) {
@@ -228,14 +260,20 @@
             type="search"
             placeholder="Search movies, shows..."
             aria-label="Global search"
+            role="combobox"
+            aria-expanded={searchOpen}
+            aria-controls="global-search-listbox"
+            aria-autocomplete="list"
+            aria-activedescendant={highlightedIndex >= 0 ? suggestionId(highlightedIndex) : undefined}
             on:input={onInput}
             on:focus={() => { if (suggestions) searchOpen = true; }}
             on:blur={onBlur}
+            on:keydown={onSearchKeydown}
             class="h-9 w-full rounded-full border bg-muted/40 pl-9 pr-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
           />
         </form>
         {#if searchOpen && (searchBusy || suggestions)}
-          <div class="absolute left-0 top-[calc(100%+8px)] z-30 w-full overflow-hidden rounded-lg bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10">
+          <div id="global-search-listbox" role="listbox" aria-label="Search suggestions" class="absolute left-0 top-[calc(100%+8px)] z-30 w-full overflow-hidden rounded-lg bg-popover text-popover-foreground shadow-md ring-1 ring-foreground/10">
             {#if searchBusy && !suggestions}
               <div class="p-4 text-sm text-muted-foreground">Searching…</div>
             {:else if suggestions && !(suggestions.movies.length || suggestions.tv.length)}
@@ -244,8 +282,8 @@
               {#if suggestions.movies.length}
                 <div class="p-1">
                   <div class="px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">Movies</div>
-                  {#each suggestions.movies.slice(0, 5) as item (suggestionKey(item))}
-                    <button type="button" class="flex w-full items-center justify-between rounded-md px-3 py-2 text-sm outline-none hover:bg-muted focus-visible:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50" on:mousedown|preventDefault={() => openSuggestion(item)}>
+                  {#each suggestions.movies.slice(0, 5) as item, i (suggestionKey(item))}
+                    <button type="button" id={suggestionId(i)} role="option" aria-selected={highlightedIndex === i} class="flex w-full items-center justify-between rounded-md px-3 py-2 text-sm outline-none hover:bg-muted focus-visible:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50" class:bg-muted={highlightedIndex === i} on:mousedown|preventDefault={() => openSuggestion(item)}>
                       <span class="truncate">{item.title}</span>
                       <span class="text-xs text-muted-foreground">{item.year || '—'}</span>
                     </button>
@@ -255,8 +293,9 @@
               {#if suggestions.tv.length}
                 <div class="p-1">
                   <div class="px-3 py-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground">TV Shows</div>
-                  {#each suggestions.tv.slice(0, 5) as item (suggestionKey(item))}
-                    <button type="button" class="flex w-full items-center justify-between rounded-md px-3 py-2 text-sm outline-none hover:bg-muted focus-visible:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50" on:mousedown|preventDefault={() => openSuggestion(item)}>
+                  {#each suggestions.tv.slice(0, 5) as item, i (suggestionKey(item))}
+                    {@const flatIndex = suggestions.movies.slice(0, 5).length + i}
+                    <button type="button" id={suggestionId(flatIndex)} role="option" aria-selected={highlightedIndex === flatIndex} class="flex w-full items-center justify-between rounded-md px-3 py-2 text-sm outline-none hover:bg-muted focus-visible:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50" class:bg-muted={highlightedIndex === flatIndex} on:mousedown|preventDefault={() => openSuggestion(item)}>
                       <span class="truncate">{item.title}</span>
                       <span class="text-xs text-muted-foreground">{item.year || '—'}</span>
                     </button>

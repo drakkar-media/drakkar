@@ -144,11 +144,20 @@ func estimateDecodedSize(encoded int64) int64 {
 // line, preferring the double-quoted segment (e.g. `"movie.mkv" yEnc
 // (1/20)`) and falling back to the first whitespace-delimited field when no
 // quotes are present.
+//
+// Uses the LAST complete quoted pair, not a first-quote-to-last-quote span:
+// a common convention repeats the filename in an earlier quoted segment too
+// (e.g. `Group presents "movie.mkv" [01/20] - "movie.mkv" yEnc (1/1917)`),
+// and spanning from the first opening quote to the last closing quote in
+// that case returns everything in between glued together -- poster tag,
+// stray quotes, and all -- instead of just the real filename immediately
+// before "yEnc".
 func ParseSubjectFilename(subject string) string {
-	start := strings.Index(subject, "\"")
 	end := strings.LastIndex(subject, "\"")
-	if start >= 0 && end > start {
-		return subject[start+1 : end]
+	if end >= 0 {
+		if start := strings.LastIndex(subject[:end], "\""); start >= 0 {
+			return subject[start+1 : end]
+		}
 	}
 	fields := strings.Fields(subject)
 	if len(fields) == 0 {

@@ -492,7 +492,11 @@ export const api = {
   // Uses a raw fetch rather than request(): logging out must always clear
   // local session state even if the server call fails (already-expired
   // session, network blip) — request() throwing here would skip that.
-  logout: () => fetch(`${baseURL()}/api/auth/logout`, { method: 'POST' }),
+  // fetch() itself still rejects on a genuine network-level failure (not
+  // just a non-2xx status), so that's caught here too -- otherwise a caller
+  // awaiting this with no try/catch of its own (see AppShell.svelte's
+  // logout()) never reaches its own local-state-clearing code either.
+  logout: () => fetch(`${baseURL()}/api/auth/logout`, { method: 'POST' }).catch(() => undefined),
   listApiTokens: () => request<APIToken[]>('/api/auth/tokens'),
   createApiToken: (name: string, expiresAt?: string | null) =>
     request<APIToken & { token: string }>('/api/auth/tokens', {

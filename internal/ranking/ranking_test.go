@@ -206,6 +206,22 @@ func TestScoreRejectsWrongSeasonPack(t *testing.T) {
 	}
 }
 
+// TestScoreAcceptsSeasonRangePackForMiddleSeason is the direct end-to-end
+// regression test for the 2026-08-20 gap: a legitimate multi-season/
+// complete-series range pack must not be hard-rejected as wrong-season for
+// a season that falls inside the range but isn't the literal first/last
+// number printed.
+func TestScoreAcceptsSeasonRangePackForMiddleSeason(t *testing.T) {
+	result := Score(Candidate{
+		Title:      "Breaking.Bad.S01-S05.1080p.BluRay-GROUP",
+		Resolution: "1080p",
+		Source:     "bluray",
+	}, Requirements{Title: "Breaking Bad", MediaType: "episode", SeasonNumber: 3, EpisodeNumber: 1})
+	if result.Rejected {
+		t.Fatalf("expected a season-3 search to accept a S01-S05 range pack, got rejected: %+v", result)
+	}
+}
+
 // TestScoreRejectsEpisodeFromWrongProductionWithSameTitleAndNumbering guards
 // a real mismatch reported live (2026-07-28): the 1999 "One Piece" anime and
 // the 2023 live-action "One Piece" share an identical title, and their own
@@ -368,6 +384,44 @@ func TestScoreWithPreferencesRemuxUsesItsOwnSizeTier(t *testing.T) {
 	})
 	if allowed.Rejected {
 		t.Fatalf("expected the remux-specific tier to allow a real remux size through, got %+v", allowed)
+	}
+}
+
+// TestScoreWithPreferencesTierLimitOverridesGlobalBoundForOtherResolutions
+// guards a real bug: rejectBySize ANDed the profile's single global
+// MB/min bound with the per-resolution tier limit instead of letting the
+// tier take over for its own resolution. A global MaxMBPerMinute sized for
+// 1080p (~155) hard-rejected a perfectly valid 2160p candidate as
+// too_large before the 2160p-specific tier (which explicitly allows up to
+// 300) was ever consulted -- the tier limit for a resolution must be
+// authoritative for that resolution, not just an additional constraint on
+// top of a bound sized for an entirely different one.
+func TestScoreWithPreferencesTierLimitOverridesGlobalBoundForOtherResolutions(t *testing.T) {
+	// 250 MB/min * 120 min = 30000 MB: over the global 1080p-sized max
+	// (155*120=18600) but comfortably under the 2160p tier's max
+	// (300*120=36000).
+	candidate := Candidate{
+		Title:      "Dune.2021.2160p.WEB-DL.x265",
+		SizeBytes:  250 * 120 * 1024 * 1024,
+		Resolution: "2160p",
+		Source:     "web-dl",
+		Language:   "en",
+	}
+	req := Requirements{Title: "Dune", MediaType: "movie", Year: 2021, RuntimeMinutes: 120}
+
+	rejected := ScoreWithPreferences(candidate, req, Preferences{
+		MaxMBPerMinute: 155,
+	})
+	if !rejected.Rejected || rejected.RejectReason != "too_large" {
+		t.Fatalf("expected the global 1080p-sized max to reject this candidate with no tier present, got %+v", rejected)
+	}
+
+	allowed := ScoreWithPreferences(candidate, req, Preferences{
+		MaxMBPerMinute:        155,
+		TierMBPerMinuteLimits: map[string][2]int{"2160p": {4, 300}},
+	})
+	if allowed.Rejected {
+		t.Fatalf("expected the 2160p tier limit to take over from the 1080p-sized global bound, got %+v", allowed)
 	}
 }
 
@@ -676,6 +730,18 @@ func TestMatchEpisode(t *testing.T) {
 		{"season-pack-bare", "Show.Name.S01.1080p", 1, 5, episodeSeasonPack},
 		{"mismatch-different-episode", "Show.Name.S01E09.1080p.WEB-DL", 1, 5, episodeMismatch},
 		{"unknown-no-season-info", "Show.Name.2024.1080p.WEB-DL", 1, 5, episodeUnknown},
+		// Season-range packs (e.g. a complete-series pack) must be accepted
+		// as a season pack for every season the range actually covers, not
+		// just the literal first/last number printed -- guards the
+		// 2026-08-20 regression from hasOtherBareSeasonToken (added
+		// 2026-08-11 for a genuinely wrong single-season pack) reading a
+		// range's two endpoints as unrelated bare "sNN" tokens.
+		{"season-range-requested-season-in-middle", "Breaking.Bad.S01-S05.1080p.BluRay-GROUP", 3, 1, episodeSeasonPack},
+		{"season-range-requested-season-is-first-endpoint", "Breaking.Bad.S01-S05.1080p.BluRay-GROUP", 1, 1, episodeSeasonPack},
+		{"season-range-requested-season-is-last-endpoint", "Breaking.Bad.S01-S05.1080p.BluRay-GROUP", 5, 1, episodeSeasonPack},
+		{"season-range-second-endpoint-not-s-prefixed", "Show.Name.Complete.Series.S01-03.1080p", 2, 1, episodeSeasonPack},
+		{"season-range-unpadded", "Show.Name.S1-S3.1080p", 2, 1, episodeSeasonPack},
+		{"season-range-requested-season-outside-range", "Breaking.Bad.S01-S05.1080p.BluRay-GROUP", 6, 1, episodeWrongSeason},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

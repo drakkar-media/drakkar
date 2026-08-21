@@ -202,6 +202,17 @@ func (db *DB) enrichBlocklistExternalURL(ctx context.Context, item *BlocklistIte
 	return nil
 }
 
+// enrichBlocklistSignatureScanLimit bounds how many release_candidates rows
+// enrichBlocklistSignature will fetch and re-normalize in Go. A manual-entry
+// blocklist item (indexerKey/sizeBucket/dateBucket all blank) makes every
+// clause in the query below vacuously true, turning what looks like a
+// filtered lookup into an unbounded scan of the entire table -- issued once
+// per blocklist row needing enrichment on every page render. Ordered newest
+// first, so this is a best-effort "most likely match" cap, consistent with
+// this function's existing no-op-if-nothing-matches contract, not a
+// guarantee of finding an older match beyond the cap.
+const enrichBlocklistSignatureScanLimit = 500
+
 // enrichBlocklistSignature resolves release metadata for a blocklist entry
 // keyed by a release_signature (normalized title + indexer + bucketed
 // size/date), which can't be matched by an exact SQL predicate -- it scans
@@ -220,7 +231,8 @@ func (db *DB) enrichBlocklistSignature(ctx context.Context, item *BlocklistItemS
 		where ($1 = '' or lower(trim(rc.indexer_name)) = $1)
 		  and ($2 < 0 or coalesce(rc.size_bytes, 0) / (1024 * 1024) = $2)
 		  and ($3::date is null or (rc.posted_at at time zone 'UTC')::date = ($3 at time zone 'UTC')::date)
-		order by sr.id desc nulls last, rc.id desc`, indexerKey, sizeBucket, dateBucket)
+		order by sr.id desc nulls last, rc.id desc
+		limit $4`, indexerKey, sizeBucket, dateBucket, enrichBlocklistSignatureScanLimit)
 	if err != nil {
 		return err
 	}

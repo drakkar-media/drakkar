@@ -450,13 +450,22 @@ func (db *DB) FulfillEpisodeLibraryItem(ctx context.Context, libraryItemID, sour
 
 	// Update the virtual file to also reference this selected release.
 	// We do NOT duplicate the virtual file — we just update the queue item.
+	//
+	// This must be an upsert, not a bare UPDATE: a season-pack sibling
+	// episode reached only through FindSeasonPackMatches (never through
+	// createSeasonPackEpisodeItem's own queue_items upsert above) can have no
+	// queue_items row at all yet. A plain UPDATE against a nonexistent row
+	// silently affects zero rows, leaving the episode with no queue_items
+	// row even though library_items.available gets set true below --
+	// and ListPendingRepublishTargets's stale-symlink reconciliation branch
+	// inner-joins against queue_items, so an episode with no row there can
+	// never be found and self-healed if its symlink later goes stale.
 	_, err = tx.ExecContext(ctx, `
-		UPDATE queue_items SET
-			state = 'available',
-			selected_release_id = $2,
-			updated_at = now()
-		WHERE library_item_id = $1 AND state != 'available'`,
-		libraryItemID, newSelectedReleaseID)
+		INSERT INTO queue_items (library_item_id, selected_release_id, state, idempotency_key, updated_at)
+		VALUES ($1, $2, 'available', $3, now())
+		ON CONFLICT (library_item_id) DO UPDATE
+		  SET state = 'available', selected_release_id = excluded.selected_release_id, updated_at = now()`,
+		libraryItemID, newSelectedReleaseID, "episode-"+strconv.FormatInt(libraryItemID, 10)+"-fulfilled")
 	if err != nil {
 		return err
 	}

@@ -71,42 +71,51 @@
   $: status = itemStatus(item);
 </script>
 
-<a
-  class="poster-card"
-  href={href || ((item.tmdbId || item.imdbId) ? detailsHref(item) : `/library/${item.id}`)}
->
-  {#if showStatus}
-    <div class={`poster-status-bar poster-status-bar-${status}`}></div>
-  {/if}
-
-  <div class="poster-frame">
-    {#if item.posterUrl}
-      <img src={item.posterUrl} alt="" loading="lazy" draggable="false" />
-    {:else}
-      <div class="poster-fallback"><Tv size={24} /></div>
-    {/if}
+<div class="poster-card">
+  <!--
+    The request button below is a SIBLING of this link, not nested inside
+    it -- HTML's content model forbids interactive content (a button/role
+    inside an <a>), which the previous markup violated by nesting a
+    role="button" span inside this anchor. Positioned via CSS to still sit
+    visually on top of the poster art (see .poster-request-btn).
+  -->
+  <a
+    class="poster-card-link"
+    href={href || ((item.tmdbId || item.imdbId) ? detailsHref(item) : `/library/${item.id}`)}
+  >
     {#if showStatus}
-      <div class={`poster-badge poster-badge-${status}`}>{statusLabel(item)}</div>
+      <div class={`poster-status-bar poster-status-bar-${status}`}></div>
     {/if}
-    {#if notInLibrary && onRequest}
-      <span
-        class="poster-request-btn"
-        role="button"
-        tabindex="0"
-        aria-label="Request this title"
-        title="Request this title"
-        on:click|preventDefault|stopPropagation={() => onRequest && onRequest(item)}
-        on:keydown|preventDefault|stopPropagation={(e) => { if (e.key === 'Enter' || e.key === ' ') onRequest && onRequest(item); }}
-      >
-        <Plus size={14} />
-      </span>
-    {/if}
-  </div>
 
-  <div class="poster-copy" class:poster-copy-compact={compact}>
-    <div class="poster-title" class:poster-title-compact={compact}>{item.title}</div>
-    {#if metaLine(item)}
-      <div class="poster-meta">{metaLine(item)}</div>
-    {/if}
-  </div>
-</a>
+    <div class="poster-frame">
+      {#if item.posterUrl}
+        <img src={item.posterUrl} alt="" loading="lazy" draggable="false" />
+      {:else}
+        <div class="poster-fallback"><Tv size={24} /></div>
+      {/if}
+      {#if showStatus}
+        <div class={`poster-badge poster-badge-${status}`}>{statusLabel(item)}</div>
+      {/if}
+    </div>
+
+    <div class="poster-copy" class:poster-copy-compact={compact}>
+      <div class="poster-title" class:poster-title-compact={compact}>{item.title}</div>
+      {#if metaLine(item)}
+        <div class="poster-meta">{metaLine(item)}</div>
+      {/if}
+    </div>
+  </a>
+
+  {#if notInLibrary && onRequest}
+    <button
+      type="button"
+      class="poster-request-btn"
+      class:poster-request-btn-with-status-bar={showStatus}
+      aria-label="Request this title"
+      title="Request this title"
+      on:click={() => onRequest && onRequest(item)}
+    >
+      <Plus size={14} />
+    </button>
+  {/if}
+</div>

@@ -138,6 +138,7 @@
   let speedTestResults: SpeedTestResult[] = [];
 
   let blockQuery = '';
+  let blLoadToken = 0;
   let blockReasonFilter = 'all';
   let blockSortCol: 'reason' | 'key' | 'expires' | 'createdAt' = 'createdAt';
   let blockSortDir: 'asc' | 'desc' = 'desc';
@@ -180,9 +181,13 @@
   $: webhookUrl = (typeof window !== 'undefined' ? window.location.origin : '') + '/api/webhooks/seerr';
 
   async function copyWebhookUrl() {
-    await copyToClipboard(webhookUrl);
-    webhookCopied = true;
-    setTimeout(() => { webhookCopied = false; }, 2000);
+    try {
+      await copyToClipboard(webhookUrl);
+      webhookCopied = true;
+      setTimeout(() => { webhookCopied = false; }, 2000);
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : String(e));
+    }
   }
 
   async function createWebhookToken() {
@@ -199,9 +204,13 @@
 
   async function copyWebhookToken() {
     if (!webhookToken) return;
-    await copyToClipboard(webhookToken);
-    webhookTokenCopied = true;
-    setTimeout(() => { webhookTokenCopied = false; }, 2000);
+    try {
+      await copyToClipboard(webhookToken);
+      webhookTokenCopied = true;
+      setTimeout(() => { webhookTokenCopied = false; }, 2000);
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : String(e));
+    }
   }
 
   type SABCopyField =
@@ -222,11 +231,15 @@
   const sabDockerVolume = '- /mnt/drakkar:/mnt/drakkar:rslave';
 
   async function copySABField(field: SABCopyField, value: string) {
-    await copyToClipboard(value);
-    sabCopiedField = field;
-    setTimeout(() => {
-      if (sabCopiedField === field) sabCopiedField = null;
-    }, 2000);
+    try {
+      await copyToClipboard(value);
+      sabCopiedField = field;
+      setTimeout(() => {
+        if (sabCopiedField === field) sabCopiedField = null;
+      }, 2000);
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : String(e));
+    }
   }
 
   // ── Logs tab state ──────────────────────────────────────────────────────────
@@ -873,21 +886,46 @@
   }
 
   async function loadBlocklist() {
+    const token = ++blLoadToken;
     blLoading = true;
     try {
       const [page, stats] = await Promise.all([
         api.blocklistPaged({ page: blPage, pageSize: blPageSize, q: blockQuery || undefined, reason: blockReasonFilter !== 'all' ? blockReasonFilter : undefined, sort: blockSortCol === 'expires' ? 'expiresAt' : blockSortCol === 'createdAt' ? 'createdAt' : blockSortCol, dir: blockSortDir }),
         api.blocklistStats()
       ]);
+      if (token !== blLoadToken) return;
       blocklist = page.items ?? [];
       blTotal = page.total;
       blTotalPages = page.totalPages;
       blStats = stats;
     } catch (e) {
+      if (token !== blLoadToken) return;
       toastError(e instanceof Error ? e.message : String(e));
     } finally {
-      blLoading = false;
+      if (token === blLoadToken) blLoading = false;
     }
+  }
+
+  // Unlike every other search input in the app, this one used to fire two
+  // full API calls (blocklistPaged + blocklistStats) on every single
+  // keystroke with no debounce -- debounced here the same way the SSE
+  // reload elsewhere in this file already is.
+  const debouncedBlocklistSearch = debounce(() => { blPage = 1; void loadBlocklist(); }, 400);
+
+  /** Toggles direction if already sorting by col, otherwise switches to col at defaultDir. */
+  function sortBlocklistBy(col: typeof blockSortCol, defaultDir: 'asc' | 'desc' = 'asc') {
+    if (blockSortCol === col) blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc';
+    else {
+      blockSortCol = col;
+      blockSortDir = defaultDir;
+    }
+    void loadBlocklist();
+  }
+
+  /** aria-sort value for a sortable blocklist column header. */
+  function blocklistAriaSort(col: typeof blockSortCol): 'ascending' | 'descending' | 'none' {
+    if (blockSortCol !== col) return 'none';
+    return blockSortDir === 'asc' ? 'ascending' : 'descending';
   }
 
   async function clearBlocklist(id: number) {
@@ -1996,7 +2034,7 @@
           <div class="bl-search">
             <Search size={14} />
             <input bind:value={blockQuery} placeholder="Search key or reason…"
-              on:input={() => { blPage = 1; void loadBlocklist(); }} />
+              on:input={debouncedBlocklistSearch} />
           </div>
           {#if blockReasonFilter !== 'all'}
             <button class="bl-filter-active" on:click={() => { blockReasonFilter = 'all'; blPage = 1; void loadBlocklist(); }}>
@@ -2030,17 +2068,25 @@
             <Table.Root class="bl-table">
               <Table.Header>
                 <Table.Row>
-                  <Table.Head class="sortable" onclick={() => { if (blockSortCol === 'reason') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'reason'; blockSortDir = 'asc'; } void loadBlocklist(); }}>
+                  <Table.Head class="sortable" role="button" tabindex={0} aria-sort={blocklistAriaSort('reason')}
+                    onclick={() => sortBlocklistBy('reason', 'asc')}
+                    onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); sortBlocklistBy('reason', 'asc'); } }}>
                     Reason {blockSortCol === 'reason' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
                   </Table.Head>
-                  <Table.Head class="sortable" onclick={() => { if (blockSortCol === 'key') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'key'; blockSortDir = 'asc'; } void loadBlocklist(); }}>
+                  <Table.Head class="sortable" role="button" tabindex={0} aria-sort={blocklistAriaSort('key')}
+                    onclick={() => sortBlocklistBy('key', 'asc')}
+                    onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); sortBlocklistBy('key', 'asc'); } }}>
                     Runtime Key {blockSortCol === 'key' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
                   </Table.Head>
                   <Table.Head>Matched Release</Table.Head>
-                  <Table.Head class="sortable" onclick={() => { if (blockSortCol === 'createdAt') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'createdAt'; blockSortDir = 'desc'; } void loadBlocklist(); }}>
+                  <Table.Head class="sortable" role="button" tabindex={0} aria-sort={blocklistAriaSort('createdAt')}
+                    onclick={() => sortBlocklistBy('createdAt', 'desc')}
+                    onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); sortBlocklistBy('createdAt', 'desc'); } }}>
                     Added {blockSortCol === 'createdAt' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
                   </Table.Head>
-                  <Table.Head class="sortable" onclick={() => { if (blockSortCol === 'expires') blockSortDir = blockSortDir === 'asc' ? 'desc' : 'asc'; else { blockSortCol = 'expires'; blockSortDir = 'asc'; } void loadBlocklist(); }}>
+                  <Table.Head class="sortable" role="button" tabindex={0} aria-sort={blocklistAriaSort('expires')}
+                    onclick={() => sortBlocklistBy('expires', 'asc')}
+                    onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); sortBlocklistBy('expires', 'asc'); } }}>
                     Expires {blockSortCol === 'expires' ? (blockSortDir === 'asc' ? '↑' : '↓') : ''}
                   </Table.Head>
                   <Table.Head></Table.Head>
@@ -3097,7 +3143,19 @@
             <Table.Body>
               {#each taskGroups as group}
                 {@const groupCollapsed = collapsedTaskGroups.has(group)}
-                <Table.Row class="task-group-row" onclick={() => toggleTaskGroup(group)}>
+                <Table.Row
+                  class="task-group-row"
+                  role="button"
+                  tabindex={0}
+                  aria-expanded={!groupCollapsed}
+                  onclick={() => toggleTaskGroup(group)}
+                  onkeydown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      toggleTaskGroup(group);
+                    }
+                  }}
+                >
                   <Table.Cell colspan={5}>
                     <span class="task-group-toggle">
                       <svelte:component this={groupCollapsed ? ChevronRight : ChevronDown} size={14} />

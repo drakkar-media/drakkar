@@ -85,6 +85,67 @@ func TestRotatingFileRotatesAtSizeThreshold(t *testing.T) {
 	}
 }
 
+// TestRotatingFileSurvivesFailedRotationRename guards a real gap: rotate()
+// closes the current file handle up front, then renames the log to its
+// backup path -- if that rename fails (simulated here by making the backup
+// path an existing non-empty directory, which makes a file-onto-directory
+// rename fail with EISDIR regardless of permissions), the old code returned
+// early without ever reopening a file. r.f was left permanently closed, so
+// every subsequent Write silently failed forever -- logging was gone for
+// the rest of the process's life. A failed rotation must still leave a
+// writable file behind.
+func TestRotatingFileSurvivesFailedRotationRename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "drakkar.log")
+
+	rf, err := newRotatingFile(path, 5, 1)
+	if err != nil {
+		t.Fatalf("newRotatingFile: %v", err)
+	}
+
+	// Occupy the rotation's target backup path with a non-empty directory,
+	// so os.Rename(path, path+".1") is guaranteed to fail with EISDIR --
+	// deterministic and independent of permissions (this test may run as
+	// root, where permission-based failures wouldn't reliably trigger).
+	backupDir := path + ".1"
+	if err := os.Mkdir(backupDir, 0o755); err != nil {
+		t.Fatalf("mkdir backup dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(backupDir, "occupied"), []byte("x"), 0o644); err != nil {
+		t.Fatalf("seed backup dir: %v", err)
+	}
+
+	if _, err := rf.Write([]byte("12345")); err != nil {
+		t.Fatalf("write 1: %v", err)
+	}
+	// This write pushes size past maxSize, forcing rotate() -- which must
+	// fail internally (the rename above can't succeed) but still leave a
+	// writable file behind.
+	n, err := rf.Write([]byte("abcde"))
+	if err != nil {
+		t.Fatalf("expected Write to still succeed despite the failed rotation (matching \"rotation failure is non-fatal\"), got: %v", err)
+	}
+	if n != 5 {
+		t.Fatalf("expected 5 bytes written, got %d", n)
+	}
+
+	// The real proof: logging must still work on a THIRD write, after
+	// rotate() has already failed once. The old bug's symptom was r.f stuck
+	// on a closed handle forever, not just a one-off error from the failed
+	// rotation itself.
+	if _, err := rf.Write([]byte("still-logging")); err != nil {
+		t.Fatalf("expected logging to keep working after a failed rotation, got: %v", err)
+	}
+
+	current, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("expected the log file to still exist and be readable: %v", err)
+	}
+	if string(current) != "12345abcdestill-logging" {
+		t.Fatalf("current content = %q, want all three writes appended", current)
+	}
+}
+
 func TestRotatingFileKeepsOnlyMaxBackups(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "drakkar.log")

@@ -7,6 +7,7 @@ package maintenance
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"time"
@@ -38,6 +39,15 @@ const releaseCandidateRetention = 14 * 24 * time.Hour
 // 1 hour gives generous margin over the longest legitimate in-flight window
 // elsewhere in the codebase (the 90-minute download-stale timeout).
 const orphanedSelectedReleaseRetention = time.Hour
+
+// orphanedContentGracePeriod protects a just-published symlink from
+// RemoveOrphanedContent's stale-snapshot race: known publications are
+// snapshotted once before the (potentially long) filesystem walk begins, so
+// a symlink published after the snapshot but before the walk reaches its
+// path would otherwise look orphaned and get deleted even though it's
+// brand new. Skipping anything modified more recently than this window
+// gives the next run's fresh snapshot time to catch up.
+const orphanedContentGracePeriod = time.Hour
 
 // Service runs the periodic library/database maintenance tasks: pruning
 // broken or orphaned symlinks and their records, pruning stale search
@@ -81,6 +91,10 @@ func (s *Service) RemoveBrokenMediaSymlinks(ctx context.Context) (Result, error)
 	if err != nil {
 		return Result{}, err
 	}
+	return s.removeBrokenMediaSymlinks(ctx, records)
+}
+
+func (s *Service) removeBrokenMediaSymlinks(ctx context.Context, records []database.SymlinkPublicationRecord) (Result, error) {
 	result := Result{TaskName: "broken-media-symlinks", ScannedRows: len(records)}
 	for _, record := range records {
 		info, err := os.Lstat(record.LibraryPath)
@@ -134,6 +148,10 @@ func (s *Service) RemoveOrphanedCompletedSymlinks(ctx context.Context) (Result, 
 	if err != nil {
 		return Result{}, err
 	}
+	return s.removeOrphanedCompletedSymlinks(ctx, records)
+}
+
+func (s *Service) removeOrphanedCompletedSymlinks(ctx context.Context, records []database.SymlinkPublicationRecord) (Result, error) {
 	result := Result{TaskName: "orphaned-completed-symlinks", ScannedRows: len(records)}
 	for _, record := range records {
 		_, err := os.Lstat(record.LibraryPath)
@@ -197,10 +215,15 @@ func (s *Service) RemoveOrphanedContent(ctx context.Context) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	return s.removeOrphanedContent(ctx, records)
+}
+
+func (s *Service) removeOrphanedContent(ctx context.Context, records []database.SymlinkPublicationRecord) (Result, error) {
 	known := make(map[string]struct{}, len(records))
 	for _, record := range records {
 		known[filepath.Clean(record.LibraryPath)] = struct{}{}
 	}
+	walkStartedAt := time.Now()
 	result := Result{TaskName: "orphaned-content"}
 	for _, root := range []string{s.runtime.MovieLibraryPath, s.runtime.TVLibraryPath} {
 		err := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
@@ -222,6 +245,13 @@ func (s *Service) RemoveOrphanedContent(ctx context.Context) (Result, error) {
 			if _, ok := known[clean]; ok {
 				return nil
 			}
+			// A symlink published after `known` was snapshotted but before
+			// the walk reached this path would otherwise look orphaned and
+			// get deleted despite being brand new -- skip anything too
+			// recent and let the next run's fresh snapshot judge it fairly.
+			if walkStartedAt.Sub(info.ModTime()) < orphanedContentGracePeriod {
+				return nil
+			}
 			if err := os.Remove(clean); err == nil {
 				result.DeletedFiles++
 			}
@@ -232,4 +262,30 @@ func (s *Service) RemoveOrphanedContent(ctx context.Context) (Result, error) {
 		}
 	}
 	return result, s.repo.TouchMaintenanceCursor(ctx, result.TaskName, time.Now().UTC().Format(time.RFC3339))
+}
+
+// RunSymlinkMaintenance runs RemoveBrokenMediaSymlinks,
+// RemoveOrphanedCompletedSymlinks, and RemoveOrphanedContent against a
+// single shared ListSymlinkPublicationRecords fetch, instead of each
+// independently re-querying the entire symlink_publications table.
+//
+// Confirmed live: runStorageMaintenance (internal/app/app.go) called these
+// three back to back every 6h, each issuing its own full-table query over
+// what can be an ~11,100-row table (the same library size cited in the
+// internal/dav cache-TTL fix) purely to build the same "known paths" lookup
+// three times over. Continues past an error from an earlier pass so a later
+// pass still gets its chance to run, mirroring how these three already ran
+// independently before this fix -- one pass's failure was never a reason to
+// skip the others.
+func (s *Service) RunSymlinkMaintenance(ctx context.Context) (broken, orphanedCompleted, orphanedContent Result, err error) {
+	records, err := s.repo.ListSymlinkPublicationRecords(ctx)
+	if err != nil {
+		return Result{}, Result{}, Result{}, err
+	}
+	var brokenErr, orphanedCompletedErr, orphanedContentErr error
+	broken, brokenErr = s.removeBrokenMediaSymlinks(ctx, records)
+	orphanedCompleted, orphanedCompletedErr = s.removeOrphanedCompletedSymlinks(ctx, records)
+	orphanedContent, orphanedContentErr = s.removeOrphanedContent(ctx, records)
+	err = errors.Join(brokenErr, orphanedCompletedErr, orphanedContentErr)
+	return broken, orphanedCompleted, orphanedContent, err
 }

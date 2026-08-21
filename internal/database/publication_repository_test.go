@@ -253,6 +253,150 @@ func TestListPendingRepublishTargets(t *testing.T) {
 	}
 }
 
+// TestListPendingRepublishTargetsCatchesStaleSymlinkOnSeasonPackFulfilledEpisode
+// guards a real gap: a season-pack-fulfilled episode's own selected_release
+// deliberately has no virtual_files of its own (the backing file lives under
+// the pack's source selected_release, sharing its release_candidate_id -- see
+// FindSourceSelectedReleaseForItem). The "stale symlink" branch used to check
+// "virtual_files where selected_release_id = <the episode's own selected
+// release>" directly, which can never find a row for such an episode, so a
+// stale symlink on one could never be caught and reconciled -- silently
+// compounding any earlier symlink-publish failure (see the fulfillSeasonPackEpisodes
+// fix in publisher.go).
+func TestListPendingRepublishTargetsCatchesStaleSymlinkOnSeasonPackFulfilledEpisode(t *testing.T) {
+	db, sqlDB, ctx := openPublicationTestDB(t)
+
+	// The season pack itself: source library item with its own selected
+	// release and the one physical virtual file all episodes share.
+	sourceLibID := setupRaceTestLibraryItem(t, ctx, sqlDB, "pub-republish-pack-source", "available")
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, sourceLibID)
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, external_url, indexer_name)
+		values ($1, 'pub-republish-pack', 'http://example/pub-republish-pack', 'test-indexer')
+		returning id`, sourceLibID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+	var sourceSelectedReleaseID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2) returning id`, sourceLibID, rcID).Scan(&sourceSelectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+	var vfCurrent int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, reader_kind)
+		values ($1, '/pub-republish-pack/Show.S01E01.mkv', 'Show.S01E01.mkv', 'archive')
+		returning id`, sourceSelectedReleaseID).Scan(&vfCurrent); err != nil {
+		t.Fatal(err)
+	}
+
+	// The episode library item, fulfilled by the pack -- same as a real
+	// season-pack sibling created ahead of time via createSeasonPackEpisodeItem.
+	targetLibID := setupRaceTestLibraryItem(t, ctx, sqlDB, "pub-republish-pack-episode", "requested")
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, targetLibID)
+	if err := db.FulfillEpisodeLibraryItem(ctx, targetLibID, sourceSelectedReleaseID, vfCurrent); err != nil {
+		t.Fatal(err)
+	}
+
+	// Its symlink was published once, but against a stale, unrelated virtual
+	// file -- simulating drift (e.g. the pack having since been replaced).
+	var staleRcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, external_url, indexer_name)
+		values ($1, 'pub-republish-pack-stale', 'http://example/pub-republish-pack-stale', 'test-indexer')
+		returning id`, sourceLibID).Scan(&staleRcID); err != nil {
+		t.Fatal(err)
+	}
+	var staleSrID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2) returning id`, sourceLibID, staleRcID).Scan(&staleSrID); err != nil {
+		t.Fatal(err)
+	}
+	var vfStale int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, reader_kind)
+		values ($1, '/pub-republish-pack-stale/old.mkv', 'old.mkv', 'archive')
+		returning id`, staleSrID).Scan(&vfStale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into symlink_publications (library_item_id, virtual_file_id, library_path, target_path)
+		values ($1, $2, '/library/pub-republish-pack-episode.mkv', '/virtual/old.mkv')`,
+		targetLibID, vfStale,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := db.ListPendingRepublishTargets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := map[int64]bool{}
+	for _, item := range got {
+		set[item.LibraryItemID] = true
+	}
+	if !set[targetLibID] {
+		t.Fatalf("expected season-pack-fulfilled episode %d with a stale symlink to be a pending republish target, got %+v", targetLibID, got)
+	}
+}
+
+// TestListPendingRepublishTargetsExcludesUpToDateSeasonPackFulfilledEpisode is
+// the mirror-image guard: an episode whose symlink already points at the
+// pack's current virtual file must NOT be flagged, even though its own
+// selected_release still has no virtual_files of its own -- proving the
+// source-release fallback resolves correctly rather than over-matching.
+func TestListPendingRepublishTargetsExcludesUpToDateSeasonPackFulfilledEpisode(t *testing.T) {
+	db, sqlDB, ctx := openPublicationTestDB(t)
+
+	sourceLibID := setupRaceTestLibraryItem(t, ctx, sqlDB, "pub-republish-pack-source-ok", "available")
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, sourceLibID)
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, external_url, indexer_name)
+		values ($1, 'pub-republish-pack-ok', 'http://example/pub-republish-pack-ok', 'test-indexer')
+		returning id`, sourceLibID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+	var sourceSelectedReleaseID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2) returning id`, sourceLibID, rcID).Scan(&sourceSelectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+	var vfCurrent int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, reader_kind)
+		values ($1, '/pub-republish-pack-ok/Show.S01E02.mkv', 'Show.S01E02.mkv', 'archive')
+		returning id`, sourceSelectedReleaseID).Scan(&vfCurrent); err != nil {
+		t.Fatal(err)
+	}
+
+	targetLibID := setupRaceTestLibraryItem(t, ctx, sqlDB, "pub-republish-pack-episode-ok", "requested")
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, targetLibID)
+	if err := db.FulfillEpisodeLibraryItem(ctx, targetLibID, sourceSelectedReleaseID, vfCurrent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.ExecContext(ctx, `
+		insert into symlink_publications (library_item_id, virtual_file_id, library_path, target_path)
+		values ($1, $2, '/library/pub-republish-pack-episode-ok.mkv', '/virtual/current.mkv')`,
+		targetLibID, vfCurrent,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := db.ListPendingRepublishTargets(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range got {
+		if item.LibraryItemID == targetLibID {
+			t.Fatalf("expected up-to-date season-pack-fulfilled episode %d to NOT be a pending republish target, got %+v", targetLibID, got)
+		}
+	}
+}
+
 func TestMarkReleaseAvailableClearsFailureReasonAndMarksAvailable(t *testing.T) {
 	db, sqlDB, ctx := openPublicationTestDB(t)
 

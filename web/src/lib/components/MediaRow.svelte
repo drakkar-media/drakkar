@@ -92,7 +92,12 @@
     if (event.key === 'ArrowLeft') {
       event.preventDefault();
       scrollByDelta(-pageDelta());
-    } else if (event.key === 'ArrowRight') {
+    } else if (event.key === 'ArrowRight' || event.key === ' ') {
+      // Space pages the row forward, matching ArrowRight -- without this,
+      // Space falls through to the browser's default behavior of scrolling
+      // the whole page down, since this is a plain div (not a native
+      // button, which is the only element type the browser auto-intercepts
+      // Space for).
       event.preventDefault();
       scrollByDelta(pageDelta());
     } else if (event.key === 'Home') {
@@ -128,11 +133,22 @@
   {#if items.length === 0}
     <div class="media-row-empty">No items.</div>
   {:else}
+    <!--
+      role="group" (not "button"): this is a scrollable strip of cards, not
+      a single-action control -- there's nothing for Enter/Space to
+      "activate". It still needs to be focusable and keyboard-navigable
+      (arrow keys page it, see onKeyDown), which is why svelte's a11y linter
+      flags it below as a non-interactive element carrying interactive
+      behavior; that's an intentional, accessible custom-widget pattern
+      (WAI-ARIA calls this a "composite widget"), not an oversight.
+    -->
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div
       class="media-row-scroll drag-scroll"
       class:dragging
       bind:this={scroller}
-      role="button"
+      role="group"
       aria-label={title}
       tabindex="0"
       on:pointerdown={onPointerDown}
@@ -143,7 +159,7 @@
       on:click|capture={onClickCapture}
       on:keydown={onKeyDown}
     >
-      {#each items as item}
+      {#each items as item (item.id || item.tmdbId || item.title)}
         <div class="media-row-item" style={`width:${itemWidth}px`}>
           <PosterCard {item} showStatus={item.id !== 0} {onRequest} />
         </div>

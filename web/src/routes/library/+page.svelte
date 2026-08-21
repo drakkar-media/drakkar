@@ -39,16 +39,24 @@
   let currentPage = 1;
   const pageSize = 40;
 
+  // status only feeds seerrReady/hydraReady below -- integration config that
+  // essentially never changes mid-session -- so it's fetched once on mount
+  // (see loadStatus/onMount) rather than every time loadLibrary runs, which
+  // this function used to also do on every pagination click, filter change,
+  // SSE-triggered reload, and the 30s poll.
+  async function loadStatus() {
+    try {
+      status = await api.status();
+    } catch (err) {
+      toastError(err instanceof Error ? err.message : String(err));
+    }
+  }
+
   async function loadLibrary() {
     loading = true;
     try {
-      const [statusResult, result] = await Promise.all([
-        api.status(),
-        api.library({ page: currentPage, pageSize, q: query.trim(), kind, state: stateFilter })
-      ]);
-      status = statusResult;
-      libraryPage = result;
-      items = result.items;
+      libraryPage = await api.library({ page: currentPage, pageSize, q: query.trim(), kind, state: stateFilter });
+      items = libraryPage.items;
     } catch (err) {
       toastError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -108,6 +116,7 @@
     stateFilter = page.url.searchParams.get('state') ?? 'all';
     currentPage = Number(page.url.searchParams.get('page') ?? '1') || 1;
 
+    void loadStatus();
     void loadLibrary();
 
     const debouncedLoadLibrary = debounce(() => void loadLibrary(), 500);

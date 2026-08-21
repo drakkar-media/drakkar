@@ -439,6 +439,39 @@ func (db *DB) GetEpisodeMetadataForLibraryItem(ctx context.Context, libraryItemI
 	return m, err
 }
 
+// GetEpisodeMetadataForLibraryItems is GetEpisodeMetadataForLibraryItem's
+// batch form: one round trip for every library item in libraryItemIDs
+// instead of one per item. A library item with no matching row (or no
+// episode_id/tv_show_id) is simply absent from the returned map -- callers
+// already handle "no metadata" via the single-item version's error path, so
+// this mirrors that by omission rather than a zero-value entry.
+func (db *DB) GetEpisodeMetadataForLibraryItems(ctx context.Context, libraryItemIDs []int64) (map[int64]EpisodeMetadata, error) {
+	out := make(map[int64]EpisodeMetadata, len(libraryItemIDs))
+	if len(libraryItemIDs) == 0 {
+		return out, nil
+	}
+	rows, err := db.SQL.QueryContext(ctx, `
+		select li.id, coalesce(tv.title, ''), coalesce(tv.release_year, 0), coalesce(tv.tvdb_id, 0),
+		       coalesce(e.season_number, 0), coalesce(e.episode_number, 0)
+		from library_items li
+		left join episodes e on e.id = li.episode_id
+		left join tv_shows tv on tv.id = e.tv_show_id
+		where li.id = any($1::bigint[])`, libraryItemIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var m EpisodeMetadata
+		if err := rows.Scan(&id, &m.ShowTitle, &m.ShowYear, &m.ShowTVDBID, &m.SeasonNumber, &m.EpisodeNumber); err != nil {
+			return nil, err
+		}
+		out[id] = m
+	}
+	return out, rows.Err()
+}
+
 // FindSourceSelectedReleaseForItem returns the selected_release ID of the season
 // pack that owns the virtual files for a given library item. Used when an episode
 // item has a selected_release but no virtual files of its own — the files live
@@ -486,7 +519,16 @@ func (db *DB) ListPendingRepublishTargets(ctx context.Context) ([]PendingRepubli
 		union
 		-- Items marked available whose current selected release already has
 		-- virtual files, but none of the existing symlink publications point
-		-- at that current release anymore.
+		-- at that current release anymore. A season-pack-fulfilled episode
+		-- deliberately has a selected_release with no virtual_files of its
+		-- own -- the backing file lives under the pack's own (source)
+		-- selected_release, which shares the same release_candidate_id (see
+		-- FindSourceSelectedReleaseForItem) -- so "the release's virtual
+		-- files" must be resolved through that same indirection here too,
+		-- falling back to the source release only when the item's own
+		-- selected_release has no virtual files of its own. Without this,
+		-- this branch could never match a season-pack episode at all, so a
+		-- stale symlink on one could never be caught and reconciled.
 		select li.id
 		from library_items li
 		join lateral (
@@ -496,20 +538,30 @@ func (db *DB) ListPendingRepublishTargets(ctx context.Context) ([]PendingRepubli
 		    order by qi.id desc
 		    limit 1
 		) q on true
+		join selected_releases ep_sr on ep_sr.id = q.selected_release_id
+		join lateral (
+		    select coalesce(
+		        (select ep_sr.id where exists (select 1 from virtual_files where selected_release_id = ep_sr.id)),
+		        (
+		            select pack_sr.id
+		            from selected_releases pack_sr
+		            where pack_sr.release_candidate_id = ep_sr.release_candidate_id
+		              and pack_sr.library_item_id != li.id
+		              and exists (select 1 from virtual_files where selected_release_id = pack_sr.id)
+		            limit 1
+		        )
+		    ) as resolved_sr_id
+		) resolved on true
 		where li.available = true
 		  and q.state in ($4, $5)
 		  and q.selected_release_id is not null
-		  and exists (
-		      select 1
-		      from virtual_files vf
-		      where vf.selected_release_id = q.selected_release_id
-		  )
+		  and resolved.resolved_sr_id is not null
 		  and not exists (
 		      select 1
 		      from symlink_publications sp
 		      join virtual_files vf on vf.id = sp.virtual_file_id
 		      where sp.library_item_id = li.id
-		        and vf.selected_release_id = q.selected_release_id
+		        and vf.selected_release_id = resolved.resolved_sr_id
 		  )
 		order by library_item_id asc`, QueuePreflight, QueuePublishing, QueueIndexing,
 		QueueAvailable, QueueDegraded,

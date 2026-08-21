@@ -18,7 +18,7 @@ import (
 // sentinel this test guards against.
 type statOnlySource struct {
 	statErr   error
-	statCalls int
+	statCalls atomic.Int32
 }
 
 func (s *statOnlySource) Body(ctx context.Context, messageID string) ([]byte, error) {
@@ -26,7 +26,7 @@ func (s *statOnlySource) Body(ctx context.Context, messageID string) ([]byte, er
 }
 
 func (s *statOnlySource) Stat(ctx context.Context, messageID string) error {
-	s.statCalls++
+	s.statCalls.Add(1)
 	return s.statErr
 }
 
@@ -89,7 +89,7 @@ func TestCachedFallbackSourceStatCachesArticleMissingFromStatPath(t *testing.T) 
 	if err := cached.Stat(ctx, "msg1"); err == nil {
 		t.Fatal("expected Stat to return an error for a missing article")
 	}
-	if got := stub.statCalls; got != 1 {
+	if got := stub.statCalls.Load(); got != 1 {
 		t.Fatalf("expected exactly 1 live Stat call, got %d", got)
 	}
 	if got := cached.MissingCount(); got != 1 {
@@ -101,87 +101,240 @@ func TestCachedFallbackSourceStatCachesArticleMissingFromStatPath(t *testing.T) 
 	if err := cached.Stat(ctx, "msg1"); err == nil {
 		t.Fatal("expected cached Stat to still report the article as missing")
 	}
-	if got := stub.statCalls; got != 1 {
+	if got := stub.statCalls.Load(); got != 1 {
 		t.Fatalf("expected the cache to short-circuit the second Stat call (still 1 live call), got %d", got)
 	}
 }
 
-// TestConfirmedTTLRequiresAgreementAtBackgroundPriority guards the 2026-08-11
-// fix: a single 430/423 sample was trusted enough on its own to cache an
-// article as missing for a full day (missingArticleTTL), which then feeds
-// straight into blocklisting a release forever via every downstream caller
-// (preflight, calibration, health checks). This provider has already had
-// its 430 handling reversed once (see classifyCacheableError's own doc
-// comment) and is independently documented (see nntp.ErrArticleMissing's
-// doc comment) to sometimes return 430 for a transient throttle, not just a
-// genuinely absent article -- exactly the class of false positive
-// confirmed live for the CRC-mismatch case (confirmPermanentCRCMismatch).
-// A second, independent, delayed sample must agree before the long TTL is
-// used; a disagreeing (or erroring differently) confirmation must fall back
-// to the short throttleTTL instead.
-func TestConfirmedTTLRequiresAgreementAtBackgroundPriority(t *testing.T) {
+// TestConfirmMissingRequiresAgreementAtBackgroundPriority guards the
+// 2026-08-11 fix: a single 430/423 sample was trusted enough on its own to
+// cache an article as missing for a full day (missingArticleTTL), which
+// then feeds straight into blocklisting a release forever via every
+// downstream caller (preflight, calibration, health checks). This provider
+// has already had its 430 handling reversed once (see
+// classifyCacheableError's own doc comment) and is independently documented
+// (see nntp.ErrArticleMissing's doc comment) to sometimes return 430 for a
+// transient throttle, not just a genuinely absent article -- exactly the
+// class of false positive confirmed live for the CRC-mismatch case
+// (confirmPermanentCRCMismatch). A second, independent, delayed sample must
+// agree before the long TTL is used; a disagreeing (or erroring
+// differently) confirmation must fall back to the short throttleTTL
+// instead. confirmMissing is called directly (not via markAndMaybeConfirm's
+// `go`) so its effect on the cache is deterministically observable.
+func TestConfirmMissingRequiresAgreementAtBackgroundPriority(t *testing.T) {
 	original := confirmMissingDelay
 	confirmMissingDelay = time.Millisecond
 	t.Cleanup(func() { confirmMissingDelay = original })
 
-	t.Run("confirmation agrees -> long TTL", func(t *testing.T) {
+	t.Run("confirmation agrees -> upgrades to long TTL", func(t *testing.T) {
 		stub := &statOnlySource{statErr: ErrArticleMissing}
 		fallback := NewFallbackSource([]NamedArticleSource{{Name: "provider1", Source: stub}}, 1)
 		cached := NewCachedFallbackSource(fallback)
+		cached.markMissing("msg1", throttleTTL) // provisional mark, as markAndMaybeConfirm does before confirming
 
-		got := cached.confirmedTTL(context.Background(), "msg1", stream.PriorityBackground, false, missingArticleTTL)
-		if got != missingArticleTTL {
-			t.Fatalf("expected agreement to produce missingArticleTTL, got %v", got)
+		cached.confirmMissing("msg1", stream.PriorityBackground, false)
+
+		cached.mu.Lock()
+		expiry := cached.missing["msg1"]
+		cached.mu.Unlock()
+		if wantMin := time.Now().Add(missingArticleTTL - time.Minute); expiry.Before(wantMin) {
+			t.Fatalf("expected agreement to upgrade the cache to missingArticleTTL, expiry=%v", expiry)
 		}
-		if stub.statCalls != 1 {
-			t.Fatalf("expected exactly 1 confirmation call to the stub, got %d", stub.statCalls)
+		if stub.statCalls.Load() != 1 {
+			t.Fatalf("expected exactly 1 confirmation call to the stub, got %d", stub.statCalls.Load())
 		}
 	})
 
-	t.Run("confirmation disagrees -> short throttleTTL", func(t *testing.T) {
+	t.Run("confirmation disagrees -> stays at short throttleTTL", func(t *testing.T) {
 		stub := &statOnlySource{statErr: nil} // confirmation succeeds -- article is actually there
 		fallback := NewFallbackSource([]NamedArticleSource{{Name: "provider1", Source: stub}}, 1)
 		cached := NewCachedFallbackSource(fallback)
+		cached.markMissing("msg1", throttleTTL)
 
-		got := cached.confirmedTTL(context.Background(), "msg1", stream.PriorityBackground, false, missingArticleTTL)
-		if got != throttleTTL {
-			t.Fatalf("expected disagreement to fall back to throttleTTL, got %v", got)
-		}
-	})
+		cached.confirmMissing("msg1", stream.PriorityBackground, false)
 
-	t.Run("interactive priority skips confirmation entirely", func(t *testing.T) {
-		stub := &statOnlySource{statErr: ErrArticleMissing}
-		fallback := NewFallbackSource([]NamedArticleSource{{Name: "provider1", Source: stub}}, 1)
-		cached := NewCachedFallbackSource(fallback)
-
-		got := cached.confirmedTTL(context.Background(), "msg1", stream.PriorityInteractive, false, missingArticleTTL)
-		if got != missingArticleTTL {
-			t.Fatalf("expected interactive priority to pass the TTL through unchanged, got %v", got)
-		}
-		if stub.statCalls != 0 {
-			t.Fatalf("expected zero confirmation calls at interactive priority (must not add latency to a live playback read), got %d", stub.statCalls)
+		cached.mu.Lock()
+		expiry := cached.missing["msg1"]
+		cached.mu.Unlock()
+		if wantMax := time.Now().Add(time.Minute); expiry.After(wantMax) {
+			t.Fatalf("expected disagreement to leave the cache at throttleTTL, expiry=%v", expiry)
 		}
 	})
 }
 
+// TestMarkAndMaybeConfirmSkipsConfirmationAtInteractivePriority guards the
+// same interactive fast-path guarantee, adapted for markAndMaybeConfirm:
+// at interactive priority, the raw ttl is cached directly and no
+// confirmation goroutine is ever spawned, so a live playback read gains no
+// extra latency from this mechanism at all.
+func TestMarkAndMaybeConfirmSkipsConfirmationAtInteractivePriority(t *testing.T) {
+	stub := &statOnlySource{statErr: ErrArticleMissing}
+	fallback := NewFallbackSource([]NamedArticleSource{{Name: "provider1", Source: stub}}, 1)
+	cached := NewCachedFallbackSource(fallback)
+
+	cached.markAndMaybeConfirm("msg1", stream.PriorityInteractive, false, missingArticleTTL)
+
+	cached.mu.Lock()
+	expiry := cached.missing["msg1"]
+	cached.mu.Unlock()
+	if wantMin := time.Now().Add(missingArticleTTL - time.Minute); expiry.Before(wantMin) {
+		t.Fatalf("expected interactive priority to cache the raw missingArticleTTL immediately, expiry=%v", expiry)
+	}
+	// No goroutine should ever call the stub for this priority.
+	time.Sleep(20 * time.Millisecond)
+	if stub.statCalls.Load() != 0 {
+		t.Fatalf("expected zero confirmation calls at interactive priority (must not add latency to a live playback read), got %d", stub.statCalls.Load())
+	}
+}
+
 // TestCachedFallbackSourceStatConfirmsBeforeLongCacheAtBackgroundPriority is
-// the end-to-end counterpart: StatPriority at background priority must issue
-// a second live call before caching a miss for the full day.
+// the end-to-end counterpart: StatPriority at background priority returns
+// immediately after the first live call (never blocking on confirmation),
+// and a second, independent confirmation call eventually follows in the
+// background before the cache is upgraded to the full-day TTL.
+//
+// Confirmed live 2026-08-20: this confirmation used to run synchronously
+// inside the statFlight/bodyFlight singleflight critical section, so a
+// low-priority caller here held every OTHER concurrent caller for the SAME
+// messageID -- including an unrelated interactive-priority playback read --
+// for the full confirmMissingDelay plus a live re-fetch (10-40s), since
+// singleflight coalesces by messageID alone with no priority awareness.
+// StatPriority must now return as soon as the FIRST live call resolves,
+// with confirmation happening strictly afterward and out-of-line.
 func TestCachedFallbackSourceStatConfirmsBeforeLongCacheAtBackgroundPriority(t *testing.T) {
 	original := confirmMissingDelay
 	confirmMissingDelay = time.Millisecond
 	t.Cleanup(func() { confirmMissingDelay = original })
 
+	// confirmMissing runs detached in its own goroutine by design (see
+	// markAndMaybeConfirm) -- this hook lets the test wait for it to fully
+	// finish before asserting on its effects, establishing a proper
+	// happens-before edge. Polling a side effect (e.g. the stub's call
+	// count) does NOT do this for OTHER memory the goroutine touches (like
+	// confirmMissingDelay, restored by t.Cleanup above) -- confirmed live
+	// via `go test -race`, which flagged exactly that as an unsynchronized
+	// access when this test used a poll loop instead.
+	done := make(chan struct{})
+	confirmMissingDone = func() { close(done) }
+	t.Cleanup(func() { confirmMissingDone = nil })
+
 	stub := &statOnlySource{statErr: ErrArticleMissing}
 	fallback := NewFallbackSource([]NamedArticleSource{{Name: "provider1", Source: stub}}, 1)
 	cached := NewCachedFallbackSource(fallback)
 
+	start := time.Now()
 	if err := cached.StatPriority(context.Background(), "msg1", stream.PriorityBackground); err == nil {
 		t.Fatal("expected an error for a missing article")
 	}
-	if stub.statCalls != 2 {
-		t.Fatalf("expected 1 live call + 1 confirmation call at background priority, got %d", stub.statCalls)
+	if elapsed := time.Since(start); elapsed >= 10*confirmMissingDelay {
+		t.Fatalf("StatPriority blocked for %v waiting on confirmation instead of returning immediately", elapsed)
 	}
+	if got := stub.statCalls.Load(); got != 1 {
+		t.Fatalf("expected exactly 1 live call before StatPriority returns, got %d", got)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the background confirmation to finish")
+	}
+	if got := stub.statCalls.Load(); got != 2 {
+		t.Fatalf("expected 1 live call + 1 confirmation call at background priority, got %d", got)
+	}
+}
+
+// TestConcurrentInteractiveCallerNeverBlocksOnBackgroundCallersConfirmation
+// is the direct regression test for the 2026-08-20 production finding: a
+// background-priority caller's confirmation delay must never stall a
+// concurrent interactive-priority caller for the SAME messageID, since
+// statFlight/bodyFlight coalesce purely by messageID with no priority
+// awareness. Uses a stub whose confirmation (second) call blocks
+// indefinitely to prove the interactive call cannot possibly be waiting on
+// it if it returns before the block is ever released.
+func TestConcurrentInteractiveCallerNeverBlocksOnBackgroundCallersConfirmation(t *testing.T) {
+	original := confirmMissingDelay
+	confirmMissingDelay = time.Millisecond
+	t.Cleanup(func() { confirmMissingDelay = original })
+
+	// See the matching comment in
+	// TestCachedFallbackSourceStatConfirmsBeforeLongCacheAtBackgroundPriority
+	// for why this hook (rather than a fixed sleep) is needed to avoid a
+	// real, `go test -race`-confirmed data race against t.Cleanup restoring
+	// confirmMissingDelay above.
+	confirmDone := make(chan struct{})
+	confirmMissingDone = func() { close(confirmDone) }
+	t.Cleanup(func() { confirmMissingDone = nil })
+
+	stub := &firstFastThenBlockingStatSource{
+		statErr: ErrArticleMissing,
+		started: make(chan struct{}),
+		block:   make(chan struct{}),
+	}
+	fallback := NewFallbackSource([]NamedArticleSource{{Name: "provider1", Source: stub}}, 1)
+	cached := NewCachedFallbackSource(fallback)
+
+	ctx := context.Background()
+	if err := cached.StatPriority(ctx, "msg1", stream.PriorityBackground); err == nil {
+		t.Fatal("expected an error for a missing article")
+	}
+
+	// Wait deterministically for the confirmation goroutine to actually
+	// reach its (blocked) re-check call, instead of sleeping a fixed
+	// duration and hoping it got there in time.
+	select {
+	case <-stub.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the confirmation goroutine to start")
+	}
+
+	interactiveDone := make(chan error, 1)
+	go func() { interactiveDone <- cached.StatPriority(ctx, "msg1", stream.PriorityInteractive) }()
+	select {
+	case err := <-interactiveDone:
+		if err == nil {
+			t.Fatal("expected an error for a missing article")
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(stub.block) // don't leak the blocked goroutine past this failing test
+		t.Fatal("interactive-priority call blocked on a concurrent background caller's confirmation delay -- the bug this test guards against")
+	}
+
+	close(stub.block) // release the still-blocked confirmation goroutine
+	select {
+	case <-confirmDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the background confirmation goroutine to finish")
+	}
+}
+
+// firstFastThenBlockingStatSource returns statErr immediately on its first
+// call (simulating the initial live fetch that triggers a missing-article
+// classification), then closes started and blocks every subsequent call on
+// block until the test releases it (simulating a slow, still-in-flight
+// confirmation re-check).
+type firstFastThenBlockingStatSource struct {
+	mu      sync.Mutex
+	calls   int
+	statErr error
+	started chan struct{}
+	block   chan struct{}
+}
+
+func (s *firstFastThenBlockingStatSource) Body(ctx context.Context, messageID string) ([]byte, error) {
+	return nil, errors.New("firstFastThenBlockingStatSource: Body should not be called in this test")
+}
+
+func (s *firstFastThenBlockingStatSource) Stat(ctx context.Context, messageID string) error {
+	s.mu.Lock()
+	s.calls++
+	first := s.calls == 1
+	s.mu.Unlock()
+	if first {
+		return s.statErr
+	}
+	close(s.started)
+	<-s.block
+	return s.statErr
 }
 
 // blockingStatSource is a StatSource whose Stat call blocks on a channel

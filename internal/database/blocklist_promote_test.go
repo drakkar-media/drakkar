@@ -330,6 +330,96 @@ func TestFailSelectedReleaseAndPromoteNextSkipsBlocklistedSibling(t *testing.T) 
 	}
 }
 
+// TestFailSelectedReleaseAndPromoteNextAssignsDistinctReasonsToEachBlockedCandidate
+// guards markBlockedCandidatesRejected's batched multi-row UPDATE: with TWO
+// independently-blocked candidates skipped in the same scan, each must land
+// its OWN correct reject_reason on its OWN row -- not the other's, and not
+// silently dropped -- exactly the kind of id/reason mix-up a hand-built
+// multi-row VALUES query risks getting wrong.
+func TestFailSelectedReleaseAndPromoteNextAssignsDistinctReasonsToEachBlockedCandidate(t *testing.T) {
+	db, sqlDB, ctx := openBlocklistTestDB(t)
+	libID := setupRaceTestLibraryItem(t, ctx, sqlDB, "fail-multi-blocked", "selected")
+	t.Cleanup(func() {
+		_, _ = sqlDB.ExecContext(context.Background(), `delete from library_items where id = $1`, libID)
+	})
+
+	scopeKey, err := resolveMediaScopeKey(ctx, sqlDB, libID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	insertBlockedCandidate := func(title, reason string) (rcID int64) {
+		sizeBytes := int64(2_000_000_000)
+		postedAt := time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC)
+		if err := sqlDB.QueryRowContext(ctx, `
+			insert into release_candidates (library_item_id, title, external_url, indexer_name, size_bytes, posted_at)
+			values ($1, $2, $3, 'indexer-a', $4, $5)
+			returning id`, libID, title, "fail-multi-blocked-"+title, sizeBytes, postedAt,
+		).Scan(&rcID); err != nil {
+			t.Fatal(err)
+		}
+		familyKey := scopeKey + "|" + blocklistReleaseFamilyKey(title, sizeBytes, postedAt)
+		if _, err := sqlDB.ExecContext(ctx, `
+			insert into blocklist_items (key, reason) values ($1, $2)`, familyKey, reason,
+		); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_, _ = sqlDB.ExecContext(context.Background(), `delete from blocklist_items where key = $1`, familyKey)
+		})
+		return rcID
+	}
+
+	rcBlockedA := insertBlockedCandidate("Blocked Release Alpha 2024", "test_reason_alpha")
+	rcBlockedB := insertBlockedCandidate("Blocked Release Beta 2024", "test_reason_beta")
+
+	var rcFallback int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, external_url, indexer_name)
+		values ($1, 'Unrelated Fallback Release 2024', 'fail-multi-blocked-fallback-url', 'indexer-b')
+		returning id`, libID,
+	).Scan(&rcFallback); err != nil {
+		t.Fatal(err)
+	}
+
+	_, selectedReleaseID := attachSelectedBlocklistTestCandidate(t, ctx, sqlDB, libID, "fail-multi-blocked")
+
+	summary, err := db.FailSelectedReleaseAndPromoteNext(ctx, selectedReleaseID, "context deadline exceeded")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary == nil || summary.ReleaseCandidateID != rcFallback {
+		t.Fatalf("expected the unrelated fallback candidate to be promoted, got %+v", summary)
+	}
+
+	rows, err := sqlDB.QueryContext(ctx, `
+		select id, rejected, reject_reason from release_candidates where id in ($1, $2)`, rcBlockedA, rcBlockedB,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := map[int64]string{}
+	for rows.Next() {
+		var id int64
+		var rejected bool
+		var reason string
+		if err := rows.Scan(&id, &rejected, &reason); err != nil {
+			t.Fatal(err)
+		}
+		if !rejected {
+			t.Fatalf("expected candidate %d to be marked rejected", id)
+		}
+		got[id] = reason
+	}
+	if got[rcBlockedA] != "test_reason_alpha" {
+		t.Errorf("candidate A reject_reason = %q, want %q", got[rcBlockedA], "test_reason_alpha")
+	}
+	if got[rcBlockedB] != "test_reason_beta" {
+		t.Errorf("candidate B reject_reason = %q, want %q", got[rcBlockedB], "test_reason_beta")
+	}
+}
+
 func TestFailSelectedReleaseAndPromoteNextMarksActiveItemUnavailable(t *testing.T) {
 	db, sqlDB, ctx := openBlocklistTestDB(t)
 	libID := setupRaceTestLibraryItem(t, ctx, sqlDB, "fail-active-available", "selected")

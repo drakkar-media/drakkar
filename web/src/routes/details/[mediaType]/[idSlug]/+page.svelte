@@ -1003,12 +1003,12 @@
                   <div class="flex flex-col gap-2 rounded-xl border border-white/[0.08] bg-white/[0.03] p-3 px-4 cursor-pointer transition-colors hover:border-primary/50" on:click={() => importManualResult(item)} role="button" tabindex="0" on:keydown={(e) => e.key === 'Enter' && importManualResult(item)}>
                     <div class="flex items-start justify-between gap-2">
                       <p class="m-0 min-w-0 flex-1 break-all text-[13px] font-semibold leading-[1.4] text-foreground">{item.title}</p>
-                      <span class="shrink-0 whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-bold leading-none {item.score <= 0 ? 'bg-destructive/15 text-destructive' : 'bg-primary/[0.18] text-primary'}">Rank: {item.score}</span>
+                      <span class="shrink-0 whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-bold leading-none {item.score <= 0 ? 'bg-destructive/15 text-destructive' : 'bg-primary/[0.18] text-primary-foreground'}">Rank: {item.score}</span>
                     </div>
                     <div class="flex flex-wrap items-center gap-1.5">
                       {#each tags as tag}
                         {@const toned = badgeTone(tag) !== 'default'}
-                        <span class="rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap {toned ? 'border border-transparent bg-primary/[0.16] text-primary' : 'border border-white/[0.12] font-normal text-muted-foreground'}">{tag}</span>
+                        <span class="rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap {toned ? 'border border-transparent bg-primary/[0.16] text-primary-foreground' : 'border border-white/[0.12] font-normal text-muted-foreground'}">{tag}</span>
                       {/each}
                       {#if item.indexer}<span class="rounded-full border border-white/[0.12] px-2 py-0.5 text-[11px] text-muted-foreground whitespace-nowrap">{item.indexer}</span>{/if}
                       <span class="mono rounded-full border border-white/[0.12] px-2 py-0.5 text-[11px] text-muted-foreground whitespace-nowrap">{fmtBytes(item.sizeBytes)}</span>
@@ -1045,12 +1045,12 @@
                 <div class="flex flex-col gap-2 rounded-xl border border-white/[0.08] bg-white/[0.03] p-3 px-4 transition-colors {c.selected ? 'border-primary/40 bg-primary/[0.06]' : ''} {c.rejected && !c.selected ? 'opacity-50' : ''}">
                   <div class="flex items-start justify-between gap-2">
                     <p class="m-0 min-w-0 flex-1 break-all text-[13px] font-semibold leading-[1.4] text-foreground">{c.title}</p>
-                    <span class="shrink-0 whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-bold leading-none {c.rejected && !c.selected ? 'bg-destructive/15 text-destructive' : 'bg-primary/[0.18] text-primary'}">Score: {c.score}</span>
+                    <span class="shrink-0 whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-bold leading-none {c.rejected && !c.selected ? 'bg-destructive/15 text-destructive' : 'bg-primary/[0.18] text-primary-foreground'}">Score: {c.score}</span>
                   </div>
                   <div class="flex flex-wrap items-center gap-1.5">
                     {#each tags as tag}
                       {@const toned = badgeTone(tag) !== 'default'}
-                      <span class="rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap {toned ? 'border border-transparent bg-primary/[0.16] text-primary' : 'border border-white/[0.12] font-normal text-muted-foreground'}">{tag}</span>
+                      <span class="rounded-full px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap {toned ? 'border border-transparent bg-primary/[0.16] text-primary-foreground' : 'border border-white/[0.12] font-normal text-muted-foreground'}">{tag}</span>
                     {/each}
                     {#if c.indexerName}<span class="rounded-full border border-white/[0.12] px-2 py-0.5 text-[11px] text-muted-foreground whitespace-nowrap">{c.indexerName}</span>{/if}
                     <span class="mono rounded-full border border-white/[0.12] px-2 py-0.5 text-[11px] text-muted-foreground whitespace-nowrap">{fmtBytes(c.sizeBytes)}</span>

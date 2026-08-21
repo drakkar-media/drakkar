@@ -1100,7 +1100,12 @@ func parseRAR5FileHeader(raw []byte, pos, end, bodyEnd int, dataStart, dataAreaS
 					params.PasswordCheck = check
 				}
 				encLg2, encSalt, encIV = lg2, salt, iv
-				if archivePassword != "" {
+				if archivePassword != "" && params.HasPasswordCheck {
+					// DeriveKey only actually verifies the password when
+					// HasPasswordCheck is set -- with no check value, key
+					// derivation always succeeds regardless of whether the
+					// password is right, so a bare "no error" can't be
+					// trusted as proof of a correct password.
 					if _, derr := rarcrypto.DeriveKey(archivePassword, params); derr == nil {
 						encVerified = true
 					}

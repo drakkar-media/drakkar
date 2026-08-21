@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/drakkar-media/drakkar/internal/config"
 	"github.com/drakkar-media/drakkar/internal/database"
@@ -27,6 +28,7 @@ type Repository interface {
 	ListSelectedReleasesByLibraryItem(ctx context.Context, libraryItemID int64) ([]int64, error)
 	FindSourceSelectedReleaseForItem(ctx context.Context, libraryItemID int64) (int64, error)
 	GetEpisodeMetadataForLibraryItem(ctx context.Context, libraryItemID int64) (database.EpisodeMetadata, error)
+	GetEpisodeMetadataForLibraryItems(ctx context.Context, libraryItemIDs []int64) (map[int64]database.EpisodeMetadata, error)
 	ListPendingRepublishTargets(ctx context.Context) ([]database.PendingRepublishTarget, error)
 	UpsertSymlinkPublication(ctx context.Context, libraryItemID, virtualFileID int64, libraryPath, targetPath string) error
 	MarkReleaseAvailable(ctx context.Context, selectedReleaseID int64) error
@@ -46,6 +48,28 @@ type Publisher struct {
 	rclone                *rclone.Client
 	postPublishHook       func(context.Context, int64) error
 	mediaServerNotifyHook func(context.Context, int64) error
+
+	// republishMu holds one *sync.Mutex per library item ID, serializing
+	// concurrent RepublishLibraryItem calls for the SAME item -- without it,
+	// two overlapping repair passes for the same item (e.g. a manual repair
+	// click racing an automatic health-check repair) each independently read
+	// the current selection and write their own symlink/DB target; whichever
+	// finishes last wins the DB record while the on-disk symlink can be left
+	// pointing at whichever finished last on the filesystem -- not
+	// necessarily the same release if the selection changed in between.
+	// Entries are never removed (one mutex per distinct item ever repaired,
+	// same unbounded-but-small-in-practice tradeoff other per-key caches in
+	// this codebase already make).
+	republishMu sync.Map
+}
+
+// lockLibraryItem blocks until it holds the per-item mutex for
+// libraryItemID, returning the unlock function to defer.
+func (p *Publisher) lockLibraryItem(libraryItemID int64) func() {
+	value, _ := p.republishMu.LoadOrStore(libraryItemID, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
 }
 
 // BulkRepublishResult summarizes the outcome of RepublishPendingLibrary.
@@ -229,6 +253,7 @@ func (p *Publisher) RebuildPublications(ctx context.Context) error {
 // release of their own) are resolved back to their source release and
 // published directly rather than republishing the whole pack.
 func (p *Publisher) RepublishLibraryItem(ctx context.Context, libraryItemID int64) error {
+	defer p.lockLibraryItem(libraryItemID)()
 	selectedReleaseIDs, err := p.repo.ListSelectedReleasesByLibraryItem(ctx, libraryItemID)
 	if err != nil {
 		return err
@@ -238,7 +263,12 @@ func (p *Publisher) RepublishLibraryItem(ctx context.Context, libraryItemID int6
 		// Rather than re-publishing the whole pack (which may have no show metadata),
 		// use the episode item's own metadata to find and publish the matching VF directly.
 		sourceID, err := p.repo.FindSourceSelectedReleaseForItem(ctx, libraryItemID)
-		if err != nil || sourceID == 0 {
+		if err != nil {
+			return err
+		}
+		if sourceID == 0 {
+			// Genuinely nothing to do: this item isn't a season-pack episode
+			// borrowing a virtual file from another release.
 			return nil
 		}
 		return p.republishEpisodeFromSourceRelease(ctx, libraryItemID, sourceID)
@@ -260,7 +290,12 @@ func (p *Publisher) RepublishLibraryItem(ctx context.Context, libraryItemID int6
 // matches the corresponding virtual file by parsing the filename.
 func (p *Publisher) republishEpisodeFromSourceRelease(ctx context.Context, libraryItemID, sourceReleaseID int64) error {
 	meta, err := p.repo.GetEpisodeMetadataForLibraryItem(ctx, libraryItemID)
-	if err != nil || meta.ShowTitle == "" || meta.SeasonNumber <= 0 || meta.EpisodeNumber <= 0 {
+	if err != nil {
+		return err
+	}
+	if meta.ShowTitle == "" || meta.SeasonNumber <= 0 || meta.EpisodeNumber <= 0 {
+		// Genuinely nothing to do: this item has no usable episode metadata
+		// to match against the source release's virtual files.
 		return nil
 	}
 	files, err := p.repo.ListVirtualFilesForRelease(ctx, sourceReleaseID)
@@ -355,6 +390,18 @@ func (p *Publisher) fulfillSeasonPackEpisodes(ctx context.Context, selectedRelea
 		}
 	}
 
+	// One round trip for every match's episode metadata instead of one per
+	// match -- this reintroduced the exact per-row pattern
+	// FindSeasonPackMatches (just above) was already rewritten to batch away.
+	libraryItemIDs := make([]int64, len(matches))
+	for i, m := range matches {
+		libraryItemIDs[i] = m.LibraryItemID
+	}
+	metaByLibraryItemID, metaErr := p.repo.GetEpisodeMetadataForLibraryItems(ctx, libraryItemIDs)
+	if metaErr != nil {
+		metaByLibraryItemID = map[int64]database.EpisodeMetadata{}
+	}
+
 	for _, m := range matches {
 		vf, ok := fileByEpisode[epKey{m.SeasonNumber, m.EpisodeNumber}]
 		virtualFileID := m.VirtualFileID
@@ -381,7 +428,7 @@ func (p *Publisher) fulfillSeasonPackEpisodes(ctx context.Context, selectedRelea
 			Path:              enrichedPath,
 			FileName:          enrichedFileName,
 		}
-		if meta, metaErr := p.repo.GetEpisodeMetadataForLibraryItem(ctx, m.LibraryItemID); metaErr == nil {
+		if meta, ok := metaByLibraryItemID[m.LibraryItemID]; ok {
 			enriched.ShowTitle = meta.ShowTitle
 			enriched.ShowYear = meta.ShowYear
 			enriched.ShowTVDBID = meta.ShowTVDBID
@@ -395,18 +442,22 @@ func (p *Publisher) fulfillSeasonPackEpisodes(ctx context.Context, selectedRelea
 		target := filepath.Join(p.runtime.FuseMountPath, "content", enriched.Path)
 		libraryPath := p.libraryPathFor(enriched)
 		if libraryPath != "" {
-			if symlinkErr := p.syml.Publish(libraryPath, target); symlinkErr == nil {
-				if upsertErr := p.repo.UpsertSymlinkPublication(ctx, m.LibraryItemID, virtualFileID, libraryPath, target); upsertErr == nil {
-					_ = p.rclone.RefreshPath(ctx, filepath.Dir(libraryPath))
-					// Also refresh the content directory the symlink points into
-					// (see the comment in publishSelectedRelease above for why the
-					// "releases" parent directory is deliberately NOT refreshed too).
-					_ = p.rclone.RefreshMountPath(ctx, p.runtime.FuseMountPath, filepath.Dir(target))
-					if notifyMediaServers && p.mediaServerNotifyHook != nil {
-						if err := p.mediaServerNotifyHook(ctx, m.LibraryItemID); err != nil {
-							slog.Warn("season pack: media server notify failed", "library_item_id", m.LibraryItemID, "err", err)
-						}
-					}
+			if symlinkErr := p.syml.Publish(libraryPath, target); symlinkErr != nil {
+				slog.Warn("season pack: failed to publish symlink for episode", "library_item_id", m.LibraryItemID, "err", symlinkErr)
+				continue
+			}
+			if upsertErr := p.repo.UpsertSymlinkPublication(ctx, m.LibraryItemID, virtualFileID, libraryPath, target); upsertErr != nil {
+				slog.Warn("season pack: failed to upsert symlink publication for episode", "library_item_id", m.LibraryItemID, "err", upsertErr)
+				continue
+			}
+			_ = p.rclone.RefreshPath(ctx, filepath.Dir(libraryPath))
+			// Also refresh the content directory the symlink points into
+			// (see the comment in publishSelectedRelease above for why the
+			// "releases" parent directory is deliberately NOT refreshed too).
+			_ = p.rclone.RefreshMountPath(ctx, p.runtime.FuseMountPath, filepath.Dir(target))
+			if notifyMediaServers && p.mediaServerNotifyHook != nil {
+				if err := p.mediaServerNotifyHook(ctx, m.LibraryItemID); err != nil {
+					slog.Warn("season pack: media server notify failed", "library_item_id", m.LibraryItemID, "err", err)
 				}
 			}
 		}

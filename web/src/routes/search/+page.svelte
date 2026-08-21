@@ -8,6 +8,7 @@
    * reuse PosterCard.
    */
   import { page } from '$app/state';
+  import { afterNavigate } from '$app/navigation';
   import PosterCard from '$lib/components/PosterCard.svelte';
   import { api } from '$lib/api';
   import { detailsHref } from '$lib/detailsHref';
@@ -65,13 +66,22 @@
     }
   }
 
-  $: {
-    const nextQuery = page.url.searchParams.get('q')?.trim() ?? '';
+  // Reading page.url from a $: block does not reliably re-run on client-side
+  // navigation in this app (e.g. searching again from the topbar while
+  // already on /search updates the URL but this block never re-fires) --
+  // same root cause fixed in +layout.svelte, AppShell.svelte, and the details
+  // page. afterNavigate + a plain reassignment, plus an eager synchronous
+  // read for the very first load (afterNavigate does not fire for that one),
+  // is the reliable alternative used there too.
+  activeQuery = page.url.searchParams.get('q')?.trim() ?? '';
+  void loadSearch();
+  afterNavigate((nav) => {
+    const nextQuery = nav.to?.url.searchParams.get('q')?.trim() ?? '';
     if (nextQuery !== activeQuery) {
       activeQuery = nextQuery;
       void loadSearch();
     }
-  }
+  });
 </script>
 
 <svelte:head><title>Search — Drakkar</title></svelte:head>

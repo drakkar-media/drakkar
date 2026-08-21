@@ -221,7 +221,19 @@
       {#each groups as group}
         {@const groupTasks = tasks.filter((t) => t.group === group)}
         {@const collapsed = collapsedGroups.has(group)}
-        <Table.Row class="cursor-pointer select-none" onclick={() => toggleGroup(group)}>
+        <Table.Row
+          class="cursor-pointer select-none"
+          role="button"
+          tabindex={0}
+          aria-expanded={!collapsed}
+          onclick={() => toggleGroup(group)}
+          onkeydown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              toggleGroup(group);
+            }
+          }}
+        >
           <Table.Cell colspan={5} class="bg-transparent pt-5 text-xs font-bold uppercase tracking-[0.12em] text-primary">
             <span class="inline-flex items-center gap-1.5">
               <svelte:component this={collapsed ? ChevronRight : ChevronDown} size={14} />

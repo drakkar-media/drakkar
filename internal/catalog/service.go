@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/drakkar-media/drakkar/internal/database"
@@ -36,6 +37,33 @@ type TMDBClient interface {
 type Service struct {
 	db   *database.DB
 	tmdb TMDBClient
+
+	seasonCacheMu      sync.Mutex
+	seasonNumbersCache map[int64]seasonNumbersCacheEntry
+	seasonCache        map[seasonCacheKey]seasonCacheEntry
+}
+
+// tvSeasonCacheTTL bounds how long a show's TVSeasonNumbers/TVSeason
+// responses are reused across buildTVSeasons calls -- confirmed live: the
+// weekly air-date-backfill task calls buildTVSeasons for every show, and a
+// live details-page view for the same show minutes later re-fetched every
+// season from TMDB all over again. Long enough to absorb that overlap, short
+// enough to still pick up a genuine TMDB metadata correction within a day.
+const tvSeasonCacheTTL = 6 * time.Hour
+
+type seasonNumbersCacheEntry struct {
+	numbers   []int
+	expiresAt time.Time
+}
+
+type seasonCacheKey struct {
+	tmdbID       int64
+	seasonNumber int
+}
+
+type seasonCacheEntry struct {
+	season    tmdb.TVSeason
+	expiresAt time.Time
 }
 
 // NewService creates a catalog Service. tmdbClient may be a client whose
@@ -43,7 +71,55 @@ type Service struct {
 // discover/trending features degrade gracefully in that case while
 // library-only views continue to work.
 func NewService(db *database.DB, tmdbClient TMDBClient) *Service {
-	return &Service{db: db, tmdb: tmdbClient}
+	return &Service{
+		db:                 db,
+		tmdb:               tmdbClient,
+		seasonNumbersCache: make(map[int64]seasonNumbersCacheEntry),
+		seasonCache:        make(map[seasonCacheKey]seasonCacheEntry),
+	}
+}
+
+// cachedTVSeasonNumbers wraps TMDBClient.TVSeasonNumbers with a short TTL
+// cache keyed by tmdbID (see tvSeasonCacheTTL).
+func (s *Service) cachedTVSeasonNumbers(ctx context.Context, tmdbID int64) ([]int, error) {
+	now := time.Now()
+	s.seasonCacheMu.Lock()
+	if entry, ok := s.seasonNumbersCache[tmdbID]; ok && now.Before(entry.expiresAt) {
+		s.seasonCacheMu.Unlock()
+		return entry.numbers, nil
+	}
+	s.seasonCacheMu.Unlock()
+
+	numbers, err := s.tmdb.TVSeasonNumbers(ctx, tmdbID)
+	if err != nil {
+		return nil, err
+	}
+	s.seasonCacheMu.Lock()
+	s.seasonNumbersCache[tmdbID] = seasonNumbersCacheEntry{numbers: numbers, expiresAt: now.Add(tvSeasonCacheTTL)}
+	s.seasonCacheMu.Unlock()
+	return numbers, nil
+}
+
+// cachedTVSeason wraps TMDBClient.TVSeason with a short TTL cache keyed by
+// (tmdbID, seasonNumber) (see tvSeasonCacheTTL).
+func (s *Service) cachedTVSeason(ctx context.Context, tmdbID int64, seasonNumber int) (tmdb.TVSeason, error) {
+	key := seasonCacheKey{tmdbID: tmdbID, seasonNumber: seasonNumber}
+	now := time.Now()
+	s.seasonCacheMu.Lock()
+	if entry, ok := s.seasonCache[key]; ok && now.Before(entry.expiresAt) {
+		s.seasonCacheMu.Unlock()
+		return entry.season, nil
+	}
+	s.seasonCacheMu.Unlock()
+
+	season, err := s.tmdb.TVSeason(ctx, tmdbID, seasonNumber)
+	if err != nil {
+		return tmdb.TVSeason{}, err
+	}
+	s.seasonCacheMu.Lock()
+	s.seasonCache[key] = seasonCacheEntry{season: season, expiresAt: now.Add(tvSeasonCacheTTL)}
+	s.seasonCacheMu.Unlock()
+	return season, nil
 }
 
 // MediaCard is the summary representation of a movie or TV show used in
@@ -1149,15 +1225,52 @@ func (s *Service) buildTVSeasons(ctx context.Context, detail LibraryDetail) ([]S
 	if s.tmdb == nil || !s.tmdb.Enabled() || detail.TMDBID <= 0 {
 		return fallbackTVSeasonsFromRows(rows), nil
 	}
-	seasonNumbers, err := s.tmdb.TVSeasonNumbers(ctx, detail.TMDBID)
+	seasonNumbers, err := s.cachedTVSeasonNumbers(ctx, detail.TMDBID)
 	if err != nil || len(seasonNumbers) == 0 {
 		return fallbackTVSeasonsFromRows(rows), nil
 	}
 
+	// Fetch every season concurrently instead of one round trip at a time --
+	// confirmed live: a 20+ season show blocked the details page on 21
+	// sequential TMDB round trips per view. Bounded so a huge show doesn't
+	// fire dozens of requests at once; results are gathered into a plain
+	// slice and processed sequentially afterward (below, unchanged from the
+	// non-concurrent version) so the DB writes and accumulation logic there
+	// need no concurrency-safety changes of their own.
+	type seasonFetchResult struct {
+		seasonNumber int
+		season       tmdb.TVSeason
+		err          error
+	}
+	results := make([]seasonFetchResult, len(seasonNumbers))
+	const maxParallelSeasonFetches = 6
+	sem := make(chan struct{}, maxParallelSeasonFetches)
+	var wg sync.WaitGroup
+	for i, seasonNumber := range seasonNumbers {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i, seasonNumber int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			season, err := s.cachedTVSeason(ctx, detail.TMDBID, seasonNumber)
+			results[i] = seasonFetchResult{seasonNumber: seasonNumber, season: season, err: err}
+		}(i, seasonNumber)
+	}
+	wg.Wait()
+
 	var out []SeasonDetail
-	for _, seasonNumber := range seasonNumbers {
-		season, err := s.tmdb.TVSeason(ctx, detail.TMDBID, seasonNumber)
+	for _, result := range results {
+		seasonNumber := result.seasonNumber
+		season, err := result.season, result.err
 		if err != nil {
+			// A failed TMDB call for THIS season must not drop it from the
+			// response entirely -- that silently corrupts the whole show's
+			// AvailableCount/MissingCount rollup (summed from out below) and
+			// hides the season from the UI. Fall back to whatever local data
+			// is already loaded for it instead, matching the no-TMDB path.
+			if fallback := fallbackTVSeasonsFromRows(seasonRowsFromAvailable(available, seasonNumber)); len(fallback) > 0 {
+				out = append(out, fallback[0])
+			}
 			continue
 		}
 		item := SeasonDetail{
@@ -1336,6 +1449,20 @@ func (s *Service) showEpisodes(ctx context.Context, tvShowID int64) ([]showEpiso
 // local database rows, used when TMDB season metadata is unavailable (TMDB
 // disabled, unmatched title, or an API error) so the detail view still shows
 // whatever the library actually has.
+// seasonRowsFromAvailable extracts the showEpisodeRow entries for one season
+// number out of the merged local+selected-release availability map built by
+// buildTVSeasons, for use as a fallback source when a TMDB call for that
+// season fails.
+func seasonRowsFromAvailable(available map[string]showEpisodeRow, seasonNumber int) []showEpisodeRow {
+	var out []showEpisodeRow
+	for _, row := range available {
+		if row.SeasonNumber == seasonNumber {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
 func fallbackTVSeasonsFromRows(rows []showEpisodeRow) []SeasonDetail {
 	if len(rows) == 0 {
 		return nil

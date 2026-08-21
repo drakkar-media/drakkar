@@ -93,3 +93,17 @@ func TestParseSubjectFilename(t *testing.T) {
 		t.Fatalf("got %s", got)
 	}
 }
+
+// TestParseSubjectFilenameUsesLastQuotedSegmentNotFirstToLastSpan guards a
+// real bug: a common posting convention repeats the filename in an earlier
+// quoted segment too (e.g. a group/poster tag also wrapped in quotes),
+// giving the subject line TWO separate quoted segments. Spanning from the
+// FIRST opening quote to the LAST closing quote returns everything glued
+// together in between -- the poster tag, stray quotes, and all -- instead
+// of just the real filename immediately before "yEnc".
+func TestParseSubjectFilenameUsesLastQuotedSegmentNotFirstToLastSpan(t *testing.T) {
+	got := ParseSubjectFilename(`Group presents "Dune (2021)" [01/20] - "Dune (2021).mkv" yEnc (1/1917) 734004718`)
+	if got != "Dune (2021).mkv" {
+		t.Fatalf("ParseSubjectFilename() = %q, want %q", got, "Dune (2021).mkv")
+	}
+}

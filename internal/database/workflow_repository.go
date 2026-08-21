@@ -1801,83 +1801,148 @@ func (db *DB) ReplaceSearchCandidates(ctx context.Context, libraryItemID int64, 
 	}
 	candidates = orderCandidatesByCutoff(candidates, cutoffResolution)
 
-	var selectedReleaseID *int64
+	// Resolve every candidate's blocked/rejected/shouldSelect status in one
+	// pure Go pass first -- shouldSelect only depends on iteration order via
+	// selectedAssigned (a local bookkeeping flag, not the database), so none
+	// of this needs a round trip. Only the insert itself does.
+	n := len(candidates)
+	shouldSelects := make([]bool, n)
 	selectedAssigned := false
-	for _, candidate := range candidates {
-		if reason, ok := blockedReleaseReason(scopeKey, blocked, candidate); ok {
-			candidate.Rejected = true
-			if candidate.RejectReason == "" {
-				candidate.RejectReason = reason
+	for i := range candidates {
+		if reason, ok := blockedReleaseReason(scopeKey, blocked, candidates[i]); ok {
+			candidates[i].Rejected = true
+			if candidates[i].RejectReason == "" {
+				candidates[i].RejectReason = reason
 			}
 		}
-		shouldSelect := !selectedAssigned && !candidate.Rejected && (!requireBeatExisting || candidate.Score > existingScore)
-		var releaseCandidateID int64
-		if err = tx.QueryRowContext(ctx, `
+		shouldSelect := !selectedAssigned && !candidates[i].Rejected && (!requireBeatExisting || candidates[i].Score > existingScore)
+		shouldSelects[i] = shouldSelect
+		if shouldSelect {
+			selectedAssigned = true
+		}
+	}
+
+	// Batch every release_candidates row into a single round trip instead of
+	// one INSERT...RETURNING per candidate -- confirmed live (2026-08-20): a
+	// large candidate pool (one production case had 2,759) issued thousands
+	// of sequential round trips here, all while holding this item's
+	// lockLibraryItemQueueRow, blocking every other writer touching the same
+	// row (RetryFailedQueue, health checks, manual reject/skip/restore) for
+	// the whole duration. Built as a dynamic multi-row VALUES insert rather
+	// than unnest: explanations/compatibility_warnings are themselves arrays
+	// per row, and unnest flattens a text[][] parameter across every element
+	// instead of yielding one text[] per row, unlike the 1D-array-only
+	// pattern insertArchiveVolumes/insertArchiveEntries use in
+	// queue_repository.go. release_candidates has no ordinal column to
+	// RETURNING (and INSERT...RETURNING can only reference the target
+	// table's own columns, not other columns from the source VALUES list),
+	// so rows are mapped back by scan position instead: a single, plain
+	// multi-row VALUES INSERT with no ON CONFLICT/trigger reordering
+	// returns rows in the exact order they were listed, confirmed against
+	// the real database (id sequence assigned 1:1 with input order).
+	const colsPerRow = 15
+	valueTuples := make([]string, n)
+	args := make([]any, 0, 1+n*colsPerRow)
+	args = append(args, libraryItemID)
+	for i, candidate := range candidates {
+		var postedAt sql.NullTime
+		if !candidate.PostedAt.IsZero() {
+			postedAt = sql.NullTime{Time: candidate.PostedAt, Valid: true}
+		}
+		explanations := candidate.Explanations
+		if explanations == nil {
+			explanations = []string{}
+		}
+		compatWarnings := candidate.CompatibilityWarnings
+		if compatWarnings == nil {
+			compatWarnings = []string{}
+		}
+
+		base := len(args)
+		placeholders := make([]string, colsPerRow)
+		for j := 0; j < colsPerRow; j++ {
+			placeholders[j] = fmt.Sprintf("$%d", base+j+1)
+		}
+		valueTuples[i] = "($1," + strings.Join(placeholders, ",") + ")"
+		args = append(args,
+			candidate.Title, int32(candidate.Score), int32(candidate.CustomFormatScore),
+			shouldSelects[i], candidate.Rejected, candidate.RejectReason,
+			int32(candidate.FailureCount), candidate.LastFailureReason, candidate.ExternalURL,
+			candidate.IndexerName, candidate.SizeBytes, postedAt,
+			candidate.Resolution, explanations, compatWarnings,
+		)
+	}
+
+	releaseCandidateIDByOrdinal := make(map[int]int64, n)
+	if n > 0 {
+		query := `
 			insert into release_candidates (
 				library_item_id, title, score, custom_format_score, selected, rejected, reject_reason,
 				failure_count, last_failure_reason, external_url, indexer_name, size_bytes, posted_at, resolution, explanations, compatibility_warnings
-			) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-			returning id`,
-			libraryItemID,
-			candidate.Title,
-			candidate.Score,
-			candidate.CustomFormatScore,
-			shouldSelect,
-			candidate.Rejected,
-			candidate.RejectReason,
-			candidate.FailureCount,
-			candidate.LastFailureReason,
-			candidate.ExternalURL,
-			candidate.IndexerName,
-			candidate.SizeBytes,
-			nullTime(candidate.PostedAt),
-			candidate.Resolution,
-			func() []string {
-				if candidate.Explanations == nil {
-					return []string{}
-				}
-				return candidate.Explanations
-			}(),
-			func() []string {
-				if candidate.CompatibilityWarnings == nil {
-					return []string{}
-				}
-				return candidate.CompatibilityWarnings
-			}(),
-		).Scan(&releaseCandidateID); err != nil {
+			)
+			values ` + strings.Join(valueTuples, ",") + `
+			returning id`
+		rows, insErr := tx.QueryContext(ctx, query, args...)
+		if insErr != nil {
+			err = insErr
 			return nil, err
 		}
-		if shouldSelect {
-			if hasExisting {
-				// Upgrade candidates are staged beside the current working
-				// release. The active queue pointer is switched only after
-				// fetch/import/preflight and symlink publication succeed.
-				if _, err = tx.ExecContext(ctx, `
-						update release_candidates
-						set selected = false
-						where id = $1`, existingReleaseCandidateID); err != nil {
-					return nil, err
+		func() {
+			defer rows.Close()
+			ord := 0
+			for rows.Next() {
+				var id int64
+				if scanErr := rows.Scan(&id); scanErr != nil {
+					err = scanErr
+					return
 				}
-				hasExisting = false
+				releaseCandidateIDByOrdinal[ord] = id
+				ord++
 			}
-			var value int64
-			if err = tx.QueryRowContext(ctx, `
-				insert into selected_releases (library_item_id, release_candidate_id)
-				values ($1, $2)
-				returning id`, libraryItemID, releaseCandidateID).Scan(&value); err != nil {
-				return nil, err
+			if rows.Err() != nil {
+				err = rows.Err()
 			}
-			selectedReleaseID = &value
-			selectedAssigned = true
-			if _, err = tx.ExecContext(ctx, `
-				insert into grab_history (library_item_id, release_candidate_id, title, indexer_name, score, resolution)
-				values ($1, $2, $3, $4, $5, $6)`,
-				libraryItemID, releaseCandidateID,
-				candidate.Title, candidate.IndexerName, candidate.Score, candidate.Resolution,
-			); err != nil {
-				return nil, err
-			}
+		}()
+		if err != nil {
+			return nil, err
 		}
+	}
+
+	var selectedReleaseID *int64
+	for i, candidate := range candidates {
+		if !shouldSelects[i] {
+			continue
+		}
+		releaseCandidateID := releaseCandidateIDByOrdinal[i]
+		if hasExisting {
+			// Upgrade candidates are staged beside the current working
+			// release. The active queue pointer is switched only after
+			// fetch/import/preflight and symlink publication succeed.
+			if _, err = tx.ExecContext(ctx, `
+					update release_candidates
+					set selected = false
+					where id = $1`, existingReleaseCandidateID); err != nil {
+				return nil, err
+			}
+			hasExisting = false
+		}
+		var value int64
+		if err = tx.QueryRowContext(ctx, `
+			insert into selected_releases (library_item_id, release_candidate_id)
+			values ($1, $2)
+			returning id`, libraryItemID, releaseCandidateID).Scan(&value); err != nil {
+			return nil, err
+		}
+		selectedReleaseID = &value
+		if _, err = tx.ExecContext(ctx, `
+			insert into grab_history (library_item_id, release_candidate_id, title, indexer_name, score, resolution)
+			values ($1, $2, $3, $4, $5, $6)`,
+			libraryItemID, releaseCandidateID,
+			candidate.Title, candidate.IndexerName, candidate.Score, candidate.Resolution,
+		); err != nil {
+			return nil, err
+		}
+		break
 	}
 
 	if selectedReleaseID != nil {
@@ -3279,19 +3344,31 @@ func scanNextViableCandidate(ctx context.Context, tx *sql.Tx, scopeKey string, q
 // scanNextViableCandidate skipped over. Must run after that scan's rows
 // have been closed (ExecContext on the same tx while a QueryContext's rows
 // are still open holds the pgConn lock and returns driver.ErrBadConn).
+//
+// Batched into a single multi-row UPDATE...FROM(VALUES...) round trip
+// instead of one UPDATE per entry -- this runs on FailSelectedReleaseAndPromoteNext,
+// which fires on every download/search failure system-wide, and a large
+// candidate pool means a large blocked-entry list every time.
 func markBlockedCandidatesRejected(ctx context.Context, tx *sql.Tx, entries []blockedCandidateEntry) error {
-	for _, be := range entries {
-		if _, err := tx.ExecContext(ctx, `
-			update release_candidates
-			set rejected = true,
-			    reject_reason = $2,
-			    selected = false
-			where id = $1`, be.id, be.reason,
-		); err != nil {
-			return err
-		}
+	if len(entries) == 0 {
+		return nil
 	}
-	return nil
+	valueTuples := make([]string, len(entries))
+	args := make([]any, 0, len(entries)*2)
+	for i, be := range entries {
+		base := len(args)
+		valueTuples[i] = fmt.Sprintf("($%d::bigint, $%d::text)", base+1, base+2)
+		args = append(args, be.id, be.reason)
+	}
+	query := `
+		update release_candidates rc
+		set rejected = true,
+		    reject_reason = v.reason,
+		    selected = false
+		from (values ` + strings.Join(valueTuples, ",") + `) as v(id, reason)
+		where rc.id = v.id`
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
 }
 
 // IsFKViolation returns true when err is a PostgreSQL foreign-key constraint violation (SQLSTATE 23503).

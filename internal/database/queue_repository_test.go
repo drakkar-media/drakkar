@@ -14,30 +14,7 @@ import (
 )
 
 func TestCreateImportedNZBConcurrentIdempotency(t *testing.T) {
-	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
-	}
-	u, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	port, err := strconv.Atoi(u.Port())
-	if err != nil {
-		t.Fatal(err)
-	}
-	password, _ := u.User.Password()
-	db, err := Open(config.DatabaseConfig{
-		Host:     u.Hostname(),
-		Port:     port,
-		Name:     strings.TrimPrefix(u.Path, "/"),
-		Username: u.User.Username(),
-		Password: password,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := openTestDB(t)
 
 	key := "queue-idempotency-test:" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	input := ImportedNZB{
@@ -83,6 +60,186 @@ func TestCreateImportedNZBConcurrentIdempotency(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("idempotency key has %d queue rows, want 1", count)
+	}
+}
+
+// openTestDB opens a connection to DRAKKAR_TEST_DATABASE_URL, skipping the
+// test if it isn't set -- shared by every test in this package that needs a
+// real database rather than a stub/mock.
+func openTestDB(t *testing.T) *DB {
+	t.Helper()
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	password, _ := u.User.Password()
+	db, err := Open(config.DatabaseConfig{
+		Host:     u.Hostname(),
+		Port:     port,
+		Name:     strings.TrimPrefix(u.Path, "/"),
+		Username: u.User.Username(),
+		Password: password,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// TestInsertImportedFilesBatchPreservesPerFileMessageIDsAndLinksVirtualFiles
+// guards the batched multi-file insert introduced to replace a one-round-
+// trip-per-file loop (a multi-file season-pack NZB used to pay one
+// nzb_files + one virtual_files round trip per file). The regression this
+// specifically targets: message_ids is a per-row text[] of variable length,
+// which rules out the unnest()-backed batching pattern used by the sibling
+// archive-import path -- unnest() on an array of arrays flattens every
+// element across every row into one long sequence instead of preserving one
+// sub-array per row, which would scramble each file's own message IDs
+// across its siblings. Uses 3 files with DIFFERENT segment counts (2, 1, 3)
+// specifically so an accidental flatten would be detectable: a subtly wrong
+// batching would either miscount message_id_count per file or assign the
+// wrong message IDs to the wrong file.
+func TestInsertImportedFilesBatchPreservesPerFileMessageIDsAndLinksVirtualFiles(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	key := "queue-batch-import-test:" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	bigEnough := int64(60 * 1024 * 1024) // over minPlayableFileSizeBytes
+	imported := ImportedNZB{
+		FileName:       "batch-import.nzb",
+		XML:            []byte("<nzb/>"),
+		IdempotencyKey: key,
+		Files: []ImportedNZBFile{
+			{
+				FileName:      "Episode.S01E01.mkv",
+				Subject:       "subject-episode-1",
+				Poster:        "poster-a",
+				FileSizeBytes: bigEnough,
+				Segments: []ImportedNZBSegment{
+					{MessageID: "<e1-seg1@example>"},
+					{MessageID: "<e1-seg2@example>"},
+				},
+			},
+			{
+				FileName:      "notes.txt",
+				Subject:       "subject-notes",
+				Poster:        "poster-b",
+				FileSizeBytes: 512,
+				Segments: []ImportedNZBSegment{
+					{MessageID: "<nfo-seg1@example>"},
+				},
+			},
+			{
+				FileName:      "Episode.S01E02.mkv",
+				Subject:       "subject-episode-2",
+				Poster:        "poster-c",
+				FileSizeBytes: bigEnough,
+				Segments: []ImportedNZBSegment{
+					{MessageID: "<e2-seg1@example>"},
+					{MessageID: "<e2-seg2@example>"},
+					{MessageID: "<e2-seg3@example>"},
+				},
+			},
+		},
+		FileCount:    3,
+		SegmentCount: 6,
+	}
+
+	snapshot, err := db.CreateImportedNZB(ctx, imported)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.SQL.ExecContext(context.Background(), `delete from library_items where id = $1`, snapshot.LibraryItemID)
+	})
+
+	rows, err := db.SQL.QueryContext(ctx, `
+		select nf.subject, nf.message_id_count, nf.message_ids
+		from nzb_files nf
+		join nzb_documents nd on nd.id = nf.nzb_document_id
+		join selected_releases sr on sr.id = nd.selected_release_id
+		where sr.id = (select selected_release_id from queue_items where id = $1)
+		order by nf.subject`, snapshot.QueueItemID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	type fileRow struct {
+		subject   string
+		msgCount  int
+		messageID []string
+	}
+	byMsgCount := map[string]fileRow{}
+	var got []fileRow
+	for rows.Next() {
+		var fr fileRow
+		if err := rows.Scan(&fr.subject, &fr.msgCount, pgTextArrayScan(&fr.messageID)); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, fr)
+		byMsgCount[fr.subject] = fr
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 nzb_files rows, got %d: %+v", len(got), got)
+	}
+
+	want := map[string]struct {
+		count int
+		ids   []string
+	}{
+		"subject-episode-1": {2, []string{"<e1-seg1@example>", "<e1-seg2@example>"}},
+		"subject-notes":     {1, []string{"<nfo-seg1@example>"}},
+		"subject-episode-2": {3, []string{"<e2-seg1@example>", "<e2-seg2@example>", "<e2-seg3@example>"}},
+	}
+	for subject, w := range want {
+		fr, ok := byMsgCount[subject]
+		if !ok {
+			t.Fatalf("missing nzb_files row for subject %q", subject)
+		}
+		if fr.msgCount != w.count {
+			t.Fatalf("subject %q: message_id_count = %d, want %d (a flattened/scrambled batch insert would miscount this)", subject, fr.msgCount, w.count)
+		}
+		if strings.Join(fr.messageID, ",") != strings.Join(w.ids, ",") {
+			t.Fatalf("subject %q: message_ids = %v, want %v (a flattened/scrambled batch insert would assign the wrong IDs to this file)", subject, fr.messageID, w.ids)
+		}
+	}
+
+	var vfCount int
+	if err := db.SQL.QueryRowContext(ctx, `
+		select count(*)
+		from virtual_files vf
+		join nzb_files nf on nf.id = vf.nzb_file_id
+		join nzb_documents nd on nd.id = nf.nzb_document_id
+		join selected_releases sr on sr.id = nd.selected_release_id
+		where sr.id = (select selected_release_id from queue_items where id = $1)`, snapshot.QueueItemID).Scan(&vfCount); err != nil {
+		t.Fatal(err)
+	}
+	if vfCount != 2 {
+		t.Fatalf("expected exactly 2 virtual_files rows (the 2 playable .mkv files, not the .nfo), got %d", vfCount)
+	}
+
+	var vfFileName string
+	if err := db.SQL.QueryRowContext(ctx, `
+		select vf.file_name
+		from virtual_files vf
+		join nzb_files nf on nf.id = vf.nzb_file_id
+		where nf.subject = 'subject-episode-1'`).Scan(&vfFileName); err != nil {
+		t.Fatal(err)
+	}
+	if vfFileName != "Episode.S01E01.mkv" {
+		t.Fatalf("virtual_files row linked to the wrong nzb_files row: got file_name %q, want it linked via subject-episode-1's own nzb_file_id", vfFileName)
 	}
 }
 

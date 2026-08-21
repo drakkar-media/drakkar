@@ -37,6 +37,13 @@ const throttleTTL = 30 * time.Second
 // insurance against the same class of mistake recurring here.
 var confirmMissingDelay = 10 * time.Second
 
+// confirmMissingBudget bounds confirmMissing's own detached re-check fetch.
+// Generous relative to clientSession's own 30s internal timeout (client.go)
+// so it never truncates a legitimate in-flight confirmation, while still
+// giving this fire-and-forget goroutine its own explicit ceiling rather
+// than running unbounded on context.Background().
+const confirmMissingBudget = 45 * time.Second
+
 // CachedFallbackSource wraps FallbackSource and caches message IDs that
 // recently failed, so repeated fetches for the same dead/throttled article
 // are short-circuited without hitting NNTP every time.
@@ -91,7 +98,7 @@ func (s *CachedFallbackSource) BodyPriority(ctx context.Context, messageID strin
 		body, err := s.inner.BodyPriority(ctx, messageID, priority)
 		if err != nil {
 			if ttl, ok := classifyCacheableError(err); ok {
-				s.markMissing(messageID, s.confirmedTTL(ctx, messageID, priority, true, ttl))
+				s.markAndMaybeConfirm(messageID, priority, true, ttl)
 			}
 		}
 		return body, err
@@ -114,7 +121,7 @@ func (s *CachedFallbackSource) StatPriority(ctx context.Context, messageID strin
 		err := s.inner.StatPriority(ctx, messageID, priority)
 		if err != nil {
 			if ttl, ok := classifyCacheableError(err); ok {
-				s.markMissing(messageID, s.confirmedTTL(ctx, messageID, priority, false, ttl))
+				s.markAndMaybeConfirm(messageID, priority, false, ttl)
 			}
 		}
 		return nil, err
@@ -122,33 +129,64 @@ func (s *CachedFallbackSource) StatPriority(ctx context.Context, messageID strin
 	return err
 }
 
-// confirmedTTL returns ttl unchanged, EXCEPT for the missingArticleTTL
-// (24h, "confirmed gone") case at background priority: there, a single
-// 430/423 sample is not trusted enough on its own to cache for a full day
-// (and, via every caller downstream, to justify blocklisting a release
-// forever) -- see confirmMissingDelay's doc comment. One extra, independent,
-// delayed re-check via s.inner directly (bypassing this cache) must agree
-// before the long TTL is used; if it doesn't, a short throttleTTL is used
-// instead so the next real request gets a fresh look soon rather than being
-// stuck on an unconfirmed verdict for a day.
+// markAndMaybeConfirm caches messageID as missing for ttl, immediately and
+// synchronously, EXCEPT for the missingArticleTTL (24h, "confirmed gone")
+// classification at below-interactive priority: there, a single 430/423
+// sample is not trusted enough on its own to cache for a full day (and, via
+// every caller downstream, to justify blocklisting a release forever) --
+// see confirmMissingDelay's doc comment. This caches a short, provisional
+// throttleTTL right away and hands off to confirmMissing, running in a
+// detached background goroutine, to independently re-check and upgrade the
+// cache entry to the full 24h TTL if confirmed.
 //
-// Deliberately NOT applied at interactive/read-ahead priority: a real-time
-// playback read that hits a genuinely missing segment must fail fast, not
-// wait an extra confirmMissingDelay before the error even surfaces --
-// confirmation only gates how long the NEGATIVE result is cached, not
-// whether this one caller's own failure is reported, so skipping it here
-// costs nothing but latency for the (much rarer) interactive path.
-func (s *CachedFallbackSource) confirmedTTL(ctx context.Context, messageID string, priority stream.FetchPriority, isBody bool, ttl time.Duration) time.Duration {
+// Previously the delayed re-check ran synchronously, inside the
+// bodyFlight/statFlight singleflight critical section, before this
+// function's caller (BodyPriority/StatPriority) could return at all.
+// bodyFlight/statFlight coalesce every concurrent caller for the same
+// messageID onto ONE shared call regardless of priority, so a low-priority
+// caller (a background health check or read-ahead prefetch) that happened
+// to be first through the door held every OTHER caller for that same
+// messageID -- including a concurrent INTERACTIVE playback read -- for the
+// full confirmMissingDelay plus a live re-fetch (10-40s). That defeated the
+// "interactive reads fail fast" guarantee this function's own doc comment
+// already promised, but only for whichever caller happened to start the
+// flight; every rider on the same flight paid the delay regardless of its
+// own priority. Confirmed live 2026-08-20: this is the same mechanism
+// documented as a possible cause of unexplained multi-second playback
+// stalls with no error anywhere in the chain.
+//
+// The confirmation step only ever refines how long the cached NEGATIVE
+// result is trusted for -- it never changes what's returned to the caller
+// that triggered it, since that value was already read from inner before
+// this function is even called. Moving it out of the critical section
+// therefore changes nothing about the eventual cached outcome, only
+// removes the blocking.
+func (s *CachedFallbackSource) markAndMaybeConfirm(messageID string, priority stream.FetchPriority, isBody bool, ttl time.Duration) {
 	if ttl != missingArticleTTL || priority >= stream.PriorityInteractive {
-		return ttl
+		s.markMissing(messageID, ttl)
+		return
+	}
+	s.markMissing(messageID, throttleTTL) // provisional, until confirmed
+	go s.confirmMissing(messageID, priority, isBody)
+}
+
+// confirmMissing waits confirmMissingDelay, then independently re-checks
+// messageID via s.inner directly (bypassing this cache) and upgrades its
+// cached TTL to the full missingArticleTTL if the recheck agrees it's
+// genuinely gone -- otherwise leaves the provisional throttleTTL mark
+// already in place. Runs detached from any caller's context (the caller
+// that triggered this has already returned by the time this executes) with
+// its own bounded budget, matching the pattern every other fire-and-forget
+// goroutine in this codebase uses.
+func (s *CachedFallbackSource) confirmMissing(messageID string, priority stream.FetchPriority, isBody bool) {
+	if confirmMissingDone != nil {
+		defer confirmMissingDone()
 	}
 	timer := time.NewTimer(confirmMissingDelay)
 	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return throttleTTL // Couldn't confirm -- don't commit to a day-long verdict.
-	case <-timer.C:
-	}
+	<-timer.C
+	ctx, cancel := context.WithTimeout(context.Background(), confirmMissingBudget)
+	defer cancel()
 	var confirmErr error
 	if isBody {
 		_, confirmErr = s.inner.BodyPriority(ctx, messageID, priority)
@@ -156,10 +194,19 @@ func (s *CachedFallbackSource) confirmedTTL(ctx context.Context, messageID strin
 		confirmErr = s.inner.StatPriority(ctx, messageID, priority)
 	}
 	if confirmTTL, ok := classifyCacheableError(confirmErr); ok && confirmTTL == missingArticleTTL {
-		return missingArticleTTL // Independently confirmed -- trust it for the full day.
+		s.markMissing(messageID, missingArticleTTL) // Independently confirmed -- trust it for the full day.
 	}
-	return throttleTTL
 }
+
+// confirmMissingDone, when non-nil, is called synchronously at the very end
+// of every confirmMissing invocation. Test-only hook: since confirmMissing
+// runs detached in its own goroutine by design (see markAndMaybeConfirm),
+// tests need a deterministic way to wait for it to fully finish before
+// asserting on its effects or restoring shared package state like
+// confirmMissingDelay -- polling a side effect (e.g. a stub's call count)
+// does not establish a happens-before edge for OTHER memory the goroutine
+// touches, and the race detector correctly flags that as unsynchronized.
+var confirmMissingDone func()
 
 // isMissing reports whether messageID is currently cached as missing,
 // lazily evicting the entry first if its TTL has already expired.

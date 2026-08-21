@@ -491,8 +491,7 @@ h3 { font-size: clamp(1rem, 1.4vw, 1.25rem);  font-weight: 600; line-height: 1.2
 /* PosterCard — poster-first card for a library item or discover result,
    used on Dashboard/Library/Search/Discover/Details. */
 .poster-card {
-  display: flex;
-  flex-direction: column;
+  position: relative;
   height: 100%;
   min-width: 0;
   overflow: hidden;
@@ -500,12 +499,20 @@ h3 { font-size: clamp(1rem, 1.4vw, 1.25rem);  font-weight: 600; line-height: 1.2
   border: 1px solid hsl(0 0% 100% / 0.07);
   background: color-mix(in oklch, var(--card) 90%, transparent);
   transition: border-color 0.18s ease, box-shadow 0.18s ease;
-  text-decoration: none;
   cursor: pointer;
 }
 .poster-card:hover {
   border-color: color-mix(in oklch, var(--primary) 40%, transparent);
   box-shadow: 0 8px 24px color-mix(in oklch, var(--background) 60%, transparent);
+}
+/* Fills the whole card and carries the actual navigation -- the request
+   button overlay is a sibling of this link, not a descendant, since HTML
+   doesn't allow interactive content nested inside an <a>. */
+.poster-card-link {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
 }
 
 /* 2px status bar at top of the poster card */
@@ -566,7 +573,12 @@ h3 { font-size: clamp(1rem, 1.4vw, 1.25rem);  font-weight: 600; line-height: 1.2
 .poster-badge-missing     { background: hsl(var(--status-missing) / 0.8); }
 .poster-badge-failed      { background: hsl(var(--status-failed) / 0.85); }
 
-/* Request button overlay — top-right corner of the poster */
+/* Request button overlay — top-right corner of the poster. Positioned
+   relative to .poster-card (its parent, a sibling of .poster-card-link),
+   not .poster-frame -- see PosterCard.svelte for why it can't be nested
+   inside the card's link. top is offset an extra 2px (the status bar's
+   height) when the status bar renders above the poster frame, so the
+   button still lands in the same visual spot either way. */
 .poster-request-btn {
   position: absolute;
   top: 6px;
@@ -582,6 +594,9 @@ h3 { font-size: clamp(1rem, 1.4vw, 1.25rem);  font-weight: 600; line-height: 1.2
   cursor: pointer;
   backdrop-filter: blur(6px);
   transition: background 0.15s, transform 0.15s;
+}
+.poster-request-btn-with-status-bar {
+  top: 8px;
 }
 .poster-request-btn:hover {
   background: var(--primary);

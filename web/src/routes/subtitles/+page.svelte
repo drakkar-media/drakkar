@@ -211,6 +211,7 @@
               disabled={isBusy('bulk-search') || isBusy('bulk-delete')}
               on:change={(e) => toggleSelected(item.libraryItemId, (e.currentTarget as HTMLInputElement).checked)}
             />
+            <span class="sr-only">Select {rowLabel(item)}</span>
           </label>
           <div class="min-w-0 flex-1">
             <div class="font-semibold">{rowLabel(item)}</div>
@@ -226,7 +227,7 @@
             </div>
           </div>
           <div class="flex shrink-0 items-center gap-2">
-            <a href={`/details/${item.mediaType === 'movie' ? 'movie' : 'tv'}/${item.libraryItemId}`} class="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-border bg-muted/40 px-3 text-sm">
+            <a href={`/library/${item.libraryItemId}`} class="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-border bg-muted/40 px-3 text-sm">
               <Link size={14} />
               Open
             </a>

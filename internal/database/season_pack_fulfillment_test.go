@@ -111,6 +111,86 @@ func TestFulfillEpisodeLibraryItemIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestFulfillEpisodeLibraryItemCreatesQueueItemWhenNoneExists guards a real
+// gap: the target library item may have no queue_items row at all yet (e.g.
+// a season-pack sibling reached only through FindSeasonPackMatches, never
+// through createSeasonPackEpisodeItem's own queue_items upsert). The old
+// code only ever UPDATEd an existing row, which silently affects zero rows
+// when there is none -- leaving the episode marked available with no
+// queue_items row, which ListPendingRepublishTargets' stale-symlink branch
+// inner-joins against and so could never find or reconcile.
+func TestFulfillEpisodeLibraryItemCreatesQueueItemWhenNoneExists(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	sourceLibID := setupRaceTestLibraryItem(t, ctx, sqlDB, "fulfill-no-queue-source", "available")
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, sourceLibID)
+	var rcID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into release_candidates (library_item_id, title, external_url, indexer_name)
+		values ($1, 'Fulfill No Queue Pack', 'http://example/fulfill-no-queue-pack', 'test-indexer')
+		returning id`, sourceLibID).Scan(&rcID); err != nil {
+		t.Fatal(err)
+	}
+	var sourceSelectedReleaseID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into selected_releases (library_item_id, release_candidate_id)
+		values ($1, $2)
+		returning id`, sourceLibID, rcID).Scan(&sourceSelectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+	var vfID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into virtual_files (selected_release_id, path, file_name, reader_kind)
+		values ($1, '/pack/Show.S01E01.mkv', 'Show.S01E01.mkv', 'archive')
+		returning id`, sourceSelectedReleaseID).Scan(&vfID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Target library item with deliberately NO queue_items row -- a bare
+	// insert, unlike setupRaceTestLibraryItem which always creates one.
+	var targetLibID int64
+	if err := sqlDB.QueryRowContext(ctx, `
+		insert into library_items (media_type, title, available)
+		values ('episode', 'fulfill-no-queue-target', false)
+		returning id`).Scan(&targetLibID); err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.ExecContext(ctx, `delete from library_items where id = $1`, targetLibID)
+
+	if err := db.FulfillEpisodeLibraryItem(ctx, targetLibID, sourceSelectedReleaseID, vfID); err != nil {
+		t.Fatalf("FulfillEpisodeLibraryItem: %v", err)
+	}
+
+	var selectedReleaseID int64
+	if err := sqlDB.QueryRowContext(ctx, `select id from selected_releases where library_item_id = $1`, targetLibID).Scan(&selectedReleaseID); err != nil {
+		t.Fatal(err)
+	}
+
+	var qState string
+	var qSelectedReleaseID sql.NullInt64
+	if err := sqlDB.QueryRowContext(ctx, `
+		select state, selected_release_id from queue_items where library_item_id = $1`, targetLibID,
+	).Scan(&qState, &qSelectedReleaseID); err != nil {
+		t.Fatalf("expected a queue_items row to have been created, got: %v", err)
+	}
+	if qState != "available" {
+		t.Fatalf("expected queue_items.state = available, got %q", qState)
+	}
+	if !qSelectedReleaseID.Valid || qSelectedReleaseID.Int64 != selectedReleaseID {
+		t.Fatalf("expected queue_items.selected_release_id = %d, got %v", selectedReleaseID, qSelectedReleaseID)
+	}
+}
+
 // TestFulfillEpisodeLibraryItemNoopsWhenAlreadyFulfilledByDifferentRelease
 // covers the case a plain "call twice with identical args" test can't reach:
 // the existence check in FulfillEpisodeLibraryItem is keyed purely on

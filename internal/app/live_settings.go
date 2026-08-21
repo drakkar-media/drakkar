@@ -103,9 +103,16 @@ func (m *recurringTaskManager) Reschedule(name string, interval time.Duration) {
 // StartWithStartupDelay is Start plus a one-shot extra run after
 // startupDelay, separate from the task's own interval loop — useful to give
 // a task a first run sooner than its steady-state interval without making
-// every subsequent run happen on that shorter cadence.
-func (m *recurringTaskManager) StartWithStartupDelay(name string, interval, startupDelay time.Duration, fn func()) {
+// every subsequent run happen on that shorter cadence. The delayed run only
+// actually fires when runOnStartup is true (see shouldRunRecentOnStartup) --
+// otherwise a burst of redeploys/restarts each re-triggers a full extra run
+// of a potentially expensive sweep regardless of how recently it last
+// genuinely ran.
+func (m *recurringTaskManager) StartWithStartupDelay(name string, interval, startupDelay time.Duration, runOnStartup bool, fn func()) {
 	m.Start(name, interval, false, fn)
+	if !runOnStartup {
+		return
+	}
 	go func() {
 		defer observability.Recover(name + "-startup-delay")
 		timer := time.NewTimer(startupDelay)

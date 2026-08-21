@@ -867,38 +867,52 @@ func rejectBySize(candidate Candidate, prefs Preferences, runtimeMinutes int) st
 	}
 	sizeMB := int(candidate.SizeBytes / (1024 * 1024))
 	// Profile-level and tier limits are MB/min; skip if runtime unknown.
-	if runtimeMinutes > 0 {
-		if prefs.MinMBPerMinute > 0 && sizeMB < prefs.MinMBPerMinute*runtimeMinutes {
-			return "too_small"
-		}
-		if prefs.MaxMBPerMinute > 0 && sizeMB > prefs.MaxMBPerMinute*runtimeMinutes {
-			return "too_large"
-		}
-		if len(prefs.TierMBPerMinuteLimits) > 0 && candidate.Resolution != "" {
-			// Remux gets its own, much larger size bucket (quality_definitions
-			// stores e.g. 1080p Remux's max as ~1000 MB/min vs ~130-155 for
-			// WEB-DL/BluRay at the same resolution -- a lossless remux is
-			// legitimately many times bigger for the same runtime). Without
-			// this, a real 1080p/2160p remux was checked against the plain
-			// resolution bucket's much tighter max and hard-rejected as
-			// too_large. Falls back to the plain resolution key when no
-			// remux-specific tier exists (e.g. an older DB before this key was
-			// added), preserving prior behavior exactly.
-			key := candidate.Resolution
-			if reRemux.MatchString(candidate.Title) {
-				if _, ok := prefs.TierMBPerMinuteLimits[candidate.Resolution+"-remux"]; ok {
-					key = candidate.Resolution + "-remux"
-				}
-			}
-			if lim, ok := prefs.TierMBPerMinuteLimits[key]; ok {
-				if lim[0] > 0 && sizeMB < lim[0]*runtimeMinutes {
-					return "too_small"
-				}
-				if lim[1] > 0 && sizeMB > lim[1]*runtimeMinutes {
-					return "too_large"
-				}
+	if runtimeMinutes <= 0 {
+		return ""
+	}
+
+	// A per-resolution tier limit, when one exists for this candidate, is
+	// authoritative for it -- it must NOT also be ANDed with the profile's
+	// single global bound. The global bound is sized for whatever one
+	// resolution the operator had in mind (e.g. ~155 MB/min for 1080p); a
+	// 2160p release legitimately needs a much higher MB/min floor/ceiling,
+	// and a plain remux needs a far higher one still (see below) -- checking
+	// those against the 1080p-sized global bound first hard-rejected
+	// perfectly valid releases of every OTHER resolution/tier before the
+	// correct tier-specific bound was ever consulted. The global bound is
+	// now only a fallback for a resolution with no tier entry of its own.
+	if len(prefs.TierMBPerMinuteLimits) > 0 && candidate.Resolution != "" {
+		// Remux gets its own, much larger size bucket (quality_definitions
+		// stores e.g. 1080p Remux's max as ~1000 MB/min vs ~130-155 for
+		// WEB-DL/BluRay at the same resolution -- a lossless remux is
+		// legitimately many times bigger for the same runtime). Without
+		// this, a real 1080p/2160p remux was checked against the plain
+		// resolution bucket's much tighter max and hard-rejected as
+		// too_large. Falls back to the plain resolution key when no
+		// remux-specific tier exists (e.g. an older DB before this key was
+		// added), preserving prior behavior exactly.
+		key := candidate.Resolution
+		if reRemux.MatchString(candidate.Title) {
+			if _, ok := prefs.TierMBPerMinuteLimits[candidate.Resolution+"-remux"]; ok {
+				key = candidate.Resolution + "-remux"
 			}
 		}
+		if lim, ok := prefs.TierMBPerMinuteLimits[key]; ok {
+			if lim[0] > 0 && sizeMB < lim[0]*runtimeMinutes {
+				return "too_small"
+			}
+			if lim[1] > 0 && sizeMB > lim[1]*runtimeMinutes {
+				return "too_large"
+			}
+			return ""
+		}
+	}
+
+	if prefs.MinMBPerMinute > 0 && sizeMB < prefs.MinMBPerMinute*runtimeMinutes {
+		return "too_small"
+	}
+	if prefs.MaxMBPerMinute > 0 && sizeMB > prefs.MaxMBPerMinute*runtimeMinutes {
+		return "too_large"
 	}
 	return ""
 }
@@ -1311,10 +1325,54 @@ func matchEpisode(title string, seasonNumber, episodeNumber int) episodeMatch {
 	if containsEpisodeToken(title) {
 		return episodeMismatch
 	}
+	if matchesSeasonRange(title, seasonNumber) {
+		return episodeSeasonPack
+	}
 	if hasOtherBareSeasonToken(title, seasonNumber) {
 		return episodeWrongSeason
 	}
 	return episodeUnknown
+}
+
+// seasonRangePattern matches an explicit multi-season range token (e.g.
+// "S01-S05", "S01-05", "Season 1-5") -- the scene convention for a
+// complete-series or multi-season pack spanning more than one season.
+var seasonRangePattern = regexp.MustCompile(`(?i)\bs(\d{1,2})\s*-\s*s?(\d{1,2})\b|\bseason\s+(\d{1,2})\s*-\s*(\d{1,2})\b`)
+
+// matchesSeasonRange reports whether title names an explicit season RANGE
+// (e.g. "S01-S05") that includes seasonNumber -- a legitimate multi-season
+// or complete-series pack, not a wrong-season release. Checked before
+// hasOtherBareSeasonToken's hard reject.
+//
+// Confirmed live 2026-08-20: hasOtherBareSeasonToken (added 2026-08-11 for a
+// genuinely wrong-season single-season pack) reads bareSeasonTokenPattern's
+// individual "sNN" matches with no concept of a range, so a title like
+// "Breaking.Bad.S01-S05.1080p.BluRay-GROUP" searched for season 3 matched
+// bare tokens "s01" and "s05" (both != 3, since the literal substring "s03"
+// never appears) and hard-rejected as wrong-season -- for a legitimate
+// 5-season complete-series pack that does contain season 3. Only a search
+// for the literal first or last season number printed in the range was ever
+// accepted; every middle season was silently, permanently excluded from an
+// otherwise perfectly valid candidate.
+func matchesSeasonRange(title string, seasonNumber int) bool {
+	for _, m := range seasonRangePattern.FindAllStringSubmatch(title, -1) {
+		startStr, endStr := m[1], m[2]
+		if startStr == "" {
+			startStr, endStr = m[3], m[4]
+		}
+		start, err1 := strconv.Atoi(startStr)
+		end, err2 := strconv.Atoi(endStr)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		if start > end {
+			start, end = end, start
+		}
+		if seasonNumber >= start && seasonNumber <= end {
+			return true
+		}
+	}
+	return false
 }
 
 // bareSeasonTokenPattern matches an explicit season-only token ("s02" or

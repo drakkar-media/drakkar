@@ -35,7 +35,11 @@ func (s *Service) correctExternalSubtitleSync(ctx context.Context, libraryItemID
 // spec-permitted shorter MM:SS.mmm form is deliberately not matched here;
 // a timestamp this doesn't recognize is just left untouched, which is safe
 // by construction).
-var subtitleTimestampPattern = regexp.MustCompile(`(\d{1,}):(\d{2}):(\d{2})[.,](\d{3})`)
+// The hours group is capped at 4 digits (up to 9999h, far beyond any real
+// subtitle) rather than left unbounded -- an unbounded run of digits from a
+// malformed cue can overflow strconv.ParseInt's int64 range in
+// parseSubtitleTimestampMs below, and that error is discarded there.
+var subtitleTimestampPattern = regexp.MustCompile(`(\d{1,4}):(\d{2}):(\d{2})[.,](\d{3})`)
 
 // knownFramerateRatios are the duration ratios a subtitle authored for one
 // common video framerate produces when played against a release encoded at
@@ -123,13 +127,30 @@ func rescaleSubtitleTimestamps(body []byte, ratio float64) []byte {
 // mismatch rather than, say, a subtitle authored for a differently-cut
 // release (different runtime entirely) -- which rescaling would make worse,
 // not better.
+//
+// Confirmed live 2026-08-20: this used to return the first candidate within
+// tolerance in knownFramerateRatios' fixed list order, not the CLOSEST one
+// the doc comment above already promised -- several adjacent ratios (e.g.
+// 25/23.976 ~= 1.042708 and 25/24 ~= 1.041667) are closer to each other than
+// framerateRatioTolerance's width, so their tolerance windows overlap and a
+// measurement landing in the overlap picked whichever ratio happened to be
+// checked first, not the one that actually best explains the measurement --
+// applying the wrong scale factor made sync worse than doing nothing.
 func matchKnownFramerateRatio(measured float64) (ratio float64, ok bool) {
+	bestDiff := framerateRatioTolerance
+	found := false
 	for _, known := range knownFramerateRatios {
-		if diff := measured - known; diff > -framerateRatioTolerance && diff < framerateRatioTolerance {
-			return known, true
+		diff := measured - known
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff < framerateRatioTolerance && diff < bestDiff {
+			bestDiff = diff
+			ratio = known
+			found = true
 		}
 	}
-	return 0, false
+	return ratio, found
 }
 
 // correctFramerateMismatch checks a freshly-downloaded external subtitle's

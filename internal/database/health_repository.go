@@ -269,6 +269,32 @@ func (db *DB) RecordHealthStatus(ctx context.Context, publicationID int64, ok bo
 	return err
 }
 
+// TouchHealthCheckTimestamp records that publicationID was just examined,
+// without asserting a health_ok verdict either way -- for a check that hit
+// a transient/inconclusive condition (timeout, provider circuit open,
+// momentarily-unreadable container) rather than a genuine pass or fail.
+// Preserves whatever health_ok already holds, including NULL if this item
+// has never been conclusively checked.
+//
+// Confirmed live 2026-08-20: without this, a candidate that reliably hits a
+// transient condition on every attempt (e.g. a segment on a provider whose
+// circuit stays open) never gets any timestamp recorded at all.
+// ListDeepHealthCandidates orders by "last_checked_at ASC NULLS FIRST", so
+// such an item stays permanently first in line -- every scheduled pass
+// selects it again ahead of every other, never-yet-tried candidate, wasting
+// that pass's time budget on the same doomed-to-fail item instead of
+// rotating through the rest of the library. Bumping the timestamp (without
+// claiming a health verdict this check couldn't actually confirm) demotes
+// its selection priority behind other candidates while still leaving it
+// eligible for its next real check.
+func (db *DB) TouchHealthCheckTimestamp(ctx context.Context, publicationID int64) error {
+	_, err := db.SQL.ExecContext(ctx, `
+		update symlink_publications
+		set last_checked_at = now()
+		where id = $1`, publicationID)
+	return err
+}
+
 const deepHealthCandidatesQuery = `
 	SELECT DISTINCT ON (sp.library_item_id)
 	    sp.id AS publication_id,

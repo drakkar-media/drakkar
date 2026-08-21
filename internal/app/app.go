@@ -1158,9 +1158,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			logger.Info().Str("task", taskStorageMaintenance).Str("reason", reason).Msg("scheduler: skipping non-critical (filesystem-heavy) storage maintenance")
 			return
 		}
-		_, _ = maintenanceSvc.RemoveOrphanedContent(ctx)
-		_, _ = maintenanceSvc.RemoveBrokenMediaSymlinks(ctx)
-		_, _ = maintenanceSvc.RemoveOrphanedCompletedSymlinks(ctx)
+		_, _, _, _ = maintenanceSvc.RunSymlinkMaintenance(ctx)
 		if result, err := cacheSvc.Prune(ctx); err != nil {
 			logger.Error().Err(err).Msg("monitoring: cache prune error")
 		} else {
@@ -1205,7 +1203,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	// discovery happens via recent-feed polling or explicit/manual search.
 	startRecurring(taskSeerrSync, 10*time.Minute, true, runSyncOnce)
 	// Sync Plex-detected shows (partial Seerr media without requests) hourly.
-	startRecurringWithStartupDelay(taskSyncPlexDetected, 60*time.Minute, 90*time.Second, func() {
+	startRecurringWithStartupDelay(taskSyncPlexDetected, 60*time.Minute, 90*time.Second, shouldRunRecentOnStartup(ctx, db, taskSyncPlexDetected, 60*time.Minute, 0, time.Now().UTC()), func() {
 		ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		defer cancel()
 		result, err := workflowSvc.SyncPlexDetectedShows(ctx)
@@ -1249,8 +1247,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	})
 
 	startRecurring(taskQueueHousekeeping, 10*time.Minute, true, runQueueHousekeeping)
-	startRecurringWithStartupDelay(taskPublishingMaintenance, 30*time.Minute, 2*time.Minute, runPublishingMaintenance)
-	startRecurringWithStartupDelay(taskHealthCheck, backgroundHealthCheckInterval, 6*time.Minute, runHealthCheck)
+	startRecurringWithStartupDelay(taskPublishingMaintenance, 30*time.Minute, 2*time.Minute, shouldRunRecentOnStartup(ctx, db, taskPublishingMaintenance, 30*time.Minute, 0, time.Now().UTC()), runPublishingMaintenance)
+	startRecurringWithStartupDelay(taskHealthCheck, backgroundHealthCheckInterval, 6*time.Minute, shouldRunRecentOnStartup(ctx, db, taskHealthCheck, backgroundHealthCheckInterval, 0, time.Now().UTC()), runHealthCheck)
 	// Polling the durable sweep state separates continuation cadence from the
 	// seven-day completion cadence. An interrupted sweep resumes within one
 	// coordinator tick, while an idle coordinator performs only two cursor reads.
@@ -1278,7 +1276,7 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		logger.Info().Int("scanned", result.ScannedRows).Int("reset", result.ResetItems).
 			Msg("deep nzb health check step complete")
 	})
-	startRecurringWithStartupDelay(taskArticleHealthCheck, 6*time.Hour, 15*time.Minute, func() {
+	startRecurringWithStartupDelay(taskArticleHealthCheck, 6*time.Hour, 15*time.Minute, shouldRunRecentOnStartup(ctx, db, taskArticleHealthCheck, 6*time.Hour, 0, time.Now().UTC()), func() {
 		ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 		defer cancel()
 		n, err := workflowSvc.ValidatePublishedArticles(ctx)
@@ -1293,8 +1291,8 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			logger.Info().Msg("article health check: all published articles reachable")
 		}
 	})
-	startRecurringWithStartupDelay(taskStorageMaintenance, 6*time.Hour, 10*time.Minute, runStorageMaintenance)
-	startRecurringWithStartupDelay(taskContentMaintenance, 6*time.Hour, 20*time.Minute, runContentMaintenance)
+	startRecurringWithStartupDelay(taskStorageMaintenance, 6*time.Hour, 10*time.Minute, shouldRunRecentOnStartup(ctx, db, taskStorageMaintenance, 6*time.Hour, 0, time.Now().UTC()), runStorageMaintenance)
+	startRecurringWithStartupDelay(taskContentMaintenance, 6*time.Hour, 20*time.Minute, shouldRunRecentOnStartup(ctx, db, taskContentMaintenance, 6*time.Hour, 0, time.Now().UTC()), runContentMaintenance)
 	// A cycle only takes ~9 minutes at the safe per-call search pace (2s
 	// delay, ~260 deduped targets/cycle), so a 30-minute interval left ~20
 	// minutes idle per cycle. Halved to close most of that gap without

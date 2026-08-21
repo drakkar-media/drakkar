@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,21 +20,36 @@ import (
 // the tree cache is doing its job instead of hitting the "database" on every
 // request.
 type countingProvider struct {
-	pubs      []database.SymlinkPublication
-	entries   []database.ContentMountEntry
-	vf        stream.VirtualMediaFile
-	calls     int64
-	openCalls int64
+	pubs                      []database.SymlinkPublication
+	entries                   []database.ContentMountEntry
+	vf                        stream.VirtualMediaFile
+	calls                     int64
+	openCalls                 int64
+	contentEntriesCalls       int64
+	contentEntriesForRelCalls int64
+	// rebuildDelay, when non-zero, is slept inside ListSymlinkPublications
+	// and ListContentMountEntries before returning -- widens the race
+	// window so a concurrency test can reliably catch a thundering-herd
+	// rebuild instead of the goroutines finishing too fast to overlap.
+	rebuildDelay time.Duration
 }
 
 func (p *countingProvider) ListSymlinkPublications(ctx context.Context) ([]database.SymlinkPublication, error) {
 	atomic.AddInt64(&p.calls, 1)
+	if p.rebuildDelay > 0 {
+		time.Sleep(p.rebuildDelay)
+	}
 	return p.pubs, nil
 }
 func (p *countingProvider) ListContentMountEntries(ctx context.Context) ([]database.ContentMountEntry, error) {
+	atomic.AddInt64(&p.contentEntriesCalls, 1)
+	if p.rebuildDelay > 0 {
+		time.Sleep(p.rebuildDelay)
+	}
 	return p.entries, nil
 }
 func (p *countingProvider) ListContentMountEntriesForRelease(ctx context.Context, selectedReleaseID int64) ([]database.ContentMountEntry, error) {
+	atomic.AddInt64(&p.contentEntriesForRelCalls, 1)
 	var out []database.ContentMountEntry
 	for _, e := range p.entries {
 		if e.SelectedReleaseID == selectedReleaseID {
@@ -114,6 +130,71 @@ func TestGetTreeRefreshesAfterTTL(t *testing.T) {
 	}
 }
 
+// TestGetTreeConcurrentRebuildsCollapseToOne guards a thundering-herd gap:
+// getTree only held treeMu while swapping the cached pointer, not across the
+// rebuild itself, so every caller that arrived after the TTL expired --
+// exactly the burst of Stat/Readdir calls a Plex library scan or rclone
+// dir-cache refresh issues back to back -- ran its own concurrent
+// ListSymlinkPublications query and buildTree pass. With a real (if small)
+// rebuild delay to widen the race window, this must collapse to exactly one
+// query no matter how many callers race in at once.
+func TestGetTreeConcurrentRebuildsCollapseToOne(t *testing.T) {
+	provider := &countingProvider{
+		pubs: []database.SymlinkPublication{
+			{LibraryPath: "/movies/Some Movie (2021)/Some Movie (2021).mkv", TargetPath: "/vfs/content/releases/1/movie.mkv"},
+		},
+		rebuildDelay: 50 * time.Millisecond,
+	}
+	fs := &contentFS{db: provider, movieLibPath: "/movies", cacheTTL: time.Hour}
+
+	const concurrency = 20
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := fs.getTree(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if calls := atomic.LoadInt64(&provider.calls); calls != 1 {
+		t.Fatalf("expected exactly 1 ListSymlinkPublications call across %d concurrent getTree calls racing past an empty cache, got %d", concurrency, calls)
+	}
+}
+
+// TestGetContentIndexConcurrentRebuildsCollapseToOne mirrors
+// TestGetTreeConcurrentRebuildsCollapseToOne for getContentIndex's identical
+// caching shape.
+func TestGetContentIndexConcurrentRebuildsCollapseToOne(t *testing.T) {
+	provider := &countingProvider{
+		entries: []database.ContentMountEntry{
+			{SelectedReleaseID: 1, VirtualFileID: 10},
+		},
+		rebuildDelay: 50 * time.Millisecond,
+	}
+	fs := &contentFS{db: provider, movieLibPath: "/movies", contentCacheTTL: time.Hour}
+
+	const concurrency = 20
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := fs.getContentIndex(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if calls := atomic.LoadInt64(&provider.contentEntriesCalls); calls != 1 {
+		t.Fatalf("expected exactly 1 ListContentMountEntries call across %d concurrent getContentIndex calls racing past an empty cache, got %d", concurrency, calls)
+	}
+}
+
 // TestStatAndOpenCompletedResolveCachedTree confirms the cache doesn't break
 // correctness: statCompleted/openCompleted must still resolve real entries
 // (and reject missing ones) via the cached tree.
@@ -145,6 +226,102 @@ func TestStatAndOpenCompletedResolveCachedTree(t *testing.T) {
 
 	if calls := atomic.LoadInt64(&provider.calls); calls != 1 {
 		t.Fatalf("expected all 3 calls to share one cached tree build, got %d ListSymlinkPublications calls", calls)
+	}
+}
+
+// TestGetContentIndexCachesWithinTTL is the /content/releases counterpart to
+// TestGetTreeCachesWithinTTL: unlike /completed-symlinks, this tree had no
+// caching at all -- opening "/content/releases/" ran an unfiltered
+// ListContentMountEntries scan, and every per-release Stat/OpenFile call
+// issued a fresh ListContentMountEntriesForRelease query with no TTL to
+// absorb repeats. getContentIndex must serve repeated calls within the TTL
+// from one cached, indexed fetch.
+func TestGetContentIndexCachesWithinTTL(t *testing.T) {
+	provider := &countingProvider{
+		entries: []database.ContentMountEntry{
+			{SelectedReleaseID: 1, VirtualFileID: 10, FileName: "movie.mkv", SizeBytes: 1024},
+			{SelectedReleaseID: 2, VirtualFileID: 20, FileName: "other.mkv", SizeBytes: 2048},
+		},
+	}
+	fs := &contentFS{db: provider, movieLibPath: "/movies", contentCacheTTL: time.Hour}
+
+	for i := 0; i < 20; i++ {
+		if _, err := fs.getContentIndex(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls := atomic.LoadInt64(&provider.contentEntriesCalls); calls != 1 {
+		t.Fatalf("expected exactly 1 ListContentMountEntries call across 20 getContentIndex calls within TTL, got %d", calls)
+	}
+}
+
+// TestGetContentIndexRefreshesAfterTTL is the /content/releases counterpart
+// to TestGetTreeRefreshesAfterTTL: the cache must not be permanent.
+func TestGetContentIndexRefreshesAfterTTL(t *testing.T) {
+	provider := &countingProvider{}
+	fs := &contentFS{db: provider, movieLibPath: "/movies", contentCacheTTL: 10 * time.Millisecond}
+
+	if _, err := fs.getContentIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.getContentIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls := atomic.LoadInt64(&provider.contentEntriesCalls); calls != 1 {
+		t.Fatalf("expected 1 call before TTL expiry, got %d", calls)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	if _, err := fs.getContentIndex(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if calls := atomic.LoadInt64(&provider.contentEntriesCalls); calls != 2 {
+		t.Fatalf("expected a second call after TTL expiry, got %d", calls)
+	}
+}
+
+// TestStatAndOpenContentResolveCachedIndexWithoutPerReleaseQueries confirms
+// the cache doesn't break correctness -- statContent/openContent must still
+// resolve real entries (and reject missing ones) -- and that it eliminates
+// the N+1 entirely: ListContentMountEntriesForRelease must never be called
+// at all once the single indexed fetch has run, for any number of distinct
+// releases or files looked up.
+func TestStatAndOpenContentResolveCachedIndexWithoutPerReleaseQueries(t *testing.T) {
+	provider := &countingProvider{
+		entries: []database.ContentMountEntry{
+			{SelectedReleaseID: 1, VirtualFileID: 10, FileName: "movie.mkv", SizeBytes: 1024},
+			{SelectedReleaseID: 2, VirtualFileID: 20, FileName: "other.mkv", SizeBytes: 2048},
+		},
+	}
+	fs := &contentFS{db: provider, movieLibPath: "/movies", contentCacheTTL: time.Hour}
+	ctx := context.Background()
+
+	if _, err := fs.openContent(ctx, "releases"); err != nil {
+		t.Fatalf("expected releases listing to resolve, got err=%v", err)
+	}
+	if info, err := fs.statContent(ctx, "releases/1"); err != nil || info == nil {
+		t.Fatalf("expected release 1 to resolve, got info=%v err=%v", info, err)
+	}
+	if info, err := fs.statContent(ctx, "releases/1/movie.mkv"); err != nil || info.IsDir() {
+		t.Fatalf("expected movie.mkv to resolve as a file, got info=%v err=%v", info, err)
+	}
+	if _, err := fs.statContent(ctx, "releases/2/movie.mkv"); err == nil {
+		t.Fatal("expected release 2's file lookup to miss (wrong release), got no error")
+	}
+	if file, err := fs.openContent(ctx, "releases/2/other.mkv"); err != nil {
+		t.Fatalf("expected release 2's other.mkv to open, got err=%v", err)
+	} else {
+		_ = file.Close()
+	}
+	if _, err := fs.statContent(ctx, "releases/999"); err == nil {
+		t.Fatal("expected a nonexistent release to error")
+	}
+
+	if calls := atomic.LoadInt64(&provider.contentEntriesCalls); calls != 1 {
+		t.Fatalf("expected exactly 1 ListContentMountEntries call across all lookups, got %d", calls)
+	}
+	if calls := atomic.LoadInt64(&provider.contentEntriesForRelCalls); calls != 0 {
+		t.Fatalf("expected zero ListContentMountEntriesForRelease calls -- the indexed cache should serve every per-release lookup from memory, got %d", calls)
 	}
 }
 
