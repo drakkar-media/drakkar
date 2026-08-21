@@ -4317,13 +4317,6 @@ func (db *DB) ResetLibraryItemState(ctx context.Context, libraryItemID int64) er
 	return tx.Commit()
 }
 
-func nullTime(value time.Time) any {
-	if value.IsZero() {
-		return nil
-	}
-	return value
-}
-
 // MetadataRefreshStatus records whether the latest provider refresh applied,
 // failed, or was skipped because no provider was available.
 type MetadataRefreshStatus string
