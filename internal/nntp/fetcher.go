@@ -72,6 +72,37 @@ func (f *SegmentFetcher) DecodedSize(ctx context.Context, messageID string) (int
 	return int64(len(decoded)), nil
 }
 
+// DecodedStart fetches messageID's decoded article and returns the yEnc
+// header's declared absolute decoded-start offset (info.DecodedStart())
+// alongside the decoded size. valid is false when the source can't supply
+// PartInfo at all, or the header it returned doesn't pass yenc.PartInfo.Valid()
+// -- callers must treat that as "position unknown", not "starts at 0".
+func (f *SegmentFetcher) DecodedStart(ctx context.Context, messageID string) (start, size int64, valid bool, err error) {
+	if f == nil || f.source == nil {
+		return 0, 0, false, errors.New("nntp source unavailable")
+	}
+	var (
+		decoded []byte
+		info    yenc.PartInfo
+	)
+	switch src := f.source.(type) {
+	case PriorityDecodedArticleInfoSource:
+		decoded, info, err = src.DecodedBodyInfoPriority(ctx, messageID, stream.PriorityBackground)
+	case DecodedArticleInfoSource:
+		decoded, info, err = src.DecodedBodyInfo(ctx, messageID)
+	default:
+		size, err = f.DecodedSize(ctx, messageID)
+		return 0, size, false, err
+	}
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if !info.Valid() {
+		return 0, int64(len(decoded)), false, nil
+	}
+	return info.DecodedStart(), int64(len(decoded)), true, nil
+}
+
 // Exists verifies that the article exists without forcing a full decoded-body
 // download when the underlying source supports NNTP STAT.
 func (f *SegmentFetcher) Exists(ctx context.Context, messageID string) error {

@@ -216,3 +216,150 @@ func TestPreflightCheckFirstSegmentsSkipsInteriorSamplingForMultiFileReleases(t 
 		t.Fatalf("expected preflight to pass (interior sampling must be skipped for multi-file releases), got: %v", err)
 	}
 }
+
+// fakeSegmentPositionSizer implements SegmentSizer + SegmentPositionSizer so
+// tests can control the declared yEnc decoded-start position
+// StrictCheckFirstSegments' position check reads, independent of whether the
+// segment "decodes" at all. startByMessageID holds the declared start for a
+// given message ID; any message ID absent from it reports start=0 (correctly
+// positioned), matching a real, unaffected article.
+type fakeSegmentPositionSizer struct {
+	startByMessageID map[string]int64
+}
+
+func (f *fakeSegmentPositionSizer) FetchRange(ctx context.Context, segment stream.SegmentRange) ([]byte, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (f *fakeSegmentPositionSizer) DecodedSize(ctx context.Context, messageID string) (int64, error) {
+	return 1024, nil
+}
+
+func (f *fakeSegmentPositionSizer) DecodedStart(ctx context.Context, messageID string) (start, size int64, valid bool, err error) {
+	return f.startByMessageID[messageID], 1024, true, nil
+}
+
+// TestStrictCheckFirstSegmentsCatchesWrongFirstSegment guards the fix for the
+// real incident this whole check exists to catch (2026-08-22): a library
+// item's stored first segment message ID resolved, on live NNTP fetch, to a
+// real, valid, successfully-decoding Usenet article that simply belonged to
+// a different post entirely -- its own yEnc header honestly declared a
+// decoded-start hundreds of megabytes into ITS source file. Every
+// pre-existing check (article exists, decodes, has a plausible size) passed
+// on this wrong article; only checking the declared position against
+// maxPlausibleFirstSegmentStart catches it.
+func TestStrictCheckFirstSegmentsCatchesWrongFirstSegment(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+
+	ids := makeMessageIDs(200, "wrong-first-segment")
+	nzbDocID, cleanup := insertPreflightFixture(t, sqlDB, ctx, "strict-wrong-first-segment", [][]string{ids})
+	defer cleanup()
+
+	sizer := &fakeSegmentPositionSizer{startByMessageID: map[string]int64{
+		ids[0]: 498121728, // matches the real corruption's order of magnitude
+	}}
+	db := &DB{SQL: sqlDB, SegmentFetcher: sizer}
+
+	if err := db.StrictCheckFirstSegments(ctx, nzbDocID); err == nil {
+		t.Fatal("expected a first segment whose own yEnc header places it far into an unrelated file to fail the check")
+	}
+}
+
+// TestStrictCheckFirstSegmentsPassesCorrectlyPositionedFirstSegment is the
+// mirror-image sanity check: a first segment whose declared position is
+// exactly where it should be (byte 0) must not fail.
+func TestStrictCheckFirstSegmentsPassesCorrectlyPositionedFirstSegment(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+
+	ids := makeMessageIDs(200, "correct-first-segment")
+	nzbDocID, cleanup := insertPreflightFixture(t, sqlDB, ctx, "strict-correct-first-segment", [][]string{ids})
+	defer cleanup()
+
+	sizer := &fakeSegmentPositionSizer{startByMessageID: map[string]int64{ids[0]: 0}}
+	db := &DB{SQL: sqlDB, SegmentFetcher: sizer}
+
+	if err := db.StrictCheckFirstSegments(ctx, nzbDocID); err != nil {
+		t.Fatalf("expected a correctly-positioned first segment to pass, got: %v", err)
+	}
+}
+
+// TestStrictCheckFirstSegmentsDoesNotPositionCheckLastSegment locks in the
+// deliberate scope limit: the last segment of a large file legitimately
+// declares a decoded-start far beyond maxPlausibleFirstSegmentStart (it's
+// near the END of the file) -- the position check must only ever apply to
+// the first segment, never the last, or every large release would fail.
+func TestStrictCheckFirstSegmentsDoesNotPositionCheckLastSegment(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+
+	ids := makeMessageIDs(200, "last-segment-far")
+	nzbDocID, cleanup := insertPreflightFixture(t, sqlDB, ctx, "strict-last-segment-far", [][]string{ids})
+	defer cleanup()
+
+	sizer := &fakeSegmentPositionSizer{startByMessageID: map[string]int64{
+		ids[0]:   0,         // first segment: correctly at the start
+		ids[199]: 140000000, // last segment: legitimately far into the file
+	}}
+	db := &DB{SQL: sqlDB, SegmentFetcher: sizer}
+
+	if err := db.StrictCheckFirstSegments(ctx, nzbDocID); err != nil {
+		t.Fatalf("expected the last segment's large (but legitimate) position to be ignored, got: %v", err)
+	}
+}
+
+// TestStrictCheckFirstSegmentsSkipsPositionCheckWithoutPositionSupport
+// guards backward compatibility: a SegmentFetcher that only implements
+// SegmentSizer (no SegmentPositionSizer) -- e.g. a source without yEnc
+// PartInfo access -- must keep passing exactly as before this check was
+// added, not fail or panic from a missing capability.
+func TestStrictCheckFirstSegmentsSkipsPositionCheckWithoutPositionSupport(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+
+	ids := makeMessageIDs(200, "no-position-support")
+	nzbDocID, cleanup := insertPreflightFixture(t, sqlDB, ctx, "strict-no-position-support", [][]string{ids})
+	defer cleanup()
+
+	// fakeSegmentSizer implements SegmentSizer only (see calibrate_test.go) --
+	// no DecodedStart method, so it cannot satisfy SegmentPositionSizer.
+	sizer := &fakeSegmentSizer{}
+	db := &DB{SQL: sqlDB, SegmentFetcher: sizer}
+
+	if err := db.StrictCheckFirstSegments(ctx, nzbDocID); err != nil {
+		t.Fatalf("expected a fetcher without position support to pass (graceful degradation), got: %v", err)
+	}
+}

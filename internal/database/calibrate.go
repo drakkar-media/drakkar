@@ -22,6 +22,30 @@ type SegmentSizer interface {
 	DecodedSize(ctx context.Context, messageID string) (int64, error)
 }
 
+// SegmentPositionSizer extends SegmentSizer with the article's own declared
+// absolute decoded-start position (from its yEnc header), letting a caller
+// verify a successfully-fetched segment actually belongs where the stored
+// layout says it does -- not just that "an article with this message ID
+// exists and decodes". A wrong-but-real article passes every check
+// DecodedSize alone can make: it exists, it decodes, it has a plausible
+// size. See maxPlausibleFirstSegmentStart for the real incident this guards.
+type SegmentPositionSizer interface {
+	DecodedStart(ctx context.Context, messageID string) (start, size int64, valid bool, err error)
+}
+
+// maxPlausibleFirstSegmentStart bounds how far into its own source file a
+// release's first segment may legitimately start. Real NZB segments are
+// typically well under 1MB; 10MiB is generous headroom above that while
+// sitting far below the actual corruption confirmed live (2026-08-22): a
+// batch of imported episodes had their stored first ~695 (of ~10,446)
+// segments swapped for message IDs belonging to other, unrelated posts --
+// each one a real, valid, successfully-decoding Usenet article, just not
+// this file's. Their own yEnc headers honestly declared their true absolute
+// start somewhere between 89MB and 827MB into THEIR source file, which is
+// what this check catches: a wrong article at that scale isn't a rounding
+// error that self-corrects, the message ID itself is wrong.
+const maxPlausibleFirstSegmentStart = 10 << 20
+
 // SegmentChecker confirms whether an NNTP article still exists via a cheap
 // STAT-style check, without downloading its body.
 type SegmentChecker interface {
@@ -274,19 +298,38 @@ func (db *DB) loadNZBInteriorSampleSegments(ctx context.Context, nzbDocumentID i
 
 // StrictCheckFirstSegments uses the older heavier validation strategy:
 // download enough decoded article data to measure first/last segment sizes for
-// every file, failing as soon as any required segment is unavailable.
+// every file, failing as soon as any required segment is unavailable -- and,
+// when the fetcher supports it, verifying the first segment's own yEnc
+// header actually places it near the start of its file (see
+// SegmentPositionSizer).
 func (db *DB) StrictCheckFirstSegments(ctx context.Context, nzbDocumentID int64) error {
 	sizer, ok := db.SegmentFetcher.(SegmentSizer)
 	if !ok || sizer == nil {
 		return nil
 	}
+	posSizer, _ := db.SegmentFetcher.(SegmentPositionSizer)
 	pairs, err := db.loadNZBFirstLastSegmentPairs(ctx, nzbDocumentID)
 	if err != nil {
 		return err
 	}
-	for _, p := range pairs {
-		if _, err := sizer.DecodedSize(ctx, p.first); err != nil {
-			if errors.Is(err, yenc.ErrCRCMismatch) && !db.confirmPermanentCRCMismatch(ctx, p.first) {
+	checkSegment := func(messageID, pos string, verifyNearFileStart bool) error {
+		if posSizer != nil {
+			start, _, valid, fetchErr := posSizer.DecodedStart(ctx, messageID)
+			if fetchErr != nil {
+				if errors.Is(fetchErr, yenc.ErrCRCMismatch) && !db.confirmPermanentCRCMismatch(ctx, messageID) {
+					return nil
+				}
+				return sanitizedSegmentErr("strict health", pos, fetchErr, messageID)
+			}
+			if verifyNearFileStart && valid && start >= maxPlausibleFirstSegmentStart {
+				return sanitizedSegmentErr("strict health", pos+"-position",
+					fmt.Errorf("segment's own yEnc header declares it starts %d bytes into its source file -- wrong article stored for this file's %s segment", start, pos),
+					messageID)
+			}
+			return nil
+		}
+		if _, fetchErr := sizer.DecodedSize(ctx, messageID); fetchErr != nil {
+			if errors.Is(fetchErr, yenc.ErrCRCMismatch) && !db.confirmPermanentCRCMismatch(ctx, messageID) {
 				// Not confirmed on independent, delayed re-fetch -- treat as
 				// the same transient glitch class confirmPermanentCRCMismatch
 				// already guards calibration against, not permanent
@@ -296,16 +339,19 @@ func (db *DB) StrictCheckFirstSegments(ctx context.Context, nzbDocumentID int64)
 				// independent, delayed, agreeing samples for the identical
 				// failure class -- confirmed live, two false positives, on
 				// this same provider.
-				continue
+				return nil
 			}
-			return sanitizedSegmentErr("strict health", "first", err, p.first)
+			return sanitizedSegmentErr("strict health", pos, fetchErr, messageID)
+		}
+		return nil
+	}
+	for _, p := range pairs {
+		if err := checkSegment(p.first, "first", true); err != nil {
+			return err
 		}
 		if p.last != p.first {
-			if _, err := sizer.DecodedSize(ctx, p.last); err != nil {
-				if errors.Is(err, yenc.ErrCRCMismatch) && !db.confirmPermanentCRCMismatch(ctx, p.last) {
-					continue
-				}
-				return sanitizedSegmentErr("strict health", "last", err, p.last)
+			if err := checkSegment(p.last, "last", false); err != nil {
+				return err
 			}
 		}
 	}
