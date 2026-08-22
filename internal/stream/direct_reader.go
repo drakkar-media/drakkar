@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"sort"
 	"sync"
 )
@@ -93,6 +94,7 @@ func (r *DirectNzbReader) currentSize() int64 {
 // each trigger and observe realignment independently.
 func (r *DirectNzbReader) ReadAt(ctx context.Context, dst []byte, offset int64) (int, error) {
 	size := r.currentSize()
+	slog.Debug("dnr ReadAt call", "name", r.name, "offset", offset, "len(dst)", len(dst), "size", size)
 	if offset >= size {
 		return 0, io.EOF
 	}
@@ -194,6 +196,12 @@ func (r *DirectNzbReader) findSpan(offset int64) (SegmentSpan, int, error) {
 	if i < n && r.spans[i].Start <= offset {
 		return r.spans[i], i, nil
 	}
+	var first, last SegmentSpan
+	if n > 0 {
+		first, last = r.spans[0], r.spans[n-1]
+	}
+	slog.Debug("dnr findSpan miss", "name", r.name, "offset", offset, "size", r.size,
+		"spanCount", n, "searchIndex", i, "firstSpan", first, "lastSpan", last)
 	return SegmentSpan{}, -1, ErrRangeOutsideFile
 }
 
