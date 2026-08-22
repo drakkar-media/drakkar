@@ -9,6 +9,7 @@ import (
 
 	"github.com/drakkar-media/drakkar/internal/config"
 	"github.com/drakkar-media/drakkar/internal/nntp"
+	"github.com/drakkar-media/drakkar/internal/privacy"
 	"github.com/drakkar-media/drakkar/internal/stream"
 	"github.com/rs/zerolog"
 )
@@ -183,9 +184,10 @@ type dynamicArticleSource struct {
 	rt     config.Runtime
 	logger zerolog.Logger
 
-	mu      sync.RWMutex
-	chain   *articleSourceChain
-	lastCfg *config.UsenetConfig
+	mu           sync.RWMutex
+	chain        *articleSourceChain
+	lastCfg      *config.UsenetConfig
+	lastRouteCfg privacy.Config
 }
 
 func newDynamicArticleSource(rt config.Runtime, logger zerolog.Logger) *dynamicArticleSource {
@@ -195,13 +197,27 @@ func newDynamicArticleSource(rt config.Runtime, logger zerolog.Logger) *dynamicA
 // Rebuild constructs a fresh pipeline from usenetCfg/dialer and atomically
 // swaps it in; the previous chain is closed only after the swap succeeds,
 // so a rebuild can never leave zero working pipeline installed. A no-op if
-// usenetCfg is identical to the last applied config -- ApplySettings calls
-// this on every settings save regardless of what changed, and rebuilding
-// (re-dialing every provider) on an unrelated save would needlessly churn
-// live NNTP connections.
+// BOTH usenetCfg and the dialer's current route are identical to the last
+// applied config -- ApplySettings calls this on every settings save
+// regardless of what changed, and rebuilding (re-dialing every provider) on
+// an unrelated save would needlessly churn live NNTP connections.
+//
+// The route comparison matters just as much as usenetCfg: dialer is always
+// the same *privacy.Manager pointer (app.go wires it once at startup), so
+// comparing it by identity can never detect a privacy-mode change on its
+// own. Confirmed live 2026-08-22: a privacy routing switch (e.g. WireGuard
+// to Direct) with no accompanying Usenet settings change in the same save
+// left usenetCfg byte-identical, so this used to return here without
+// rebuilding -- even though privacy.Manager.Reload (called just before this,
+// in ApplySettings) had already torn down the old WireGuard tunnel every
+// pooled connection in the untouched chain was still using. Every
+// subsequent read failed instantly (write/read on an already-closed
+// connection) regardless of which mode was now configured, since the stale
+// pool was never replaced.
 func (d *dynamicArticleSource) Rebuild(ctx context.Context, usenetCfg config.UsenetConfig, dialer nntp.ContextDialer) {
+	routeCfg := currentRouteConfig(dialer)
 	d.mu.RLock()
-	unchanged := d.lastCfg != nil && reflect.DeepEqual(*d.lastCfg, usenetCfg)
+	unchanged := d.lastCfg != nil && reflect.DeepEqual(*d.lastCfg, usenetCfg) && d.lastRouteCfg == routeCfg
 	d.mu.RUnlock()
 	if unchanged {
 		return
@@ -214,11 +230,26 @@ func (d *dynamicArticleSource) Rebuild(ctx context.Context, usenetCfg config.Use
 	d.chain = newChain
 	cfgCopy := usenetCfg
 	d.lastCfg = &cfgCopy
+	d.lastRouteCfg = routeCfg
 	d.mu.Unlock()
 
 	if old != nil {
 		go old.Close()
 	}
+}
+
+// currentRouteConfig extracts dialer's current routing config for change
+// detection, if it exposes one (true for the production *privacy.Manager
+// dialer). Returns the zero Config for any other dialer (e.g. a test
+// double), so callers that don't route through privacy.Manager see this
+// term of the comparison as always-equal -- unchanged from Rebuild's
+// pre-existing behavior for them.
+func currentRouteConfig(dialer nntp.ContextDialer) privacy.Config {
+	mgr, ok := dialer.(*privacy.Manager)
+	if !ok {
+		return privacy.Config{}
+	}
+	return mgr.CurrentConfig()
 }
 
 func (d *dynamicArticleSource) get() *articleSourceChain {

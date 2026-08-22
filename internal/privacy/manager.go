@@ -182,6 +182,17 @@ func (m *Manager) Mode() Mode {
 	return m.state.Load().mode
 }
 
+// CurrentConfig returns the Config the active route was built from -- the
+// exact snapshot Reload compares against on its next call (see Reload's own
+// short-circuit). Config is a plain comparable struct, so callers that need
+// to detect a routing change (e.g. dynamicArticleSource.Rebuild, which must
+// re-dial every provider connection when the underlying route changes even
+// if the Usenet settings that also feed it did not) can compare this across
+// calls with plain ==.
+func (m *Manager) CurrentConfig() Config {
+	return m.state.Load().cfg
+}
+
 // Status returns the read-only runtime view for the settings/status API.
 func (m *Manager) Status() Status {
 	st := m.state.Load()

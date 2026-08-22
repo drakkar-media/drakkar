@@ -99,6 +99,80 @@ func TestDynamicArticleSourceRebuildSwapsChain(t *testing.T) {
 	}
 }
 
+// TestDynamicArticleSourceRebuildDetectsPrivacyRouteChange guards a real
+// production incident (2026-08-22): dialer is always the same *privacy.Manager
+// pointer (app.go wires it once at startup), so Rebuild's old
+// usenetCfg-only comparison could never detect a privacy-mode switch on its
+// own -- a settings save that changes ONLY privacy routing (not any Usenet
+// field) left usenetCfg byte-identical, so Rebuild returned without
+// rebuilding. Meanwhile privacy.Manager.Reload (called just before Rebuild
+// in ApplySettings) had already torn down the OLD route (e.g. closed a
+// WireGuard tunnel) out from under the untouched chain's still-pooled
+// connections -- every subsequent read failed instantly (write/read on an
+// already-closed connection) regardless of which mode was now configured,
+// since the stale pool was never replaced. This reproduces the exact
+// trigger: Rebuild is called twice with the IDENTICAL usenetCfg, with only
+// the manager's underlying route changed in between.
+func TestDynamicArticleSourceRebuildDetectsPrivacyRouteChange(t *testing.T) {
+	addr, _ := countingListener(t)
+	host, portStr, _ := net.SplitHostPort(addr)
+	port := 0
+	for _, c := range portStr {
+		port = port*10 + int(c-'0')
+	}
+
+	rt := config.Runtime{
+		BlockCachePath:         t.TempDir(),
+		DiskCacheLimitBytes:    1 << 20,
+		MemoryHotCacheMaxBytes: 1 << 20,
+	}
+	src := newDynamicArticleSource(rt, zerolog.Nop())
+	mgr := privacy.NewManager() // starts in ModeDirect
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfg := config.UsenetConfig{
+		MaxDownloadConnections: 2,
+		Providers: []config.UsenetProvider{
+			{Name: "provider-a", Host: host, Port: port, Enabled: true, MaxConnections: 2},
+		},
+	}
+	src.Rebuild(ctx, cfg, mgr)
+	firstChain := src.get()
+	if firstChain == nil || firstChain.fetcher == nil {
+		t.Fatal("expected a fetcher after first rebuild")
+	}
+
+	// Switch the manager's route (Direct -> SOCKS5) without touching cfg at
+	// all -- mirrors a settings save that only changes privacy routing.
+	// SOCKS5Dialer construction is pure/local (no real proxy needed); only
+	// DialContext would actually reach the network, which this test never
+	// calls.
+	if err := mgr.Reload(ctx, privacy.Config{
+		Mode: privacy.ModeSOCKS5,
+		SOCKS5: privacy.SOCKS5Config{
+			Host:           "127.0.0.1",
+			Port:           1,
+			TimeoutSeconds: 1,
+		},
+	}); err != nil {
+		t.Fatalf("reload to socks5: %v", err)
+	}
+
+	// Same cfg as the first call -- the old bug returned here without
+	// rebuilding, leaving firstChain (and its now-orphaned pooled
+	// connections) active forever.
+	src.Rebuild(ctx, cfg, mgr)
+	secondChain := src.get()
+	if secondChain == firstChain {
+		t.Fatal("expected Rebuild to detect the privacy route change and swap in a new chain, even with byte-identical usenetCfg")
+	}
+	if secondChain == nil || secondChain.fetcher == nil {
+		t.Fatal("expected a fetcher after the route-change rebuild")
+	}
+}
+
 func TestDynamicArticleSourceNoProvidersReturnsClearError(t *testing.T) {
 	rt := config.Runtime{BlockCachePath: t.TempDir(), DiskCacheLimitBytes: 1 << 20, MemoryHotCacheMaxBytes: 1 << 20}
 	src := newDynamicArticleSource(rt, zerolog.Nop())
