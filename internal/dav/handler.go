@@ -538,7 +538,7 @@ func (f *virtualFile) Read(p []byte) (int, error) {
 	}
 	n, err := f.vf.ReadAt(f.readCtx, p, f.pos)
 	if err != nil && err != io.EOF {
-		slog.Debug("dav read error", "name", f.fi.Name(), "pos", f.pos, "n", n, "err", err)
+		slog.Warn("dav read error", "name", f.fi.Name(), "pos", f.pos, "n", n, "err", err, "readCtxErr", f.readCtx.Err(), "vfCtxErr", f.ctx.Err())
 	}
 	if n > 0 {
 		f.pos += int64(n)
