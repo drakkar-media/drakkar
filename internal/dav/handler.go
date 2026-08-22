@@ -462,11 +462,9 @@ func (f *virtualFile) ensureOpen() error {
 	}
 	vf, err := f.db.OpenVirtualMediaFile(f.ctx, f.virtualFileID)
 	if err != nil {
-		slog.Warn("DIAG ensureOpen error", "name", f.fi.Name(), "virtualFileID", f.virtualFileID, "posAtOpen", f.pos, "err", err)
 		f.openErr = err
 		return err
 	}
-	slog.Warn("DIAG ensureOpen ok", "name", f.fi.Name(), "virtualFileID", f.virtualFileID, "posAtOpen", f.pos, "vfType", fmt.Sprintf("%T", vf), "vfSize", vf.Size())
 	f.vf = vf
 	f.readCtx, f.cancel = context.WithCancel(f.ctx)
 	if sf, ok := vf.(stream.SessionVirtualMediaFile); ok {
@@ -519,7 +517,6 @@ func (f *virtualFile) Seek(offset int64, whence int) (int64, error) {
 	if f.sessionFile != nil && f.hasRead && newPos != f.lastEnd {
 		f.sessionFile.Seek(f.sessionID, newPos)
 	}
-	slog.Warn("DIAG Seek", "name", f.fi.Name(), "offset", offset, "whence", whence, "oldPos", f.pos, "newPos", newPos, "hasRead", f.hasRead)
 	f.pos = newPos
 	return newPos, nil
 }
@@ -528,9 +525,7 @@ func (f *virtualFile) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	slog.Warn("DIAG Read enter", "name", f.fi.Name(), "pos", f.pos, "len", len(p), "size", f.size)
 	if err := f.ensureOpen(); err != nil {
-		slog.Warn("DIAG Read ensureOpen failed", "name", f.fi.Name(), "pos", f.pos, "err", err)
 		return 0, err
 	}
 	size := f.size
@@ -542,9 +537,8 @@ func (f *virtualFile) Read(p []byte) (int, error) {
 		p = p[:remaining]
 	}
 	n, err := f.vf.ReadAt(f.readCtx, p, f.pos)
-	slog.Warn("DIAG ReadAt result", "name", f.fi.Name(), "pos", f.pos, "requested", len(p), "n", n, "err", err)
 	if err != nil && err != io.EOF {
-		slog.Warn("dav read error", "name", f.fi.Name(), "pos", f.pos, "n", n, "err", err, "readCtxErr", f.readCtx.Err(), "vfCtxErr", f.ctx.Err())
+		slog.Debug("dav read error", "name", f.fi.Name(), "pos", f.pos, "n", n, "err", err)
 	}
 	if n > 0 {
 		f.pos += int64(n)
@@ -724,7 +718,6 @@ func (f *contentFS) openContent(ctx context.Context, rest string) (webdav.File, 
 	filename := rest[slash+1:]
 	for _, e := range idx.byRelease[rid] {
 		if e.FileName == filename {
-			slog.Warn("DIAG openContent constructing virtualFile", "name", e.FileName, "virtualFileID", e.VirtualFileID, "size", e.SizeBytes, "ctxErr", ctx.Err())
 			return &virtualFile{
 				ctx:           ctx,
 				db:            f.db,
