@@ -744,6 +744,184 @@ func rarBlock(headType byte, flags uint16, body []byte) []byte {
 	return raw
 }
 
+// rar5Vint encodes v as a RAR5 variable-length integer (7 data bits per
+// byte, high bit set on every byte but the last) -- the inverse of
+// rar5ReadVint, for building synthetic RAR5 fixtures byte-for-byte.
+func rar5Vint(v int64) []byte {
+	if v == 0 {
+		return []byte{0}
+	}
+	var out []byte
+	for v > 0 {
+		b := byte(v & 0x7F)
+		v >>= 7
+		if v > 0 {
+			b |= 0x80
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
+// buildRAR5Header assembles one complete RAR5 header block: a 4-byte CRC
+// (unchecked by the parser, left zero), a HeaderSize vint declaring the
+// exact length of everything that follows it in this block, headType,
+// headFlags (DATA_AREA_PRESENT set whenever dataAreaSize > 0), the
+// dataAreaSize vint itself, and finally typeFields.
+func buildRAR5Header(headType int64, typeFields []byte, dataAreaSize int64) []byte {
+	headFlags := int64(0)
+	var flagFields []byte
+	if dataAreaSize > 0 {
+		headFlags |= 0x0002
+		flagFields = append(flagFields, rar5Vint(dataAreaSize)...)
+	}
+	body := append([]byte{}, rar5Vint(headType)...)
+	body = append(body, rar5Vint(headFlags)...)
+	body = append(body, flagFields...)
+	body = append(body, typeFields...)
+	header := append([]byte{0, 0, 0, 0}, rar5Vint(int64(len(body)))...)
+	return append(header, body...)
+}
+
+// rar5EntryTypeFields builds the type-specific fields shared by RAR5 FILE
+// (headType 2) and SERVICE (headType 3) header blocks: flags, unpacked
+// size, attributes, compression info (0 = store method, non-solid), host
+// OS, and the name length + name itself.
+func rar5EntryTypeFields(name string, unpackedSize int64) []byte {
+	var out []byte
+	out = append(out, rar5Vint(0)...)             // entry flags: size known, not a directory
+	out = append(out, rar5Vint(unpackedSize)...)  // unpacked size
+	out = append(out, rar5Vint(0644)...)          // attributes (unix mode)
+	out = append(out, rar5Vint(0)...)             // compression info: method 0 (store), non-solid
+	out = append(out, rar5Vint(1)...)             // host OS: unix
+	out = append(out, rar5Vint(int64(len(name)))...)
+	return append(out, []byte(name)...)
+}
+
+// buildRAR5Volume assembles one physical RAR5 volume file: magic, a minimal
+// main header, a FILE header for fileName declaring fileDataAreaSize bytes
+// of data (unpackedSize is the entry's total size across every volume, as
+// RAR5's own format redeclares it per volume), that many bytes of content,
+// and -- when qoData is non-empty -- a trailing SERVICE header named "QO"
+// (RAR5's real Quick Open navigation cache) whose own data area holds
+// qoData. This mirrors a real production archive byte-for-byte: a
+// non-final volume's usable data ends where its QO block begins, not at
+// the volume's physical end.
+func buildRAR5Volume(fileName string, unpackedSize, fileDataAreaSize int64, fileData []byte, qoData []byte, trailingPad int) []byte {
+	buf := append([]byte{}, "Rar!\x1a\x07\x01\x00"...)
+	buf = append(buf, buildRAR5Header(1, append(rar5Vint(0), rar5Vint(0)...), 0)...) // minimal main header
+	buf = append(buf, buildRAR5Header(2, rar5EntryTypeFields(fileName, unpackedSize), fileDataAreaSize)...)
+	buf = append(buf, fileData...)
+	if len(qoData) > 0 {
+		buf = append(buf, buildRAR5Header(3, rar5EntryTypeFields("QO", int64(len(qoData))), int64(len(qoData)))...)
+		buf = append(buf, qoData...)
+	}
+	return append(buf, make([]byte, trailingPad)...)
+}
+
+// multiFileFetcherStub serves FetchRange from whichever byte slice matches
+// the requested segment's MessageID, for tests spanning more than one
+// physical volume file (fetcherStub only ever serves a single buffer,
+// regardless of MessageID).
+type multiFileFetcherStub struct {
+	byMessageID map[string][]byte
+}
+
+func (f multiFileFetcherStub) FetchRange(ctx context.Context, segment stream.SegmentRange) ([]byte, error) {
+	data, ok := f.byMessageID[segment.MessageID]
+	if !ok {
+		return nil, errors.New("unknown message id")
+	}
+	return append([]byte(nil), data[segment.RangeStart:segment.RangeEnd]...), nil
+}
+
+// TestInspectRARArchiveVolumeZeroKeepsOwnPackedSizeThroughStoreReconcile
+// guards the fix for a confirmed real-world corruption: reconcileStoreMethodSize
+// overwrote volume 0's entry.PackedSizeBytes (524287672 in production, here
+// scaled down to fileDataAreaSize0) with the entry's cross-volume total
+// (unpackedSize) before that same, now-corrupted entry was copied into
+// volumeEntries and handed to aggregateRARVolumeEntries -- which needs each
+// volume's own local contribution, not the file's total size. Because the
+// wrongly-inflated total exceeded volume 0's raw capacity, its safety clamp
+// (available = volumeSize - archiveOffset) let the FULL remaining volume
+// capacity through instead, silently including volume 0's trailing "QO"
+// (Quick Open) service block -- real RAR5 metadata, not video content -- in
+// the range Drakkar serves as playback data. Confirmed via byte-for-byte
+// comparison of a live NNTP fetch against live DAV output at a real
+// production archive's volume boundary: this spliced header/filename bytes
+// directly into the served stream, which is what surfaced as a visible
+// block plus audio/video desync during playback, worse on releases with
+// more volumes (more boundaries) such as higher-bitrate encodes.
+func TestInspectRARArchiveVolumeZeroKeepsOwnPackedSizeThroughStoreReconcile(t *testing.T) {
+	const (
+		fileName          = "Video.2160p.WEB-DL.mkv"
+		fileDataAreaSize0 = 300
+		fileDataAreaSize1 = 150
+		totalUnpackedSize = fileDataAreaSize0 + fileDataAreaSize1
+	)
+	vol0Data := make([]byte, fileDataAreaSize0)
+	for i := range vol0Data {
+		vol0Data[i] = byte(i + 1) // never zero, so it can't be mistaken for the QO block or trailing pad
+	}
+	qoData := []byte("synthetic-quick-open-cache-of-the-next-header")
+	vol0 := buildRAR5Volume(fileName, totalUnpackedSize, fileDataAreaSize0, vol0Data, qoData, 2)
+
+	vol1Data := make([]byte, fileDataAreaSize1)
+	for i := range vol1Data {
+		vol1Data[i] = byte(i + 100)
+	}
+	vol1 := buildRAR5Volume(fileName, totalUnpackedSize, fileDataAreaSize1, vol1Data, nil, 0)
+
+	files := []ImportedNZBFile{
+		{
+			FileName:      "Video.part01.rar",
+			FileSizeBytes: int64(len(vol0)),
+			Segments: []ImportedNZBSegment{{
+				MessageID: "<vol0@test>", DecodedStartOffset: 0, DecodedEndOffset: int64(len(vol0)),
+			}},
+		},
+		{
+			FileName:      "Video.part02.rar",
+			FileSizeBytes: int64(len(vol1)),
+			Segments: []ImportedNZBSegment{{
+				MessageID: "<vol1@test>", DecodedStartOffset: 0, DecodedEndOffset: int64(len(vol1)),
+			}},
+		},
+	}
+	fetcher := multiFileFetcherStub{byMessageID: map[string][]byte{
+		"<vol0@test>": vol0,
+		"<vol1@test>": vol1,
+	}}
+
+	archives := inspectImportedArchives(context.Background(), []ImportedArchive{{
+		Kind:   "rar",
+		Status: "pending",
+		Volumes: []ImportedArchiveVolume{
+			{Path: "Video.part01.rar", VolumeIndex: 0},
+			{Path: "Video.part02.rar", VolumeIndex: 1},
+		},
+	}}, files, fetcher, "")
+
+	if len(archives) != 1 || archives[0].Status != "supported" {
+		t.Fatalf("unexpected archive result %+v", archives)
+	}
+	if len(archives[0].Entries) != 1 {
+		t.Fatalf("unexpected entries %+v", archives[0].Entries)
+	}
+	entry := archives[0].Entries[0]
+	if len(entry.Ranges) == 0 {
+		t.Fatalf("expected at least one range, got %+v", entry)
+	}
+	vol0Range := entry.Ranges[0]
+	if vol0Range.VolumeIndex != 0 {
+		t.Fatalf("expected first range to cover volume 0, got %+v", vol0Range)
+	}
+	if vol0Range.LengthBytes != fileDataAreaSize0 {
+		t.Fatalf("volume 0 range length = %d, want %d (its own header-declared data size, excluding the trailing QO block) -- entry %+v",
+			vol0Range.LengthBytes, fileDataAreaSize0, entry)
+	}
+}
+
 func loadSevenZipFixture(t *testing.T, name string) []byte {
 	t.Helper()
 	out, err := exec.Command("go", "env", "GOMODCACHE").Output()

@@ -59,23 +59,26 @@ import (
 )
 
 const (
-	maintenanceRecentTVTask    = "hydra_recent_tv"
-	maintenanceRecentMovieTask = "hydra_recent_movie"
-	taskSeerrSync              = "seerr_sync"
-	taskPendingQueuePush       = "pending_queue_push"
-	taskQueueHousekeeping      = "queue_housekeeping"     // merged: stale-queue-reset + retry_failed_queue
-	taskPublishingMaintenance  = "publishing_maintenance" // merged: republish_pending + reset_orphaned_available
-	taskHealthCheck            = "health_check"
-	taskNZBHealthCheck         = "nzb_health_check"
-	taskNZBHealthCheckProgress = "nzb_health_check_progress"
-	taskNZBHealthCoordinator   = "nzb_health_check_coordinator"
-	taskStorageMaintenance     = "storage_maintenance" // merged: cache_prune + library-cleanup
-	taskContentMaintenance     = "content_maintenance" // merged: fill_missing_episodes + search_upgrades
-	taskSyncPlexDetected       = "sync_plex_detected"
-	taskArticleHealthCheck     = "article_health_check"
-	taskBacklogSearch          = "backlog_search"
-	taskEpisodeAirDateBackfill = "episode_air_date_backfill"
-	taskMetadataBackfill       = "metadata_backfill"
+	maintenanceRecentTVTask           = "hydra_recent_tv"
+	maintenanceRecentMovieTask        = "hydra_recent_movie"
+	taskSeerrSync                     = "seerr_sync"
+	taskPendingQueuePush              = "pending_queue_push"
+	taskQueueHousekeeping             = "queue_housekeeping"     // merged: stale-queue-reset + retry_failed_queue
+	taskPublishingMaintenance         = "publishing_maintenance" // merged: republish_pending + reset_orphaned_available
+	taskHealthCheck                   = "health_check"
+	taskNZBHealthCheck                = "nzb_health_check"
+	taskNZBHealthCheckProgress        = "nzb_health_check_progress"
+	taskNZBHealthCoordinator          = "nzb_health_check_coordinator"
+	taskArchiveRangeRepair            = "archive_range_repair"
+	taskArchiveRangeRepairProgress    = "archive_range_repair_progress"
+	taskArchiveRangeRepairCoordinator = "archive_range_repair_coordinator"
+	taskStorageMaintenance            = "storage_maintenance" // merged: cache_prune + library-cleanup
+	taskContentMaintenance            = "content_maintenance" // merged: fill_missing_episodes + search_upgrades
+	taskSyncPlexDetected              = "sync_plex_detected"
+	taskArticleHealthCheck            = "article_health_check"
+	taskBacklogSearch                 = "backlog_search"
+	taskEpisodeAirDateBackfill        = "episode_air_date_backfill"
+	taskMetadataBackfill              = "metadata_backfill"
 )
 
 const (
@@ -348,6 +351,7 @@ func (s *taskScheduleStatusService) ListTaskSchedules(ctx context.Context) ([]ap
 		{ID: taskPublishingMaintenance, Label: "Publishing Maintenance", Group: "Publishing", Interval: "30m", Automated: true, LastRunState: "idle"},
 		{ID: taskHealthCheck, Label: "Run Health Check", Group: "Maintenance", Interval: "15m", Automated: true, LastRunState: "idle"},
 		{ID: taskNZBHealthCheck, Label: "Deep NZB Article Check", Group: "Maintenance", Interval: "168h", Automated: true, LastRunState: "idle"},
+		{ID: taskArchiveRangeRepair, Label: "Archive Range Repair", Group: "Maintenance", Interval: "once", Automated: true, LastRunState: "idle"},
 		{ID: taskArticleHealthCheck, Label: "Article Health Check", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskStorageMaintenance, Label: "Storage Maintenance", Group: "Maintenance", Interval: "6h", Automated: true, LastRunState: "idle"},
 		{ID: taskContentMaintenance, Label: "Content Maintenance", Group: "Indexing", Interval: "6h", Automated: true, LastRunState: "idle"},
@@ -623,12 +627,18 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 	workflowSvc.SetTVDBClient(tvdbClient)
 	publicationSvc := library.NewPublisher(db, rt, cfg.Rclone.RCAddr)
 	rcloneClient := rclone.NewClient(cfg.Rclone.RCAddr)
-	maintenanceSvc := &maintenanceOpsService{
-		base:           maintenance.NewService(db, rt),
+	archiveRepairSvc := &archiveRangeRepairService{
 		db:             db,
-		workflowSvc:    workflowSvc,
 		publicationSvc: publicationSvc,
 		logger:         logger,
+	}
+	maintenanceSvc := &maintenanceOpsService{
+		base:             maintenance.NewService(db, rt),
+		db:               db,
+		workflowSvc:      workflowSvc,
+		publicationSvc:   publicationSvc,
+		logger:           logger,
+		archiveRepairSvc: archiveRepairSvc,
 	}
 	cacheSvc := cache.NewService(cache.NewFileCache(rt.BlockCachePath, rt.DiskCacheLimitBytes))
 	catalogSvc := catalog.NewService(db, tmdbClient)
@@ -1275,6 +1285,35 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 		}
 		logger.Info().Int("scanned", result.ScannedRows).Int("reset", result.ResetItems).
 			Msg("deep nzb health check step complete")
+	})
+	// Gradual, resumable sweep repairing archive_ranges/virtual_files for
+	// multi-volume RAR archives affected by the reconcileStoreMethodSize
+	// ordering bug (fixed in this release) -- see archive_range_repair.go.
+	// Ticks continuously (no due-date gate like the health check) until the
+	// one-time sweep's completion cursor is set, then goes idle.
+	startRecurring(taskArchiveRangeRepairCoordinator, archiveRangeRepairCoordinatorTick, true, func() {
+		completedAt, err := db.GetMaintenanceCursor(ctx, taskArchiveRangeRepair)
+		if err != nil {
+			logger.Error().Err(err).Msg("archive range repair: completion cursor query failed")
+			return
+		}
+		if strings.TrimSpace(completedAt) != "" {
+			return
+		}
+		run, started := archiveRepairSvc.TryStartArchiveRangeRepairSweep()
+		if !started {
+			logger.Info().Msg("archive range repair skipped — worker busy")
+			return
+		}
+		runCtx, cancel := context.WithTimeout(ctx, archiveRangeRepairWorkBudget+5*time.Minute)
+		defer cancel()
+		result, err := run(runCtx)
+		if err != nil {
+			logger.Error().Err(err).Msg("archive range repair failed")
+			return
+		}
+		logger.Info().Int("scanned", result.ScannedRows).Int("repaired", result.RepairedItems).
+			Msg("archive range repair step complete")
 	})
 	startRecurringWithStartupDelay(taskArticleHealthCheck, 6*time.Hour, 15*time.Minute, shouldRunRecentOnStartup(ctx, db, taskArticleHealthCheck, 6*time.Hour, 0, time.Now().UTC()), func() {
 		ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)

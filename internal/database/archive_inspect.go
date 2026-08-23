@@ -205,6 +205,29 @@ func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName
 		return err
 	}
 
+	// Snapshot each first-volume entry's own header-declared PackedSizeBytes
+	// before reconcileStoreMethodSize below can overwrite it. That call
+	// rewrites PackedSizeBytes to the entry's total size across every
+	// volume -- correct for assignArchiveRanges' legacy "total size, walk
+	// forward" algorithm below, but wrong for aggregateRARVolumeEntries,
+	// which needs each volume's own real, local contribution (the same
+	// thing every OTHER volume's entry already supplies, unreconciled).
+	// Confirmed against a real production RAR5 archive: volume 0's header
+	// declares a per-volume data size that already correctly excludes a
+	// trailing "QO" (Quick Open) service block RAR5 writes after a
+	// volume's real data -- reconcileStoreMethodSize's overwrite replaced
+	// that correct, smaller value with the file's cross-volume total, and
+	// aggregateRARVolumeEntries' own safety clamp (available = volumeSize
+	// - archiveOffset) then let the wrongly-inflated value straight
+	// through as if the QO block's bytes were video content, splicing
+	// RAR header/filename metadata into playback at that volume boundary.
+	var volumeEntries []ImportedArchiveEntry
+	for i := range entries {
+		entry := entries[i]
+		entry.VolumeIndex = 0
+		volumeEntries = append(volumeEntries, entry)
+	}
+
 	// Keep the classic first-volume flow as a fallback for older scene archives
 	// where continuation parts may not expose standalone file headers.
 	volumeDataOffsets := fetchContinuationOffsets(ctx, archive.Volumes[1:], fileByName, fetcher)
@@ -221,12 +244,6 @@ func inspectRARArchive(ctx context.Context, archive *ImportedArchive, fileByName
 	copy(legacyEntries, entries)
 	assignArchiveRanges(legacyEntries, volumeSizes, volumeDataOffsets)
 
-	var volumeEntries []ImportedArchiveEntry
-	for i := range entries {
-		entry := entries[i]
-		entry.VolumeIndex = 0
-		volumeEntries = append(volumeEntries, entry)
-	}
 	for _, volume := range archive.Volumes {
 		if volume.VolumeIndex == 0 {
 			continue

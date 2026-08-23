@@ -24,12 +24,20 @@ import (
 // database, workflow, and publication dependencies the base service does not
 // carry; one atomic gate serializes scheduled, regular, and manual callers.
 type maintenanceOpsService struct {
-	base           *maintenance.Service
-	db             *database.DB
-	workflowSvc    *workflow.Service
-	publicationSvc *library.Publisher
-	logger         zerolog.Logger
-	deepHealthRun  atomic.Bool
+	base             *maintenance.Service
+	db               *database.DB
+	workflowSvc      *workflow.Service
+	publicationSvc   *library.Publisher
+	logger           zerolog.Logger
+	deepHealthRun    atomic.Bool
+	archiveRepairSvc *archiveRangeRepairService
+}
+
+// RepairArchiveRangeForRelease delegates to the shared archive-range repair
+// worker (see archive_range_repair.go) to immediately fix one specific
+// release without waiting for the gradual background sweep to reach it.
+func (s *maintenanceOpsService) RepairArchiveRangeForRelease(ctx context.Context, selectedReleaseID int64) (changed bool, started bool, err error) {
+	return s.archiveRepairSvc.RepairArchiveRangeForRelease(ctx, selectedReleaseID)
 }
 
 func (s *maintenanceOpsService) RemoveBrokenMediaSymlinks(ctx context.Context) (maintenance.Result, error) {

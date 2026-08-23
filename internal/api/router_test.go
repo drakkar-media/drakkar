@@ -97,7 +97,10 @@ type publicationStub struct {
 }
 
 type maintenanceStub struct {
-	running bool
+	running              bool
+	archiveRepairRunning bool
+	archiveRepairChanged bool
+	archiveRepairErr     error
 }
 type cacheStub struct{}
 type probeStub struct {
@@ -308,6 +311,13 @@ func (s maintenanceStub) TryStartDeepNZBHealthCheck() (func(context.Context) (ma
 	return func(context.Context) (maintenance.Result, error) {
 		return maintenance.Result{TaskName: "nzb-health-check", ScannedRows: 4, ResetItems: 2}, nil
 	}, true
+}
+
+func (s maintenanceStub) RepairArchiveRangeForRelease(ctx context.Context, selectedReleaseID int64) (bool, bool, error) {
+	if s.archiveRepairRunning {
+		return false, false, nil
+	}
+	return s.archiveRepairChanged, true, s.archiveRepairErr
 }
 
 func (cacheStub) Prune(ctx context.Context) (cache.PruneResult, error) {
@@ -860,6 +870,28 @@ func TestWorkflowEndpoints(t *testing.T) {
 	busyRouter.ServeHTTP(busyHealthRec, httptest.NewRequest(http.MethodPost, "/api/maintenance/nzb-health-check", nil))
 	if busyHealthRec.Code != http.StatusConflict || !strings.Contains(busyHealthRec.Body.String(), `"running":true`) {
 		t.Fatalf("unexpected busy nzb health response %d %s", busyHealthRec.Code, busyHealthRec.Body.String())
+	}
+
+	archiveRepairRouter := Router(statusStub{}, queueSvc, workflowSvc, pub, maintenanceStub{archiveRepairChanged: true}, cacheSvc, subtitles, blocklist, probes, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	archiveRepairReq := httptest.NewRequest(http.MethodPost, "/api/maintenance/archive-range-repair", strings.NewReader(`{"selectedReleaseId":539532}`))
+	archiveRepairRec := httptest.NewRecorder()
+	archiveRepairRouter.ServeHTTP(archiveRepairRec, archiveRepairReq)
+	if archiveRepairRec.Code != http.StatusOK || !strings.Contains(archiveRepairRec.Body.String(), `"changed":true`) {
+		t.Fatalf("unexpected archive range repair response %d %s", archiveRepairRec.Code, archiveRepairRec.Body.String())
+	}
+
+	missingIDReq := httptest.NewRequest(http.MethodPost, "/api/maintenance/archive-range-repair", strings.NewReader(`{}`))
+	missingIDRec := httptest.NewRecorder()
+	archiveRepairRouter.ServeHTTP(missingIDRec, missingIDReq)
+	if missingIDRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected bad request for missing selectedReleaseId, got %d %s", missingIDRec.Code, missingIDRec.Body.String())
+	}
+
+	busyArchiveRepairRouter := Router(statusStub{}, queueSvc, workflowSvc, pub, maintenanceStub{archiveRepairRunning: true}, cacheSvc, subtitles, blocklist, probes, nil, NewEventBroker(), nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	busyArchiveRepairRec := httptest.NewRecorder()
+	busyArchiveRepairRouter.ServeHTTP(busyArchiveRepairRec, httptest.NewRequest(http.MethodPost, "/api/maintenance/archive-range-repair", strings.NewReader(`{"selectedReleaseId":539532}`)))
+	if busyArchiveRepairRec.Code != http.StatusConflict || !strings.Contains(busyArchiveRepairRec.Body.String(), `"running":true`) {
+		t.Fatalf("unexpected busy archive range repair response %d %s", busyArchiveRepairRec.Code, busyArchiveRepairRec.Body.String())
 	}
 
 	searchReq := httptest.NewRequest(http.MethodPost, "/api/library/42/search", nil)

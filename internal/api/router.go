@@ -215,6 +215,12 @@ type PublicationService interface {
 // an acquired run must release its reservation on every exit path.
 type MaintenanceService interface {
 	TryStartDeepNZBHealthCheck() (func(context.Context) (maintenance.Result, error), bool)
+	// RepairArchiveRangeForRelease immediately re-inspects and repairs one
+	// specific release's archive_ranges/virtual_files, without waiting for
+	// the gradual background sweep to reach it. started=false means the
+	// shared repair worker was already busy (scheduled sweep or another
+	// manual call) and nothing was attempted.
+	RepairArchiveRangeForRelease(ctx context.Context, selectedReleaseID int64) (changed bool, started bool, err error)
 }
 
 // CacheService defines the operation required to prune the on-disk segment
@@ -1875,6 +1881,36 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 			publishMutation("maintenance.nzb_health_check", map[string]any{"scannedRows": result.ScannedRows, "resetItems": result.ResetItems})
 		}()
 		respondJSON(w, http.StatusAccepted, map[string]any{"queued": true})
+	})
+	r.Post("/api/maintenance/archive-range-repair", func(w http.ResponseWriter, r *http.Request) {
+		if maintenance == nil {
+			respondError(w, http.StatusNotImplemented, errors.New("maintenance unavailable"))
+			return
+		}
+		var body struct {
+			SelectedReleaseID int64 `json:"selectedReleaseId"`
+		}
+		if err := decodeJSONBody(r, &body); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		if body.SelectedReleaseID <= 0 {
+			respondError(w, http.StatusBadRequest, errors.New("selectedReleaseId required"))
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		changed, started, err := maintenance.RepairArchiveRangeForRelease(ctx, body.SelectedReleaseID)
+		if !started {
+			respondJSON(w, http.StatusConflict, map[string]any{"queued": false, "running": true})
+			return
+		}
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, err)
+			return
+		}
+		publishMutation("maintenance.archive_range_repair", map[string]any{"selectedReleaseId": body.SelectedReleaseID, "changed": changed})
+		respondJSON(w, http.StatusOK, map[string]any{"changed": changed})
 	})
 	r.Get("/api/events", broker.ServeHTTP)
 	r.Get("/api/health/summary", func(w http.ResponseWriter, r *http.Request) {
