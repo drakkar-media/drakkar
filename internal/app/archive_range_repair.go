@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -62,10 +63,32 @@ func (s *archiveRangeRepairService) RepairArchiveRangeForRelease(ctx context.Con
 // symlink and available/published state afterward via RepublishLibraryItem,
 // since ImportSelectedReleaseNZB's delete-and-recreate of virtual_files
 // cascades away the existing symlink_publications row.
+//
+// CalibrateNZBOffsets is called synchronously (unlike the normal import
+// path's fire-and-forget calibrateImportedDocumentBestEffort) and its error
+// is fatal to this repair: ImportSelectedReleaseNZB inserts fresh nzb_files
+// rows with only estimated per-segment sizes (parsed from the NZB's encoded
+// byte counts times a fixed yEnc factor), never the real, live-measured
+// value the previous rows had. The stored_rar reader has no tolerance for
+// that gap the way direct_nzb does -- confirmed live, the hard way: an
+// earlier version of this function that skipped this call left every
+// repaired release with "stored_rar layout invalid" on every read, an
+// outright playback break, not the narrower boundary corruption this repair
+// was written to fix.
+//
+// changed is measured by comparing the full per-volume archive_ranges shape
+// before and after, not virtual_files.size_bytes -- the exact corruption
+// this repairs (volume 0 stealing a few hundred bytes that belong to the
+// next volume) routinely leaves the release's grand total completely
+// unchanged, since aggregateRARVolumeEntries' own diff<=16 reconciliation
+// forces the total to match regardless of whether any individual volume's
+// boundary was computed correctly. Confirmed live: the archive this fix was
+// first found on shows no size_bytes change at all despite a real,
+// corrected boundary.
 func repairArchiveRangeCandidate(ctx context.Context, db *database.DB, publicationSvc *library.Publisher, selectedReleaseID int64) (bool, error) {
-	before, err := db.SumVirtualFileSizeForRelease(ctx, selectedReleaseID)
+	before, err := db.SnapshotArchiveRangesForRelease(ctx, selectedReleaseID)
 	if err != nil {
-		return false, fmt.Errorf("read pre-repair size for release %d: %w", selectedReleaseID, err)
+		return false, fmt.Errorf("read pre-repair ranges for release %d: %w", selectedReleaseID, err)
 	}
 	doc, err := db.GetStoredNZBDocument(ctx, selectedReleaseID)
 	if err != nil {
@@ -79,16 +102,21 @@ func repairArchiveRangeCandidate(ctx context.Context, db *database.DB, publicati
 	if err != nil {
 		return false, err
 	}
+	if snapshot.NZBDocumentID != nil {
+		if err := db.CalibrateNZBOffsets(ctx, *snapshot.NZBDocumentID); err != nil {
+			return false, fmt.Errorf("calibrate nzb document %d after repair: %w", *snapshot.NZBDocumentID, err)
+		}
+	}
 	if publicationSvc != nil {
 		if err := publicationSvc.RepublishLibraryItem(ctx, snapshot.LibraryItemID); err != nil {
 			return false, fmt.Errorf("republish library item %d after repair: %w", snapshot.LibraryItemID, err)
 		}
 	}
-	after, err := db.SumVirtualFileSizeForRelease(ctx, selectedReleaseID)
+	after, err := db.SnapshotArchiveRangesForRelease(ctx, selectedReleaseID)
 	if err != nil {
-		return false, fmt.Errorf("read post-repair size for release %d: %w", selectedReleaseID, err)
+		return false, fmt.Errorf("read post-repair ranges for release %d: %w", selectedReleaseID, err)
 	}
-	return before != after, nil
+	return !slices.Equal(before, after), nil
 }
 
 const (

@@ -1,6 +1,9 @@
 package database
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // ArchiveRangeRepairCandidate identifies a multi-volume RAR archive whose
 // entries/ranges may have been computed by the pre-fix inspectRARArchive
@@ -73,9 +76,14 @@ func (db *DB) ArchiveRangeRepairSweepUpperBound(ctx context.Context) (int64, err
 }
 
 // SumVirtualFileSizeForRelease returns the total virtual_files.size_bytes
-// across every entry of selectedReleaseID, used by the archive-range repair
-// task to detect whether re-inspection actually changed anything (0 if the
-// release currently has no virtual files, e.g. mid-repair).
+// across every entry of selectedReleaseID. Kept as a cheap sanity signal, but
+// NOT sufficient on its own to detect whether a repair actually changed
+// anything: aggregateRARVolumeEntries' own diff<=16 reconciliation forces the
+// entry's total size to match regardless of whether an individual volume's
+// boundary was computed correctly, so the exact corruption this repair fixes
+// -- a wrong split between two volumes' lengths -- routinely leaves the
+// grand total completely unchanged. Use SnapshotArchiveRangesForRelease for
+// real before/after change detection.
 func (db *DB) SumVirtualFileSizeForRelease(ctx context.Context, selectedReleaseID int64) (int64, error) {
 	var total int64
 	err := db.SQL.QueryRowContext(ctx, `
@@ -84,4 +92,41 @@ func (db *DB) SumVirtualFileSizeForRelease(ctx context.Context, selectedReleaseI
 		where selected_release_id = $1`, selectedReleaseID,
 	).Scan(&total)
 	return total, err
+}
+
+// SnapshotArchiveRangesForRelease returns a stable, order-independent
+// representation of every archive_ranges row for selectedReleaseID's
+// archives, keyed by (entry path, volume index) rather than row id --
+// ImportSelectedReleaseNZB deletes and recreates these rows with fresh ids on
+// every repair, so id-based comparison would always report "changed" even
+// when nothing about the actual byte layout moved. Compare two snapshots with
+// slices.Equal after sorting (both are already sorted here) to detect
+// whether a repair actually altered any volume's offset or length.
+func (db *DB) SnapshotArchiveRangesForRelease(ctx context.Context, selectedReleaseID int64) ([]string, error) {
+	rows, err := db.SQL.QueryContext(ctx, `
+		select ae.path, av.volume_index, ar.entry_offset, ar.archive_offset, ar.length_bytes
+		from archive_ranges ar
+		join archive_entries ae on ae.id = ar.archive_entry_id
+		join archive_volumes av on av.id = ar.archive_volume_id
+		join archives a on a.id = ae.archive_id
+		where a.selected_release_id = $1
+		order by ae.path, av.volume_index`, selectedReleaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var path string
+		var volumeIndex int
+		var entryOffset, archiveOffset, lengthBytes int64
+		if err := rows.Scan(&path, &volumeIndex, &entryOffset, &archiveOffset, &lengthBytes); err != nil {
+			return nil, err
+		}
+		out = append(out, fmt.Sprintf("%s|%d|%d|%d|%d", path, volumeIndex, entryOffset, archiveOffset, lengthBytes))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
