@@ -5018,7 +5018,13 @@ func (s *Service) manageQueueItemWithSettings(ctx context.Context, queueItemID i
 		if err := s.repo.BlocklistQueueSelectedRelease(ctx, queueItemID, "manual_reject", settings.BlocklistTTLDays); err != nil {
 			return QueueManageResult{}, err
 		}
-		if err := s.repo.ClearQueueSelectedRelease(ctx, queueItemID); err != nil {
+		// ResetLibraryItem, not the bare ClearQueueSelectedRelease this used to
+		// call: blocklisting is reachable against a queue item in ANY state,
+		// including one that's currently `available` (e.g. the details page's
+		// per-episode "blocklist bad release" action) -- see the sibling
+		// QueueActionRemoveBlocklistAndSearch case below for why
+		// ClearQueueSelectedRelease alone is unsafe for that case.
+		if err := s.ResetLibraryItem(ctx, target.LibraryItemID); err != nil {
 			return QueueManageResult{}, err
 		}
 		return QueueManageResult{QueueItemID: queueItemID, Action: string(policy.QueueActionRemoveAndBlocklist)}, nil
@@ -5026,7 +5032,31 @@ func (s *Service) manageQueueItemWithSettings(ctx context.Context, queueItemID i
 		if err := s.repo.BlocklistQueueSelectedRelease(ctx, queueItemID, "manual_reject", settings.BlocklistTTLDays); err != nil {
 			return QueueManageResult{}, err
 		}
-		if err := s.repo.ClearQueueSelectedRelease(ctx, queueItemID); err != nil {
+		// ResetLibraryItem (symlink cleanup + ResetLibraryItemState), not the
+		// bare ClearQueueSelectedRelease this used to call. Confirmed live
+		// (2026-08-23): this action is reachable against a queue item that is
+		// currently `state='available'` (a published, currently-playing
+		// episode whose release a health check or the user has just found to
+		// be bad) -- ClearQueueSelectedRelease only deletes the DB
+		// selected_releases/virtual_files/symlink_publications rows (cascade),
+		// it never calls os.Remove on the actual filesystem symlink, and it
+		// deliberately leaves queue_items.state and library_items.available
+		// untouched "so the item can be re-dispatched by the normal retry
+		// loop" -- correct for an already-failed item (nothing published to
+		// clean up), wrong for an available one: the on-disk symlink is left
+		// dangling (pointing at now-deleted backing data) while
+		// library_items.available still reports true, until either the
+		// search below republishes over the same path or the 30-minute
+		// ResetOrphanedAvailableItems sweep notices and cleans up. It also
+		// meant the immediately-following SearchLibrary call still saw an
+		// existing selection reference get raced by GetLatestSelectedReleaseSummaryByLibraryItem
+		// inconsistently depending on timing. ResetLibraryItem removes the
+		// symlink synchronously, marks available=false honestly, and fully
+		// clears the selection before the search below runs -- for an
+		// already-failed item (the only case this action was reachable for
+		// before), DeleteSymlinkPublicationsForLibraryItem is simply a no-op
+		// (no symlink exists yet), so behavior is unchanged there.
+		if err := s.ResetLibraryItem(ctx, target.LibraryItemID); err != nil {
 			return QueueManageResult{}, err
 		}
 		search, err := s.SearchLibrary(ctx, target.LibraryItemID)

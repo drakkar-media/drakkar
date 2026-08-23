@@ -22,6 +22,7 @@
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import Upload from '@lucide/svelte/icons/upload';
   import Info from '@lucide/svelte/icons/info';
+  import SearchCheck from '@lucide/svelte/icons/search-check';
   import Button from '$lib/components/Button.svelte';
   import PosterCard from '$lib/components/PosterCard.svelte';
   import StatusPill from '$lib/components/StatusPill.svelte';
@@ -35,7 +36,7 @@
   import { bytes as fmtBytes } from '$lib/format';
   import { runAction, confirmed } from '$lib/actions';
   import { onMount } from 'svelte';
-  import type { CurrentFile, DiscoverDetails, LibraryDetail, LibraryItem, ManualSearchItem, QualityProfile, ReleaseItem } from '$lib/types';
+  import type { CurrentFile, DiscoverDetails, LibraryDetail, LibraryItem, ManualSearchItem, QualityProfile, QueueItem, ReleaseItem } from '$lib/types';
 
   let detail: DiscoverDetails | null = null;
   let libraryMatch: LibraryItem | null = null;
@@ -122,6 +123,13 @@
     busy = { ...busy, [key]: value };
   }
   let activeKey = '';
+  // Maps an episode's libraryItemId to its queueItemId, needed by the
+  // per-episode "Blacklist + search next" action (api.queueAction operates
+  // on a queue item, not a library item). Sourced from api.queue(), which
+  // only returns active items plus the most recent 200 available/failed ones
+  // — a very old, untouched episode may have no entry here, in which case
+  // the button simply doesn't render for it (see episode row markup below).
+  let episodeQueueItemIds: Record<number, number> = {};
 
   let episodeInfoOpen = false;
   let episodeInfoLoading = false;
@@ -212,19 +220,28 @@
       detail = discover;
       libraryMatch = library.items.find((item) => sameIdentity(item, mediaType, discover.title, discover.year, discover.tmdbId, discover.imdbId)) ?? null;
       if (libraryMatch) {
-        const [detailResult, profilesResult, activeProfileResult] = await Promise.all([
+        const [detailResult, profilesResult, activeProfileResult, queueItems] = await Promise.all([
           api.libraryDetail(libraryMatch.id),
           api.listProfiles().catch(() => ({ profiles: [] })),
-          api.getLibraryProfile(libraryMatch.id).catch(() => ({ profile: null }))
+          api.getLibraryProfile(libraryMatch.id).catch(() => ({ profile: null })),
+          mediaType === 'tv'
+            ? api.queue().then((r) => r.items).catch(() => [] as QueueItem[])
+            : Promise.resolve([] as QueueItem[])
         ]);
         if (token !== loadToken) return;
         localDetail = detailResult;
         profiles = profilesResult.profiles ?? [];
         activeProfileId = activeProfileResult.profile?.id ?? null;
+        const nextEpisodeQueueItemIds: Record<number, number> = {};
+        for (const item of queueItems) {
+          nextEpisodeQueueItemIds[item.libraryItemId] = item.queueItemId;
+        }
+        episodeQueueItemIds = nextEpisodeQueueItemIds;
       } else {
         localDetail = null;
         profiles = [];
         activeProfileId = null;
+        episodeQueueItemIds = {};
       }
     } catch (error) {
       if (token !== loadToken) return;
@@ -467,6 +484,17 @@
     await runAction(() => api.resetLibraryItem(targetLibraryItemId), {
       setWorking: (v) => setBusy(`reset-${targetLibraryItemId}`, v),
       successMessage: () => 'Item reset — re-queued',
+      afterSuccess: loadDetail
+    });
+  }
+
+  async function blacklistAndSearchEpisode(targetLibraryItemId: number, label: string) {
+    const targetQueueItemId = episodeQueueItemIds[targetLibraryItemId];
+    if (!targetQueueItemId) return;
+    if (!confirmed(`Blacklist the current release for "${label}" and search for a replacement now?`)) return;
+    await runAction(() => api.queueAction(targetQueueItemId, 'remove_blocklist_and_search'), {
+      setWorking: (v) => setBusy(`blacklist-search-${targetLibraryItemId}`, v),
+      successMessage: (result) => (result.searchCandidateCount ? `Blacklisted — found ${result.searchCandidateCount} replacement candidate(s)` : 'Blacklisted — searching for a replacement'),
       afterSuccess: loadDetail
     });
   }
@@ -746,6 +774,14 @@
                                   title="Episode file info"
                                   on:click={() => openEpisodeInfo(epId, epLabel)}
                                 ><Info size={11} /></button>
+                                {#if episodeQueueItemIds[epId]}
+                                  <button
+                                    class="action-btn"
+                                    title="Blacklist the current release and search for a replacement now"
+                                    disabled={isBusy(`blacklist-search-${epId}`)}
+                                    on:click={() => blacklistAndSearchEpisode(epId, epLabel)}
+                                  ><SearchCheck size={11} /> Replace</button>
+                                {/if}
                                 <button
                                   class="action-btn action-btn-icon action-btn-danger"
                                   title="Reset this episode"

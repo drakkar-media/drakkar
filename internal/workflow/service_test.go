@@ -61,6 +61,7 @@ type repoStub struct {
 	rejected                  []string
 	retryTarget               database.QueueRetryTarget
 	skipped                   []int64
+	resetLibraryItems         []int64
 	requeued                  []int64
 	clearedDispatchBackoff    []int64
 	paused                    []int64
@@ -506,7 +507,10 @@ func (r *repoStub) DismissSabItems(_ context.Context, _ []int64) error { return 
 func (r *repoStub) DeleteSymlinkPublicationsForLibraryItem(_ context.Context, _ int64) ([]string, error) {
 	return nil, nil
 }
-func (r *repoStub) ResetLibraryItemState(_ context.Context, _ int64) error { return nil }
+func (r *repoStub) ResetLibraryItemState(_ context.Context, libraryItemID int64) error {
+	r.resetLibraryItems = append(r.resetLibraryItems, libraryItemID)
+	return nil
+}
 func (r *repoStub) ListUnrecoverableLibraryItems(_ context.Context) ([]int64, error) {
 	return nil, nil
 }
@@ -3500,7 +3504,7 @@ func TestSearchRecentPendingStopsCleanlyOnceBatchContextExpires(t *testing.T) {
 // this function via a 2026-08-20 codebase audit: ManageQueueItems is
 // reachable synchronously from POST /api/queue/bulk-action (r.Context()),
 // and shared ONE context across every item in the batch, all the way down
-// through manageQueueItemWithSettings's ClearQueueSelectedRelease call (and,
+// through manageQueueItemWithSettings's per-action cleanup call (and,
 // for QueueActionRemoveBlocklistAndSearch, a real SearchLibrary indexer
 // round-trip). A large batch outliving the client's own timeout or an
 // intervening reverse-proxy's read timeout would cancel r.Context()
@@ -3529,6 +3533,85 @@ func TestManageQueueItemsStopsCleanlyOnceBatchContextExpires(t *testing.T) {
 	}
 	if len(repo.skipped) != 0 {
 		t.Fatalf("expected no ClearQueueSelectedRelease calls once the batch context is already done, got %v", repo.skipped)
+	}
+}
+
+// TestManageQueueItemRemoveAndBlocklistUsesResetLibraryItem guards a real gap
+// (2026-08-23): QueueActionRemoveAndBlocklist and QueueActionRemoveBlocklistAndSearch
+// used to call the bare ClearQueueSelectedRelease after blocklisting, which
+// only deletes DB rows (selected_releases/virtual_files/symlink_publications
+// cascade) -- it never calls os.Remove on the actual filesystem symlink, and
+// it deliberately leaves queue_items.state and library_items.available
+// untouched. That's correct for an already-failed item (nothing published to
+// clean up), but both actions are also reachable against a queue item that is
+// currently state='available' (e.g. the details page's per-episode
+// "blocklist bad release, search for a replacement" action, added for a
+// currently-published episode found corrupt by the health check) -- for that
+// case, ClearQueueSelectedRelease left a dangling on-disk symlink pointing at
+// now-deleted backing data while library_items.available kept reporting
+// true. ResetLibraryItem (symlink cleanup + ResetLibraryItemState) is correct
+// for both cases: a no-op symlink deletion when none exists yet, and a real
+// one when it does. This asserts ResetLibraryItemState (not the old
+// ClearQueueSelectedRelease) is what actually runs.
+func TestManageQueueItemRemoveAndBlocklistUsesResetLibraryItem(t *testing.T) {
+	repo := &repoStub{
+		retryTarget: database.QueueRetryTarget{QueueItemID: 55, LibraryItemID: 42, State: database.QueueAvailable},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{})
+
+	result, err := service.ManageQueueItem(context.Background(), 55, string(policy.QueueActionRemoveAndBlocklist))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Action != string(policy.QueueActionRemoveAndBlocklist) {
+		t.Fatalf("unexpected action in result: %+v", result)
+	}
+	if len(repo.failed) != 1 || repo.failed[0] != "blocklist:manual_reject" {
+		t.Fatalf("expected the release to be blocklisted, got %v", repo.failed)
+	}
+	if len(repo.skipped) != 0 {
+		t.Fatalf("expected the old bare ClearQueueSelectedRelease NOT to be called anymore, got %v", repo.skipped)
+	}
+	if len(repo.resetLibraryItems) != 1 || repo.resetLibraryItems[0] != 42 {
+		t.Fatalf("expected ResetLibraryItemState to be called for library item 42, got %v", repo.resetLibraryItems)
+	}
+}
+
+// TestManageQueueItemRemoveBlocklistAndSearchUsesResetLibraryItem is the
+// full-flow sibling of TestManageQueueItemRemoveAndBlocklistUsesResetLibraryItem:
+// blocklist, reset (symlink+state cleanup), then a real search that finds and
+// selects a replacement -- exactly the "this release is bad, get me a
+// different one now" action a currently-available episode needs.
+func TestManageQueueItemRemoveBlocklistAndSearchUsesResetLibraryItem(t *testing.T) {
+	repo := &repoStub{
+		retryTarget: database.QueueRetryTarget{QueueItemID: 55, LibraryItemID: 42, State: database.QueueAvailable},
+		searchInput: database.LibrarySearchInput{
+			LibraryItemID: 42,
+			MediaType:     "movie",
+			Title:         "Dune",
+			MovieYear:     2021,
+		},
+	}
+	service := NewService(repo, seerrStub{}, hydraStub{results: []hydra.SearchResult{
+		{Title: "Dune.2021.1080p.WEB-DL.x265-GRP", Link: "http://example/nzb", Indexer: "hydra", SizeBytes: 1234, PublishedAt: time.Now()},
+	}})
+	service.fetcher = fetcherStub{
+		fileName: "dune.nzb",
+		raw:      []byte(`<?xml version="1.0" encoding="UTF-8"?><nzb><file subject="&quot;Dune (2021).mkv&quot;" poster="poster" date="1710000000"><groups><group>alt.binaries.movies</group></groups><segments><segment bytes="1000" number="1">&lt;msg1&gt;</segment></segments></file></nzb>`),
+	}
+
+	result, err := service.ManageQueueItem(context.Background(), 55, string(policy.QueueActionRemoveBlocklistAndSearch))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.resetLibraryItems) != 1 || repo.resetLibraryItems[0] != 42 {
+		t.Fatalf("expected ResetLibraryItemState to be called for library item 42 before the search ran, got %v", repo.resetLibraryItems)
+	}
+	if len(repo.skipped) != 0 {
+		t.Fatalf("expected the old bare ClearQueueSelectedRelease NOT to be called anymore, got %v", repo.skipped)
+	}
+	if result.SelectedReleaseID == nil {
+		t.Fatalf("expected the search to find and select a replacement, got %+v", result)
 	}
 }
 
