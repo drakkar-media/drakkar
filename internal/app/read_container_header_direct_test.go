@@ -112,3 +112,25 @@ func TestContainerHeaderBackendEOFIsDefinitiveHealthFailure(t *testing.T) {
 		t.Fatalf("expected cancellation to remain transient, got: %v", err)
 	}
 }
+
+// TestWildlyInconsistentPositionIsDefinitiveHealthFailure guards the
+// 2026-08-23 fix: FetchRangeInfoPriority's yEnc-position sanity check
+// (internal/nntp/fetcher.go) rejects a segment whose fetched article
+// declares a decoded position nowhere near its expected one -- confirmed
+// live to mean the article is a permanent, one-time data error in the
+// original post (it genuinely belongs to a different upload), never
+// something a retry fixes. Before this fix, readContainerHeaderDirect's
+// errContainerHeaderUnreadable wrapping (this message matches none of its
+// three explicit substrings) fell through to the default "true" (transient)
+// branch, so a release broken this way was retried forever instead of being
+// blocklisted in favor of a working alternate.
+func TestWildlyInconsistentPositionIsDefinitiveHealthFailure(t *testing.T) {
+	inner := errors.New("article <msg@id>: declared decoded position 64601088 is wildly inconsistent with expected 0 (off by 64601088) -- likely wrong cached/fetched article data")
+	wrapped := fmt.Errorf("%w: read header: %w", errContainerHeaderUnreadable, inner)
+	if isTransientHealthCheckErr(wrapped) {
+		t.Fatalf("expected a wildly-inconsistent position to be definitive (permanent, one-time data error), got transient: %v", wrapped)
+	}
+	if isTransientHealthCheckErr(inner) {
+		t.Fatalf("expected a wildly-inconsistent position to be definitive even unwrapped, got transient: %v", inner)
+	}
+}

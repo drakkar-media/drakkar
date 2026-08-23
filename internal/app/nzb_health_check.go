@@ -162,6 +162,23 @@ func isTransientHealthCheckErr(err error) bool {
 	if strings.Contains(msg, "status 430") {
 		return false
 	}
+	// FetchRangeInfoPriority's yEnc-position sanity check (internal/nntp/fetcher.go):
+	// the fetched article's own declared decoded position is nowhere near
+	// where its messageID is supposed to sit in the file. Confirmed live
+	// (2026-08-23) this reflects a permanent, one-time data error in the
+	// original post -- the article genuinely belongs to a different upload
+	// entirely (its own yEnc header names a different total size and part
+	// count) -- not a transient fetch/provider issue, so a segment
+	// mismatched this badly will never resolve itself on retry. Without this
+	// check, readContainerHeaderDirect's errContainerHeaderUnreadable
+	// wrapping (below) would fall through to its default "true" (transient)
+	// branch, since this message matches none of its three explicit
+	// substrings, and a release broken this way would be retried forever
+	// instead of being blocklisted so a working alternate release can be
+	// found.
+	if strings.Contains(msg, "wildly inconsistent") {
+		return false
+	}
 	if errors.Is(err, errContainerHeaderUnreadable) {
 		lower := strings.ToLower(msg)
 		if strings.Contains(lower, "range outside file") ||
