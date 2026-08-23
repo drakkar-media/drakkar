@@ -185,15 +185,36 @@ func (s *clientSession) Body(ctx context.Context, messageID string) ([]byte, err
 	// where a seek cancels up to 40 in-flight read-ahead connections.
 	stop := context.AfterFunc(ctx, func() { _ = s.conn.SetDeadline(time.Now()) })
 	defer stop()
-	if err := writeCommand(s.writer, "BODY "+normalizeMessageID(messageID)); err != nil {
+	normalized := normalizeMessageID(messageID)
+	if err := writeCommand(s.writer, "BODY "+normalized); err != nil {
 		return nil, err
 	}
-	code, _, err := readStatusLine(s.reader)
+	code, text, err := readStatusLine(s.reader)
 	if err != nil {
 		return nil, err
 	}
 	if code != 222 {
 		return nil, fmt.Errorf("unexpected BODY status %d", code)
+	}
+	// The 222 response echoes "<article-number> <message-id>" (RFC 3977
+	// §6.2.3) -- confirmed live against this project's actual provider
+	// (Newshosting): every real BODY response reliably includes it. Requiring
+	// it match before trusting the body that follows is the fix for a real,
+	// confirmed-live 2026-08-23 production incident: a session whose protocol
+	// stream had desynced (root cause not fully pinned down -- a provider-side
+	// hiccup and a client-side race were both live candidates, but this check
+	// is correct regardless of which) kept returning some OTHER article's
+	// bytes for whatever messageID was actually requested, with no
+	// transport-level error at all -- FetchRangeInfoPriority's yEnc-position
+	// sanity check (see fetcher.go) could catch the resulting mismatch after
+	// the fact, but by then this session had already been handed back to
+	// PooledSource as "healthy" and reused for every subsequent caller,
+	// repeating the same wrong answer for hundreds of unrelated requests
+	// before whatever connection eventually got swept. Rejecting here, before
+	// readMultilineBody, means PooledSource.discard closes this connection
+	// immediately instead of recycling a desynced one back into the pool.
+	if !strings.Contains(text, normalized) {
+		return nil, fmt.Errorf("nntp: BODY response for %s did not echo the requested message-id (got %q) -- connection desynced", normalized, text)
 	}
 	return readMultilineBody(s.reader)
 }
@@ -208,10 +229,11 @@ func (s *clientSession) Stat(ctx context.Context, messageID string) error {
 	}
 	stop := context.AfterFunc(ctx, func() { _ = s.conn.SetDeadline(time.Now()) })
 	defer stop()
-	if err := writeCommand(s.writer, "STAT "+normalizeMessageID(messageID)); err != nil {
+	normalized := normalizeMessageID(messageID)
+	if err := writeCommand(s.writer, "STAT "+normalized); err != nil {
 		return err
 	}
-	code, _, err := readStatusLine(s.reader)
+	code, text, err := readStatusLine(s.reader)
 	if err != nil {
 		return err
 	}
@@ -220,6 +242,12 @@ func (s *clientSession) Stat(ctx context.Context, messageID string) error {
 	}
 	if code != 223 {
 		return fmt.Errorf("unexpected STAT status %d", code)
+	}
+	// See the matching check in Body for why this matters: a desynced
+	// connection giving a stale 223 response for a different article would
+	// otherwise report success for entirely the wrong messageID.
+	if !strings.Contains(text, normalized) {
+		return fmt.Errorf("nntp: STAT response for %s did not echo the requested message-id (got %q) -- connection desynced", normalized, text)
 	}
 	return nil
 }
