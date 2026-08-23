@@ -205,6 +205,24 @@ func (s *CachedDecodedSource) DecodedBodyInfoPriority(ctx context.Context, messa
 	return combined[encodedPartInfoLen:], info, nil
 }
 
+// InvalidateCached forgets messageID's cached decoded body and PartInfo in
+// this in-memory layer, then delegates to the wrapped source so a
+// further-wrapped layer (in production, DiskCachedDecodedSource's on-disk
+// cache) forgets it too -- otherwise clearing only this RAM layer would just
+// have the very next fetch repopulate it straight from the still-poisoned
+// disk entry. See DiskCachedDecodedSource.InvalidateCached for why this
+// exists at all.
+func (s *CachedDecodedSource) InvalidateCached(messageID string) {
+	if s == nil {
+		return
+	}
+	s.cache.Remove(messageID)
+	s.infoCache.Remove(messageID)
+	if inv, ok := s.source.(interface{ InvalidateCached(string) }); ok {
+		inv.InvalidateCached(messageID)
+	}
+}
+
 // Stat reports whether messageID exists without requiring the caller to
 // consume a decoded body: a cache hit is itself proof of existence, and
 // otherwise this defers to the wrapped source's Stat when available, falling

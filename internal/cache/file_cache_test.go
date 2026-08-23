@@ -29,6 +29,38 @@ func TestFileCachePutGetTrim(t *testing.T) {
 	}
 }
 
+// TestFileCacheRemove guards InvalidateCached's use of FileCache.Remove: a
+// cache entry that turns out to hold wrong data must actually disappear from
+// disk (not just become unreachable in the in-memory index), and the freed
+// bytes must come back off the size budget so they don't count against future
+// evictions forever.
+func TestFileCacheRemove(t *testing.T) {
+	cache := NewFileCache(t.TempDir(), 1024)
+	if err := cache.Put("a", []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	path := cache.pathFor("a")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected cache file to exist before Remove: %v", err)
+	}
+	if err := cache.Remove("a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := cache.Get("a"); err != nil || ok {
+		t.Fatalf("expected a removed, ok=%v err=%v", ok, err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected cache file deleted from disk, stat err=%v", err)
+	}
+	if cache.total != 0 {
+		t.Fatalf("expected size index back to 0 after removing sole entry, got %d", cache.total)
+	}
+	// Removing an absent key must not error.
+	if err := cache.Remove("missing"); err != nil {
+		t.Fatalf("expected no error removing absent key, got %v", err)
+	}
+}
+
 // TestFileCacheSeedsFromExistingDiskContentsAfterRestart guards the new
 // in-memory-index design (replacing the old per-call full-directory-rescan
 // Trim, which cost 58% of the process's CPU in production once the cache hit

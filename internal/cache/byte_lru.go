@@ -89,6 +89,11 @@ func (c *ByteLRU) Put(key string, value []byte) {
 	c.shardFor(key).put(key, value)
 }
 
+// Remove deletes key from the cache, if present.
+func (c *ByteLRU) Remove(key string) {
+	c.shardFor(key).remove(key)
+}
+
 func (s *byteLRUShard) get(key string) ([]byte, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -118,6 +123,17 @@ func (s *byteLRUShard) put(key string, value []byte) {
 	s.entries[key] = ele
 	s.size += int64(len(clone))
 	s.trim()
+}
+
+func (s *byteLRUShard) remove(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if ele, ok := s.entries[key]; ok {
+		item := ele.Value.(*byteEntry)
+		s.size -= int64(len(item.value))
+		delete(s.entries, key)
+		s.ll.Remove(ele)
+	}
 }
 
 func (s *byteLRUShard) trim() {

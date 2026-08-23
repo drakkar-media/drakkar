@@ -50,6 +50,22 @@ func TestByteLRURoundTrip(t *testing.T) {
 // blow past maxBytes many times over, older entries must eventually be
 // evicted somewhere, even though sharding means eviction order is no longer
 // exact across the whole cache (see the ByteLRU type comment).
+func TestByteLRURemove(t *testing.T) {
+	c := NewByteLRU(1024)
+	c.Put("a", []byte("hello"))
+	c.Remove("a")
+	if _, ok := c.Get("a"); ok {
+		t.Fatal("expected a removed")
+	}
+	// Removing an absent key must not panic and must leave other keys alone.
+	c.Remove("missing")
+	c.Put("b", []byte("world"))
+	c.Remove("missing")
+	if got, ok := c.Get("b"); !ok || string(got) != "world" {
+		t.Fatalf("expected b unaffected by unrelated Remove, got %q, %v", got, ok)
+	}
+}
+
 func TestByteLRUEvictsUnderBudget(t *testing.T) {
 	c := NewByteLRU(256)
 	for i := 0; i < 1000; i++ {

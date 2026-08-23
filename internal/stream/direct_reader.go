@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"sort"
 	"sync"
 )
@@ -193,6 +194,13 @@ func (r *DirectNzbReader) findSpan(offset int64) (SegmentSpan, int, error) {
 	i := sort.Search(n, func(i int) bool { return r.spans[i].End > offset })
 	if i < n && r.spans[i].Start <= offset {
 		return r.spans[i], i, nil
+	}
+	if n == 0 {
+		slog.Debug("findSpan failed", "name", r.name, "offset", offset, "spanCount", n)
+	} else {
+		slog.Debug("findSpan failed", "name", r.name, "offset", offset, "spanCount", n,
+			"firstStart", r.spans[0].Start, "firstEnd", r.spans[0].End,
+			"lastStart", r.spans[n-1].Start, "lastEnd", r.spans[n-1].End, "searchIndex", i)
 	}
 	return SegmentSpan{}, -1, ErrRangeOutsideFile
 }

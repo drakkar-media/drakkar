@@ -37,6 +37,55 @@ func TestCachedDecodedSourceCaches(t *testing.T) {
 	}
 }
 
+// TestCachedDecodedSourceInvalidateCachedForcesRefetch guards the same
+// self-heal path as DiskCachedDecodedSource's equivalent test, one layer up:
+// this in-memory hot cache must also forget a bad entry, or the very next
+// fetch would just repopulate straight from it again even after a lower
+// layer's cache was correctly cleared.
+func TestCachedDecodedSourceInvalidateCachedForcesRefetch(t *testing.T) {
+	src := &countingSource{body: []byte("hello")}
+	cache := NewCachedDecodedSource(src, 1024)
+	if _, err := cache.DecodedBody(context.Background(), "<msg1>"); err != nil {
+		t.Fatal(err)
+	}
+	if src.calls.Load() != 1 {
+		t.Fatalf("expected 1 fetch before invalidate, got %d", src.calls.Load())
+	}
+	cache.InvalidateCached("<msg1>")
+	if _, err := cache.DecodedBody(context.Background(), "<msg1>"); err != nil {
+		t.Fatal(err)
+	}
+	if src.calls.Load() != 2 {
+		t.Fatalf("expected a fresh fetch after InvalidateCached, got %d total fetches", src.calls.Load())
+	}
+}
+
+// invalidateTrackingSource records InvalidateCached calls so cascading
+// behavior through a wrap chain can be asserted directly.
+type invalidateTrackingSource struct {
+	countingSource
+	invalidated []string
+}
+
+func (s *invalidateTrackingSource) InvalidateCached(messageID string) {
+	s.invalidated = append(s.invalidated, messageID)
+}
+
+// TestCachedDecodedSourceInvalidateCachedCascadesToWrappedSource guards the
+// production wiring specifically: SegmentFetcher only ever holds a
+// *CachedDecodedSource (the in-memory hot cache), which wraps
+// *DiskCachedDecodedSource underneath. Clearing only the top layer and never
+// telling the wrapped source would leave the disk-cache entry -- the one that
+// actually persists across restarts -- still poisoned.
+func TestCachedDecodedSourceInvalidateCachedCascadesToWrappedSource(t *testing.T) {
+	src := &invalidateTrackingSource{countingSource: countingSource{body: []byte("hello")}}
+	cache := NewCachedDecodedSource(src, 1024)
+	cache.InvalidateCached("<msg1>")
+	if len(src.invalidated) != 1 || src.invalidated[0] != "<msg1>" {
+		t.Fatalf("expected wrapped source to receive InvalidateCached(<msg1>), got %v", src.invalidated)
+	}
+}
+
 // countingInfoSource implements PriorityDecodedArticleInfoSource, matching
 // the real production wiring (CachedDecodedSource wraps DiskCachedDecodedSource,
 // which implements this interface). This is the shape that exposed the hot

@@ -178,6 +178,29 @@ func (c *FileCache) Put(key string, value []byte) error {
 	return c.Trim()
 }
 
+// Remove deletes key's cached file, if present, and updates the in-memory
+// size index to match. A missing file is not an error -- callers use this to
+// forget a cache entry that turned out to hold wrong data, and the entry may
+// already be gone (evicted, or never written).
+func (c *FileCache) Remove(key string) error {
+	if err := c.ensureSeeded(); err != nil {
+		return err
+	}
+	path := c.pathFor(key)
+	c.mu.Lock()
+	if el, ok := c.byPath[path]; ok {
+		entry := el.Value.(*fileCacheEntry)
+		c.total -= entry.size
+		c.order.Remove(el)
+		delete(c.byPath, path)
+	}
+	c.mu.Unlock()
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 // Stats returns the current file count and total size tracked by the cache.
 func (c *FileCache) Stats() (DirStats, error) {
 	if err := c.ensureSeeded(); err != nil {

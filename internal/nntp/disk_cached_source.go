@@ -219,6 +219,23 @@ func (s *DiskCachedDecodedSource) storePartInfo(messageID string, info yenc.Part
 	s.partInfo.Put(messageID, encodePartInfo(info))
 }
 
+// InvalidateCached forgets messageID's cached decoded body and PartInfo
+// companion entry, if any, so the next fetch goes back to source instead of
+// replaying a previously-cached result. Used when a caller has independently
+// determined that a cached body doesn't actually match the article it's
+// supposed to be (see the fetchRangeInfo mismatch guard in fetcher.go) --
+// without this, a single bad fetch (e.g. a provider returning the wrong
+// article body for a messageID with no transport-level error) would poison
+// this entry on disk forever, since a cache hit is otherwise never
+// re-validated against anything.
+func (s *DiskCachedDecodedSource) InvalidateCached(messageID string) {
+	if s == nil {
+		return
+	}
+	_ = s.cache.Remove(messageID)
+	s.partInfo.Remove(messageID)
+}
+
 // Stat reports whether messageID exists, preferring the cheapest available
 // signal: a disk-cache hit is itself proof of existence and is returned
 // without recovering PartInfo or fetching anything further (see the inline

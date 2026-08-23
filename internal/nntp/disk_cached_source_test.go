@@ -41,6 +41,38 @@ func TestDiskCachedDecodedSourceCaches(t *testing.T) {
 	}
 }
 
+// TestDiskCachedDecodedSourceInvalidateCachedForcesRefetch guards the
+// self-heal path: a cached entry that turned out to hold the wrong article
+// must actually be forgotten (not just shadowed), so the next call goes back
+// to the source instead of replaying the same bad bytes forever -- the exact
+// gap that let a single bad fetch permanently poison a file in production
+// (2026-08-23).
+func TestDiskCachedDecodedSourceInvalidateCachedForcesRefetch(t *testing.T) {
+	src := &countingBodySource{body: []byte("=ybegin line=128 size=5 name=test\r\n" + encode([]byte("hello")) + "\r\n=yend size=5\r\n")}
+	cache := NewDiskCachedDecodedSource(src, t.TempDir(), 1024)
+	if _, err := cache.DecodedBody(context.Background(), "<msg1>"); err != nil {
+		t.Fatal(err)
+	}
+	if src.calls.Load() != 1 {
+		t.Fatalf("expected 1 fetch before invalidate, got %d", src.calls.Load())
+	}
+	cache.InvalidateCached("<msg1>")
+	if _, err := cache.DecodedBody(context.Background(), "<msg1>"); err != nil {
+		t.Fatal(err)
+	}
+	if src.calls.Load() != 2 {
+		t.Fatalf("expected a fresh fetch after InvalidateCached, got %d total fetches", src.calls.Load())
+	}
+}
+
+// TestDiskCachedDecodedSourceInvalidateCachedNeverCachedKeyIsNoop confirms
+// invalidating a key that was never fetched (or already evicted) is a safe
+// no-op rather than a panic.
+func TestDiskCachedDecodedSourceInvalidateCachedNeverCachedKeyIsNoop(t *testing.T) {
+	cache := NewDiskCachedDecodedSource(&countingBodySource{}, t.TempDir(), 1024)
+	cache.InvalidateCached("<never-fetched>")
+}
+
 // TestDiskCachedDecodedSourceBoundsDecodeConcurrency guards against
 // unbounded concurrent yEnc decodes: the rapidyenc/CGO decoder isn't
 // preemptible mid-call the way pure-Go code is, so many concurrent decodes

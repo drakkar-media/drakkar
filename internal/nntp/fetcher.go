@@ -37,6 +37,22 @@ type PriorityStatSource interface {
 	StatPriority(ctx context.Context, messageID string, priority stream.FetchPriority) error
 }
 
+// minRealignSanityBound floors the tolerance FetchRangeInfoPriority allows
+// between a segment's estimated and actually-declared decoded position,
+// for the (rare) tiny final segment of a file where the segment-width-based
+// tolerance alone would otherwise be too tight to absorb normal variance.
+const minRealignSanityBound = 64 * 1024
+
+// cacheInvalidator is implemented by decoded-article sources that cache
+// results and can be told to forget one, so FetchRangeInfoPriority can evict
+// a cached body that turned out not to match the article it's supposed to
+// be, rather than leaving it to keep poisoning every future read of the same
+// messageID. Both CachedDecodedSource and DiskCachedDecodedSource implement
+// this, cascading through the wrap chain.
+type cacheInvalidator interface {
+	InvalidateCached(messageID string)
+}
+
 // SegmentFetcher resolves stream.SegmentRange requests against a
 // DecodedArticleSource, mapping each requested byte range onto the article's
 // actual decoded content and returning only the bytes that fall within it.
@@ -203,6 +219,34 @@ func (f *SegmentFetcher) FetchRangeInfoPriority(ctx context.Context, segment str
 	if info.Valid() {
 		actualStart = info.DecodedStart()
 		actualEnd = actualStart + int64(len(decoded))
+	}
+	// A legitimate yEnc decode-ratio estimate is off by a small fraction of one
+	// segment (the ~0.15% drift the comment below refers to) -- never anywhere
+	// close to a whole segment's width. A mismatch this large means the article
+	// actually fetched under this messageID does not belong at this position at
+	// all: confirmed live (2026-08-23) via a disk-cache entry that had been
+	// silently serving another segment's decoded bytes (~90 segments off) under
+	// the correct messageID key, with no transport-level error at any layer, for
+	// hours -- realignSpans blindly trusted it and shifted every later span in
+	// the file by the same huge delta, permanently corrupting the whole file's
+	// layout from one bad segment. Treat this as a fetch failure instead of a
+	// self-correction, and forget whatever got cached under this messageID so
+	// the next attempt has a chance to fetch a genuinely correct copy instead of
+	// replaying the same wrong bytes forever.
+	if info.Valid() {
+		threshold := segment.SegmentEnd - segment.SegmentStart
+		if threshold < minRealignSanityBound {
+			threshold = minRealignSanityBound
+		}
+		if delta := actualStart - segment.SegmentStart; delta > threshold || delta < -threshold {
+			if inv, ok := f.source.(cacheInvalidator); ok {
+				inv.InvalidateCached(segment.MessageID)
+			}
+			slog.Warn("nntp: fetched article's declared position is wildly inconsistent with expected position, discarding",
+				"messageID", segment.MessageID, "estimatedStart", segment.SegmentStart, "estimatedEnd", segment.SegmentEnd,
+				"actualStart", actualStart, "actualEnd", actualEnd, "delta", delta)
+			return nil, stream.SegmentSpan{}, fmt.Errorf("article %s: declared decoded position %d is wildly inconsistent with expected %d (off by %d) -- likely wrong cached/fetched article data", segment.MessageID, actualStart, segment.SegmentStart, delta)
+		}
 	}
 	start := int(segment.RangeStart - actualStart)
 	end := int(segment.RangeEnd - actualStart)
