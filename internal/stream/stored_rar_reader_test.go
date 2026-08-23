@@ -160,6 +160,56 @@ func TestStoredRarReaderRealignsUnderEstimatedSegment(t *testing.T) {
 	}
 }
 
+// TestStoredRarReaderDoesNotGrowEntryTruncatedSpan guards the fix for a
+// regression the fix above (TestStoredRarReaderRealignsUnderEstimatedSegment)
+// introduced for one specific shape of span: a non-final RAR volume's last
+// segment, where archive_ranges deliberately ends the entry before the
+// segment's own real decoded end to exclude trailing RAR container metadata
+// (e.g. a "QO" Quick Open service block) from being served as video content.
+// Confirmed live: without EntryTruncated, this is byte-for-byte the same
+// "more data exists past this span" signal the fix above treats as an
+// under-estimate to grow from -- so it silently re-extended a just-corrected
+// archive boundary back out to the segment's full physical size on the very
+// next read, re-splicing archive metadata into playback.
+//
+// Same setup as TestStoredRarReaderRealignsUnderEstimatedSegment (segment 1
+// declared 0..10 VF bytes, real decoded content is 12 bytes) except segment
+// 1 is marked EntryTruncated: unlike that test, the span here must NOT grow.
+func TestStoredRarReaderDoesNotGrowEntryTruncatedSpan(t *testing.T) {
+	reader := NewStoredRarReader("Movie.mkv", 20, []SegmentSpan{
+		{SegmentID: 1, MessageID: "<seg1>", Start: 0, End: 10, DecodedStart: 0, SegmentByteStart: 0, EntryTruncated: true},
+		{SegmentID: 2, MessageID: "<seg2>", Start: 10, End: 20, DecodedStart: 10, SegmentByteStart: 0},
+	}, awareFetcherStub{
+		data: map[int64][]byte{
+			1: []byte("AAAAAAAAAAAA"), // 12 real bytes -- the fetcher only ever returns the 10 requested, matching the declared span
+			2: []byte("BBBBBBBBBB"),
+		},
+		info: map[int64]SegmentSpan{
+			1: {SegmentID: 1, MessageID: "<seg1>", Start: 0, End: 12}, // reveals 12 real bytes exist, same signal the grow test relies on
+			2: {SegmentID: 2, MessageID: "<seg2>", Start: 10, End: 20},
+		},
+	}, nil)
+
+	// Spans the declared boundary at VF offset 10: bytes 8-9 are segment 1's
+	// true tail (within its declared range regardless of growth), bytes
+	// 10-13 must be segment 2's real content at its ORIGINAL offset -- not
+	// segment 1's bytes 10-11 as the grow path would splice in.
+	buf := make([]byte, 6)
+	n, err := reader.ReadAt(context.Background(), buf, 8)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if n != 6 {
+		t.Fatalf("expected 6 bytes, got %d", n)
+	}
+	if got := string(buf); got != "AABBBB" {
+		t.Fatalf("expected segment 1 to stay capped at its declared boundary (excluding the archive-metadata tail) then segment 2's real content at its original offset, got %q", got)
+	}
+	if got := reader.Size(); got != 20 {
+		t.Fatalf("expected reader.Size() to stay at 20 (entry-truncated span must never grow), got %d", got)
+	}
+}
+
 // TestStoredRarReaderStateRemainsStableAfterRealign guards the immutable
 // copy-on-write state contract: a state obtained before realignment must
 // retain its original backing data after the corrected version is published.

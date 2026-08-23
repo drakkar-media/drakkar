@@ -55,6 +55,12 @@ func computeSpans(messageIDs []string, decodedSegmentSize, lastDecodedSize, segm
 			End:              vfPos + chunkLen,
 			DecodedStart:     segStart,
 			SegmentByteStart: byteInSeg,
+			// dataEnd < segEnd means entrySize cut this span short of the
+			// segment's own natural end -- e.g. a non-final RAR volume's
+			// last segment, where real bytes exist past the entry's
+			// boundary (trailing RAR container metadata) but must never be
+			// served as content.
+			EntryTruncated: dataEnd < segEnd,
 		})
 		vfPos += chunkLen
 	}

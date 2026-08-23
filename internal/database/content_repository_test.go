@@ -16,6 +16,45 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
+// TestComputeSpansMarksEntryTruncatedOnlyWhenEntryCutsSegmentShort guards the
+// signal StoredRarReader's live-read self-heal depends on to avoid
+// re-splicing archive metadata into playback (see EntryTruncated's doc
+// comment on stream.SegmentSpan): a span must be marked EntryTruncated only
+// when entrySize -- not the segment running out of real data -- is what cut
+// it short. Numbers mirror a real production case (Fire Country S02E03,
+// archive_id 81988): a non-final RAR volume's last segment is declared
+// 716800 bytes but the archive entry's own boundary ends 172 bytes before
+// that (a trailing RAR5 "QO" Quick Open service block), while every earlier
+// segment in the same volume reaches its own natural end untouched.
+func TestComputeSpansMarksEntryTruncatedOnlyWhenEntryCutsSegmentShort(t *testing.T) {
+	const decodedSegmentSize = 716800
+	const lastDecodedSize = 307200
+	messageIDs := make([]string, 732)
+	for i := range messageIDs {
+		messageIDs[i] = "<seg>"
+	}
+	// archiveOffset=156 (volume's own leading header), lengthBytes=524287672
+	// (this volume's real video data, per its own RAR header -- excludes the
+	// trailing 172-byte QO block that would otherwise occupy the rest of the
+	// last segment's physical 307200 bytes).
+	spans := computeSpans(messageIDs, decodedSegmentSize, lastDecodedSize, 156, 524287672)
+	if len(spans) == 0 {
+		t.Fatal("expected at least one span")
+	}
+	last := spans[len(spans)-1]
+	if !last.EntryTruncated {
+		t.Fatalf("expected the last segment (cut short of its own 307200-byte end by the entry boundary) to be EntryTruncated, got %+v", last)
+	}
+	if got := last.End - last.Start; got != 307028 {
+		t.Fatalf("expected the truncated last span to cover exactly 307028 bytes (307200 - 172), got %d", got)
+	}
+	for i, span := range spans[:len(spans)-1] {
+		if span.EntryTruncated {
+			t.Fatalf("span %d reaches its own natural segment end (nowhere near entrySize) and must not be EntryTruncated: %+v", i, span)
+		}
+	}
+}
+
 type rangeInfoFetcherStub struct {
 	actual stream.SegmentSpan
 	err    error

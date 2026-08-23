@@ -39,6 +39,17 @@ type SegmentSpan struct {
 	End              int64
 	DecodedStart     int64 // decoded_start_offset of the NZB segment (stored_rar only)
 	SegmentByteStart int64 // byte offset within decoded segment at span.Start (stored_rar only)
+	// EntryTruncated is true when this span's End was cut short by the
+	// archive entry's own declared length (archive_ranges.length_bytes),
+	// not because the underlying NZB segment ran out of decoded data
+	// (stored_rar only; always false for DirectNzbReader spans, which have
+	// no such archive-level boundary). A non-final RAR volume's last
+	// segment routinely has real bytes past this point -- trailing RAR
+	// container metadata (e.g. a "QO" Quick Open service block) that
+	// belongs to the archive, not the video -- so a live read confirming
+	// "more data exists here than this span claims" must never be treated
+	// as an under-estimate to self-heal from.
+	EntryTruncated bool
 }
 
 // ResolveRange splits the byte range [offset, offset+length) into one

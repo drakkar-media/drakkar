@@ -186,7 +186,7 @@ func (r *StoredRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 				continue
 			}
 		}
-		if err2 == nil && len(block) == expected && hasActual && requestEnd == span.End {
+		if err2 == nil && len(block) == expected && hasActual && requestEnd == span.End && !span.EntryTruncated {
 			// The fetch fully satisfied the request, but that alone doesn't
 			// rule out an UNDER-estimate: the assumed span may simply not
 			// have asked for enough (a short fetch, the only other trigger
@@ -206,6 +206,18 @@ func (r *StoredRarReader) ReadAt(ctx context.Context, dst []byte, offset int64) 
 			// already holds the correct bytes for this request regardless
 			// of the correction, so grow the span for future iterations and
 			// fall through to consume it normally rather than re-fetching.
+			//
+			// !span.EntryTruncated excludes the one case where "more data
+			// exists past this span" is expected and correct: a non-final
+			// RAR volume's last segment, where archive_ranges deliberately
+			// ends the entry before the segment's own natural end to
+			// exclude trailing RAR container metadata (e.g. a "QO" Quick
+			// Open service block) from being served as video content.
+			// Confirmed live: without this guard, this exact self-heal
+			// silently re-extended that span back to the segment's full
+			// decoded size on the very next read, re-splicing archive
+			// metadata into playback that a corrected archive_ranges row
+			// had just excluded.
 			if available := actualSpan.End - actualSpan.Start - span.SegmentByteStart; available > span.End-span.Start {
 				r.realignSpan(span.SegmentID, actualSpan)
 			}
