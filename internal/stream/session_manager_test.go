@@ -516,29 +516,44 @@ func TestRegisterMetaLeavesUnrelatedSessionsAlone(t *testing.T) {
 	manager.Stop("new-session")
 }
 
-// TestRegisterMetaCancelsStaleSessionsForegroundServing guards a real
-// production incident (2026-08-10): stopping only the stale session's
-// read-ahead wasn't enough -- its foreground Read loop (the dav.virtualFile
-// serving the old, now-abandoned HTTP connection) kept running for as long
-// as the client kept draining it, measured live at up to ~163s of real data
-// transfer nobody needed anymore. meta.Cancel is the hook a session's owner
-// supplies to tear that foreground loop down directly; RegisterMeta must
-// call it for any stale session it finds, not just cancel its read-ahead.
-func TestRegisterMetaCancelsStaleSessionsForegroundServing(t *testing.T) {
+// TestRegisterMetaLeavesOtherSessionsForegroundServingAlone guards the fix
+// for a real production incident (2026-08-23): RegisterMeta used to also
+// tear down another session's foreground serving loop the instant a new one
+// opened for the same VirtualFileID, on the assumption that this always
+// meant the same client seeking. That assumption is false whenever two
+// genuinely independent reads of the same file overlap (confirmed live: a
+// second, unrelated request cut an unrelated 500MB transfer off after 322
+// bytes) -- and since a client retries a cut-off read by reopening the
+// file, which re-enters this same path, two such reads could keep killing
+// each other's retries indefinitely. RegisterMeta must still stop the other
+// session's read-ahead (safe: it only affects not-yet-requested speculative
+// prefetch), but must never have any way to reach into and cancel its
+// actual foreground transfer -- confirmed structurally here, not just
+// behaviorally: SessionMeta no longer has a Cancel field at all, so there is
+// no hook left for this function to call even if it wanted to.
+func TestRegisterMetaLeavesOtherSessionsForegroundServingAlone(t *testing.T) {
 	manager := NewReadAheadManager(32)
 	fetcher := &priorityFetcherStub{calls: make(chan priorityFetchCall, 2)}
 
-	foregroundCancelled := false
-	cancel := func() { foregroundCancelled = true }
-
 	manager.Register("old-session", []SegmentSpan{{SegmentID: 1, MessageID: "<msg1>", Start: 0, End: 128}}, fetcher)
-	manager.RegisterMeta("old-session", SessionMeta{VirtualFileID: 99, Cancel: cancel})
+	manager.RegisterMeta("old-session", SessionMeta{VirtualFileID: 99})
+	manager.NotifyRead("old-session", 0)
+	oldCall := <-fetcher.calls
 
 	manager.Register("new-session", []SegmentSpan{{SegmentID: 1, MessageID: "<msg1>", Start: 0, End: 128}}, fetcher)
 	manager.RegisterMeta("new-session", SessionMeta{VirtualFileID: 99})
 
-	if !foregroundCancelled {
-		t.Fatal("expected the stale session's foreground serving Cancel to be called when a new session opened for the same VirtualFileID")
+	select {
+	case <-oldCall.ctx.Done():
+		// Expected: read-ahead for the superseded session is stopped.
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("expected the superseded session's read-ahead to be cancelled")
+	}
+
+	for _, s := range manager.ActiveSessions() {
+		if s.SessionID == "old-session" {
+			t.Fatal("expected the superseded session to no longer be tracked for read-ahead")
+		}
 	}
 
 	manager.Stop("new-session")

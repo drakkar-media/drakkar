@@ -145,16 +145,12 @@ type ReadAheadManager struct {
 	articleLimit   int
 }
 
-// SessionMeta carries display metadata for an open stream session, plus an
-// optional Cancel hook the session's owner can use to tear down its actual
-// foreground serving loop -- not just read-ahead -- when RegisterMeta finds
-// it superseded by a new session on the same VirtualFileID.
+// SessionMeta carries display metadata for an open stream session.
 type SessionMeta struct {
 	VirtualFileID int64
 	FileName      string
 	FileSizeBytes int64
 	OpenedAt      time.Time
-	Cancel        context.CancelFunc
 }
 
 // SessionSnapshot is a point-in-time view of one active session, safe to read outside the lock.
@@ -283,23 +279,45 @@ func (m *ReadAheadManager) Register(sessionID string, spans []SegmentSpan, fetch
 }
 
 // RegisterMeta attaches display metadata to an already-registered session,
-// and stops both read-ahead AND the foreground serving loop for any other
-// session already open on the same VirtualFileID.
+// and stops read-ahead for any other session already open on the same
+// VirtualFileID -- but, as of the fix below, deliberately leaves that other
+// session's foreground serving loop alone.
 //
-// A seek from a WebDAV client (e.g. Plex) doesn't reuse the existing
-// connection -- it opens a brand-new GET/Range request while the old one
-// may still be lingering (see deadlineResponseWriter in internal/dav for
-// why that lingering can itself take a while to resolve). Read-ahead
-// cancellation alone wasn't enough: confirmed live (2026-08-10, another
-// high-bitrate stream) that the old session's actual foreground Read loop kept
-// running for as long as its client (rclone) kept draining it -- up to
-// ~163s of real, no-longer-needed data transfer, holding NNTP connection
-// budget the new seek's fetch was waiting on the whole time. meta.Cancel,
-// when the session's owner supplied one, tears that foreground loop down
-// immediately instead of leaving it to notice on its own. Since
-// VirtualFileID only becomes known here (Register, called from
-// StartSession, has none yet), this is the first point two sessions for the
-// same file can be recognized as the same logical playback.
+// This used to also tear the foreground loop down immediately (meta.Cancel),
+// on the theory that a seek from a WebDAV client (e.g. Plex) opens a
+// brand-new GET/Range request while the old one may still be lingering (see
+// deadlineResponseWriter in internal/dav for why that lingering can itself
+// take a while to resolve), and read-ahead cancellation alone left that old
+// connection's real Read loop running for as long as its client (rclone)
+// kept draining it -- confirmed live 2026-08-10, up to ~163s of
+// no-longer-needed transfer holding NNTP connection budget a new seek's
+// fetch was waiting on.
+//
+// That fix rested on an assumption confirmed FALSE live 2026-08-23: two
+// sessions open on the same VirtualFileID are not reliably "the same
+// logical playback, mid-seek" -- they're just as often two genuinely
+// independent, still-wanted reads of the same file (a second viewer, or any
+// internal code doing its own OpenVirtualMediaFile read against a file a
+// real client also happens to be streaming; there is nothing in a raw
+// WebDAV GET that distinguishes the two, since every read -- regardless of
+// which end-user or process it belongs to -- arrives through the single
+// shared rclone mount). Confirmed with a direct, reproducible test: opening
+// a second, unrelated read against a file already mid-transfer cut the
+// first one off after 322 bytes of a requested 500MB, with zero trace in
+// this app's own logs (meta.Cancel's teardown was never itself logged).
+// Since rclone retries a failed read by reopening the file -- which
+// re-enters this exact path -- two genuinely concurrent readers of the same
+// file could each keep killing the other's retry indefinitely.
+//
+// Silently corrupting an active, wanted transfer is a worse failure mode
+// than the resource waste the removed cancellation avoided: the existing,
+// independent write-idle-timeout (deadlineResponseWriter, internal/dav)
+// already bounds how long ANY connection -- superseded or not -- can hold
+// its NNTP budget while making zero real progress, so a genuinely abandoned
+// session still gets cleaned up without this function guessing at intent
+// from information it structurally cannot have. Read-ahead cancellation
+// stays: it only stops speculative prefetch for data nothing has actually
+// asked for yet, so it can never cut off an active transfer.
 func (m *ReadAheadManager) RegisterMeta(sessionID string, meta SessionMeta) {
 	if m == nil || sessionID == "" {
 		return
@@ -320,9 +338,6 @@ func (m *ReadAheadManager) RegisterMeta(sessionID string, meta SessionMeta) {
 		if s := m.sessions[id]; s != nil {
 			if s.cancel != nil {
 				s.cancel()
-			}
-			if s.meta.Cancel != nil {
-				s.meta.Cancel()
 			}
 			delete(m.sessions, id)
 		}

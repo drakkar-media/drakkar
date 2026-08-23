@@ -476,7 +476,6 @@ func (f *virtualFile) ensureOpen() error {
 			FileName:      f.fi.Name(),
 			FileSizeBytes: f.size,
 			OpenedAt:      time.Now().UTC(),
-			Cancel:        f.cancel,
 		})
 	}
 	return nil
