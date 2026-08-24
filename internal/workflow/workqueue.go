@@ -146,24 +146,46 @@ func (q *WorkQueue) Start(ctx context.Context, fn func(ctx context.Context, libr
 		bullmqQueueName,
 		q.workerClient,
 		processor,
-		&gobullmq.WorkerOptions{
-			Concurrency:      q.workers,
-			RemoveOnComplete: &gobullmq.KeepJobs{Count: 0},
-			RemoveOnFail:     &gobullmq.KeepJobs{Count: 0},
-			// Search jobs complete in seconds (NZBHydra HTTP call + async download
-			// dispatch). A 2-minute lock is more than sufficient and ensures stalled
-			// jobs are detected and re-queued quickly instead of blocking dedup for
-			// 30 minutes. Lock renewal runs every LockDuration/4 = 30s.
-			LockDuration:    2 * time.Minute,
-			StalledInterval: 1 * time.Minute,
-			// Allow one recovery attempt before failing: if the stalled check fires
-			// while the lock is briefly between renewals, the job is moved back to
-			// wait instead of immediately to failed (MaxStalledCount=0 default).
-			MaxStalledCount: 2,
-		},
+		workerOptions(q.workers),
 	)
 	if err != nil {
 		return fmt.Errorf("workqueue: create worker: %w", err)
 	}
 	return worker.Run(ctx)
+}
+
+// workerOptions builds the BullMQ worker configuration for the search queue.
+// Extracted from Start so its fields -- especially DrainDelay -- can be
+// asserted on directly in tests without needing a live Redis.
+func workerOptions(workers int) *gobullmq.WorkerOptions {
+	return &gobullmq.WorkerOptions{
+		Concurrency:      workers,
+		RemoveOnComplete: &gobullmq.KeepJobs{Count: 0},
+		RemoveOnFail:     &gobullmq.KeepJobs{Count: 0},
+		// Search jobs complete in seconds (NZBHydra HTTP call + async download
+		// dispatch). A 2-minute lock is more than sufficient and ensures stalled
+		// jobs are detected and re-queued quickly instead of blocking dedup for
+		// 30 minutes. Lock renewal runs every LockDuration/4 = 30s.
+		LockDuration:    2 * time.Minute,
+		StalledInterval: 1 * time.Minute,
+		// Allow one recovery attempt before failing: if the stalled check fires
+		// while the lock is briefly between renewals, the job is moved back to
+		// wait instead of immediately to failed (MaxStalledCount=0 default).
+		MaxStalledCount: 2,
+		// Left unset, this is gobullmq's own zero value (0), not its documented
+		// 1s default: NewWorker's own default-application only fires on a
+		// negative value (worker.go's `if opts.DrainDelay < 0`), which a plain
+		// zero never satisfies, so it silently falls through unset all the way
+		// to waitForJob's *separate* fallback (`if blockTimeout <= 0`), which
+		// backs off to 10ms instead -- a 100x busier BLMove poll than intended.
+		// Confirmed live (2026-08-25): with this left implicit, every worker
+		// polled Redis roughly 100x/sec even with an empty queue (blocked_clients
+		// was always 0 -- nothing was ever actually using the blocking wait this
+		// is supposed to provide), measured at ~312 ops/sec sustained across
+		// Concurrency=3 workers for the process's entire uptime -- ~155GB and
+		// 121 million Redis commands, almost all of them "still nothing to do."
+		// Setting this explicitly is what actually makes BLMove block for a
+		// real interval between empty polls.
+		DrainDelay: 1 * time.Second,
+	}
 }
