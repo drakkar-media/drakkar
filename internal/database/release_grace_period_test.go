@@ -115,7 +115,10 @@ func TestListFailedQueueRetryTargetsSkipsUnreleasedMovies(t *testing.T) {
 	ctx := context.Background()
 	db := &DB{SQL: sqlDB}
 
-	releasedMovie, releasedQueueID := setupFailedMovie(t, ctx, sqlDB, "grace-failed-movie-released", -1)
+	// -2 (not -1) so (release_date+1)+12h deterministically lands in the past
+	// regardless of what time of day this test runs -- see the doc comment on
+	// TestListPendingLibrarySearchTargetsAppliesReleaseGraceHours.
+	releasedMovie, releasedQueueID := setupFailedMovie(t, ctx, sqlDB, "grace-failed-movie-released", -2)
 	delayedMovie, delayedQueueID := setupFailedMovie(t, ctx, sqlDB, "grace-failed-movie-delayed", 1)
 	defer func() {
 		for _, id := range []int64{releasedMovie, delayedMovie} {
@@ -136,6 +139,40 @@ func TestListFailedQueueRetryTargetsSkipsUnreleasedMovies(t *testing.T) {
 	}
 	if byQueueID[delayedQueueID] {
 		t.Error("expected a failed movie item whose release date slipped into the future to be excluded from retry")
+	}
+}
+
+// TestListFailedQueueRetryTargetsAnchorsGraceToEndOfReleaseDay mirrors
+// TestListPendingLibrarySearchTargetsAppliesReleaseGraceHours's graceHours=0
+// same-day case for this query specifically: a movie releasing TODAY must
+// stay excluded even with a zero-hour grace period, since the anchor shift
+// to (release_date+1) -- not the configured grace value -- is what
+// guarantees a full calendar day elapses before eligibility. See that other
+// test's doc comment for the full 2026-08-24 incident this guards.
+func TestListFailedQueueRetryTargetsAnchorsGraceToEndOfReleaseDay(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	movieID, queueID := setupFailedMovie(t, ctx, sqlDB, "grace-failed-movie-today-zerograce", 0)
+	defer sqlDB.ExecContext(ctx, `delete from movies where id = $1`, movieID)
+
+	targets, err := db.ListFailedQueueRetryTargets(ctx, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tg := range targets {
+		if tg.QueueItemID == queueID {
+			t.Error("expected a failed movie item releasing today to NOT be eligible for retry yet even with graceHours=0 -- the release day itself must fully elapse first")
+		}
 	}
 }
 
@@ -169,8 +206,12 @@ func TestListFailedQueueRetryTargetsRespectsDispatchBackoffUntil(t *testing.T) {
 	ctx := context.Background()
 	db := &DB{SQL: sqlDB}
 
-	backedOffMovie, backedOffQueueID := setupFailedMovie(t, ctx, sqlDB, "backoff-failed-movie-backed-off", -1)
-	clearMovie, clearQueueID := setupFailedMovie(t, ctx, sqlDB, "backoff-failed-movie-clear", -1)
+	// -2 (not -1) so both movies deterministically clear the release-date
+	// grace check regardless of what time of day this test runs, isolating
+	// the assertions below to dispatch_backoff_until specifically -- see the
+	// doc comment on TestListPendingLibrarySearchTargetsAppliesReleaseGraceHours.
+	backedOffMovie, backedOffQueueID := setupFailedMovie(t, ctx, sqlDB, "backoff-failed-movie-backed-off", -2)
+	clearMovie, clearQueueID := setupFailedMovie(t, ctx, sqlDB, "backoff-failed-movie-clear", -2)
 	defer func() {
 		for _, id := range []int64{backedOffMovie, clearMovie} {
 			sqlDB.ExecContext(ctx, `delete from movies where id = $1`, id)
@@ -408,12 +449,27 @@ func TestListPendingTVShowLibraryItemIDsOrdersByOldestSearch(t *testing.T) {
 }
 
 // TestListPendingLibrarySearchTargetsAppliesReleaseGraceHours guards the
-// 2026-07-26 feature: search eligibility isn't just "release date has
-// passed" (a bare calendar-date comparison), it's "release date + a
-// configurable grace period has passed" -- since a release posts at a
-// specific time, not literally at 00:00 local time the moment the calendar
-// date flips. Offsets are chosen so every assertion is deterministic
-// regardless of what time of day the test actually runs.
+// 2026-07-26 grace-period feature and its 2026-08-24 anchor fix: search
+// eligibility isn't "release date has passed" (a bare calendar-date
+// comparison), it's "the release date's entire calendar day has elapsed,
+// plus a configurable grace period on top" -- TMDB/TVDB only ever give a
+// date, never a time, and a release posts at a specific moment that day
+// (often evening, often in a source timezone well ahead of this server's),
+// so anchoring the grace window to the release date's own midnight (the
+// pre-2026-08-24 behavior) could mark an item searchable many hours BEFORE
+// it had actually released anywhere -- confirmed live: an HBO Max episode's
+// window opened 15 hours before its real air time once converted to this
+// server's clock. The window is now anchored to the START OF THE NEXT DAY
+// instead, so a same-day release is never "immediately" eligible even with
+// graceHours=0 -- that's the point, not a gap: we don't know what time
+// today it released, so we wait for today to fully elapse first.
+//
+// Offsets are chosen so every assertion is deterministic regardless of what
+// time of day the test actually runs: "two days ago" is used (rather than
+// "yesterday") for the always-eligible cases, since (twoDaysAgo+1)+12h lands
+// at yesterday noon -- always in the past no matter when today the test
+// executes -- whereas (yesterday+1)+12h lands at today noon, which would be
+// flaky depending on the clock.
 func TestListPendingLibrarySearchTargetsAppliesReleaseGraceHours(t *testing.T) {
 	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -427,24 +483,25 @@ func TestListPendingLibrarySearchTargetsAppliesReleaseGraceHours(t *testing.T) {
 	ctx := context.Background()
 	db := &DB{SQL: sqlDB}
 
-	movieYesterday, movieYesterdayLib := setupPendingMovie(t, ctx, sqlDB, "grace-movie-yesterday", -1)
+	movieTwoDaysAgo, movieTwoDaysAgoLib := setupPendingMovie(t, ctx, sqlDB, "grace-movie-twodaysago", -2)
 	movieTomorrow, movieTomorrowLib := setupPendingMovie(t, ctx, sqlDB, "grace-movie-tomorrow", 1)
-	movieTodayNoGrace, movieTodayNoGraceLib := setupPendingMovie(t, ctx, sqlDB, "grace-movie-today-nograce", 0)
+	movieToday, movieTodayLib := setupPendingMovie(t, ctx, sqlDB, "grace-movie-today", 0)
 	movieTodayLongGrace, movieTodayLongGraceLib := setupPendingMovie(t, ctx, sqlDB, "grace-movie-today-longgrace", 0)
-	epYesterday, epYesterdayLib := setupPendingEpisode(t, ctx, sqlDB, "grace-episode-yesterday", -1)
+	epTwoDaysAgo, epTwoDaysAgoLib := setupPendingEpisode(t, ctx, sqlDB, "grace-episode-twodaysago", -2)
 	epTomorrow, epTomorrowLib := setupPendingEpisode(t, ctx, sqlDB, "grace-episode-tomorrow", 1)
 	defer func() {
-		for _, id := range []int64{movieYesterday, movieTomorrow, movieTodayNoGrace, movieTodayLongGrace} {
+		for _, id := range []int64{movieTwoDaysAgo, movieTomorrow, movieToday, movieTodayLongGrace} {
 			sqlDB.ExecContext(ctx, `delete from movies where id = $1`, id)
 		}
-		for _, id := range []int64{epYesterday, epTomorrow} {
+		for _, id := range []int64{epTwoDaysAgo, epTomorrow} {
 			sqlDB.ExecContext(ctx, `delete from tv_shows where id = $1`, id)
 		}
 	}()
 
-	// graceHours=12: yesterday's release/air date is always eligible (its
-	// midnight+12h is always in the past relative to "now" today), tomorrow's
-	// is always ineligible (its midnight+12h is always still in the future).
+	// graceHours=12: a release/air date from two full days ago is always
+	// eligible ((date+1)+12h lands at yesterday noon, always past); tomorrow's
+	// is always ineligible ((date+1)+12h lands at the day-after-tomorrow noon,
+	// always future).
 	targets, err := db.ListPendingLibrarySearchTargets(ctx, 12)
 	if err != nil {
 		t.Fatal(err)
@@ -453,37 +510,34 @@ func TestListPendingLibrarySearchTargetsAppliesReleaseGraceHours(t *testing.T) {
 	for _, tg := range targets {
 		byLibID[tg.LibraryItemID] = true
 	}
-	if !byLibID[movieYesterdayLib] {
-		t.Error("expected a movie released yesterday to be eligible for search with a 12h grace period")
+	if !byLibID[movieTwoDaysAgoLib] {
+		t.Error("expected a movie released two days ago to be eligible for search with a 12h grace period")
 	}
 	if byLibID[movieTomorrowLib] {
 		t.Error("expected a movie releasing tomorrow to NOT be eligible for search with a 12h grace period")
 	}
-	if !byLibID[epYesterdayLib] {
-		t.Error("expected an episode that aired yesterday to be eligible for search with a 12h grace period")
+	if !byLibID[epTwoDaysAgoLib] {
+		t.Error("expected an episode that aired two days ago to be eligible for search with a 12h grace period")
 	}
 	if byLibID[epTomorrowLib] {
 		t.Error("expected an episode airing tomorrow to NOT be eligible for search with a 12h grace period")
 	}
 
-	// graceHours=0 must preserve the original "eligible the instant the
-	// release day starts" behavior for an item releasing today.
+	// graceHours=0 must now still exclude a same-day release: the anchor
+	// shift alone (not the configured grace value) is what guarantees a full
+	// calendar day elapses first, since (today+1)+0h is always tomorrow
+	// midnight -- always in the future relative to any time today.
 	targetsNoGrace, err := db.ListPendingLibrarySearchTargets(ctx, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	foundToday := false
 	for _, tg := range targetsNoGrace {
-		if tg.LibraryItemID == movieTodayNoGraceLib {
-			foundToday = true
+		if tg.LibraryItemID == movieTodayLib {
+			t.Error("expected a movie releasing today to NOT be eligible yet even with graceHours=0 -- the release day itself must fully elapse first")
 		}
 	}
-	if !foundToday {
-		t.Error("expected a movie releasing today to be eligible immediately with graceHours=0 (original release-day behavior)")
-	}
 
-	// graceHours=48 must keep a same-day release out entirely (today's
-	// midnight + 48h is always at least a day beyond "now").
+	// graceHours=48 must also keep a same-day release out entirely.
 	targetsLongGrace, err := db.ListPendingLibrarySearchTargets(ctx, 48)
 	if err != nil {
 		t.Fatal(err)
@@ -493,6 +547,40 @@ func TestListPendingLibrarySearchTargetsAppliesReleaseGraceHours(t *testing.T) {
 			t.Error("expected a movie releasing today to NOT be eligible yet with a 48h grace period")
 		}
 	}
+}
+
+// TestListPendingLibrarySearchTargetsBecomesEligibleTheDayAfterRelease guards
+// the other side of the 2026-08-24 anchor fix: a release date that has just
+// barely fully elapsed (yesterday, as of any time today) must become
+// eligible with a zero grace period, once the anchor's implicit one-day wait
+// is satisfied -- this isn't an unbounded extra delay, just "wait for the
+// whole release day, then apply whatever grace is configured."
+func TestListPendingLibrarySearchTargetsBecomesEligibleTheDayAfterRelease(t *testing.T) {
+	dsn := os.Getenv("DRAKKAR_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("DRAKKAR_TEST_DATABASE_URL not set")
+	}
+	sqlDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqlDB.Close()
+	ctx := context.Background()
+	db := &DB{SQL: sqlDB}
+
+	movieID, libID := setupPendingMovie(t, ctx, sqlDB, "grace-movie-yesterday-zerograce", -1)
+	defer sqlDB.ExecContext(ctx, `delete from movies where id = $1`, movieID)
+
+	targets, err := db.ListPendingLibrarySearchTargets(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tg := range targets {
+		if tg.LibraryItemID == libID {
+			return
+		}
+	}
+	t.Fatalf("expected a movie released yesterday to be eligible today with graceHours=0, got targets: %+v", targets)
 }
 
 // TestListPendingLibrarySearchTargetsAppliesBackoffToRequestedState guards a
@@ -523,7 +611,12 @@ func TestListPendingLibrarySearchTargetsAppliesBackoffToRequestedState(t *testin
 	// is high and last_searched_at is 2 hours ago -- inside the old flat 1h
 	// window's "eligible" zone, but well short of the escalated >=10 tier's
 	// 7-day cooldown, which should exclude it.
-	movieID, libID := setupPendingMovie(t, ctx, sqlDB, "backoff-requested-bounced", -1)
+	// -2 (not -1) so the movie deterministically clears the release-date grace
+	// check regardless of what time of day this test runs, isolating the
+	// assertion below to the consecutive_failure_searches escalation
+	// specifically -- see the doc comment on
+	// TestListPendingLibrarySearchTargetsAppliesReleaseGraceHours.
+	movieID, libID := setupPendingMovie(t, ctx, sqlDB, "backoff-requested-bounced", -2)
 	defer sqlDB.ExecContext(ctx, `delete from movies where id = $1`, movieID)
 	if _, err := sqlDB.ExecContext(ctx, `
 		update queue_items

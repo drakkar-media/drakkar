@@ -1157,24 +1157,38 @@ func (db *DB) ListPendingLibrarySearchTargets(ctx context.Context, releaseGraceH
 			    or q.state = $3
 			  )
 			  -- Skip movies that haven't been released yet -- plus a grace period
-			  -- ($4 hours) past release_date itself, since a release posts at a
-			  -- specific time, not literally at 00:00 local time the calendar
-			  -- date flips.
+			  -- ($4 hours) past the END of release_date, not its start: TMDB/TVDB
+			  -- only ever give a date, never a time, and a release posts at a
+			  -- specific moment that day, not at 00:00 -- often the evening,
+			  -- and often in a source timezone well ahead of this server's own
+			  -- (e.g. a US evening premiere converted to Europe/Amsterdam lands
+			  -- in the early hours of the NEXT calendar day here). Anchoring the
+			  -- grace window to release_date's own midnight (the previous
+			  -- behavior) could therefore mark an item searchable many hours
+			  -- BEFORE it had actually released anywhere -- confirmed live
+			  -- 2026-08-24: an HBO Max episode's search window opened 15 hours
+			  -- before its real 21:00 ET air time once converted to this
+			  -- server's Europe/Amsterdam clock. Treating the whole calendar
+			  -- date as the release window and only starting the grace period
+			  -- once it's fully elapsed removes that systematic early-search
+			  -- gap without needing per-title broadcast-time data this project
+			  -- has no source for.
 			  and not exists (
 			      select 1 from movies m
 			      where m.id = li.movie_id
 			        and m.release_date is not null
-			        and m.release_date::timestamp + make_interval(hours => $4::int) > now()
+			        and (m.release_date + 1)::timestamp + make_interval(hours => $4::int) > now()
 			  )
 			  -- Skip TV episodes that haven't aired yet (air_date + grace period
-			  -- still in the future). NULL air_date = unknown, search anyway
-			  -- (mirrors Sonarr behaviour). monitoring_mode='future' explicitly
-			  -- opts into pre-air searching.
+			  -- still in the future, measured from the end of air_date's calendar
+			  -- day -- see the matching movie comment above for why). NULL
+			  -- air_date = unknown, search anyway (mirrors Sonarr behaviour).
+			  -- monitoring_mode='future' explicitly opts into pre-air searching.
 			  and (
 			      li.media_type != 'episode'
 			      or ep.id is null
 			      or ep.air_date is null
-			      or ep.air_date::timestamp + make_interval(hours => $4::int) <= now()
+			      or (ep.air_date + 1)::timestamp + make_interval(hours => $4::int) <= now()
 			      or coalesce(tv.monitoring_mode, 'all') = 'future'
 			  )
 			  -- TV monitoring mode filter (applies only to episode items).
@@ -1383,24 +1397,27 @@ func (db *DB) ListFailedQueueRetryTargets(ctx context.Context, limit int, releas
 		    ))
 		    or (q.state = $2 and q.selected_release_id is not null and q.updated_at < now() - interval '2 minutes')
 		  )
-		  -- Skip movies that haven't been released yet (+ grace period); mirrors
-		  -- ListPendingLibrarySearchTargets. Confirmed a real gap live
-		  -- (2026-07-26): this query had no movie release_date check at all, so
-		  -- a failed movie item whose release date later slipped into the
-		  -- future (a real-world delay) would still be retried with no
-		  -- protection, unlike the main pending-search path.
+		  -- Skip movies that haven't been released yet (+ grace period, measured
+		  -- from the end of release_date's calendar day); mirrors
+		  -- ListPendingLibrarySearchTargets -- see its comment for why the
+		  -- anchor is (release_date + 1) rather than release_date itself.
+		  -- Confirmed a real gap live (2026-07-26): this query had no movie
+		  -- release_date check at all, so a failed movie item whose release
+		  -- date later slipped into the future (a real-world delay) would
+		  -- still be retried with no protection, unlike the main pending-search
+		  -- path.
 		  and not exists (
 		      select 1 from movies m
 		      where m.id = li.movie_id
 		        and m.release_date is not null
-		        and m.release_date::timestamp + make_interval(hours => $3::int) > now()
+		        and (m.release_date + 1)::timestamp + make_interval(hours => $3::int) > now()
 		  )
 		  -- Skip TV episodes that haven't aired yet; mirrors ListPendingLibrarySearchTargets.
 		  and (
 		      li.media_type != 'episode'
 		      or ep.id is null
 		      or ep.air_date is null
-		      or ep.air_date::timestamp + make_interval(hours => $3::int) <= now()
+		      or (ep.air_date + 1)::timestamp + make_interval(hours => $3::int) <= now()
 		      or coalesce(tv.monitoring_mode, 'all') = 'future'
 		  )
 		order by
