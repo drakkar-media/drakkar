@@ -177,15 +177,32 @@ func workerOptions(workers int) *gobullmq.WorkerOptions {
 		// negative value (worker.go's `if opts.DrainDelay < 0`), which a plain
 		// zero never satisfies, so it silently falls through unset all the way
 		// to waitForJob's *separate* fallback (`if blockTimeout <= 0`), which
-		// backs off to 10ms instead -- a 100x busier BLMove poll than intended.
-		// Confirmed live (2026-08-25): with this left implicit, every worker
-		// polled Redis roughly 100x/sec even with an empty queue (blocked_clients
-		// was always 0 -- nothing was ever actually using the blocking wait this
-		// is supposed to provide), measured at ~312 ops/sec sustained across
-		// Concurrency=3 workers for the process's entire uptime -- ~155GB and
-		// 121 million Redis commands, almost all of them "still nothing to do."
-		// Setting this explicitly is what actually makes BLMove block for a
-		// real interval between empty polls.
+		// backs off to 10ms instead -- a 100x busier BLMove poll than intended
+		// whenever the queue actually reaches its drained (blocking-wait) state.
+		// See RunRetryDelay below for why that state turned out to be rare in
+		// practice, and this alone did not fix the incident that found it.
 		DrainDelay: 1 * time.Second,
+		// gobullmq's getNextJob only takes the blocking waitForJob/DrainDelay
+		// path once its shared `drained` flag is true -- and that flag is
+		// global to every concurrent worker on this queue (Concurrency-many),
+		// reset to false the instant ANY of them sees a real job. With more
+		// than one worker and a queue that sees at least occasional traffic
+		// (a new search job every 10-15 minutes from the scheduled sweeps is
+		// enough), drained rarely stays true: every worker instead takes the
+		// *other*, non-blocking branch (a direct moveToActive EVAL call),
+		// gated only by RunRetryDelay between empty attempts. Left unset here,
+		// that defaults (correctly, per gobullmq's own `<= 0` check -- unlike
+		// DrainDelay's mismatched one) to 250ms, which is still far too
+		// aggressive for a queue that's idle the vast majority of the time.
+		// Confirmed live (2026-08-25) by instrumenting gobullmq directly:
+		// getNextJob's `drained` was false on every single observed call, so
+		// DrainDelay above was never actually being exercised -- the real,
+		// dominant traffic was this 250ms-gated non-blocking path the whole
+		// time, at ~45-95 EVAL calls/sec (varying with how many workers
+		// happened to be mid-cycle at once), matching Valkey's independently
+		// measured ~312-338 instantaneous_ops_per_sec with blocked_clients
+		// always 0. Setting this explicitly alongside DrainDelay is what
+		// actually slows down the path that's actually in play.
+		RunRetryDelay: 1 * time.Second,
 	}
 }
