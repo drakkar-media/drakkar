@@ -1,6 +1,6 @@
 module github.com/drakkar-media/drakkar
 
-go 1.26.6
+go 1.26.9
 
 require (
 	github.com/bodgit/sevenzip v1.5.1
@@ -12,10 +12,10 @@ require (
 	github.com/rs/zerolog v1.34.0
 	github.com/vishvananda/netlink v1.3.1
 	go.codycody31.dev/gobullmq v1.0.3
-	golang.org/x/crypto v0.51.0
-	golang.org/x/net v0.55.0
-	golang.org/x/sync v0.21.0
-	golang.org/x/sys v0.45.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.60.0
+	golang.org/x/sync v0.23.0
+	golang.org/x/sys v0.48.0
 	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 	gopkg.in/vansante/go-ffprobe.v2 v2.3.0
 )
@@ -43,7 +43,7 @@ require (
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go4.org v0.0.0-20200411211856-f5505b9728dd // indirect
-	golang.org/x/text v0.39.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	gvisor.dev/gvisor v0.0.0-20250503011706-39ed1f5ac29c // indirect

@@ -47,9 +47,18 @@ func newFakeInternalAPIServer(t *testing.T, initial map[string]any, secretKeys m
 	mux.HandleFunc("/internalapi/config", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
+			// Like the real server, hand out the CSRF cookie on reads.
+			http.SetCookie(w, &http.Cookie{Name: "HYDRA-XSRF-TOKEN", Value: "csrf-test-token", Path: "/"})
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(mask(stored))
 		case http.MethodPut:
+			// ...and refuse writes that don't echo it (cookie + header), as
+			// the real server does with a 403.
+			ck, cookieErr := r.Cookie("HYDRA-XSRF-TOKEN")
+			if cookieErr != nil || ck.Value != r.Header.Get("X-HYDRA-XSRF-TOKEN") || ck.Value == "" {
+				http.Error(w, "<html>Access denied</html>", http.StatusForbidden)
+				return
+			}
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)

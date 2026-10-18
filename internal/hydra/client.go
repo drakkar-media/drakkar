@@ -485,6 +485,18 @@ func (c *Client) SyncProxy(ctx context.Context, enabled bool, proxy ProxyConfig)
 		return err
 	}
 	putReq.Header.Set("Content-Type", "application/json")
+	// NZBHydra2 guards every state-changing internalapi call with CSRF
+	// protection: the GET above hands out a HYDRA-XSRF-TOKEN cookie (plus the
+	// JSESSIONID it's tied to) and the write is refused with a 403 ("Access
+	// denied to IP ...") unless both come back with the token echoed in a
+	// header. The shared http.Client has no cookie jar, so replay them by hand.
+	for _, ck := range getResp.Cookies() {
+		putReq.AddCookie(ck)
+		if ck.Name == "HYDRA-XSRF-TOKEN" {
+			putReq.Header.Set("X-HYDRA-XSRF-TOKEN", ck.Value)
+			putReq.Header.Set("X-XSRF-TOKEN", ck.Value)
+		}
+	}
 	putResp, err := c.httpClient.Load().Do(putReq)
 	if err != nil {
 		return fmt.Errorf("nzbhydra2 put config: %w", err)
