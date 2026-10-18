@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/drakkar-media/drakkar/internal/database"
@@ -51,6 +53,28 @@ type ContentProvider interface {
 	ListContentMountEntriesForRelease(ctx context.Context, selectedReleaseID int64) ([]database.ContentMountEntry, error)
 	OpenVirtualMediaFile(ctx context.Context, virtualFileID int64) (stream.VirtualMediaFile, error)
 	ListSymlinkPublications(ctx context.Context) ([]database.SymlinkPublication, error)
+}
+
+// readFailureHook, when set, is told about real playback read failures that
+// look like a permanently-missing article so the health system can re-check
+// the file immediately instead of waiting for its next scheduled pass.
+var readFailureHook atomic.Pointer[func(virtualFileID int64, err error)]
+
+// SetReadFailureHook registers the callback for article-missing read
+// failures. It runs on the read path, so it must return quickly.
+func SetReadFailureHook(fn func(virtualFileID int64, err error)) {
+	readFailureHook.Store(&fn)
+}
+
+func reportReadFailure(virtualFileID int64, err error) {
+	hook := readFailureHook.Load()
+	if hook == nil || virtualFileID <= 0 || errors.Is(err, context.Canceled) {
+		return
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "article not found") || strings.Contains(msg, "status 430") || strings.Contains(msg, "article missing") {
+		(*hook)(virtualFileID, err)
+	}
 }
 
 // Handler returns an HTTP handler serving virtual files over WebDAV.
@@ -538,6 +562,7 @@ func (f *virtualFile) Read(p []byte) (int, error) {
 	n, err := f.vf.ReadAt(f.readCtx, p, f.pos)
 	if err != nil && err != io.EOF {
 		slog.Debug("dav read error", "name", f.fi.Name(), "pos", f.pos, "n", n, "err", err)
+		reportReadFailure(f.virtualFileID, err)
 	}
 	if n > 0 {
 		f.pos += int64(n)

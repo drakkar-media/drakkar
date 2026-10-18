@@ -884,3 +884,120 @@ func (db *DB) ListPublishedDirectNzbSegments(ctx context.Context) ([]PublishedDi
 	}
 	return out, rows.Err()
 }
+
+// fullSegmentCheckConcurrency bounds in-flight STAT commands for one
+// StrictCheckAllSegments run. STAT transfers no article body, so a handful of
+// parallel commands is cheap, but it still draws from the same provider
+// connection budget as real playback.
+const fullSegmentCheckConcurrency = 4
+
+// loadNZBAllSegmentIDs returns every message ID of every file in the NZB that
+// matters for playback (same subject filter as the first/last check), in
+// file then segment order.
+func (db *DB) loadNZBAllSegmentIDs(ctx context.Context, nzbDocumentID int64) ([]string, error) {
+	rows, err := db.SQL.QueryContext(ctx, `
+		SELECT nf.subject, nf.message_ids_packed, coalesce(nf.message_ids::text, '{}')
+		FROM nzb_files nf
+		WHERE nf.nzb_document_id = $1
+		ORDER BY nf.id ASC`, nzbDocumentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var all []string
+	for rows.Next() {
+		var subject string
+		var packed []byte
+		var raw string
+		if err := rows.Scan(&subject, &packed, &raw); err != nil {
+			return nil, err
+		}
+		if !shouldValidateNZBSubject(subject) {
+			continue
+		}
+		ids, err := unpackMessageIDs(packed, raw)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, ids...)
+	}
+	return all, rows.Err()
+}
+
+// StrictCheckAllSegments STATs every article of the NZB's playable files and
+// fails on the first one the provider confirms is gone (430, verified by a
+// second STAT after a short delay so a one-off throttle/glitch can't condemn a
+// release). StrictCheckFirstSegments only samples the first and last article,
+// so a hole in the middle of the file passed every health check and only
+// surfaced as playback stalling at that exact offset. Inconclusive STAT
+// results (timeouts, throttling) never fail the check.
+//
+// The returned error is sanitizedSegmentErr-shaped and so blocklist-safe, and
+// does NOT satisfy isTransientHealthCheckErr (it carries "status 430").
+func (db *DB) StrictCheckAllSegments(ctx context.Context, nzbDocumentID int64) error {
+	checker, ok := db.SegmentFetcher.(SegmentChecker)
+	if !ok || checker == nil {
+		return nil
+	}
+	ids, err := db.loadNZBAllSegmentIDs(ctx, nzbDocumentID)
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	parent := ctx
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type missing struct {
+		idx int
+		id  string
+	}
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		first *missing
+		next  int
+	)
+	for w := 0; w < fullSegmentCheckConcurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ctx.Err() == nil {
+				mu.Lock()
+				i := next
+				next++
+				mu.Unlock()
+				if i >= len(ids) {
+					return
+				}
+				if !errors.Is(checker.Exists(ctx, ids[i]), nntp.ErrArticleMissing) {
+					continue
+				}
+				// Confirm: a throttle-induced false 430 must not blocklist.
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(2 * time.Second):
+				}
+				if !errors.Is(checker.Exists(ctx, ids[i]), nntp.ErrArticleMissing) {
+					continue
+				}
+				mu.Lock()
+				if first == nil || i < first.idx {
+					first = &missing{idx: i, id: ids[i]}
+				}
+				mu.Unlock()
+				cancel()
+				return
+			}
+		}()
+	}
+	wg.Wait()
+	if first != nil {
+		return sanitizedSegmentErr("strict health", fmt.Sprintf("segment-%d-of-%d", first.idx+1, len(ids)),
+			fmt.Errorf("article missing from provider (status 430)"), first.id)
+	}
+	// Cut short by the caller's deadline: not a verdict either way.
+	return parent.Err()
+}

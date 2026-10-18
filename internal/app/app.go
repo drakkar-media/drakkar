@@ -1400,6 +1400,10 @@ func Run(ctx context.Context, logger zerolog.Logger) error {
 			Msg("metadata backfill complete")
 	})
 
+	// Real playback hitting a missing article triggers an immediate full-file
+	// health re-check instead of waiting for the next scheduled deep pass.
+	dav.SetReadFailureHook(newReadFailureRechecker(ctx, db, workflowSvc, publicationSvc, logger).Report)
+
 	webdavServer := newBoundedHTTPServer(rt.WebDAVAddress, dav.Handler(db, rt.MovieLibraryPath, rt.TVLibraryPath))
 
 	// Loopback-only pprof server -- not published in docker-compose.yml, so

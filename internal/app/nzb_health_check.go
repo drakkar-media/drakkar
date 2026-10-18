@@ -327,6 +327,11 @@ func runDeepHealthCandidates(ctx context.Context, db *database.DB, workflowSvc *
 		checkCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 		err := db.StrictCheckFirstSegments(checkCtx, c.NZBDocumentID)
 		cancel()
+		if err == nil && shouldRunFullSegmentCheck(now, c) {
+			fullCtx, fullCancel := context.WithTimeout(ctx, fullSegmentCheckTimeout)
+			err = db.StrictCheckAllSegments(fullCtx, c.NZBDocumentID)
+			fullCancel()
+		}
 		if err != nil && isTransientHealthCheckErr(err) {
 			// Timeout/throttle/connection errors don't prove the release is
 			// bad — blocklisting on these caused good releases to be dropped
@@ -410,42 +415,64 @@ func runDeepHealthCandidates(ctx context.Context, db *database.DB, workflowSvc *
 				continue
 			}
 		}
-		logger.Warn().
-			Int64("libraryItemId", c.LibraryItemID).
-			Str("title", c.Title).
-			Err(err).
-			Msg("health check: NZB validation failed — blocklisting release and promoting next")
-		_ = db.RecordHealthCheck(ctx, c.PublicationID, false)
-		// Remove symlinks before blocklisting so the filesystem is clean
-		// regardless of whether a next candidate exists.
-		paths, pathErr := db.DeleteSymlinkPublicationsForLibraryItem(ctx, c.LibraryItemID)
-		if pathErr == nil {
-			for _, p := range paths {
-				if removeErr := os.Remove(p); removeErr != nil && !os.IsNotExist(removeErr) {
-					logger.Warn().Str("path", p).Err(removeErr).Msg("health check: could not remove symlink")
-				}
+		if failPublicationAndBlocklist(ctx, db, workflowSvc, logger, c, err) {
+			if _, exists := resetSeen[c.LibraryItemID]; !exists {
+				resetSeen[c.LibraryItemID] = struct{}{}
+				result.ResetItems++
 			}
-		}
-		// StrictCheckFirstSegments's own error already carries a "strict
-		// health: " prefix (via sanitizedSegmentErr); only the
-		// "invalid video container" variant built just above doesn't.
-		// Unconditionally prepending here produced a doubled
-		// "strict health: strict health: ..." reason for every segment
-		// failure.
-		reason := err.Error()
-		if !strings.HasPrefix(strings.ToLower(reason), "strict health:") {
-			reason = "strict health: " + reason
-		}
-		blocklistErr := workflowSvc.FailAndBlocklistRelease(ctx, c.SelectedReleaseID, reason)
-		if blocklistErr != nil {
-			logger.Error().Err(blocklistErr).Int64("libraryItemId", c.LibraryItemID).Msg("health check: blocklist failed")
-		} else if _, exists := resetSeen[c.LibraryItemID]; !exists {
-			resetSeen[c.LibraryItemID] = struct{}{}
-			result.ResetItems++
 		}
 		markProcessed()
 	}
 	return result, processed
+}
+
+// failPublicationAndBlocklist handles a definitive deep-health failure: marks
+// the publication unhealthy, removes its symlinks so the filesystem is clean
+// regardless of whether a next candidate exists, then blocklists the selected
+// release so the workflow promotes the next candidate. Reports whether the
+// blocklist step succeeded.
+func failPublicationAndBlocklist(ctx context.Context, db *database.DB, workflowSvc *workflow.Service, logger zerolog.Logger, c database.DeepHealthCandidate, err error) bool {
+	logger.Warn().
+		Int64("libraryItemId", c.LibraryItemID).
+		Str("title", c.Title).
+		Err(err).
+		Msg("health check: NZB validation failed — blocklisting release and promoting next")
+	_ = db.RecordHealthCheck(ctx, c.PublicationID, false)
+	paths, pathErr := db.DeleteSymlinkPublicationsForLibraryItem(ctx, c.LibraryItemID)
+	if pathErr == nil {
+		for _, p := range paths {
+			if removeErr := os.Remove(p); removeErr != nil && !os.IsNotExist(removeErr) {
+				logger.Warn().Str("path", p).Err(removeErr).Msg("health check: could not remove symlink")
+			}
+		}
+	}
+	// StrictCheckFirstSegments's own error already carries a "strict
+	// health: " prefix (via sanitizedSegmentErr); only the
+	// "invalid video container" variant doesn't. Unconditionally prepending
+	// produced a doubled "strict health: strict health: ..." reason.
+	reason := err.Error()
+	if !strings.HasPrefix(strings.ToLower(reason), "strict health:") {
+		reason = "strict health: " + reason
+	}
+	if blocklistErr := workflowSvc.FailAndBlocklistRelease(ctx, c.SelectedReleaseID, reason); blocklistErr != nil {
+		logger.Error().Err(blocklistErr).Int64("libraryItemId", c.LibraryItemID).Msg("health check: blocklist failed")
+		return false
+	}
+	return true
+}
+
+const (
+	// fullSegmentCheckMaxAge bounds the every-article STAT check to recently
+	// published items: a hole in an upload is almost always there from the
+	// start, so the first week of regular passes catches it, while re-STATing
+	// thousands of articles per file for the whole library on every sweep would
+	// be a large, steady load on the provider.
+	fullSegmentCheckMaxAge  = 7 * 24 * time.Hour
+	fullSegmentCheckTimeout = 5 * time.Minute
+)
+
+func shouldRunFullSegmentCheck(now time.Time, c database.DeepHealthCandidate) bool {
+	return now.Sub(c.CreatedAt) < fullSegmentCheckMaxAge
 }
 
 const (

@@ -175,7 +175,7 @@
             </Select.Content>
           </Select.Root>
         </label>
-        <Button kind="primary" disabled={isBusy('create-user') || !username.trim() || password.length < 8}>
+        <Button kind="primary" type="submit" disabled={isBusy('create-user') || !username.trim() || password.length < 8}>
           <UserPlus size={14} />
           Create User
         </Button>
@@ -192,7 +192,7 @@
           <span class="text-sm font-semibold">Expires At</span>
           <input bind:value={tokenExpiresAt} type="datetime-local" />
         </label>
-        <Button kind="primary" disabled={isBusy('create-token') || !tokenName.trim()}>
+        <Button kind="primary" type="submit" disabled={isBusy('create-token') || !tokenName.trim()}>
           <Shield size={14} />
           Create Token
         </Button>

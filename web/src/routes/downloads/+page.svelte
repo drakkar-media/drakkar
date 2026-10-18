@@ -430,7 +430,7 @@
     <Link size={14} />
     <input bind:value={nzbUrl} type="url" placeholder="Paste NZB URL to import…" class="!h-auto flex-1 !border-0 !bg-transparent p-0 text-sm text-foreground" disabled={addingUrl} />
   </div>
-  <Button kind="secondary" disabled={!nzbUrl.trim() || addingUrl}>
+  <Button kind="secondary" type="submit" disabled={!nzbUrl.trim() || addingUrl}>
     {addingUrl ? 'Adding…' : 'Add NZB URL'}
   </Button>
 </form>

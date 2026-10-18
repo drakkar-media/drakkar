@@ -360,6 +360,28 @@ func (db *DB) ListDeepHealthCandidates(ctx context.Context, limit int) ([]DeepHe
 	return scanDeepHealthCandidates(rows)
 }
 
+// GetDeepHealthCandidateForVirtualFile returns the deep-health candidate whose
+// publication is backed by virtualFileID, or ok=false when that file isn't
+// backing a currently-available published item (already replaced, never
+// published, etc.). Used to turn a live playback read failure into an
+// immediate targeted re-check.
+func (db *DB) GetDeepHealthCandidateForVirtualFile(ctx context.Context, virtualFileID int64) (DeepHealthCandidate, bool, error) {
+	rows, err := db.SQL.QueryContext(ctx, `
+		SELECT *
+		FROM (`+deepHealthCandidatesQuery+`) candidates
+		WHERE virtual_file_id = $1
+		LIMIT 1`, virtualFileID)
+	if err != nil {
+		return DeepHealthCandidate{}, false, err
+	}
+	defer rows.Close()
+	items, err := scanDeepHealthCandidates(rows)
+	if err != nil || len(items) == 0 {
+		return DeepHealthCandidate{}, false, err
+	}
+	return items[0], true, nil
+}
+
 // ListDeepHealthCandidatesPage returns one stable keyset page for a full
 // library sweep. Library-item IDs are used instead of health timestamps because
 // checking a row changes its timestamp and would otherwise reorder later pages.
