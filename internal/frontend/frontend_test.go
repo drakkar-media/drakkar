@@ -1,9 +1,32 @@
 package frontend
 
 import (
+	"io/fs"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+// firstImmutableAsset returns the URL path of some real file under the
+// embedded build's immutable-asset directory. The filenames bake in content
+// hashes that change with every frontend change, so a test must discover one
+// rather than hardcode it.
+func firstImmutableAsset(t *testing.T) string {
+	t.Helper()
+	root := strings.Trim(immutableAssetPrefix, "/")
+	var found string
+	_ = fs.WalkDir(buildFS, "build/"+root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || found != "" {
+			return nil
+		}
+		found = "/" + strings.TrimPrefix(p, "build/")
+		return fs.SkipAll
+	})
+	if found == "" {
+		t.Skip("embedded build has no immutable assets (frontend not built)")
+	}
+	return found
+}
 
 // TestImmutableAssetsAreCachedForever guards the fix for a real production
 // incident (2026-08-25): a redeploy that regenerates every content-hashed
@@ -12,7 +35,7 @@ import (
 // immutableAssetPrefix must say so explicitly.
 func TestImmutableAssetsAreCachedForever(t *testing.T) {
 	h := Handler()
-	req := httptest.NewRequest("GET", "/_app/immutable/assets/12.DBMNKZ_C.css", nil)
+	req := httptest.NewRequest("GET", firstImmutableAsset(t), nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
