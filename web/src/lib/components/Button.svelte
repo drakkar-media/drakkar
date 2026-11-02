@@ -8,8 +8,8 @@
    * ui/button) so every button in the app -- whether it goes through this
    * legacy-style wrapper or the shadcn component directly -- looks identical.
    */
-  import { buttonVariants } from '$lib/components/ui/button/index.js';
-  import { cn } from '$lib/utils.js';
+  import { buttonVariants } from '#lib/components/ui/button/index.js';
+  import { cn } from '#lib/utils.js';
 
   export let kind: 'primary' | 'secondary' | 'ghost' | 'danger' = 'secondary';
   export let type: 'button' | 'submit' = 'button';

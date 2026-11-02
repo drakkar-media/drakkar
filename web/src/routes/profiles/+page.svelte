@@ -15,14 +15,14 @@
   import ChevronUp from '@lucide/svelte/icons/chevron-up';
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
   import Star from '@lucide/svelte/icons/star';
-  import PageHeader from '$lib/components/PageHeader.svelte';
-  import Panel from '$lib/components/Panel.svelte';
-  import Button from '$lib/components/Button.svelte';
-  import StatusPill from '$lib/components/StatusPill.svelte';
-  import { api } from '$lib/api';
-  import { toastError } from '$lib/toast';
-  import { runAction, confirmed } from '$lib/actions';
-  import type { QualityProfile } from '$lib/types';
+  import PageHeader from '#lib/components/PageHeader.svelte';
+  import Panel from '#lib/components/Panel.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import StatusPill from '#lib/components/StatusPill.svelte';
+  import { api } from '#lib/api.js';
+  import { toastError } from '#lib/toast.js';
+  import { runAction, confirmed } from '#lib/actions.js';
+  import type { QualityProfile } from '#lib/types.js';
 
   const ALL_RESOLUTIONS = ['2160p', '1080p', '720p', '576p', '480p'];
   const ALL_SOURCES     = ['BluRay', 'Remux', 'WEB-DL', 'WEBRip', 'HDTV', 'DVDRip'];

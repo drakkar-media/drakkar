@@ -1,4 +1,4 @@
-import type { LibraryItem } from '$lib/types';
+import type { LibraryItem } from '#lib/types.js';
 
 /**
  * Queue states that map to the `active` ("Downloading") item status.

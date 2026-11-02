@@ -12,15 +12,15 @@
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import UserPlus from '@lucide/svelte/icons/user-plus';
   import KeyRound from '@lucide/svelte/icons/key-round';
-  import PageHeader from '$lib/components/PageHeader.svelte';
-  import Panel from '$lib/components/Panel.svelte';
-  import Button from '$lib/components/Button.svelte';
-  import StatusPill from '$lib/components/StatusPill.svelte';
-  import * as Select from '$lib/components/ui/select/index.js';
-  import { api } from '$lib/api';
-  import { toastError, toastSuccess } from '$lib/toast';
-  import { runAction, confirmed } from '$lib/actions';
-  import type { APIToken, User } from '$lib/types';
+  import PageHeader from '#lib/components/PageHeader.svelte';
+  import Panel from '#lib/components/Panel.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import StatusPill from '#lib/components/StatusPill.svelte';
+  import * as Select from '#lib/components/ui/select/index.js';
+  import { api } from '#lib/api.js';
+  import { toastError, toastSuccess } from '#lib/toast.js';
+  import { runAction, confirmed } from '#lib/actions.js';
+  import type { APIToken, User } from '#lib/types.js';
 
   let users: User[] = [];
   let me: User | null = null;

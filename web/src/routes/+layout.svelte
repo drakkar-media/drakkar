@@ -14,8 +14,8 @@
   import { afterNavigate, goto } from '$app/navigation';
   import { page } from '$app/state';
   import '../app.css';
-  import AppShell from '$lib/components/AppShell.svelte';
-  import ToastViewport from '$lib/components/ToastViewport.svelte';
+  import AppShell from '#lib/components/AppShell.svelte';
+  import ToastViewport from '#lib/components/ToastViewport.svelte';
 
   const PUBLIC_PATHS = ['/login', '/setup'];
 
@@ -49,7 +49,7 @@
         if (setupRes.ok) {
           const setup = await setupRes.json();
           if (setup.required) {
-            await goto('/setup', { replaceState: true });
+            await goto('/setup', { replace: true });
             return;
           }
         }
@@ -60,7 +60,7 @@
       // Verify the session cookie is valid.
       const meRes = await fetch('/api/auth/me');
       if (!meRes.ok) {
-        await goto('/login', { replaceState: true });
+        await goto('/login', { replace: true });
         return;
       }
 

@@ -18,14 +18,14 @@
   import Activity from '@lucide/svelte/icons/activity';
   import X from '@lucide/svelte/icons/x';
   import Home from '@lucide/svelte/icons/home';
-  import PageHeader from '$lib/components/PageHeader.svelte';
-  import Panel from '$lib/components/Panel.svelte';
-  import Button from '$lib/components/Button.svelte';
-  import * as Table from '$lib/components/ui/table/index.js';
-  import { api } from '$lib/api';
-  import { toastError, toastSuccess } from '$lib/toast';
-  import { bytes as fmtBytes } from '$lib/format';
-  import { copyToClipboard } from '$lib/clipboard';
+  import PageHeader from '#lib/components/PageHeader.svelte';
+  import Panel from '#lib/components/Panel.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import * as Table from '#lib/components/ui/table/index.js';
+  import { api } from '#lib/api.js';
+  import { toastError, toastSuccess } from '#lib/toast.js';
+  import { bytes as fmtBytes } from '#lib/format.js';
+  import { copyToClipboard } from '#lib/clipboard.js';
 
   type VFSEntry = { name: string; path: string; isDir: boolean; size: number };
   type StreamItem = {

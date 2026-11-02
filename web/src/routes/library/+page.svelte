@@ -18,15 +18,15 @@
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import SearchCheck from '@lucide/svelte/icons/search-check';
   import Play from '@lucide/svelte/icons/play';
-  import Pagination from '$lib/components/Pagination.svelte';
-  import PosterCard from '$lib/components/PosterCard.svelte';
-  import MetricCard from '$lib/components/MetricCard.svelte';
-  import Button from '$lib/components/Button.svelte';
-  import { api, subscribeEvents } from '$lib/api';
-  import { toastError, toastSuccess } from '$lib/toast';
-  import { runAction } from '$lib/actions';
-  import { debounce } from '$lib/debounce';
-  import type { LibraryItem, LibraryPage, Status } from '$lib/types';
+  import Pagination from '#lib/components/Pagination.svelte';
+  import PosterCard from '#lib/components/PosterCard.svelte';
+  import MetricCard from '#lib/components/MetricCard.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import { api, subscribeEvents } from '#lib/api.js';
+  import { toastError, toastSuccess } from '#lib/toast.js';
+  import { runAction } from '#lib/actions.js';
+  import { debounce } from '#lib/debounce.js';
+  import type { LibraryItem, LibraryPage, Status } from '#lib/types.js';
 
   let items: LibraryItem[] = [];
   let libraryPage: LibraryPage = { items: [], page: 1, pageSize: 40, total: 0, totalPages: 1, totalMonitored: 0, sumAvailable: 0, sumMissing: 0, countActive: 0 };
@@ -82,7 +82,7 @@
 
   // Sync current state back to the URL for bookmarking / browser history.
   function syncUrl() {
-    const url = new URL(page.url);
+    const url = new URL(page.url.href);
     if (kind === 'all') url.searchParams.delete('kind');
     else url.searchParams.set('kind', kind);
     if (query.trim()) url.searchParams.set('q', query.trim());
@@ -91,7 +91,7 @@
     else url.searchParams.set('state', stateFilter);
     if (currentPage <= 1) url.searchParams.delete('page');
     else url.searchParams.set('page', String(currentPage));
-    void goto(`${url.pathname}?${url.searchParams.toString()}`, { replaceState: true, noScroll: true, keepFocus: true });
+    void goto(`${url.pathname}?${url.searchParams.toString()}`, { replace: true, reset: false });
   }
 
   function updateFilters(next: { kind?: string; q?: string; state?: string }) {

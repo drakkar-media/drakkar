@@ -14,16 +14,16 @@
   import SearchCheck from '@lucide/svelte/icons/search-check';
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import Link from '@lucide/svelte/icons/link';
-  import PageHeader from '$lib/components/PageHeader.svelte';
-  import Panel from '$lib/components/Panel.svelte';
-  import Button from '$lib/components/Button.svelte';
-  import StatusPill from '$lib/components/StatusPill.svelte';
-  import * as Select from '$lib/components/ui/select/index.js';
-  import { api, subscribeEvents } from '$lib/api';
-  import { toastError, toastSuccess } from '$lib/toast';
-  import { runAction, confirmed } from '$lib/actions';
-  import { debounce } from '$lib/debounce';
-  import type { SubtitleLibraryRow } from '$lib/types';
+  import PageHeader from '#lib/components/PageHeader.svelte';
+  import Panel from '#lib/components/Panel.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import StatusPill from '#lib/components/StatusPill.svelte';
+  import * as Select from '#lib/components/ui/select/index.js';
+  import { api, subscribeEvents } from '#lib/api.js';
+  import { toastError, toastSuccess } from '#lib/toast.js';
+  import { runAction, confirmed } from '#lib/actions.js';
+  import { debounce } from '#lib/debounce.js';
+  import type { SubtitleLibraryRow } from '#lib/types.js';
 
   let items: SubtitleLibraryRow[] = [];
   let total = 0;

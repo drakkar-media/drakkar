@@ -17,15 +17,15 @@
   import AlertTriangle from '@lucide/svelte/icons/alert-triangle';
   import ChevronLeft from '@lucide/svelte/icons/chevron-left';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
-  import PageHeader from '$lib/components/PageHeader.svelte';
-  import Panel from '$lib/components/Panel.svelte';
-  import Button from '$lib/components/Button.svelte';
-  import StatusPill from '$lib/components/StatusPill.svelte';
-  import * as Table from '$lib/components/ui/table/index.js';
-  import { api, subscribeEvents } from '$lib/api';
-  import { toastError, toastSuccess } from '$lib/toast';
-  import { debounce } from '$lib/debounce';
-  import { confirmed } from '$lib/actions';
+  import PageHeader from '#lib/components/PageHeader.svelte';
+  import Panel from '#lib/components/Panel.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import StatusPill from '#lib/components/StatusPill.svelte';
+  import * as Table from '#lib/components/ui/table/index.js';
+  import { api, subscribeEvents } from '#lib/api.js';
+  import { toastError, toastSuccess } from '#lib/toast.js';
+  import { debounce } from '#lib/debounce.js';
+  import { confirmed } from '#lib/actions.js';
 
   type HealthSummary = { total: number; checked: number; healthy: number; neverChecked: number; consistencyIssues: number; uncalibratedNZBFiles: number };
   type HealthEntry = {

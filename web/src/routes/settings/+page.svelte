@@ -52,21 +52,21 @@
   import Gauge from '@lucide/svelte/icons/gauge';
   import ShieldCheck from '@lucide/svelte/icons/shield-check';
   import Upload from '@lucide/svelte/icons/upload';
-  import Button from '$lib/components/Button.svelte';
-  import BackupRestorePanel from '$lib/components/BackupRestorePanel.svelte';
-  import PageHeader from '$lib/components/PageHeader.svelte';
-  import Pagination from '$lib/components/Pagination.svelte';
-  import Panel from '$lib/components/Panel.svelte';
-  import StatusPill from '$lib/components/StatusPill.svelte';
-  import * as Table from '$lib/components/ui/table/index.js';
-  import * as Select from '$lib/components/ui/select/index.js';
-  import { api, subscribeEvents } from '$lib/api';
-  import { bytes, dateTime } from '$lib/format';
-  import { toastError, toastSuccess } from '$lib/toast';
-  import { copyToClipboard } from '$lib/clipboard';
-  import { runAction, confirmed } from '$lib/actions';
-  import { debounce } from '$lib/debounce';
-  import type { BlocklistItem, BlocklistMutation, BlockTestResult, CustomFormat, FullSettings, IndexerPolicy, IntegrationProbeReport, PolicySettings, PrivacyStatus, QualityDefinition, QualityProfile, QueueDecisionAction, ReleaseBlockRule, SpeedTestResult, Status, SubtitleProfile, TaskSchedule, UsenetProvider } from '$lib/types';
+  import Button from '#lib/components/Button.svelte';
+  import BackupRestorePanel from '#lib/components/BackupRestorePanel.svelte';
+  import PageHeader from '#lib/components/PageHeader.svelte';
+  import Pagination from '#lib/components/Pagination.svelte';
+  import Panel from '#lib/components/Panel.svelte';
+  import StatusPill from '#lib/components/StatusPill.svelte';
+  import * as Table from '#lib/components/ui/table/index.js';
+  import * as Select from '#lib/components/ui/select/index.js';
+  import { api, subscribeEvents } from '#lib/api.js';
+  import { bytes, dateTime } from '#lib/format.js';
+  import { toastError, toastSuccess } from '#lib/toast.js';
+  import { copyToClipboard } from '#lib/clipboard.js';
+  import { runAction, confirmed } from '#lib/actions.js';
+  import { debounce } from '#lib/debounce.js';
+  import type { BlocklistItem, BlocklistMutation, BlockTestResult, CustomFormat, FullSettings, IndexerPolicy, IntegrationProbeReport, PolicySettings, PrivacyStatus, QualityDefinition, QualityProfile, QueueDecisionAction, ReleaseBlockRule, SpeedTestResult, Status, SubtitleProfile, TaskSchedule, UsenetProvider } from '#lib/types.js';
 
   type SettingsTab = 'integrations' | 'providers' | 'indexers' | 'queue' | 'library' | 'rules' | 'quality' | 'formats' | 'filtering' | 'subtitle-profiles' | 'notifications' | 'privacy' | 'logs' | 'tasks' | 'media-players' | 'speed-test' | 'system';
 

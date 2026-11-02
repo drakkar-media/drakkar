@@ -13,16 +13,16 @@
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import SearchCheck from '@lucide/svelte/icons/search-check';
   import Play from '@lucide/svelte/icons/play';
-  import Button from '$lib/components/Button.svelte';
-  import PageHeader from '$lib/components/PageHeader.svelte';
-  import Panel from '$lib/components/Panel.svelte';
-  import StatusPill from '$lib/components/StatusPill.svelte';
-  import * as Select from '$lib/components/ui/select/index.js';
-  import { api, subscribeEvents } from '$lib/api';
-  import { dateTime, sentence } from '$lib/format';
-  import { toastError, toastSuccess } from '$lib/toast';
-  import { debounce } from '$lib/debounce';
-  import type { QualityProfile, RequestItem, Status } from '$lib/types';
+  import Button from '#lib/components/Button.svelte';
+  import PageHeader from '#lib/components/PageHeader.svelte';
+  import Panel from '#lib/components/Panel.svelte';
+  import StatusPill from '#lib/components/StatusPill.svelte';
+  import * as Select from '#lib/components/ui/select/index.js';
+  import { api, subscribeEvents } from '#lib/api.js';
+  import { dateTime, sentence } from '#lib/format.js';
+  import { toastError, toastSuccess } from '#lib/toast.js';
+  import { debounce } from '#lib/debounce.js';
+  import type { QualityProfile, RequestItem, Status } from '#lib/types.js';
 
   let status: Status | null = null;
   let requests: RequestItem[] = [];

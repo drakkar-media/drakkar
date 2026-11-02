@@ -18,15 +18,15 @@
   import AlertTriangle from '@lucide/svelte/icons/alert-triangle';
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
-  import PageHeader from '$lib/components/PageHeader.svelte';
-  import Panel from '$lib/components/Panel.svelte';
-  import Button from '$lib/components/Button.svelte';
-  import BackupRestorePanel from '$lib/components/BackupRestorePanel.svelte';
-  import StatusPill from '$lib/components/StatusPill.svelte';
-  import * as Table from '$lib/components/ui/table/index.js';
-  import { toastError, toastSuccess } from '$lib/toast';
-  import { api, subscribeEvents } from '$lib/api';
-  import type { TaskSchedule } from '$lib/types';
+  import PageHeader from '#lib/components/PageHeader.svelte';
+  import Panel from '#lib/components/Panel.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import BackupRestorePanel from '#lib/components/BackupRestorePanel.svelte';
+  import StatusPill from '#lib/components/StatusPill.svelte';
+  import * as Table from '#lib/components/ui/table/index.js';
+  import { toastError, toastSuccess } from '#lib/toast.js';
+  import { api, subscribeEvents } from '#lib/api.js';
+  import type { TaskSchedule } from '#lib/types.js';
 
   type TaskResult = { ok: boolean; detail: string; ranAt: string };
   type TaskDef = {

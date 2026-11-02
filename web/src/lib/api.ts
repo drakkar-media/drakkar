@@ -1,6 +1,6 @@
-import { browser } from '$app/environment';
+import { browser } from '$app/env';
 import { goto } from '$app/navigation';
-import type { BackgroundTaskEvent } from '$lib/events';
+import type { BackgroundTaskEvent } from '#lib/events.js';
 import type {
   LibraryItem,
   LibraryPage,
@@ -48,7 +48,7 @@ import type {
   BackupInfo,
   BackupOperationStatus,
   RestoreStatus
-} from '$lib/types';
+} from '#lib/types.js';
 
 function baseURL() {
   if (!browser) {
@@ -86,7 +86,7 @@ function eventsURL() {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${baseURL()}${path}`, init);
   if (response.status === 401 && browser && !path.startsWith('/api/auth') && !path.startsWith('/api/setup')) {
-    await goto('/login', { replaceState: true });
+    await goto('/login', { replace: true });
     throw new Error('Session expired');
   }
   if (!response.ok) {

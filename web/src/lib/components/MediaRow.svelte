@@ -6,8 +6,8 @@
    */
   import ChevronLeft from '@lucide/svelte/icons/chevron-left';
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
-  import PosterCard from '$lib/components/PosterCard.svelte';
-  import type { LibraryItem } from '$lib/types';
+  import PosterCard from '#lib/components/PosterCard.svelte';
+  import type { LibraryItem } from '#lib/types.js';
 
   export let title = '';
   export let subtitle = '';

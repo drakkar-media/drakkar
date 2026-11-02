@@ -2,7 +2,7 @@
 	import { Command as CommandPrimitive } from "bits-ui";
 	import { HugeiconsIcon } from "@hugeicons/svelte"
 	import { Tick02Icon } from '@hugeicons/core-free-icons';
-	import { cn } from "$lib/utils.js";
+	import { cn } from "#lib/utils.js";
 
 	let {
 		ref = $bindable(null),

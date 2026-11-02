@@ -6,8 +6,8 @@
 	import { Dialog as SheetPrimitive } from "bits-ui";
 	import { HugeiconsIcon } from "@hugeicons/svelte"
 	import { Cancel01Icon } from '@hugeicons/core-free-icons';
-	import { Button } from "$lib/components/ui/button/index.js";
-	import { cn, type WithoutChildrenOrChild } from "$lib/utils.js";
+	import { Button } from "#lib/components/ui/button/index.js";
+	import { cn, type WithoutChildrenOrChild } from "#lib/utils.js";
 	import SheetOverlay from "./sheet-overlay.svelte";
 	import SheetPortal from "./sheet-portal.svelte";
 	import type { Snippet } from "svelte";

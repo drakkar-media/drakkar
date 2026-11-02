@@ -11,13 +11,13 @@
   import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import Upload from '@lucide/svelte/icons/upload';
-  import Button from '$lib/components/Button.svelte';
-  import Panel from '$lib/components/Panel.svelte';
-  import StatusPill from '$lib/components/StatusPill.svelte';
-  import { api } from '$lib/api';
-  import { bytes, dateTime } from '$lib/format';
-  import { toastError, toastSuccess } from '$lib/toast';
-  import type { BackupInfo, BackupOperationStatus, RestoreStatus } from '$lib/types';
+  import Button from '#lib/components/Button.svelte';
+  import Panel from '#lib/components/Panel.svelte';
+  import StatusPill from '#lib/components/StatusPill.svelte';
+  import { api } from '#lib/api.js';
+  import { bytes, dateTime } from '#lib/format.js';
+  import { toastError, toastSuccess } from '#lib/toast.js';
+  import type { BackupInfo, BackupOperationStatus, RestoreStatus } from '#lib/types.js';
 
   let backups: BackupInfo[] = [];
   let restoreStatus: RestoreStatus = { state: 'idle' };

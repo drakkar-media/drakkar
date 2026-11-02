@@ -9,9 +9,9 @@
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
   import { onMount } from 'svelte';
-  import { api } from '$lib/api';
-  import { detailsHref } from '$lib/detailsHref';
-  import { toastError } from '$lib/toast';
+  import { api } from '#lib/api.js';
+  import { detailsHref } from '#lib/detailsHref.js';
+  import { toastError } from '#lib/toast.js';
 
   let loading = true;
   let errorMessage = '';
@@ -29,7 +29,7 @@
         tmdbId: detail.tmdbId,
         imdbId: detail.imdbId
       });
-      await goto(href, { replaceState: true });
+      await goto(href, { replace: true });
     } catch (error) {
       errorMessage = error instanceof Error ? error.message : String(error);
       toastError(errorMessage);

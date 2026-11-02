@@ -7,8 +7,8 @@
    * reachable via back navigation.
    */
   import { goto } from '$app/navigation';
-  import DrakkarLogo from '$lib/components/DrakkarLogo.svelte';
-  import Button from '$lib/components/Button.svelte';
+  import DrakkarLogo from '#lib/components/DrakkarLogo.svelte';
+  import Button from '#lib/components/Button.svelte';
 
   let username = '';
   let password = '';
@@ -30,7 +30,7 @@
           : 'Invalid username or password.';
         return;
       }
-      await goto('/dashboard', { replaceState: true });
+      await goto('/dashboard', { replace: true });
     } catch {
       error = 'Connection error. Please try again.';
     } finally {

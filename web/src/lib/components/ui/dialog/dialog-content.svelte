@@ -2,8 +2,8 @@
 	import { Dialog as DialogPrimitive } from "bits-ui";
 	import { HugeiconsIcon } from "@hugeicons/svelte"
 	import { Cancel01Icon } from '@hugeicons/core-free-icons';
-	import { Button } from "$lib/components/ui/button/index.js";
-	import { cn, type WithoutChildrenOrChild } from "$lib/utils.js";
+	import { Button } from "#lib/components/ui/button/index.js";
+	import { cn, type WithoutChildrenOrChild } from "#lib/utils.js";
 	import * as Dialog from "./index.js";
 	import DialogPortal from "./dialog-portal.svelte";
 	import type { Snippet } from "svelte";

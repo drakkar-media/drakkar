@@ -16,15 +16,15 @@
   import HardDrive from '@lucide/svelte/icons/hard-drive';
   import CheckCircle from '@lucide/svelte/icons/check-circle';
   import AlertCircle from '@lucide/svelte/icons/alert-circle';
-  import MediaRow from '$lib/components/MediaRow.svelte';
-  import { Badge } from '$lib/components/ui/badge/index.js';
-  import { Button } from '$lib/components/ui/button/index.js';
-  import { api, subscribeEvents } from '$lib/api';
-  import { detailsHref } from '$lib/detailsHref';
-  import { toastError, toastSuccess } from '$lib/toast';
-  import { bytes as fmt } from '$lib/format';
-  import { debounce } from '$lib/debounce';
-  import type { DashboardHome, LibraryItem, PrivacyStatus, Status } from '$lib/types';
+  import MediaRow from '#lib/components/MediaRow.svelte';
+  import { Badge } from '#lib/components/ui/badge/index.js';
+  import { Button } from '#lib/components/ui/button/index.js';
+  import { api, subscribeEvents } from '#lib/api.js';
+  import { detailsHref } from '#lib/detailsHref.js';
+  import { toastError, toastSuccess } from '#lib/toast.js';
+  import { bytes as fmt } from '#lib/format.js';
+  import { debounce } from '#lib/debounce.js';
+  import type { DashboardHome, LibraryItem, PrivacyStatus, Status } from '#lib/types.js';
 
   let home: DashboardHome | null = null;
   let status: Status | null = null;

@@ -7,9 +7,9 @@
    */
   import Tv from '@lucide/svelte/icons/tv';
   import Plus from '@lucide/svelte/icons/plus';
-  import { detailsHref } from '$lib/detailsHref';
-  import { itemStatus } from '$lib/itemStatus';
-  import type { LibraryItem } from '$lib/types';
+  import { detailsHref } from '#lib/detailsHref.js';
+  import { itemStatus } from '#lib/itemStatus.js';
+  import type { LibraryItem } from '#lib/types.js';
 
   export let item: LibraryItem;
   export let href = '';

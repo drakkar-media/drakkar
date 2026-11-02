@@ -17,18 +17,18 @@
   import Search from '@lucide/svelte/icons/search';
   import UserRound from '@lucide/svelte/icons/user-round';
   import Users from '@lucide/svelte/icons/users';
-  import { api } from '$lib/api';
-  import { detailsHref } from '$lib/detailsHref';
-  import { navItems, mobilePrimaryItems } from '$lib/nav';
-  import DrakkarLogo from '$lib/components/DrakkarLogo.svelte';
-  import { clearToastHistory, toastHistory } from '$lib/toast';
-  import type { DiscoverMediaItem, DiscoverSearchResult, User } from '$lib/types';
-  import * as Sidebar from '$lib/components/ui/sidebar/index.js';
-  import * as Popover from '$lib/components/ui/popover/index.js';
-  import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
-  import * as Avatar from '$lib/components/ui/avatar/index.js';
-  import { Button } from '$lib/components/ui/button/index.js';
-  import MobileMoreButton from '$lib/components/ui/sidebar/mobile-more-button.svelte';
+  import { api } from '#lib/api.js';
+  import { detailsHref } from '#lib/detailsHref.js';
+  import { navItems, mobilePrimaryItems } from '#lib/nav.js';
+  import DrakkarLogo from '#lib/components/DrakkarLogo.svelte';
+  import { clearToastHistory, toastHistory } from '#lib/toast.js';
+  import type { DiscoverMediaItem, DiscoverSearchResult, User } from '#lib/types.js';
+  import * as Sidebar from '#lib/components/ui/sidebar/index.js';
+  import * as Popover from '#lib/components/ui/popover/index.js';
+  import * as DropdownMenu from '#lib/components/ui/dropdown-menu/index.js';
+  import * as Avatar from '#lib/components/ui/avatar/index.js';
+  import { Button } from '#lib/components/ui/button/index.js';
+  import MobileMoreButton from '#lib/components/ui/sidebar/mobile-more-button.svelte';
 
   let globalSearch = '';
   let suggestions: DiscoverSearchResult | null = null;
@@ -160,7 +160,7 @@
   async function logout() {
     await api.logout();
     currentUser = null;
-    void goto('/login', { replaceState: true });
+    void goto('/login', { replace: true });
   }
 
   $: if (currentPath !== '/search' && !globalSearch) suggestions = null;

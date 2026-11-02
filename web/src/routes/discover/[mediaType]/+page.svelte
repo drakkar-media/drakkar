@@ -9,11 +9,11 @@
    */
   import { page } from '$app/state';
   import { afterNavigate } from '$app/navigation';
-  import PosterCard from '$lib/components/PosterCard.svelte';
-  import { api } from '$lib/api';
-  import { detailsHref } from '$lib/detailsHref';
-  import { toastError } from '$lib/toast';
-  import type { DiscoverMediaItem, LibraryItem } from '$lib/types';
+  import PosterCard from '#lib/components/PosterCard.svelte';
+  import { api } from '#lib/api.js';
+  import { detailsHref } from '#lib/detailsHref.js';
+  import { toastError } from '#lib/toast.js';
+  import type { DiscoverMediaItem, LibraryItem } from '#lib/types.js';
 
   let items: DiscoverMediaItem[] = [];
   let currentPage = 1;

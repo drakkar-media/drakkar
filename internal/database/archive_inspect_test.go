@@ -789,11 +789,11 @@ func buildRAR5Header(headType int64, typeFields []byte, dataAreaSize int64) []by
 // OS, and the name length + name itself.
 func rar5EntryTypeFields(name string, unpackedSize int64) []byte {
 	var out []byte
-	out = append(out, rar5Vint(0)...)             // entry flags: size known, not a directory
-	out = append(out, rar5Vint(unpackedSize)...)  // unpacked size
-	out = append(out, rar5Vint(0644)...)          // attributes (unix mode)
-	out = append(out, rar5Vint(0)...)             // compression info: method 0 (store), non-solid
-	out = append(out, rar5Vint(1)...)             // host OS: unix
+	out = append(out, rar5Vint(0)...)            // entry flags: size known, not a directory
+	out = append(out, rar5Vint(unpackedSize)...) // unpacked size
+	out = append(out, rar5Vint(0644)...)         // attributes (unix mode)
+	out = append(out, rar5Vint(0)...)            // compression info: method 0 (store), non-solid
+	out = append(out, rar5Vint(1)...)            // host OS: unix
 	out = append(out, rar5Vint(int64(len(name)))...)
 	return append(out, []byte(name)...)
 }
@@ -924,12 +924,14 @@ func TestInspectRARArchiveVolumeZeroKeepsOwnPackedSizeThroughStoreReconcile(t *t
 
 func loadSevenZipFixture(t *testing.T, name string) []byte {
 	t.Helper()
-	out, err := exec.Command("go", "env", "GOMODCACHE").Output()
+	// Resolve the module directory from the build list rather than hardcoding
+	// a version, so a dependency bump doesn't break fixture lookup.
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/bodgit/sevenzip").Output()
 	if err != nil {
-		t.Fatalf("go env GOMODCACHE: %v", err)
+		t.Fatalf("go list sevenzip module dir: %v", err)
 	}
-	root := strings.TrimSpace(string(out))
-	raw, err := os.ReadFile(filepath.Join(root, "github.com", "bodgit", "sevenzip@v1.5.1", "testdata", name))
+	dir := strings.TrimSpace(string(out))
+	raw, err := os.ReadFile(filepath.Join(dir, "testdata", name))
 	if err != nil {
 		t.Fatalf("read 7z fixture %s: %v", name, err)
 	}

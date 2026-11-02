@@ -10,14 +10,14 @@
   import Search from '@lucide/svelte/icons/search';
   import Download from '@lucide/svelte/icons/download';
   import ExternalLink from '@lucide/svelte/icons/external-link';
-  import PageHeader from '$lib/components/PageHeader.svelte';
-  import Panel from '$lib/components/Panel.svelte';
-  import Button from '$lib/components/Button.svelte';
-  import StatusPill from '$lib/components/StatusPill.svelte';
-  import * as Table from '$lib/components/ui/table/index.js';
-  import { api } from '$lib/api';
-  import { toastError, toastSuccess } from '$lib/toast';
-  import { bytes } from '$lib/format';
+  import PageHeader from '#lib/components/PageHeader.svelte';
+  import Panel from '#lib/components/Panel.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import StatusPill from '#lib/components/StatusPill.svelte';
+  import * as Table from '#lib/components/ui/table/index.js';
+  import { api } from '#lib/api.js';
+  import { toastError, toastSuccess } from '#lib/toast.js';
+  import { bytes } from '#lib/format.js';
 
   type Item = {
     title: string; externalUrl: string; indexer: string;

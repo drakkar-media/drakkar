@@ -18,11 +18,11 @@
   import SearchCheck from '@lucide/svelte/icons/search-check';
   import Languages from '@lucide/svelte/icons/languages';
   import Trash2 from '@lucide/svelte/icons/trash-2';
-  import Button from '$lib/components/Button.svelte';
-  import { api, subscribeEvents } from '$lib/api';
-  import { toastError } from '$lib/toast';
-  import { runAction, confirmed } from '$lib/actions';
-  import type { SubtitleFile, SubtitleCandidate } from '$lib/types';
+  import Button from '#lib/components/Button.svelte';
+  import { api, subscribeEvents } from '#lib/api.js';
+  import { toastError } from '#lib/toast.js';
+  import { runAction, confirmed } from '#lib/actions.js';
+  import type { SubtitleFile, SubtitleCandidate } from '#lib/types.js';
 
   /** Which library item (show/movie or a single episode) this panel manages. */
   export let libraryItemId: number;

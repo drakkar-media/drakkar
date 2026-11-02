@@ -13,12 +13,12 @@
   import ExternalLink from '@lucide/svelte/icons/external-link';
   import CheckCircle2 from '@lucide/svelte/icons/check-circle-2';
   import Clock from '@lucide/svelte/icons/clock';
-  import PageHeader from '$lib/components/PageHeader.svelte';
-  import StatusPill from '$lib/components/StatusPill.svelte';
-  import Button from '$lib/components/Button.svelte';
-  import { api } from '$lib/api';
-  import { toastError } from '$lib/toast';
-  import { trapFocus } from '$lib/trapFocus';
+  import PageHeader from '#lib/components/PageHeader.svelte';
+  import StatusPill from '#lib/components/StatusPill.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import { api } from '#lib/api.js';
+  import { toastError } from '#lib/toast.js';
+  import { trapFocus } from '#lib/trapFocus.js';
 
   type Entry = {
     id: number; libraryItemId: number; type: string; title: string;

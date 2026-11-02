@@ -12,12 +12,12 @@
   import Download from '@lucide/svelte/icons/download';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import Search from '@lucide/svelte/icons/search';
-  import PageHeader from '$lib/components/PageHeader.svelte';
-  import Button from '$lib/components/Button.svelte';
-  import Pagination from '$lib/components/Pagination.svelte';
-  import * as Table from '$lib/components/ui/table/index.js';
-  import * as Select from '$lib/components/ui/select/index.js';
-  import { api } from '$lib/api';
+  import PageHeader from '#lib/components/PageHeader.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import Pagination from '#lib/components/Pagination.svelte';
+  import * as Table from '#lib/components/ui/table/index.js';
+  import * as Select from '#lib/components/ui/select/index.js';
+  import { api } from '#lib/api.js';
 
   type LogEntry = {
     level: string;

@@ -7,7 +7,7 @@
   import { onMount } from 'svelte';
 
   onMount(() => {
-    void goto('/downloads', { replaceState: true });
+    void goto('/downloads', { replace: true });
   });
 </script>
 

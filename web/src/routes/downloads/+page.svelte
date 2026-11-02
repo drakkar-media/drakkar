@@ -18,16 +18,16 @@
   import Trash2 from '@lucide/svelte/icons/trash-2';
   import Upload from '@lucide/svelte/icons/upload';
   import Link from '@lucide/svelte/icons/link';
-  import PageHeader from '$lib/components/PageHeader.svelte';
-  import Panel from '$lib/components/Panel.svelte';
-  import Button from '$lib/components/Button.svelte';
-  import StatusPill from '$lib/components/StatusPill.svelte';
-  import { api, subscribeEvents } from '$lib/api';
-  import { toastError, toastSuccess } from '$lib/toast';
-  import { runAction, confirmed } from '$lib/actions';
-  import { debounce } from '$lib/debounce';
-  import { ACTIVE_STATES } from '$lib/itemStatus';
-  import type { QueueItem, WorkQueueStatus } from '$lib/types';
+  import PageHeader from '#lib/components/PageHeader.svelte';
+  import Panel from '#lib/components/Panel.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import StatusPill from '#lib/components/StatusPill.svelte';
+  import { api, subscribeEvents } from '#lib/api.js';
+  import { toastError, toastSuccess } from '#lib/toast.js';
+  import { runAction, confirmed } from '#lib/actions.js';
+  import { debounce } from '#lib/debounce.js';
+  import { ACTIVE_STATES } from '#lib/itemStatus.js';
+  import type { QueueItem, WorkQueueStatus } from '#lib/types.js';
 
   let uploading = false;
   let nzbUrl = '';

@@ -20,16 +20,16 @@
   import Zap from '@lucide/svelte/icons/zap';
   import CheckCircle2 from '@lucide/svelte/icons/check-circle-2';
   import XCircle from '@lucide/svelte/icons/x-circle';
-  import PageHeader from '$lib/components/PageHeader.svelte';
-  import Panel from '$lib/components/Panel.svelte';
-  import Button from '$lib/components/Button.svelte';
-  import StatusPill from '$lib/components/StatusPill.svelte';
-  import { api, subscribeEvents } from '$lib/api';
-  import { toastError } from '$lib/toast';
-  import { runAction } from '$lib/actions';
-  import { bytes as fmtBytes } from '$lib/format';
-  import { debounce } from '$lib/debounce';
-  import type { IntegrationProbeReport, Status } from '$lib/types';
+  import PageHeader from '#lib/components/PageHeader.svelte';
+  import Panel from '#lib/components/Panel.svelte';
+  import Button from '#lib/components/Button.svelte';
+  import StatusPill from '#lib/components/StatusPill.svelte';
+  import { api, subscribeEvents } from '#lib/api.js';
+  import { toastError } from '#lib/toast.js';
+  import { runAction } from '#lib/actions.js';
+  import { bytes as fmtBytes } from '#lib/format.js';
+  import { debounce } from '#lib/debounce.js';
+  import type { IntegrationProbeReport, Status } from '#lib/types.js';
 
   type ServiceCard = {
     key: string;
