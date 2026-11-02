@@ -528,3 +528,63 @@ func TestConcurrentIdenticalSearchesCoalesceIntoOneUpstreamCall(t *testing.T) {
 		t.Fatalf("expected exactly 1 upstream hit across %d concurrent identical searches, got %d", callers, got)
 	}
 }
+
+// A priority (user-initiated) search must not wait behind the throttle slots
+// and semaphore held by background searches.
+func TestPrioritySearchBypassesThrottleAndSemaphore(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"title":"X.2021.1080p-GRP","link":"http://example/nzb","indexer":"h","size":1,"epoch":1710000000}]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(config.ServiceConfig{URL: server.URL, APIKey: "abc"})
+	client.searchInterval = 5 * time.Second
+	// Exhaust the semaphore and push the throttle far into the future, as a
+	// busy background worker pool would.
+	for i := 0; i < cap(client.searchSem); i++ {
+		client.searchSem <- struct{}{}
+	}
+	client.rateMu.Lock()
+	client.lastCall = time.Now().Add(time.Minute)
+	client.rateMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(WithPriority(context.Background()), 2*time.Second)
+	defer cancel()
+	got, err := client.Search(ctx, SearchRequest{Query: "x 2021"})
+	if err != nil {
+		t.Fatalf("priority search blocked or failed: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(got))
+	}
+
+	// A normal search in the same state must still be gated. The flight runs
+	// detached from ctx, so check "still blocked" rather than relying on a
+	// context timeout, then free everything so the goroutine finishes.
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Search(context.Background(), SearchRequest{Query: "other"})
+		done <- err
+	}()
+	select {
+	case <-done:
+		t.Fatal("non-priority search should have been blocked by semaphore")
+	case <-time.After(300 * time.Millisecond):
+	}
+	client.SetSearchDelay(0)
+	client.rateMu.Lock()
+	client.lastCall = time.Time{}
+	client.rateMu.Unlock()
+	for i := 0; i < cap(client.searchSem); i++ {
+		<-client.searchSem
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("non-priority search failed after release: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("non-priority search never completed after release")
+	}
+}

@@ -2337,7 +2337,7 @@ func Router(status StatusService, queue QueueService, workflowSvc WorkflowServic
 		// hanging until the proxy kills the connection with an opaque 524.
 		searchCtx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 		defer cancel()
-		candidates, err := workflowSvc.ManualSearch(searchCtx, q)
+		candidates, err := workflowSvc.ManualSearch(workflow.WithForceSearch(searchCtx), q)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
 				respondError(w, http.StatusGatewayTimeout, errors.New("manual search timed out — try a narrower query"))

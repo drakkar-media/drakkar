@@ -2277,7 +2277,9 @@ func withForceSearch(ctx context.Context) context.Context {
 // the in-memory search-request dedup cooldown. Callers: user-initiated manual
 // search endpoints only (see withForceSearch for why).
 func WithForceSearch(ctx context.Context) context.Context {
-	return withForceSearch(ctx)
+	// Also mark it a priority Hydra call so the user's search is not queued
+	// behind the background workers' throttle slots.
+	return hydra.WithPriority(withForceSearch(ctx))
 }
 
 func isForceSearch(ctx context.Context) bool {

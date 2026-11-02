@@ -605,12 +605,34 @@ func (c *Client) SearchRecent(ctx context.Context, mediaType string) ([]SearchRe
 	})
 }
 
+type priorityKey struct{}
+
+// WithPriority marks ctx as a user-initiated (foreground) search. Priority
+// searches skip the shared concurrency semaphore and the inter-call throttle
+// wait, so a person waiting on results is never queued behind the background
+// search workers (a single library search fans out into ~8 queries, each of
+// which otherwise waits for its own 2s throttle slot behind every other
+// worker's reserved slots). An active 429 cooldown is still honored, and the
+// volume is bounded by human clicks.
+func WithPriority(ctx context.Context) context.Context {
+	return context.WithValue(ctx, priorityKey{}, true)
+}
+
+func isPriority(ctx context.Context) bool {
+	v, _ := ctx.Value(priorityKey{}).(bool)
+	return v
+}
+
 // throttle enforces searchInterval between consecutive Hydra API calls.
 func (c *Client) throttle(ctx context.Context) error {
 	c.rateMu.Lock()
 	if time.Now().Before(c.cooldownUntil) {
 		c.rateMu.Unlock()
 		return fmt.Errorf("%w until %s", ErrRateLimited, c.cooldownUntil.UTC().Format(time.RFC3339))
+	}
+	if isPriority(ctx) {
+		c.rateMu.Unlock()
+		return nil
 	}
 	now := time.Now()
 	next := c.lastCall.Add(c.searchInterval)
@@ -651,7 +673,13 @@ func (c *Client) Search(ctx context.Context, request SearchRequest) ([]SearchRes
 	// episodes of the same show issuing the same season-pack query) that all
 	// miss the cache above at once, so only one of them actually pages
 	// through NZBHydra2 — see the Client.searchFlight field comment.
-	return c.searchFlight.Do(ctx, key, func(ctx context.Context) ([]SearchResult, error) {
+	// A priority caller gets its own flight so it never waits on a background
+	// leader that is still queued behind the throttle.
+	flightKey := key
+	if isPriority(ctx) {
+		flightKey += "|priority"
+	}
+	return c.searchFlight.Do(ctx, flightKey, func(ctx context.Context) ([]SearchResult, error) {
 		u, err := c.apiURL()
 		if err != nil {
 			return nil, err
@@ -691,12 +719,14 @@ func (c *Client) Search(ctx context.Context, request SearchRequest) ([]SearchRes
 
 		// Acquire concurrency slot — limits simultaneous in-flight NZBHydra2
 		// requests to maxConcurrentSearches regardless of worker count.
-		select {
-		case c.searchSem <- struct{}{}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		if !isPriority(ctx) {
+			select {
+			case c.searchSem <- struct{}{}:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			defer func() { <-c.searchSem }()
 		}
-		defer func() { <-c.searchSem }()
 
 		var allResults []SearchResult
 		for page := 0; page < searchMaxPages; page++ {

@@ -371,6 +371,12 @@
    * (e.g. a dropped connection), rather than leaving the modal disabled
    * forever.
    */
+  // A full library search fans out into many Hydra queries (season pack, ID
+  // tier, title-variant tier) and can legitimately take well over 25s when the
+  // indexers are slow. This is only a safety net for a lost SSE event, so it
+  // is deliberately generous.
+  const PICKER_SEARCH_TIMEOUT_MS = 120000;
+
   async function searchAgain() {
     if (!pickerLibraryItemID) return;
     pickerSearching = true;
@@ -380,7 +386,7 @@
       pickerSearching = false;
       pickerSearchTimeout = null;
       toastError('Search is taking longer than expected — try again in a moment.');
-    }, 25000);
+    }, PICKER_SEARCH_TIMEOUT_MS);
     try {
       await api.replacementCandidates(pickerLibraryItemID);
       toastSuccess('Search queued — results will update shortly');
