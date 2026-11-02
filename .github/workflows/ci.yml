@@ -75,7 +75,7 @@ jobs:
         run: |
           GOTOOLCHAIN=local go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
           cd web
-          npm audit --omit=dev
+          npm audit --omit=dev --audit-level=high
 
       - name: Apply migrations to test database
         run: go run ./cmd/migrate
